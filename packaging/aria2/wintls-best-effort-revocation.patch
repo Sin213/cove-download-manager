@@ -1,0 +1,12 @@
+diff --git a/src/WinTLSContext.cc b/src/WinTLSContext.cc
+index a2326e42..381341a4 100644
+--- a/src/WinTLSContext.cc
++++ b/src/WinTLSContext.cc
+@@ -151,5 +151,6 @@ void WinTLSContext::setVerifyPeer(bool verify)
+   // Verify other side's cert chain.
+   credentials_.dwFlags |= SCH_CRED_AUTO_CRED_VALIDATION |
+                           SCH_CRED_REVOCATION_CHECK_CHAIN |
+-                          SCH_CRED_IGNORE_NO_REVOCATION_CHECK;
++                          SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
++                          SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+ }

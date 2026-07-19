@@ -18,11 +18,13 @@
 #       wine python -m pip install pyside6 requests pyinstaller
 #   - Inno Setup 6 — installed automatically into the same prefix on first run.
 #
-# Aria2 is bundled (Windows has no system aria2). The script downloads
-# aria2-1.37.0 from GitHub releases.
+# Aria2 is bundled (Windows has no system aria2). By default this script uses
+# Cove's pinned build with best-effort WinTLS revocation handling. Building it
+# requires Docker; set COVE_ARIA2_EXE to an explicit Windows binary to override.
 #
 # Env vars:
-#   VERSION=X.Y.Z   override the version (defaults to cove/__init__.py)
+#   VERSION=X.Y.Z     override the version (defaults to cove/__init__.py)
+#   COVE_ARIA2_EXE=PATH  use an explicit Windows aria2c.exe
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -50,23 +52,12 @@ wine "$WIN_PY" -m pip install --quiet pyinstaller pillow
 
 # ---------------------------------------------------------------- 1. aria2c.exe
 ARIA_DIR="$ROOT/build/aria2-win"
-ARIA_VERSION="1.37.0"
-if [ ! -f "$ARIA_DIR/aria2c.exe" ]; then
-    echo "==> Downloading aria2 ${ARIA_VERSION} (Windows x64)"
-    rm -rf "$ARIA_DIR"
-    mkdir -p "$ARIA_DIR"
-    TMP=$(mktemp -d)
-    curl -fL --retry 3 --silent --show-error \
-        -o "$TMP/aria2.zip" \
-        "https://github.com/aria2/aria2/releases/download/release-${ARIA_VERSION}/aria2-${ARIA_VERSION}-win-64bit-build1.zip"
-    (cd "$TMP" && unzip -q aria2.zip)
-    SRC=$(find "$TMP" -maxdepth 2 -type d -name 'aria2-*' | head -1)
-    [ -n "$SRC" ] || { echo "aria2 extract failed"; exit 1; }
-    cp -r "$SRC"/. "$ARIA_DIR/"
-    rm -rf "$TMP"
+ARIA_EXE="${COVE_ARIA2_EXE:-$ARIA_DIR/aria2c.exe}"
+if [ ! -f "$ARIA_EXE" ] && [ -z "${COVE_ARIA2_EXE:-}" ]; then
+    echo "==> Building Cove's patched aria2 1.37.0 (Windows x64)"
+    bash scripts/build-aria2-windows.sh "$ARIA_DIR"
 fi
-ARIA_EXE="$ARIA_DIR/aria2c.exe"
-[ -f "$ARIA_EXE" ] || { echo "aria2c.exe missing after extract"; exit 1; }
+[ -f "$ARIA_EXE" ] || { echo "aria2c.exe not found: $ARIA_EXE"; exit 1; }
 
 YTDLP_DIR="$ROOT/build/yt-dlp-win"
 YTDLP_EXE="$YTDLP_DIR/yt-dlp.exe"

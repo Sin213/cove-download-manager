@@ -112,8 +112,24 @@ jobs:
           if-no-files-found: error
 
   # ── Windows Setup.exe + Portable.exe (native, no Wine) ────────────────
+  aria2-windows:
+    name: Build patched Windows aria2
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build pinned aria2 source with WinTLS patch
+        run: bash scripts/build-aria2-windows.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aria2-windows
+          path: build/aria2-win/
+          if-no-files-found: error
+
   windows:
     name: Build Windows installers
+    needs: aria2-windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,17 +163,15 @@ jobs:
         run: |
           python -c "from PIL import Image; Image.open('cove_icon.png').save('cove_icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 
-      - name: Fetch aria2c.exe
+      - name: Download patched aria2 backend
+        uses: actions/download-artifact@v4
+        with:
+          name: aria2-windows
+          path: build/aria2-win
+
+      - name: Test patched aria2 TLS policy
         shell: pwsh
-        run: |
-          $aria = "1.37.0"
-          $url = "https://github.com/aria2/aria2/releases/download/release-$aria/aria2-$aria-win-64bit-build1.zip"
-          New-Item -ItemType Directory -Force -Path build/aria2-win | Out-Null
-          Invoke-WebRequest -Uri $url -OutFile build/aria2.zip
-          Expand-Archive -Path build/aria2.zip -DestinationPath build -Force
-          $src = Get-ChildItem -Path build -Directory -Filter "aria2-*" | Select-Object -First 1
-          Copy-Item -Path "$($src.FullName)/*" -Destination build/aria2-win -Recurse -Force
-          Test-Path build/aria2-win/aria2c.exe
+        run: scripts/test-aria2-windows-tls.ps1 -Aria2Exe build/aria2-win/aria2c.exe
 
       - name: Fetch yt-dlp.exe
         shell: pwsh
@@ -269,6 +283,7 @@ jobs:
           Copy-Item tools/cove-api/AI_WRAPPER_OPERATING_RULES.md $clientStage/
           Copy-Item tools/cove-api/AI_DIRECT_API_OPERATING_RULES.md $clientStage/
           Compress-Archive -Path "$clientStage/*" -DestinationPath "release/Cove-AI-Client-$version.zip" -Force
+          Copy-Item build/aria2-win/aria2-1.37.0-cove.1-source.tar.gz release/
           Get-ChildItem release | Format-Table -AutoSize
 
       - uses: actions/upload-artifact@v4
@@ -278,6 +293,7 @@ jobs:
             release/Cove-Download-Manager-${{ steps.ver.outputs.version }}-Setup.exe
             release/Cove-Download-Manager-${{ steps.ver.outputs.version }}-Portable.exe
             release/Cove-AI-Client-${{ steps.ver.outputs.version }}.zip
+            release/aria2-1.37.0-cove.1-source.tar.gz
           if-no-files-found: error
 
   # ── Publish GitHub release ─────────────────────────────────────────────
@@ -309,7 +325,7 @@ jobs:
       - name: Generate SHA256 sidecars
         run: |
           cd release
-          for f in *.exe *.AppImage *.deb *.zip; do
+          for f in *.exe *.AppImage *.deb *.zip *.tar.gz; do
             [ -e "$f" ] && sha256sum "$f" > "$f.sha256"
           done
           cat *.sha256
@@ -369,6 +385,7 @@ jobs:
           | Windows installer | `Cove-Download-Manager-VERSION-Setup.exe` |
           | Windows portable | `Cove-Download-Manager-VERSION-Portable.exe` |
           | AI command-line client | `Cove-AI-Client-VERSION.zip` |
+          | Patched aria2 source | `aria2-1.37.0-cove.1-source.tar.gz` |
 
           Each artifact has a matching `.sha256` file for verification.
           NOTESEOF
