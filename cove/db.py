@@ -46,6 +46,12 @@ _MIGRATIONS = [
         f"UPDATE downloads SET connections={MAX_CONNECTIONS_PER_SERVER} "
         f"WHERE connections > {MAX_CONNECTIONS_PER_SERVER}",
     ],
+    # v4 -> v5: persist browser headers for video (ffmpeg/yt-dlp) downloads
+    [
+        "ALTER TABLE downloads ADD COLUMN cookies TEXT DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN referrer TEXT DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN user_agent TEXT DEFAULT ''",
+    ],
 ]
 
 

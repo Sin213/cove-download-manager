@@ -21,7 +21,15 @@ from . import db
 from .aria2 import Aria2Error, Aria2RPC
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 
-URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+")
+URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+", re.IGNORECASE)
+
+
+def _clean_header(value) -> str:
+    """Strip CR/LF so a persisted or drop-file value can't inject extra
+    headers into the ffmpeg/yt-dlp request it is forwarded to."""
+    if not isinstance(value, str):
+        return ""
+    return value.replace("\r", "").replace("\n", "").strip()
 
 
 def _row_get(row, key, default=None):
@@ -46,6 +54,9 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         created_at=row["created_at"],
         segments=row["segments"],
         backend=_row_get(row, "backend", "aria2"),
+        cookies=_clean_header(_row_get(row, "cookies", "")),
+        referrer=_clean_header(_row_get(row, "referrer", "")),
+        user_agent=_clean_header(_row_get(row, "user_agent", "")),
     )
 
 
@@ -70,6 +81,12 @@ class DownloadTask:
     num_pieces: int = 0
     last_status_at: float = 0.0
     backend: str = "aria2"
+    # Browser-supplied headers, used by the ffmpeg/yt-dlp backends for
+    # authenticated or anti-hotlink media. Empty for plain aria2 tasks
+    # (the direct extension -> aria2 path passes headers via RPC instead).
+    cookies: str = ""
+    referrer: str = ""
+    user_agent: str = ""
 
     @property
     def progress(self) -> float:
@@ -228,7 +245,18 @@ class QueueManager(QObject):
                 data = _json.loads(f.read_text())
                 url = data.get("url", "")
                 if url:
-                    self.add_url(url, filename=data.get("filename"))
+                    tid = self.add_url(
+                        url,
+                        out_dir=data.get("dir") or None,
+                        filename=data.get("filename"),
+                        cookies=data.get("cookies") or "",
+                        referrer=data.get("referrer") or "",
+                        user_agent=data.get("userAgent") or "",
+                    )
+                    if tid is None:
+                        # The queue rejected the URL; sideline the file
+                        # instead of silently discarding the request.
+                        raise ValueError("queue rejected drop request")
                 f.unlink(missing_ok=True)
             except Exception:
                 # Sideline the file instead of retrying it every second or
@@ -355,8 +383,14 @@ class QueueManager(QObject):
         *,
         connections: int | None = None,
         speed_limit_kbps: int = 0,
+        cookies: str = "",
+        referrer: str = "",
+        user_agent: str = "",
     ) -> Optional[int]:
         url = url.strip()
+        cookies = _clean_header(cookies)
+        referrer = _clean_header(referrer)
+        user_agent = _clean_header(user_agent)
         if not URL_RE.match(url):
             return None
         import posixpath
@@ -407,8 +441,9 @@ class QueueManager(QObject):
                 """
                 INSERT INTO downloads
                     (url, out_dir, connections, speed_limit_kbps, status,
-                     created_at, category, backend, filename)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     created_at, category, backend, filename,
+                     cookies, referrer, user_agent)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     url,
@@ -420,6 +455,9 @@ class QueueManager(QObject):
                     category,
                     backend,
                     filename,
+                    cookies,
+                    referrer,
+                    user_agent,
                 ),
             )
             tid = cur.lastrowid
@@ -431,6 +469,9 @@ class QueueManager(QObject):
             speed_limit_kbps=speed_limit_kbps,
             backend=backend,
             filename=filename,
+            cookies=cookies,
+            referrer=referrer,
+            user_agent=user_agent,
         )
         self.tasks[tid] = t
         self.task_added.emit(tid)
@@ -522,8 +563,10 @@ class QueueManager(QObject):
         # Special case: add_uri RPC is in flight. We can't ask aria2 to
         # remove a gid we don't have yet, so keep the task alive in
         # self.tasks but hide it from the UI/DB. on_done will dispatch the
-        # actual remove once it learns the gid.
-        if t.status == "active" and not t.gid:
+        # actual remove once it learns the gid. Only aria2 tasks qualify:
+        # active ffmpeg/yt-dlp tasks never get a gid and must instead go
+        # through the normal path that terminates their process.
+        if t.status == "active" and not t.gid and t.backend == "aria2":
             self._pending_launch.setdefault(tid, {}).update(
                 {"remove": True, "delete_file": bool(delete_file)}
             )
@@ -623,18 +666,7 @@ class QueueManager(QObject):
         self._running = False
         self.queue_running_changed.emit(False)
         self._auto_paused = {t.id for t in self.tasks.values() if t.status == "active"}
-        for proc in list(self._hls_procs.values()):
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
-        self._hls_procs.clear()
-        self._hls_duration.clear()
-        self._hls_stderr.clear()
-        for proc in list(self._extractor_procs.values()):
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
-        self._extractor_procs.clear()
-        self._extractor_output.clear()
-        self._spawn(self.rpc.pause_all, on_done=lambda _: self._mark_all_active_paused())
+        self._pause_everything()
 
     def set_overall_speed_limit(self, kbps: int) -> None:
         """Push the *active* aria2 cap. Settings persistence is the
@@ -663,7 +695,34 @@ class QueueManager(QObject):
                 self._maybe_start_next()
         else:
             self._auto_paused |= {t.id for t in self.tasks.values() if t.status == "active"}
-            self._spawn(self.rpc.pause_all, on_done=lambda _: self._mark_all_active_paused())
+            self._pause_everything()
+
+    def _pause_everything(self) -> None:
+        """Queue-wide pause: terminate ffmpeg/yt-dlp processes and pause all
+        aria2 downloads. Active tasks are marked paused even if the pause_all
+        RPC fails - the video processes are already gone by then, so leaving
+        their tasks "active" would persist a state that cannot resume."""
+        for proc in list(self._hls_procs.values()):
+            if proc.state() != QProcess.NotRunning:
+                proc.terminate()
+        self._hls_procs.clear()
+        self._hls_duration.clear()
+        self._hls_stderr.clear()
+        for proc in list(self._extractor_procs.values()):
+            if proc.state() != QProcess.NotRunning:
+                proc.terminate()
+        self._extractor_procs.clear()
+        self._extractor_output.clear()
+
+        def _on_fail(msg: str) -> None:
+            self.error.emit(msg)
+            self._mark_all_active_paused()
+
+        self._spawn(
+            self.rpc.pause_all,
+            on_done=lambda _: self._mark_all_active_paused(),
+            on_fail=_on_fail,
+        )
 
     @property
     def is_running(self) -> bool:
@@ -704,8 +763,25 @@ class QueueManager(QObject):
 
     def _launch_hls(self, t: DownloadTask) -> None:
         from .hls import ffmpeg_command, parse_ffmpeg_progress
+        # ffmpeg does not create missing directories (aria2 and yt-dlp do).
+        try:
+            os.makedirs(t.out_dir, exist_ok=True)
+        except OSError as e:
+            t.status = "error"
+            t.error = f"Could not create download directory: {e}"
+            t.finished_at = time.time()
+            self._persist(t)
+            self.task_changed.emit(t.id)
+            self._maybe_start_next()
+            return
         output_path = os.path.join(t.out_dir, t.filename or "stream.mp4")
-        cmd = ffmpeg_command(t.url, output_path)
+        cmd = ffmpeg_command(
+            t.url,
+            output_path,
+            cookies=t.cookies,
+            referrer=t.referrer,
+            user_agent=t.user_agent,
+        )
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)
@@ -785,7 +861,13 @@ class QueueManager(QObject):
         escaped_dir = t.out_dir.replace("%", "%%")
         escaped_stem = stem.replace("%", "%%")
         output_template = os.path.join(escaped_dir, f"{escaped_stem}.%(ext)s")
-        cmd = ytdlp_command(t.url, output_template)
+        cmd = ytdlp_command(
+            t.url,
+            output_template,
+            cookies=t.cookies,
+            referrer=t.referrer,
+            user_agent=t.user_agent,
+        )
 
         proc = QProcess(self)
         proc.setProcessChannelMode(QProcess.MergedChannels)

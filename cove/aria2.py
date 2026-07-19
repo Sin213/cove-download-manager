@@ -123,12 +123,21 @@ class Aria2Daemon:
             max(int(self.settings.connections_per_server), 1),
             MAX_CONNECTIONS_PER_SERVER,
         )
+        # Pass the RPC secret via a 0600 conf file, not argv: command lines
+        # are world-readable on many systems (/proc, process listers).
+        conf_path = DATA_DIR / "aria2.rpc.conf"
+        conf_path.touch(exist_ok=True)
+        try:
+            os.chmod(conf_path, 0o600)
+        except OSError:
+            pass
+        conf_path.write_text(f"rpc-secret={self.settings.rpc_secret}\n")
         args = [
             aria2c,
+            f"--conf-path={conf_path}",
             "--enable-rpc",
             f"--max-concurrent-downloads={MAX_CONCURRENT_DOWNLOADS}",
             f"--rpc-listen-port={self.settings.rpc_port}",
-            f"--rpc-secret={self.settings.rpc_secret}",
             "--rpc-listen-all=false",
             "--rpc-allow-origin-all=false",
             f"--max-connection-per-server={connections}",
@@ -152,12 +161,15 @@ class Aria2Daemon:
         if self.settings.proxy_type != "none" and self.settings.proxy_host:
             proxy_url = self._build_proxy_url()
             args.append(f"--all-proxy={proxy_url}")
-        self._proc = subprocess.Popen(
-            args,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            **_hidden_console_kwargs(),
-        )
+        try:
+            self._proc = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_hidden_console_kwargs(),
+            )
+        except OSError as e:
+            raise Aria2Error(f"Failed to launch aria2c: {e}")
         # Wait briefly for RPC to come up.
         deadline = time.time() + 5.0
         client = Aria2RPC(self.settings)
@@ -196,6 +208,12 @@ class Aria2Daemon:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+                # Reap the killed child so it can't linger as a zombie or
+                # race a later startup.
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         self._proc = None
 
 

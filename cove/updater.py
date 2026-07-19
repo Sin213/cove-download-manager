@@ -229,6 +229,16 @@ class UpdateCheckWorker(QObject):
         self._repo = repo
 
     def run(self) -> None:
+        # Every exit path must emit a signal: run() is driven by
+        # thread.started, and an escaping exception would leave the thread
+        # spinning and the controller's _thread reference set forever,
+        # blocking all future update checks.
+        try:
+            self._run()
+        except Exception as exc:
+            self.failed.emit(f"malformed release data: {exc}")
+
+    def _run(self) -> None:
         data = fetch_latest_release(self._repo)
         if data is None:
             self.failed.emit("could not reach the releases API")
@@ -456,7 +466,8 @@ class UpdateController(QObject):
             _open_url(info.release_url)
             return
 
-        cache = Path(os.path.expanduser(f"~/.cache/{self._cache_subdir}"))
+        cache_root = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        cache = Path(cache_root) / self._cache_subdir
         cache.mkdir(parents=True, exist_ok=True)
         dest = cache / info.asset_name
         self._pending_info = info
@@ -563,6 +574,10 @@ class UpdateController(QObject):
     def _on_download_failed(self, msg: str) -> None:
         if self._progress is not None:
             self._progress.close()
+        worker = self._download_worker
+        if worker is not None and worker._cancelled:
+            # User-initiated cancel is not a failure; no error dialog.
+            return
         QMessageBox.warning(
             self._parent,
             "Update failed",

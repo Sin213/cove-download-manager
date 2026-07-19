@@ -19,7 +19,11 @@ def extract_urls(text: str) -> list[str]:
     for raw in URL_RE.findall(text):
         # Strip trailing punctuation/markup that gets glued to a URL when it
         # appears inside prose or brackets (e.g. "see <http://x>." or "(x)").
-        url = raw.rstrip(").,;:!?'\"]}>")
+        url = raw.rstrip(".,;:!?'\"]}>")
+        # Strip a trailing ")" only while unbalanced, so URLs that
+        # legitimately end in ")" (e.g. wiki paths) are not shortened.
+        while url.endswith(")") and url.count(")") > url.count("("):
+            url = url[:-1].rstrip(".,;:!?'\"]}>")
         if url not in seen:
             seen.add(url)
             out.append(url)

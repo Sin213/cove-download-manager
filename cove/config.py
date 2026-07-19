@@ -40,6 +40,22 @@ class ScheduleWindow:
     days: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
 
 
+def _schedule_valid(w: ScheduleWindow) -> bool:
+    """Range/type check for persisted schedule values; anything invalid
+    would raise later when converted into datetime.time/QTime."""
+    def _int_in(v, lo, hi):
+        return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+    return (
+        isinstance(w.enabled, bool)
+        and _int_in(w.start_hour, 0, 23)
+        and _int_in(w.end_hour, 0, 23)
+        and _int_in(w.start_minute, 0, 59)
+        and _int_in(w.end_minute, 0, 59)
+        and isinstance(w.days, list)
+        and all(_int_in(d, 0, 6) for d in w.days)
+    )
+
+
 CONNECTION_CHOICES = (1, 2, 4, 8, MAX_CONNECTIONS_PER_SERVER)
 
 CATEGORY_NAMES = ("Documents", "Videos", "Music", "Archives", "Programs", "Images")
@@ -160,6 +176,9 @@ class Settings:
             return {k: v for k, v in data.items() if k in klass.__annotations__}
 
         sched = ScheduleWindow(**_sub_fields(raw.pop("schedule", None), ScheduleWindow))
+        sched_reset = not _schedule_valid(sched)
+        if sched_reset:
+            sched = ScheduleWindow()
         cat = CategoryDirs(**_sub_fields(raw.pop("category_dirs", None), CategoryDirs))
         s = cls(**{k: v for k, v in raw.items() if k in cls.__annotations__})
         s.schedule = sched
@@ -167,8 +186,13 @@ class Settings:
         if s.theme not in ("dark", "light"):
             s.theme = "dark"
         # Migrate legacy / empty / suspiciously-short secrets up to a real one.
-        changed = speed_limit_unit_missing
-        if not s.rpc_secret or s.rpc_secret == _LEGACY_RPC_SECRET or len(s.rpc_secret) < 16:
+        changed = speed_limit_unit_missing or sched_reset
+        if (
+            not isinstance(s.rpc_secret, str)
+            or not s.rpc_secret
+            or s.rpc_secret == _LEGACY_RPC_SECRET
+            or len(s.rpc_secret) < 16
+        ):
             s.rpc_secret = _new_rpc_secret()
             changed = True
         if (

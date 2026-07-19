@@ -57,5 +57,28 @@ class TestFfmpegCommand:
         cmd = ffmpeg_command("https://example.com/stream.m3u8", "/tmp/out.mp4")
         assert cmd == [
             "ffmpeg", "-y", "-i", "https://example.com/stream.m3u8",
-            "-c", "copy", "-bsf:a", "aac_adtstoasc", "/tmp/out.mp4",
+            "-c", "copy", "/tmp/out.mp4",
         ]
+
+    def test_browser_headers_are_input_options(self):
+        cmd = ffmpeg_command(
+            "https://example.com/stream.m3u8",
+            "/tmp/out.mp4",
+            cookies="session=abc",
+            referrer="https://example.com/page",
+            user_agent="TestUA/1.0",
+        )
+        headers_idx = cmd.index("-headers")
+        assert cmd[headers_idx + 1] == (
+            "Cookie: session=abc\r\nReferer: https://example.com/page\r\n"
+        )
+        ua_idx = cmd.index("-user_agent")
+        assert cmd[ua_idx + 1] == "TestUA/1.0"
+        # Input options must come before -i to apply to the HLS input.
+        assert headers_idx < cmd.index("-i")
+        assert ua_idx < cmd.index("-i")
+
+    def test_no_header_flags_without_headers(self):
+        cmd = ffmpeg_command("https://example.com/stream.m3u8", "/tmp/out.mp4")
+        assert "-headers" not in cmd
+        assert "-user_agent" not in cmd

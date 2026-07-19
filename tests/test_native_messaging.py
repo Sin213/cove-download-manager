@@ -32,7 +32,7 @@ class _ChunkedStream:
 def test_decode_message_handles_short_reads():
     """A large body delivered in small chunks must not be truncated."""
     body = json.dumps({"action": "download", "url": "x" * 5000}).encode("utf-8")
-    framed = struct.pack("@I", len(body)) + body
+    framed = struct.pack("<I", len(body)) + body
     result = decode_message(_ChunkedStream(framed, chunk=7))
     assert result["action"] == "download"
     assert len(result["url"]) == 5000
@@ -40,18 +40,18 @@ def test_decode_message_handles_short_reads():
 
 def test_decode_message_eof_mid_body_returns_none():
     body = json.dumps({"action": "ping"}).encode("utf-8")
-    framed = struct.pack("@I", len(body)) + body[:-2]  # truncated body
+    framed = struct.pack("<I", len(body)) + body[:-2]  # truncated body
     assert decode_message(io.BytesIO(framed)) is None
 
 
 def test_decode_message_malformed_json_returns_none():
     bad = b"{not json"
-    framed = struct.pack("@I", len(bad)) + bad
+    framed = struct.pack("<I", len(bad)) + bad
     assert decode_message(io.BytesIO(framed)) is None
 
 
 def test_decode_message_zero_length_returns_none():
-    framed = struct.pack("@I", 0)
+    framed = struct.pack("<I", 0)
     assert decode_message(io.BytesIO(framed)) is None
 
 
@@ -101,7 +101,7 @@ def test_binary_stdio_uses_existing_buffers():
 def test_encode_message():
     msg = {"status": "ok"}
     encoded = encode_message(msg)
-    length = struct.unpack("@I", encoded[:4])[0]
+    length = struct.unpack("<I", encoded[:4])[0]
     body = json.loads(encoded[4:])
     assert length == len(encoded) - 4
     assert body == {"status": "ok"}
@@ -110,7 +110,7 @@ def test_encode_message():
 def test_decode_message():
     msg = {"action": "ping"}
     body = json.dumps(msg).encode("utf-8")
-    data = struct.pack("@I", len(body)) + body
+    data = struct.pack("<I", len(body)) + body
     result = decode_message(io.BytesIO(data))
     assert result == {"action": "ping"}
 
@@ -121,7 +121,7 @@ def test_decode_message_eof():
 
 
 def test_decode_message_too_large():
-    data = struct.pack("@I", 2 * 1024 * 1024) + b"\x00"
+    data = struct.pack("<I", 2 * 1024 * 1024) + b"\x00"
     result = decode_message(io.BytesIO(data))
     assert result is None
 
@@ -198,6 +198,33 @@ def test_handle_youtube_download_queues_extractor(tmp_path, monkeypatch):
     assert len(drop_files) == 1
     assert '"url": "https://www.youtube.com/watch?v=BMcJirSZACw"' in drop_files[0].read_text()
     rpc.add_uri.assert_not_called()
+
+
+def test_video_drop_payload_preserves_headers_and_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    result = handle_message(
+        {
+            "action": "download",
+            "url": "https://www.youtube.com/watch?v=BMcJirSZACw",
+            "filename": "clip.mp4",
+            "directory": "/tmp/videos",
+            "cookies": "session=abc",
+            "referrer": "https://example.com/page",
+            "userAgent": "TestUA/1.0",
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert result["status"] == "ok"
+    drop_files = list((tmp_path / "drop").glob("extractor-*.json"))
+    assert len(drop_files) == 1
+    data = json.loads(drop_files[0].read_text())
+    assert data["dir"] == "/tmp/videos"
+    assert data["cookies"] == "session=abc"
+    assert data["referrer"] == "https://example.com/page"
+    assert data["userAgent"] == "TestUA/1.0"
+    # Atomic write: no half-written .tmp files left behind.
+    assert list((tmp_path / "drop").glob("*.tmp")) == []
 
 
 def test_handle_download_invalid_url():

@@ -42,8 +42,27 @@ def parse_ffmpeg_progress(line: str, duration_secs: float = 0.0) -> dict:
     return result
 
 
-def ffmpeg_command(url: str, output_path: str) -> list[str]:
-    return [
-        "ffmpeg", "-y", "-i", url,
-        "-c", "copy", "-bsf:a", "aac_adtstoasc", output_path,
-    ]
+def ffmpeg_command(
+    url: str,
+    output_path: str,
+    *,
+    cookies: str = "",
+    referrer: str = "",
+    user_agent: str = "",
+) -> list[str]:
+    # No explicit "-bsf:a aac_adtstoasc": the MP4 muxer auto-inserts it for
+    # ADTS AAC input, and forcing it fails HLS streams with non-AAC audio.
+    cmd = ["ffmpeg", "-y"]
+    header_lines = []
+    if cookies:
+        header_lines.append(f"Cookie: {cookies}")
+    if referrer:
+        header_lines.append(f"Referer: {referrer}")
+    if header_lines:
+        # Input options must precede -i; the hls demuxer forwards these
+        # http options to every segment request.
+        cmd += ["-headers", "\r\n".join(header_lines) + "\r\n"]
+    if user_agent:
+        cmd += ["-user_agent", user_agent]
+    cmd += ["-i", url, "-c", "copy", output_path]
+    return cmd

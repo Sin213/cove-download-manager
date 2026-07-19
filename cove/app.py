@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sys
 import logging
+import threading
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
@@ -124,8 +125,10 @@ def run() -> int:
     app.processEvents()
 
     # Registration shells out to flatpak (up to 10 s per browser); run it
-    # after the first paint so a slow flatpak can't hold the window back.
-    QTimer.singleShot(0, _register_native_hosts)
+    # off the GUI thread so a slow or hung flatpak can't freeze the window.
+    threading.Thread(
+        target=_register_native_hosts, name="native-host-install", daemon=True
+    ).start()
 
     def _boot_daemon() -> None:
         try:

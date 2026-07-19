@@ -69,6 +69,23 @@ def test_active_row_restores_as_queued_for_repoll(tmp_path):
     assert task.status == "queued"
 
 
+def test_video_row_restores_browser_headers(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    with db.connect(path) as conn:
+        row = _row(
+            conn,
+            backend="ffmpeg",
+            cookies="session=abc",
+            referrer="https://example.com/page",
+            user_agent="TestUA/1.0",
+        )
+        task = _task_from_persisted_row(row)
+    assert task.cookies == "session=abc"
+    assert task.referrer == "https://example.com/page"
+    assert task.user_agent == "TestUA/1.0"
+
+
 def test_backend_restored_when_present(tmp_path):
     path = tmp_path / "cove.db"
     db.init(path)

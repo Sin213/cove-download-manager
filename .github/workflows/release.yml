@@ -340,20 +340,41 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 2.0.2
+          ## What's new in 2.1.0
 
-          Windows TLS reliability release.
+          Bug-audit release: 24 fixes across the queue, video backends, native messaging, local API, updater, and configuration, plus browser header support for video downloads.
 
-          ### Fixed - Windows downloads
+          ### Added - browser headers for video downloads
 
-          - HTTPS downloads on Windows no longer fail when a certificate revocation service is temporarily unreachable. Schannel's CRYPT_E_REVOCATION_OFFLINE condition is now treated as best-effort revocation checking instead of a hard TLS failure, matching standard browser behavior.
-          - Windows packages now bundle aria2 1.37.0 built from a pinned upstream commit with a narrowly scoped one-line WinTLS patch (SCH_CRED_IGNORE_REVOCATION_OFFLINE). Certificate chain validation, hostname checks, expiry checks, and known-revocation failures remain fully enforced; expired, wrong-host, and self-signed certificates are still rejected, with regression tests in CI.
-          - The patched aria2 source archive ships alongside the release artifacts so the exact GPLv2 source of the bundled binary is always available.
+          - Video and HLS downloads handed off from the browser extension now carry the page's cookies, referrer, and user agent through to the ffmpeg/yt-dlp backend, so authenticated and anti-hotlink media downloads work the same way direct aria2 downloads always have. Headers are sanitized, persisted with the task, and reused on retry after a restart.
+          - The extension's requested download directory is now honored for video downloads instead of falling back to the default folder.
 
-          ### Hardened - build pipeline
+          ### Fixed - queue and video backends
 
-          - All dependency tarballs in the aria2 Windows build are now verified against pinned SHA-256 checksums before use.
-          - The Wine packaging path can no longer silently reuse a stale stock aria2 binary from an earlier build; it rebuilds the patched backend unless the matching patched source archive is present.
+          - Removing an active HLS or yt-dlp download now terminates its process instead of leaving it running in the background.
+          - Stopping the queue or hitting the scheduler window now pauses video downloads reliably, even if the aria2 RPC call fails; previously tasks could stay "active" with no process behind them.
+          - Disabling downloads via the scheduler now stops active ffmpeg/yt-dlp processes, matching queue-stop behavior.
+          - HLS downloads into a directory that does not exist yet now create it instead of failing.
+          - HLS streams with non-AAC audio no longer fail: the AAC-specific bitstream filter is no longer forced on every stream.
+          - URLs with uppercase schemes (HTTP://, FTP://) are accepted by the queue.
+
+          ### Fixed - native messaging and drop files
+
+          - Drop files are written atomically, so the queue can no longer read a half-written request and discard it.
+          - Requests the queue rejects are kept for inspection instead of being silently deleted.
+          - Message framing uses explicit little-endian encoding per the WebExtension native messaging spec.
+          - URLs are normalized once, so a URL with surrounding whitespace can no longer pass validation and then be stored or forwarded untrimmed.
+
+          ### Fixed - local API, updater, and configuration
+
+          - The aria2 RPC secret is no longer visible in the process command line; it is passed via a permission-restricted config file.
+          - Bearer authentication accepts the scheme case-insensitively per RFC 7235, and slow clients can no longer raise unhandled socket timeouts in the API server.
+          - A malformed GitHub release response can no longer wedge future update checks, and cancelling an update download no longer shows an error dialog.
+          - The updater honors XDG_CACHE_HOME, and aria2 startup/shutdown errors are contained and reaped cleanly.
+          - Corrupted persisted settings (non-string RPC secret, out-of-range schedule values) are reset to safe defaults instead of crashing startup.
+          - Native messaging host registration uses proper macOS manifest locations and no longer runs on the GUI thread, so a slow flatpak cannot freeze the window at startup.
+          - Clipboard URL extraction no longer truncates URLs that legitimately end in a closing parenthesis.
+          - Project metadata and runtime version are aligned.
 
           ## Downloads
 
@@ -370,7 +391,7 @@ jobs:
 
           ### Credits
 
-          Huge thanks to @MilitantTurtle for diagnosing the Windows revocation failure, building the patched aria2 backend and CI pipeline, and validating the fix end to end (PR #8).
+          Thank you Kimi for finding the bugs.
           NOTESEOF
           sed -i "s/VERSION/${VERSION}/g" "$NOTES_FILE"
 

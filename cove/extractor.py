@@ -47,9 +47,15 @@ def resolve_ytdlp() -> str | None:
 
 
 def ytdlp_command(
-    url: str, output_template: str, executable: str | None = None
+    url: str,
+    output_template: str,
+    executable: str | None = None,
+    *,
+    cookies: str = "",
+    referrer: str = "",
+    user_agent: str = "",
 ) -> list[str]:
-    return [
+    cmd = [
         executable or resolve_ytdlp() or "yt-dlp",
         "--newline",
         "--no-playlist",
@@ -57,10 +63,15 @@ def ytdlp_command(
         "mp4",
         "-f",
         "bv*[height<=1080]+ba/b[height<=1080]/b",
-        "-o",
-        output_template,
-        url,
     ]
+    if cookies:
+        cmd += ["--add-header", f"Cookie: {cookies}"]
+    if referrer:
+        cmd += ["--referer", referrer]
+    if user_agent:
+        cmd += ["--user-agent", user_agent]
+    cmd += ["-o", output_template, url]
+    return cmd
 
 
 def parse_ytdlp_progress(line: str) -> dict[str, float]:

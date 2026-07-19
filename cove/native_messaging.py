@@ -42,7 +42,7 @@ def decode_message(stream: io.BufferedIOBase) -> dict | None:
     raw_length = _read_exact(stream, 4)
     if raw_length is None:
         return None
-    length = struct.unpack("@I", raw_length)[0]
+    length = struct.unpack("<I", raw_length)[0]
     if length == 0 or length > MAX_MESSAGE_SIZE:
         return None
     data = _read_exact(stream, length)
@@ -61,7 +61,7 @@ def decode_message(stream: io.BufferedIOBase) -> dict | None:
 
 def encode_message(msg: dict) -> bytes:
     body = json.dumps(msg).encode("utf-8")
-    return struct.pack("@I", len(body)) + body
+    return struct.pack("<I", len(body)) + body
 
 
 def _sanitize_header(value: Any) -> str:
@@ -93,6 +93,11 @@ def handle_message(
 
     if action == "download":
         url = msg.get("url", "")
+        # Normalize once so the same URL that passed validation is the one
+        # forwarded to aria2 / the drop file (validation checks a stripped
+        # copy, so an untrimmed original could slip through otherwise).
+        if isinstance(url, str):
+            url = url.strip()
         if not validate_url(url):
             return {"status": "error", "message": f"Invalid or blocked URL: {url!r}"}
         if rpc is None or settings is None:
@@ -129,7 +134,26 @@ def handle_message(
                     f"{drop_backend}-{int(_time.time() * 1000)}"
                     f"-{_uuid.uuid4().hex[:8]}.json"
                 )
-                drop_file.write_text(_json.dumps({"url": url, "filename": filename}))
+                payload = {"url": url, "filename": filename}
+                # Only pass a directory the caller explicitly requested, so
+                # the queue's category routing still applies otherwise.
+                requested_dir = msg.get("directory")
+                if requested_dir:
+                    payload["dir"] = requested_dir
+                # Browser headers, already CR/LF-sanitized above; the queue
+                # forwards them to the ffmpeg/yt-dlp backend so authenticated
+                # or anti-hotlink media keeps working.
+                if cookies:
+                    payload["cookies"] = cookies
+                if referrer:
+                    payload["referrer"] = referrer
+                if user_agent:
+                    payload["userAgent"] = user_agent
+                # Write via tmp + rename: the queue polls this directory and
+                # must never see a half-written .json file.
+                tmp_file = drop_file.with_suffix(".tmp")
+                tmp_file.write_text(_json.dumps(payload))
+                os.replace(tmp_file, drop_file)
             except OSError as e:
                 return {"status": "error", "message": f"Could not queue video download: {e}"}
             return {"status": "ok", "message": "Video download queued in Cove"}

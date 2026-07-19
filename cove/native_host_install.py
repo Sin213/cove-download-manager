@@ -70,6 +70,16 @@ _CHROMIUM_CONFIG_DIRS = [
     "opera",
 ]
 
+# macOS equivalents under ~/Library/Application Support/<dir>/.
+_CHROMIUM_MACOS_DIRS = [
+    "Google/Chrome",
+    "Chromium",
+    "Microsoft Edge",
+    "BraveSoftware/Brave-Browser",
+    "Vivaldi",
+    "com.operasoftware.Opera",
+]
+
 _KNOWN_FLATPAK_IDS = {
     "org.mozilla.firefox",
     "app.zen_browser.zen",
@@ -147,11 +157,20 @@ def _write_manifest(hosts_dir: Path, wrapper_content: str, manifest_fn=_manifest
 
 
 def _browser_dirs() -> list[Path]:
+    """Firefox-family manifest dirs for installed browsers only, so we
+    don't create stray directories for browsers that aren't there."""
     home = Path.home()
     dirs: list[Path] = []
 
+    if sys.platform == "darwin":
+        app_support = home / "Library" / "Application Support"
+        if (app_support / "Firefox").is_dir() or (app_support / "Mozilla").is_dir():
+            dirs.append(app_support / "Mozilla" / "NativeMessagingHosts")
+        return dirs
+
     # Primary: all Firefox-based browsers check ~/.mozilla/
-    dirs.append(home / ".mozilla" / "native-messaging-hosts")
+    if (home / ".mozilla").exists():
+        dirs.append(home / ".mozilla" / "native-messaging-hosts")
 
     # Fork-specific dirs (patched libxul builds)
     for name in _FORK_CONFIG_DIRS:
@@ -168,10 +187,15 @@ def _chromium_browser_dirs() -> list[Path]:
     Only includes a browser whose config dir already exists, so we don't
     create stray directories for browsers that aren't installed.
     """
-    config = Path.home() / ".config"
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+        names = _CHROMIUM_MACOS_DIRS
+    else:
+        base = Path.home() / ".config"
+        names = _CHROMIUM_CONFIG_DIRS
     dirs: list[Path] = []
-    for name in _CHROMIUM_CONFIG_DIRS:
-        browser_dir = config / name
+    for name in names:
+        browser_dir = base / name
         if browser_dir.is_dir():
             dirs.append(browser_dir / "NativeMessagingHosts")
     return dirs
@@ -216,11 +240,9 @@ def _install_posix() -> list[str]:
     wrapper = _wrapper_script(parts)
     installed: list[str] = []
 
-    # Firefox-based browsers (allowed_extensions).
+    # Firefox-based browsers (allowed_extensions). _browser_dirs() already
+    # filters to installed browsers.
     for hosts_dir in _browser_dirs():
-        if not hosts_dir.parent.exists():
-            continue
-
         _write_manifest(hosts_dir, wrapper)
         installed.append(str(hosts_dir))
 

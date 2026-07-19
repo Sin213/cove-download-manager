@@ -364,7 +364,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             self.close_connection = True
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            # A client that stops reading is the same as one that hung up:
+            # drop the response instead of raising out of the handler.
             pass
 
     def _fail(self, problem: ApiProblem) -> None:
@@ -378,9 +380,11 @@ class _RequestHandler(BaseHTTPRequestHandler):
         values = self.headers.get_all("Authorization") or []
         if not values:
             raise _problem(401, "missing_auth", "A bearer token is required.")
-        if len(values) != 1 or not values[0].startswith("Bearer ") or not values[0][7:]:
+        scheme, _, token = values[0].partition(" ")
+        # Auth scheme names are case-insensitive (RFC 7235).
+        if len(values) != 1 or scheme.lower() != "bearer" or not token:
             raise _problem(401, "malformed_auth", "Authorization must use a bearer token.")
-        if not secrets.compare_digest(values[0][7:], self.service.token):
+        if not secrets.compare_digest(token, self.service.token):
             raise _problem(401, "invalid_token", "The bearer token is incorrect.")
 
     def _json_body(self) -> dict[str, Any]:
