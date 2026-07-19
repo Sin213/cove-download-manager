@@ -337,44 +337,20 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 2.0.1
+          ## What's new in 2.0.2
 
-          Maintenance release fixing bugs found in a full-codebase audit.
+          Windows TLS reliability release.
 
-          ### Fixed - downloads and queue
+          ### Fixed - Windows downloads
 
-          - Pausing a yt-dlp or ffmpeg video download now actually stops the process. Previously it kept downloading while showing "Paused", and resuming started a second copy of the same download.
-          - Retry now works for failed aria2 downloads. Previously they could get stuck in "Queued" forever.
-          - If ffmpeg or yt-dlp fails to start (missing or broken binary), the task is marked as errored instead of hanging in "Active" with no way out.
-          - Stopping the queue (or a scheduler window closing) while a download was still being handed to aria2 no longer leaves it downloading in the background while shown as paused.
-          - A failed resume no longer leaves an orphaned download inside aria2 that could reappear later as a duplicate entry.
-          - ffmpeg failure messages now show the actual last lines of output instead of a partial chunk.
-          - Video downloads into folders containing a % character no longer produce broken filenames.
-          - Video downloads queued from the browser extension are no longer silently lost if adding them fails, and two arriving in the same millisecond no longer overwrite each other.
+          - HTTPS downloads on Windows no longer fail when a certificate revocation service is temporarily unreachable. Schannel's CRYPT_E_REVOCATION_OFFLINE condition is now treated as best-effort revocation checking instead of a hard TLS failure, matching standard browser behavior.
+          - Windows packages now bundle aria2 1.37.0 built from a pinned upstream commit with a narrowly scoped one-line WinTLS patch (SCH_CRED_IGNORE_REVOCATION_OFFLINE). Certificate chain validation, hostname checks, expiry checks, and known-revocation failures remain fully enforced; expired, wrong-host, and self-signed certificates are still rejected, with regression tests in CI.
+          - The patched aria2 source archive ships alongside the release artifacts so the exact GPLv2 source of the bundled binary is always available.
 
-          ### Fixed - configuration and startup
+          ### Hardened - build pipeline
 
-          - A corrupted settings.json (wrong JSON type, malformed schedule or category entries, invalid rpc_port) no longer crashes the app at startup; settings are repaired automatically.
-          - Empty XDG_CONFIG_HOME or XDG_DATA_HOME environment variables no longer make Cove write its config and database into the current working directory.
-          - Browser integration setup (Flatpak overrides) no longer runs before the window appears, so a slow flatpak can no longer delay startup.
-          - The updater rejects SHA-1/SHA-224 digests where SHA-256 is required and cleans up partial files if an update swap fails midway.
-
-          ### Fixed - browser extension and native host
-
-          - The native messaging host no longer crashes (silently dropping the download) on malformed messages or disk errors; it now reports an error to the extension instead.
-          - Clearing the minimum-size field in the extension options no longer silently disables the size filter.
-          - The popup now formats sizes of 1 TB and above correctly and no longer logs an error every 2 seconds while the background worker restarts.
-          - A malformed native host response can no longer leave an intercepted download in limbo.
-
-          ### Fixed - other
-
-          - Switching the speed limiter display unit from MB/s to KB/s no longer silently clamps high limits.
-          - build.sh now cleans stale build directories correctly on non-x86_64 machines.
-          - AI client: corrected a misleading timeout validation message.
-
-          ### Credits
-
-          - Thank you GLM for catching the bugs fixed in this release.
+          - All dependency tarballs in the aria2 Windows build are now verified against pinned SHA-256 checksums before use.
+          - The Wine packaging path can no longer silently reuse a stale stock aria2 binary from an earlier build; it rebuilds the patched backend unless the matching patched source archive is present.
 
           ## Downloads
 
@@ -388,6 +364,10 @@ jobs:
           | Patched aria2 source | `aria2-1.37.0-cove.1-source.tar.gz` |
 
           Each artifact has a matching `.sha256` file for verification.
+
+          ### Credits
+
+          Huge thanks to @MilitantTurtle for diagnosing the Windows revocation failure, building the patched aria2 backend and CI pipeline, and validating the fix end to end (PR #8).
           NOTESEOF
           sed -i "s/VERSION/${VERSION}/g" "$NOTES_FILE"
 

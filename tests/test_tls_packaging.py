@@ -32,6 +32,18 @@ def test_patched_aria2_source_is_pinned_and_soft_fails_only_offline_revocation()
     assert "SCH_CRED_NO_SERVERNAME_CHECK" not in patch
 
 
+def test_dockerfile_pins_dependency_tarballs_by_sha256():
+    dockerfile = (ROOT / "packaging" / "aria2" / "Dockerfile.mingw").read_text(
+        encoding="utf-8"
+    )
+
+    # Every fetched dependency tarball must be verified before extraction.
+    fetches = dockerfile.count("curl -fL")
+    checks = dockerfile.count("| sha256sum -c -")
+    assert fetches == checks
+    assert checks == 6
+
+
 def test_wine_build_cannot_silently_download_stock_aria2():
     wine_script = (ROOT / "scripts" / "build-windows-wine.sh").read_text(
         encoding="utf-8"
@@ -39,3 +51,6 @@ def test_wine_build_cannot_silently_download_stock_aria2():
 
     assert "scripts/build-aria2-windows.sh" in wine_script
     assert "aria2-1.37.0-win-64bit-build1.zip" not in wine_script
+    # A cached exe is only trusted when the patched-source tarball sits
+    # beside it, so stale stock binaries from the old path get rebuilt.
+    assert "aria2-1.37.0-cove.1-source.tar.gz" in wine_script

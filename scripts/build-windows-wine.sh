@@ -16,7 +16,7 @@
 #       wine python-3.12.x-amd64.exe /quiet PrependPath=1 \
 #            InstallAllUsers=0 Include_test=0
 #       wine python -m pip install pyside6 requests pyinstaller
-#   - Inno Setup 6 — installed automatically into the same prefix on first run.
+#   - Inno Setup 6 - installed automatically into the same prefix on first run.
 #
 # Aria2 is bundled (Windows has no system aria2). By default this script uses
 # Cove's pinned build with best-effort WinTLS revocation handling. Building it
@@ -45,7 +45,7 @@ PY_UNIX="$WINEPREFIX/drive_c/users/$USER/AppData/Local/Programs/Python/Python312
 [ -x "$PY_UNIX" ] || { echo "Wine Python not found at $PY_UNIX"; echo "See the prereqs comment at the top of this script."; exit 1; }
 
 # Make sure the wine Python has the runtime deps cove imports (PySide6,
-# requests). pip is idempotent — already-installed packages are no-ops.
+# requests). pip is idempotent - already-installed packages are no-ops.
 echo "==> Ensuring wine Python has cove's runtime deps"
 wine "$WIN_PY" -m pip install --quiet --upgrade -r requirements.txt
 wine "$WIN_PY" -m pip install --quiet pyinstaller pillow
@@ -53,9 +53,15 @@ wine "$WIN_PY" -m pip install --quiet pyinstaller pillow
 # ---------------------------------------------------------------- 1. aria2c.exe
 ARIA_DIR="$ROOT/build/aria2-win"
 ARIA_EXE="${COVE_ARIA2_EXE:-$ARIA_DIR/aria2c.exe}"
-if [ ! -f "$ARIA_EXE" ] && [ -z "${COVE_ARIA2_EXE:-}" ]; then
-    echo "==> Building Cove's patched aria2 1.37.0 (Windows x64)"
-    bash scripts/build-aria2-windows.sh "$ARIA_DIR"
+ARIA_SOURCE_TARBALL="$ARIA_DIR/aria2-1.37.0-cove.1-source.tar.gz"
+if [ -z "${COVE_ARIA2_EXE:-}" ]; then
+    # A cached exe without the patched-source tarball beside it is a stock
+    # binary left over from the old download path; rebuild instead of using it.
+    if [ ! -f "$ARIA_EXE" ] || [ ! -f "$ARIA_SOURCE_TARBALL" ]; then
+        echo "==> Building Cove's patched aria2 1.37.0 (Windows x64)"
+        rm -rf "$ARIA_DIR"
+        bash scripts/build-aria2-windows.sh "$ARIA_DIR"
+    fi
 fi
 [ -f "$ARIA_EXE" ] || { echo "aria2c.exe not found: $ARIA_EXE"; exit 1; }
 
