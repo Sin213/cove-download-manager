@@ -320,6 +320,9 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -type f -exec cp -v {} release/ \;
+          # The aria2-windows artifact is a build intermediate; its exe is
+          # already bundled inside Setup.exe and Portable.exe.
+          rm -f release/aria2c.exe
           ls -la release/
 
       - name: Generate SHA256 sidecars
