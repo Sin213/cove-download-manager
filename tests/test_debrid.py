@@ -1163,3 +1163,56 @@ def test_accepted_provider_filenames_satisfy_coves_own_filename_rules():
                 f"debrid accepted {accepted!r} (from {candidate!r}) but Cove's "
                 f"own filename validation rejects it: {exc.message}"
             ) from None
+
+
+# --------------------------------------------------------------------------
+# Provider share / landing links
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url,expected_label",
+    [
+        ("https://real-debrid.com/d/ALJRILITCGUEW127", "Real-Debrid"),
+        ("https://www.real-debrid.com/d/ABC123", "Real-Debrid"),
+        ("http://real-debrid.com/d/ABC123", "Real-Debrid"),
+        ("https://REAL-DEBRID.com/d/ABC123", "Real-Debrid"),
+        ("https://alldebrid.com/f/XYZ789", "AllDebrid"),
+        ("https://www.alldebrid.com/f/XYZ789", "AllDebrid"),
+    ],
+)
+def test_account_bound_share_links_are_identified(url, expected_label):
+    reason = debrid.share_link_reason(url)
+    assert reason
+    assert expected_label in reason
+    assert "original" in reason.lower()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # Generated node URLs. These are plain direct links that do work when
+        # pasted by hand, so they must keep downloading normally.
+        "https://s1.debrid.it/dl/abc/file.zip",
+        "https://debrid.it/dl/abc/file.zip",
+        "https://45.download.real-debrid.com/d/ABC123/file.zip",
+        "https://node-01.real-debrid.com/d/ABC/file.zip",
+        # Not a share path.
+        "https://real-debrid.com/",
+        "https://real-debrid.com/premium",
+        "https://alldebrid.com/",
+        "https://alldebrid.com/pricing",
+        "https://real-debrid.com/f/ABC",
+        "https://alldebrid.com/d/ABC",
+        # Lookalike hosts must not be claimed.
+        "https://real-debrid.com.evil.test/d/ABC",
+        "https://notreal-debrid.com/d/ABC",
+        # Ordinary hosters and non-http input.
+        "https://rapidgator.net/file/abc",
+        "magnet:?xt=urn:btih:abc",
+        "",
+        None,
+    ],
+)
+def test_non_share_links_are_left_alone(url):
+    assert debrid.share_link_reason(url) == ""

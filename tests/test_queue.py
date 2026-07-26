@@ -529,3 +529,79 @@ def test_resolved_url_is_not_a_persisted_column(queue_env):
         conn.close()
     assert "resolved_url" not in columns
     assert "debrid_provider" not in columns
+
+
+# ---------------------------------------------------------------------------
+# Provider share links fail with a readable reason instead of downloading
+# the provider's "forbidden" HTML page
+# ---------------------------------------------------------------------------
+
+SHARE_URL = "https://real-debrid.com/d/ALJRILITCGUEW127"
+
+
+def test_share_link_fails_the_task_with_an_explanatory_reason(queue_env, monkeypatch):
+    queue, rpc, _db = queue_env()
+    tid = queue.add_url(SHARE_URL)
+    task = queue.tasks[tid]
+
+    spawned = []
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: spawned.append(fn))
+    queue._launch(task)
+
+    assert task.status == "error"
+    assert "Real-Debrid" in task.error
+    assert "original" in task.error.lower()
+    assert task.finished_at is not None
+    assert spawned == [], "a share link must never reach aria2"
+    assert rpc.added == []
+
+
+def test_share_link_reason_is_persisted_for_the_row(queue_env, monkeypatch):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(SHARE_URL)
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    row = _persisted_row(db_path, tid)
+    assert row["status"] == "error"
+    assert "Real-Debrid" in row["error"]
+
+
+def test_share_link_is_rejected_even_with_debrid_disabled(queue_env, monkeypatch):
+    """The user's case: no key configured at all. Previously this silently
+    downloaded the provider's forbidden page as a file."""
+    queue, rpc, _db = queue_env(intelligent_segments=False)
+    tid = queue.add_url("https://www.alldebrid.com/f/XYZ789")
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].status == "error"
+    assert "AllDebrid" in queue.tasks[tid].error
+    assert rpc.added == []
+
+
+def test_generated_node_urls_still_download_normally(queue_env, monkeypatch):
+    """Pasting a link Cove itself would hand to aria2 must keep working."""
+    queue, _rpc, _db = queue_env()
+    for url in (
+        "https://s1.debrid.it/dl/abc/file.zip",
+        "https://45.download.real-debrid.com/d/ABC123/file.zip",
+    ):
+        tid = queue.add_url(url)
+        spawned = []
+        monkeypatch.setattr(queue, "_spawn",
+                            lambda fn, *a, **kw: spawned.append(getattr(fn, "__name__", fn)))
+        queue._launch(queue.tasks[tid])
+        assert queue.tasks[tid].status == "active", url
+        assert spawned, url
+
+
+def test_ordinary_download_is_unaffected_by_the_share_link_check(queue_env, monkeypatch):
+    queue, _rpc, _db = queue_env(intelligent_segments=False)
+    tid = queue.add_url("https://example.com/big.zip")
+    spawned = []
+    monkeypatch.setattr(queue, "_spawn",
+                        lambda fn, *a, **kw: spawned.append(getattr(fn, "__name__", fn)))
+    queue._launch(queue.tasks[tid])
+    assert queue.tasks[tid].status == "active"
+    assert spawned == ["add_uri"]

@@ -508,6 +508,49 @@ def is_provider_domain(url) -> bool:
     return is_supported_domain(url, PROVIDER_OWN_DOMAINS)
 
 
+# Provider share / landing pages. These serve the file only to the browser
+# session of the account that generated them, so Cove can neither fetch them
+# directly (it gets the provider's "forbidden" HTML page) nor re-resolve them
+# through the API (they are not hoster links).
+#
+# Generated node URLs are deliberately NOT listed here: a link like
+# `s1.debrid.it/dl/...` or `45.download.real-debrid.com/d/...` is a plain
+# direct URL that downloads fine when pasted by hand, and refusing those
+# would break a legitimate manual workflow. Matching is anchored to the bare
+# apex host plus the share path prefix so download subdomains fall through.
+_SHARE_LINK_HOSTS = {
+    "real-debrid.com": ("/d/", REAL_DEBRID),
+    "alldebrid.com": ("/f/", ALL_DEBRID),
+}
+
+
+def share_link_reason(url) -> str:
+    """Explain why an account-bound provider share link can't be downloaded.
+
+    Returns "" for anything Cove should keep handling normally.
+    """
+    host = _hostname(url)
+    if not host:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    entry = _SHARE_LINK_HOSTS.get(host)
+    if entry is None:
+        return ""
+    prefix, provider = entry
+    try:
+        path = urlparse(url).path
+    except ValueError:
+        return ""
+    if not path.startswith(prefix):
+        return ""
+    return (
+        f"{provider_label(provider)} share links are tied to the account that "
+        f"created them and can't be downloaded by Cove. Add the original "
+        f"hoster link instead."
+    )
+
+
 def _cache_path() -> Path:
     from .config import DATA_DIR
 

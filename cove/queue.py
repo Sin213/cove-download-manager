@@ -962,6 +962,18 @@ class QueueManager(QObject):
         if t.backend == "yt-dlp":
             self._launch_extractor(t)
             return
+        # An account-bound provider share link would otherwise "succeed" by
+        # saving the provider's forbidden HTML page as the file. Fail the
+        # task instead so the row carries a reason the user can act on.
+        share_reason = debrid.share_link_reason(t.url)
+        if share_reason:
+            t.status = "error"
+            t.error = share_reason
+            t.finished_at = time.time()
+            self._persist(t)
+            self.task_changed.emit(t.id)
+            self._maybe_start_next()
+            return
         self._pending_launch[t.id] = {}
 
         def on_done(gid: str, tid: int = t.id) -> None:
