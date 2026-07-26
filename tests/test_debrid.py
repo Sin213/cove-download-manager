@@ -1778,6 +1778,18 @@ def test_unlock_torrent_file_rejects_an_unknown_provider():
         debrid.unlock_torrent_file(RD_LOCKED_1, "nope", _torrent_settings(), session=FakeSession({}))
 
 
+def test_unlock_torrent_file_rejects_torbox():
+    """TorBox is in DEBRID_PROVIDERS (for ordering) but has no locked-link
+    credential lookup here -- it must never fall into the Real-Debrid
+    credential branch by virtue of not being AllDebrid."""
+    with pytest.raises(DebridError) as exc:
+        debrid.unlock_torrent_file(
+            "https://torbox.app/torrent/1/2", debrid.TORBOX,
+            _torrent_settings(), session=FakeSession({}),
+        )
+    assert exc.value.code == "unknown_provider"
+
+
 # --- Leak checks -----------------------------------------------------------
 
 
@@ -2290,9 +2302,359 @@ def test_resolve_falls_back_past_torbox_when_host_unsupported(torbox_available):
     assert result.provider == ALL_DEBRID
 
 
-def test_resolve_torrent_excludes_torbox_even_when_gate_is_on(torbox_available):
+def test_resolve_torrent_excludes_torbox_when_gate_is_off():
     settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
                              debrid_preferred_provider="torbox")
-    # No AD/RD enabled and TorBox excluded -> nothing to ask, returns None
-    # rather than misrouting a TorBox credential into the AD/RD-only probe.
+    # Gate is off (the default): TorBox never enters _enabled_providers, so
+    # there is nothing to ask and this returns None rather than routing a
+    # TorBox credential into a provider probe.
     assert debrid.resolve_torrent(INFO_HASH, settings, session=FakeSession({})) is None
+
+
+# --------------------------------------------------------------------------
+# TorBox (T2: cached torrent routing)
+# --------------------------------------------------------------------------
+
+TB_TORRENT_ID = 900
+
+
+def _tb_torrent_entry(files=None, ready=True, name="Season 1"):
+    return {
+        "id": TB_TORRENT_ID,
+        "name": name,
+        "download_present": ready,
+        "download_finished": ready,
+        "files": (
+            [
+                {"id": 1, "name": "Season 1/ep1.mkv", "size": 10},
+                {"id": 2, "name": "Season 1/extras/ep2.mkv", "size": 20},
+            ]
+            if files is None else files
+        ),
+    }
+
+
+def _tb_checkcached(cached=True):
+    return _tb_env([{"hash": INFO_HASH}] if cached else [])
+
+
+def test_torbox_check_cached_torrent_true_when_present():
+    session = FakeSession({"/torrents/checkcached": _tb_checkcached(True)})
+    assert debrid._torbox_check_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session) is True
+
+
+def test_torbox_check_cached_torrent_false_when_absent():
+    session = FakeSession({"/torrents/checkcached": _tb_checkcached(False)})
+    assert debrid._torbox_check_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session) is False
+
+
+def test_torbox_cached_torrent_returns_none_when_not_cached():
+    session = FakeSession({"/torrents/checkcached": _tb_checkcached(False)})
+    assert debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session) is None
+    # Not cached means never even attempting a create.
+    assert _ad_calls(session, "/torrents/createtorrent") == []
+
+
+def test_torbox_cached_torrent_creates_then_returns_files():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+    })
+    cached = debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert cached.provider == debrid.TORBOX
+    assert cached.info_hash == INFO_HASH
+    assert cached.name == "Season 1"
+    assert [f.path for f in cached.files] == [("ep1.mkv",), ("extras", "ep2.mkv")]
+    assert [f.size for f in cached.files] == [10, 20]
+    assert [f.item_id for f in cached.files] == [str(TB_TORRENT_ID), str(TB_TORRENT_ID)]
+    assert [f.file_id for f in cached.files] == ["1", "2"]
+    assert [f.locked_link for f in cached.files] == ["", ""]
+
+
+def test_torbox_numeric_id_accepts_whole_valued_floats():
+    # TorBox's own schema types these IDs as JSON numbers (e.g. 900.0).
+    assert debrid._torbox_numeric_id(900.0) == "900"
+
+
+def test_torbox_numeric_id_rejects_fractional_and_non_finite_floats():
+    for bad in (900.5, float("inf"), float("nan")):
+        with pytest.raises(DebridError):
+            debrid._torbox_numeric_id(bad)
+
+
+def test_torbox_numeric_id_rejects_bool():
+    with pytest.raises(DebridError):
+        debrid._torbox_numeric_id(True)
+
+
+def test_torbox_cached_torrent_accepts_float_torrent_and_file_ids():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": 900.0}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[
+            {"id": 1.0, "name": "ep1.mkv", "size": 10},
+        ])),
+    })
+    cached = debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert cached.files[0].item_id == "900"
+    assert cached.files[0].file_id == "1"
+
+
+def test_torbox_create_torrent_sends_multipart_with_cached_only_and_no_seed_no_zip():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+    })
+    debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    call = next(c for c in session.calls if c[1].endswith("/torrents/createtorrent"))
+    files = call[2]["files"]
+    assert files["add_only_if_cached"] == (None, "true")
+    assert files["seed"] == (None, "3")
+    assert files["allow_zip"] == (None, "false")
+    assert files["magnet"] == (None, debrid._torrent.minimal_magnet(INFO_HASH))
+
+
+def test_torbox_create_torrent_uses_torrent_file_bytes_when_given():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+    })
+    debrid.torbox_cached_torrent(
+        INFO_HASH, TORBOX_TOKEN, torrent_bytes=b"d4:infod...e", session=session,
+    )
+    call = next(c for c in session.calls if c[1].endswith("/torrents/createtorrent"))
+    assert "file" in call[2]["files"]
+    assert "magnet" not in call[2]["files"]
+
+
+def test_torbox_create_torrent_only_ever_receives_the_minimal_magnet():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+    })
+    parsed = debrid._torrent.parse_magnet(TRACKER_MAGNET)
+    debrid.torbox_cached_torrent(parsed.info_hash, TORBOX_TOKEN, session=session)
+    sent = repr(session.calls)
+    assert MINIMAL_MAGNET in sent
+    for leaked in ("SECRETPASS", "tracker.example", "dn=", "Season+1"):
+        assert leaked not in sent
+
+
+def test_torbox_cached_torrent_add_only_if_cached_refusal_returns_none():
+    # checkcached said yes but createtorrent's own cached-only guarantee
+    # disagreed and created nothing: no torrent_id means nothing to clean
+    # up either.
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({}),
+    })
+    assert debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session) is None
+    assert _ad_calls(session, "/torrents/controltorrent") == []
+
+
+def test_torbox_cached_torrent_race_deletes_and_returns_none():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(ready=False)),
+        "/torrents/controltorrent": _tb_env(None),
+    })
+    clock = FakeClock()
+    assert debrid.torbox_cached_torrent(
+        INFO_HASH, TORBOX_TOKEN, session=session,
+        sleep=clock.sleep, clock=clock.monotonic,
+    ) is None
+    assert len(_ad_calls(session, "/torrents/controltorrent")) == 1
+
+
+def test_torbox_cached_torrent_deletes_on_malformed_file_list():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[])),
+        "/torrents/controltorrent": _tb_env(None),
+    })
+    with pytest.raises(DebridError):
+        debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert len(_ad_calls(session, "/torrents/controltorrent")) == 1
+
+
+def test_torbox_cached_torrent_rejects_duplicate_file_ids():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[
+            {"id": 1, "name": "a.mkv", "size": 1},
+            {"id": 1, "name": "b.mkv", "size": 2},
+        ])),
+        "/torrents/controltorrent": _tb_env(None),
+    })
+    with pytest.raises(DebridError):
+        debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+
+
+def test_torbox_cached_torrent_rejects_unsafe_path():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[
+            {"id": 1, "name": "../../etc/passwd", "size": 1},
+        ])),
+        "/torrents/controltorrent": _tb_env(None),
+    })
+    with pytest.raises(DebridError):
+        debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+
+
+def test_torbox_cached_torrent_zero_filesize_is_accepted():
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[
+            {"id": 1, "name": "empty.txt", "size": 0},
+        ])),
+    })
+    cached = debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert cached.files[0].size == 0
+
+
+def test_torbox_cached_torrent_auth_failure_is_non_fallback():
+    session = FakeSession({"/torrents/checkcached": _Resp({}, status_code=401)})
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert exc.value.fallback_allowed is False
+
+
+def test_torbox_cached_torrent_rate_limit_allows_fallback():
+    session = FakeSession({"/torrents/checkcached": _Resp({}, status_code=429)})
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert exc.value.fallback_allowed is True
+
+
+def test_torbox_cached_torrent_transport_failure_never_carries_secrets():
+    session = FakeSession({"/torrents/checkcached": RuntimeError(f"boom {TORBOX_TOKEN}")})
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_cached_torrent(INFO_HASH, TORBOX_TOKEN, session=session)
+    assert TORBOX_TOKEN not in str(exc.value)
+    assert TORBOX_TOKEN not in repr(exc.value)
+
+
+def test_resolve_torrent_routes_through_torbox_when_preferred(torbox_available):
+    settings = _tb_settings(
+        torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
+        debrid_preferred_provider="torbox",
+    )
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(True),
+        "/torrents/createtorrent": _tb_env({"torrent_id": TB_TORRENT_ID}),
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+    })
+    cached = debrid.resolve_torrent(INFO_HASH, settings, session=session)
+    assert cached.provider == debrid.TORBOX
+
+
+def test_resolve_torrent_falls_back_past_torbox_when_uncached(torbox_available):
+    settings = _tb_settings(
+        torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
+        debrid_preferred_provider="torbox",
+        all_debrid_enabled=True, all_debrid_api_key=APIKEY,
+    )
+    session = FakeSession({
+        "/torrents/checkcached": _tb_checkcached(False),
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files(),
+    })
+    cached = debrid.resolve_torrent(INFO_HASH, settings, session=session)
+    assert cached.provider == ALL_DEBRID
+
+
+def test_resolve_torrent_excludes_torbox_when_disabled_even_with_gate_on(torbox_available):
+    settings = _tb_settings(
+        torbox_enabled=False, torbox_api_token=TORBOX_TOKEN,
+        debrid_preferred_provider="torbox",
+        all_debrid_enabled=True, all_debrid_api_key=APIKEY,
+    )
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files(),
+    })
+    cached = debrid.resolve_torrent(INFO_HASH, settings, session=session)
+    assert cached.provider == ALL_DEBRID
+
+
+def test_torbox_refresh_torrent_file_requests_a_fresh_download():
+    session = FakeSession({
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+        "/torrents/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    url = debrid.torbox_refresh_torrent_file(
+        str(TB_TORRENT_ID), "1", TORBOX_TOKEN, session=session,
+    )
+    assert url == "https://cdn.torbox.app/f"
+    call = next(c for c in session.calls if "/torrents/requestdl" in c[1])
+    assert "torrent_id" in call[1]
+    assert "file_id=1" in call[1]
+    assert "redirect=false" in call[1]
+    assert call[2].get("allow_redirects") is False
+
+
+def test_torbox_refresh_torrent_file_missing_item_is_a_fixed_error():
+    session = FakeSession({"/torrents/mylist": _tb_env(None)})
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "1", TORBOX_TOKEN, session=session)
+    assert exc.value.fallback_allowed is False
+
+
+def test_torbox_refresh_torrent_file_missing_credential_is_reported():
+    with pytest.raises(DebridError):
+        debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "1", "")
+
+
+def test_torbox_refresh_torrent_file_not_ready_is_a_fixed_error():
+    session = FakeSession({
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(ready=False)),
+    })
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "1", TORBOX_TOKEN, session=session)
+    assert exc.value.code == "not_ready"
+
+
+def test_torbox_refresh_torrent_file_stale_file_id_is_rejected():
+    """A file_id no longer present in the torrent's current file list (the
+    torrent was re-checked/re-selected on TorBox's side) must not be sent
+    to requestdl as if it were still valid."""
+    session = FakeSession({
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[
+            {"id": 1, "name": "ep1.mkv", "size": 10},
+        ])),
+    })
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "999", TORBOX_TOKEN, session=session)
+    assert exc.value.code == "missing_item"
+
+
+def test_torbox_refresh_torrent_file_matches_float_file_ids():
+    session = FakeSession({
+        "/torrents/mylist": _tb_env(_tb_torrent_entry(files=[
+            {"id": 1.0, "name": "ep1.mkv", "size": 10},
+        ])),
+        "/torrents/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    url = debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "1", TORBOX_TOKEN, session=session)
+    assert url == "https://cdn.torbox.app/f"
+
+
+def test_torbox_refresh_torrent_file_transport_failure_never_carries_the_token():
+    session = FakeSession({
+        "/torrents/mylist": _tb_env(_tb_torrent_entry()),
+        "/torrents/requestdl": RuntimeError(f"boom {TORBOX_TOKEN}"),
+    })
+    with pytest.raises(DebridError) as exc:
+        debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "1", TORBOX_TOKEN, session=session)
+    assert TORBOX_TOKEN not in str(exc.value)
+    assert TORBOX_TOKEN not in repr(exc.value)

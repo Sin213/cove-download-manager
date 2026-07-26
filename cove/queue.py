@@ -811,11 +811,22 @@ class QueueManager(QObject):
         does, and a second probe of the same info hash finds the rows and
         drops the redundant source instead of expanding twice.
 
-        Only the provider's account-bound *locked* link is stored. The
-        short-lived delivery URL is generated per launch and never reaches
-        the database, exactly as for a hoster link.
+        Only the provider's account-bound *locked* link is stored for
+        AllDebrid/Real-Debrid. TorBox has no such link: its rows persist
+        `debrid_item_id`/`debrid_file_id` instead, and `url` is set to a
+        stable, non-secret `https://` reference built from those IDs --
+        never a magnet, because `_launch`'s http(s) check is what routes a
+        SOURCE_TORRENT_FILE row through debrid resolution at all; a magnet
+        `url` would instead be handed to aria2 as a raw BitTorrent add.
+        Either way the short-lived delivery URL is generated per launch
+        and never reaches the database.
         """
         from .config import categorize
+
+        def link_for(f) -> str:
+            if f.locked_link:
+                return f.locked_link
+            return f"https://torbox.app/torrent/{f.item_id}/{f.file_id}"
 
         base = t.out_dir
         rows = []
@@ -856,14 +867,16 @@ class QueueManager(QObject):
                         completed_bytes=0, status='queued', error=NULL,
                         gid=NULL, finished_at=NULL, category=?,
                         source_type=?, info_hash=?, torrent_name=?,
-                        torrent_path='', debrid_route=?
+                        torrent_path='', debrid_route=?,
+                        debrid_item_id=?, debrid_file_id=?
                     WHERE id=?
                     """,
                     (
-                        first_file.locked_link, first_name, first_dir,
+                        link_for(first_file), first_name, first_dir,
                         first_file.size, categorize(first_name),
                         SOURCE_TORRENT_FILE, cached.info_hash, cached.name,
-                        cached.provider, t.id,
+                        cached.provider, first_file.item_id, first_file.file_id,
+                        t.id,
                     ),
                 )
                 for dest_dir, name, f in rows[1:]:
@@ -873,15 +886,17 @@ class QueueManager(QObject):
                             (url, out_dir, connections, speed_limit_kbps,
                              status, created_at, category, backend, filename,
                              total_bytes, source_type, info_hash,
-                             torrent_name, debrid_route)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                             torrent_name, debrid_route,
+                             debrid_item_id, debrid_file_id)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
-                            f.locked_link, dest_dir, t.connections,
+                            link_for(f), dest_dir, t.connections,
                             t.speed_limit_kbps, "queued", now,
                             categorize(name), "aria2", name, f.size,
                             SOURCE_TORRENT_FILE, cached.info_hash,
                             cached.name, cached.provider,
+                            f.item_id, f.file_id,
                         ),
                     )
                     new_rows.append((cur.lastrowid, dest_dir, name, f))
@@ -892,7 +907,7 @@ class QueueManager(QObject):
             self._maybe_start_next()
             return
 
-        t.url = first_file.locked_link
+        t.url = link_for(first_file)
         t.filename = first_name
         t.out_dir = first_dir
         t.total_bytes = first_file.size
@@ -907,12 +922,14 @@ class QueueManager(QObject):
         t.torrent_path = ""
         t.debrid_route = cached.provider
         t.clear_debrid()
+        t.debrid_item_id = first_file.item_id
+        t.debrid_file_id = first_file.file_id
         self.task_changed.emit(t.id)
 
         for tid, dest_dir, name, f in new_rows:
             nt = DownloadTask(
                 id=tid,
-                url=f.locked_link,
+                url=link_for(f),
                 out_dir=dest_dir,
                 connections=t.connections,
                 speed_limit_kbps=t.speed_limit_kbps,
@@ -923,6 +940,8 @@ class QueueManager(QObject):
                 info_hash=cached.info_hash,
                 torrent_name=cached.name,
                 debrid_route=cached.provider,
+                debrid_item_id=f.item_id,
+                debrid_file_id=f.file_id,
             )
             self.tasks[tid] = nt
             self.task_added.emit(tid)
@@ -1983,6 +2002,29 @@ class QueueManager(QObject):
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
         if t.source_type == SOURCE_TORRENT_FILE:
+            if (
+                t.debrid_route == debrid.TORBOX
+                and t.debrid_item_id
+                and t.debrid_file_id
+                and debrid.TORBOX_FEATURE_AVAILABLE
+            ):
+                # TorBox has no account-bound per-file link to unlock: the
+                # persisted identity is the item/file ID pair, and every
+                # launch asks requestdl for a fresh delivery URL from them.
+                # t.url (the synthetic https reference) is left untouched.
+                #
+                # The availability-gate check keeps this authoritative,
+                # matching the pinned TorBox hoster branch below: with the
+                # gate off, a row materialised during earlier development
+                # testing must not silently keep calling into a hidden,
+                # unsupported provider.
+                token = getattr(self.settings, "torbox_api_token", "")
+                download = debrid.torbox_refresh_torrent_file(
+                    t.debrid_item_id, t.debrid_file_id, token,
+                )
+                t.resolved_url = download
+                t.debrid_provider = debrid.TORBOX
+                return download
             # The persisted URL is the provider's stable account-bound link
             # for this file. It is not fetchable as-is and is not a hoster
             # link either, so it bypasses both the share-link guard and the

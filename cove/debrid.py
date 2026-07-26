@@ -577,8 +577,19 @@ def _torbox_numeric_id(value, provider: str = TORBOX) -> str:
 
     Defence in depth: these values are either freshly returned by TorBox or
     read back from our own DB column, but neither source should ever be
-    trusted enough to interpolate directly into a request.
+    trusted enough to interpolate directly into a request. TorBox's own
+    schema types these IDs as JSON numbers (e.g. `900.0`), which `int()`
+    on the raw string form rejects outright, so a whole-valued float is
+    normalized first; a fractional or non-finite one (`inf`/`nan`, whose
+    `is_integer()` is also False) still falls through to the same
+    rejection as any other malformed value.
     """
+    if isinstance(value, bool):
+        raise _bad_response(provider)
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise _bad_response(provider)
+        value = int(value)
     try:
         return str(int(str(value)))
     except (TypeError, ValueError):
@@ -808,6 +819,251 @@ def torbox_refresh_web_download(
         download=download, filename=filename, filesize=filesize,
         provider=TORBOX, item_id=item_id,
     )
+
+
+def _torbox_file_id_present(files, file_id: str) -> bool:
+    """Whether `file_id` still names one of the torrent's current files.
+
+    A stale persisted `file_id` (the torrent was re-checked/re-selected on
+    TorBox's side since materialisation) must not be sent to requestdl as
+    if it were still valid.
+    """
+    if not isinstance(files, list):
+        return False
+    try:
+        target = _torbox_numeric_id(file_id, TORBOX)
+    except DebridError:
+        return False
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        try:
+            if _torbox_numeric_id(f.get("id"), TORBOX) == target:
+                return True
+        except DebridError:
+            continue
+    return False
+
+
+def torbox_refresh_torrent_file(item_id: str, file_id: str, token: str, *, session=None) -> str:
+    """Relaunch path for an already-materialised TorBox torrent-file row.
+
+    Unlike the hoster route there is no original request to soft-recreate
+    from if TorBox no longer has the item -- selecting files again would
+    need the user's original file choice, which the queue does not keep.
+    A missing item, an item that is not ready, or a file_id that no longer
+    appears in the torrent's current file list are therefore all fixed
+    errors, never a silent recreate.
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise DebridError(
+            TORBOX, "missing_credential",
+            "is needed for this download but has no API token saved. "
+            "Add one in Settings.",
+            False, False,
+        )
+    token = token.strip()
+    entry = _torbox_torrent_entry(item_id, token, session=session)
+    if entry is None:
+        raise DebridError(
+            TORBOX, "missing_item",
+            "this TorBox torrent is no longer in your account. "
+            "Re-add it to fetch it again.",
+            False, False,
+        )
+    if not (entry.get("download_present") is True or entry.get("download_finished") is True):
+        raise DebridError(
+            TORBOX, "not_ready",
+            "this TorBox torrent is not ready yet.", False, False,
+        )
+    if not _torbox_file_id_present(entry.get("files"), file_id):
+        raise DebridError(
+            TORBOX, "missing_item",
+            "this file is no longer part of this TorBox torrent. "
+            "Re-add it to fetch it again.",
+            False, False,
+        )
+    return _torbox_request_dl("torrents", item_id, file_id, token, session=session)
+
+
+def _torbox_check_cached_torrent(info_hash: str, token: str, *, session=None) -> bool:
+    resp = _request(
+        session, "get",
+        f"{TORBOX_BASE}/torrents/checkcached?hash={info_hash}&format=list",
+        TORBOX, headers=_bearer(token),
+    )
+    data = _torbox_payload(resp)
+    if isinstance(data, dict):
+        return bool(data.get(info_hash))
+    if isinstance(data, list):
+        return len(data) > 0
+    return False
+
+
+def _torbox_create_torrent(
+    info_hash: str, token: str, *, torrent_bytes: bytes | None, session=None,
+) -> Optional[str]:
+    """Create a torrent under the account, refusing anything not cached.
+
+    `add_only_if_cached` is TorBox's own server-side guarantee for this
+    endpoint (unlike webdl's createwebdownload, which has none). `seed`
+    and `allow_zip` are sent as ordinary multipart fields, matching the
+    rest of this module's TorBox requests, so that a whole-torrent zip or
+    post-completion seeding is never silently opted into by a provider
+    default.
+
+    Returns None when TorBox reports nothing was created -- the
+    checkcached probe was a false positive, and nothing needs cleaning up.
+    """
+    parts = {
+        "seed": (None, "3"),
+        "allow_zip": (None, "false"),
+        "add_only_if_cached": (None, "true"),
+    }
+    if torrent_bytes is not None:
+        parts["file"] = ("cove.torrent", torrent_bytes, "application/x-bittorrent")
+    else:
+        parts["magnet"] = (None, _torrent.minimal_magnet(info_hash))
+    resp = _request(
+        session, "post", f"{TORBOX_BASE}/torrents/createtorrent", TORBOX,
+        headers=_bearer(token), files=parts,
+    )
+    data = _torbox_payload(resp)
+    if not isinstance(data, dict):
+        raise _bad_response(TORBOX)
+    torrent_id = data.get("torrent_id")
+    if torrent_id is None or isinstance(torrent_id, bool):
+        return None
+    return _torbox_numeric_id(torrent_id)
+
+
+def _torbox_torrent_entry(item_id: str, token: str, *, session=None):
+    """The mylist row for one torrent, or None when TorBox has no record
+    of it (a missing item, not an error)."""
+    safe_id = _torbox_numeric_id(item_id)
+    resp = _request(
+        session, "get", f"{TORBOX_BASE}/torrents/mylist?id={safe_id}", TORBOX,
+        headers=_bearer(token),
+    )
+    data = _torbox_payload(resp)
+    if data is None:
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if data is not None and not isinstance(data, dict):
+        raise _bad_response(TORBOX)
+    return data
+
+
+def _torbox_delete_torrent(item_id: str, token: str, *, session=None) -> None:
+    """Best-effort cleanup for a job Cove's own probe decided to abandon.
+
+    Never allowed to raise: this only ever runs while another outcome is
+    about to be returned, and a cleanup failure must not replace it.
+    controltorrent takes a JSON body, unlike the rest of this module's
+    form-encoded TorBox requests.
+    """
+    try:
+        safe_id = _torbox_numeric_id(item_id)
+        _request(
+            session, "post", f"{TORBOX_BASE}/torrents/controltorrent", TORBOX,
+            headers={**_bearer(token), "Content-Type": "application/json"},
+            data=json.dumps({"torrent_id": int(safe_id), "operation": "delete"}),
+        )
+    except DebridError:
+        pass
+
+
+def _torbox_cached_files(entry: dict, name: str, torrent_id: str) -> tuple:
+    raw_files = entry.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise _bad_response(TORBOX)
+    if len(raw_files) > _MAX_CACHED_FILES:
+        raise _bad_response(TORBOX)
+    seen_ids: set = set()
+    out = []
+    for index, f in enumerate(raw_files):
+        if not isinstance(f, dict):
+            raise _bad_response(TORBOX)
+        # _torbox_numeric_id rejects bools, non-integral/non-finite floats,
+        # and anything int()-unconvertible (None, empty string, ...) --
+        # TorBox's own schema types file IDs as JSON numbers.
+        file_id = _torbox_numeric_id(f.get("id"), TORBOX)
+        if file_id in seen_ids:
+            raise _bad_response(TORBOX)
+        seen_ids.add(file_id)
+        raw_path = f.get("name")
+        if not isinstance(raw_path, str) or not raw_path:
+            raw_path = f.get("short_name")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise _bad_response(TORBOX)
+        parts = tuple(
+            _torrent_component(p, TORBOX)
+            for p in raw_path.replace("\\", "/").split("/") if p
+        )
+        if not parts:
+            raise DebridError(
+                TORBOX, "unsafe_path",
+                "returned a file path Cove will not write to.", False, False,
+            )
+        out.append(CachedTorrentFile(
+            index=index,
+            path=_strip_root(name, parts),
+            size=_safe_filesize(f.get("size"), TORBOX),
+            item_id=torrent_id,
+            file_id=file_id,
+        ))
+    return tuple(out)
+
+
+def torbox_cached_torrent(
+    info_hash: str,
+    token: str,
+    *,
+    torrent_bytes: bytes | None = None,
+    session=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> Optional[CachedTorrent]:
+    """Return the torrent's files if TorBox already has it cached, else None.
+
+    Cached-only is enforced twice: Cove's own checkcached probe first, and
+    then TorBox's own `add_only_if_cached=true` on createtorrent, which
+    refuses to create anything that is not already cached. A created item
+    that still never reports ready is a cache race, not something to wait
+    out -- it is deleted and reported as not cached rather than left to
+    become an active TorBox download.
+    """
+    info_hash = _torrent.normalize_info_hash(info_hash)
+    if torrent_bytes is not None and len(torrent_bytes) > _torrent.MAX_TORRENT_BYTES:
+        raise _bad_response(TORBOX)
+    if not _torbox_check_cached_torrent(info_hash, token, session=session):
+        return None
+    torrent_id = _torbox_create_torrent(
+        info_hash, token, torrent_bytes=torrent_bytes, session=session,
+    )
+    if torrent_id is None:
+        # add_only_if_cached refused the create: nothing exists to clean up.
+        return None
+    keep = False
+    try:
+        deadline = clock() + TORBOX_READY_MAX_WAIT
+        while True:
+            entry = _torbox_torrent_entry(torrent_id, token, session=session)
+            if entry is None:
+                raise _bad_response(TORBOX)
+            if entry.get("download_present") is True or entry.get("download_finished") is True:
+                break
+            if clock() >= deadline:
+                return None
+            sleep(TORBOX_READY_POLL_INTERVAL)
+        name = _torrent_root_name(entry.get("name"), info_hash, TORBOX)
+        files = _torbox_cached_files(entry, name, torrent_id)
+        keep = True
+        return CachedTorrent(TORBOX, info_hash, name, files)
+    finally:
+        if not keep:
+            _torbox_delete_torrent(torrent_id, token, session=session)
 
 
 # ---------------------------------------------------------------------------
@@ -1115,16 +1371,23 @@ _MAX_TREE_DEPTH = 32
 class CachedTorrentFile:
     """One file of a cached torrent.
 
-    `locked_link` is the provider's account-bound link. It is not a
-    download URL: it has to be unlocked into a short-lived node URL first,
-    exactly like a hoster link. Unlike the node URL it is stable, so it is
-    what gets persisted.
+    `locked_link` is AllDebrid/Real-Debrid's account-bound link. It is not
+    a download URL: it has to be unlocked into a short-lived node URL
+    first, exactly like a hoster link. Unlike the node URL it is stable,
+    so it is what gets persisted.
+
+    TorBox has no such per-file link: `item_id`/`file_id` identify the
+    torrent and file instead, and requestdl regenerates a delivery URL
+    from them on every launch. Exactly one of `locked_link` or the
+    `item_id`/`file_id` pair is populated, depending on provider.
     """
 
     index: int
     path: tuple[str, ...]
     size: int
-    locked_link: str
+    locked_link: str = ""
+    item_id: str = ""
+    file_id: str = ""
 
     @property
     def relative_path(self) -> str:
@@ -1469,6 +1732,11 @@ def _probe_cached(provider: str, info_hash: str, credential: str, *, torrent_byt
         return all_debrid_cached_torrent(
             info_hash, credential, torrent_bytes=torrent_bytes, session=session
         )
+    if provider == TORBOX:
+        return torbox_cached_torrent(
+            info_hash, credential, torrent_bytes=torrent_bytes,
+            session=session, sleep=sleep, clock=clock,
+        )
     return real_debrid_cached_torrent(
         info_hash, credential, torrent_bytes=torrent_bytes,
         session=session, sleep=sleep, clock=clock,
@@ -1491,12 +1759,7 @@ def resolve_torrent(
     credential or account failure is not, and is raised so the user finds
     out their key is wrong instead of silently getting no torrent support.
     """
-    # TorBox torrent (checkcached / cached-only creation) is TorBox T2 and
-    # is not implemented yet; excluding it here even if a future gate or
-    # test enables it keeps this generic AD/RD torrent probe from routing a
-    # TorBox credential into _probe_cached, which only knows AllDebrid and
-    # Real-Debrid.
-    providers = [p for p in _enabled_providers(settings) if p[0] != TORBOX]
+    providers = _enabled_providers(settings)
     if not providers:
         return None
 
@@ -1532,9 +1795,13 @@ def unlock_torrent_file(locked_link: str, provider: str, settings, *, session=No
 
     This is the relaunch path for a materialised torrent file row. It is
     pinned to the provider that produced the link -- the other provider
-    cannot unlock it -- so there is no fallback here.
+    cannot unlock it -- so there is no fallback here. TorBox never reaches
+    this function: it has no locked link to unlock, and is relaunched
+    through `torbox_refresh_torrent_file` instead. `PROVIDERS` is not used
+    for this check because it also lists TorBox, which -- unlike
+    AllDebrid/Real-Debrid -- has no per-file credential lookup below.
     """
-    if provider not in PROVIDERS:
+    if provider not in (ALL_DEBRID, REAL_DEBRID):
         raise DebridError(
             provider, "unknown_provider",
             "is no longer available for this download.", False, False,

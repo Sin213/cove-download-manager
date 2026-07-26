@@ -2665,3 +2665,239 @@ def test_pinned_torbox_task_falls_through_when_gate_is_off(queue_env, monkeypatc
     monkeypatch.setattr(debrid, "torbox_refresh_web_download", _refresh_must_not_be_called)
     queue._probe_and_add(task)  # must not raise
     assert rpc.added[0]["uris"] == [ORIGINAL_URL]
+
+
+# ---------------------------------------------------------------------------
+# TorBox (T2: cached torrent routing, materialisation, requestdl relaunch)
+# ---------------------------------------------------------------------------
+
+TORBOX_TORRENT_ITEM = "900"
+TORBOX_TORRENT_CDN_URL = "https://cdn-01.torbox.app/dl/secret/ep1.mkv"
+
+
+def _torbox_torrent_settings(**extra):
+    base = _torrent_settings()
+    base.update(_torbox_settings())
+    base.update(extra)
+    return base
+
+
+def _tb_cached(files=None, name="Season 1"):
+    if files is None:
+        files = [
+            CachedTorrentFile(0, ("ep1.mkv",), 10, item_id=TORBOX_TORRENT_ITEM, file_id="1"),
+            CachedTorrentFile(1, ("extras", "ep2.mkv"), 20, item_id=TORBOX_TORRENT_ITEM, file_id="2"),
+        ]
+    return CachedTorrent(debrid.TORBOX, INFO_HASH, name, tuple(files))
+
+
+def test_torbox_cached_torrent_becomes_https_tasks_with_item_and_file_ids(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path = queue_env(**_torbox_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _tb_cached())
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    rows = _rows(db_path)
+    assert len(rows) == 2
+    assert [r["debrid_route"] for r in rows] == [debrid.TORBOX] * 2
+    assert [r["debrid_item_id"] for r in rows] == [TORBOX_TORRENT_ITEM] * 2
+    assert [r["debrid_file_id"] for r in rows] == ["1", "2"]
+    # No locked_link exists for TorBox: url is a stable non-secret
+    # https reference built from the item/file IDs, never a magnet (which
+    # would bypass debrid resolution) and never a CDN/requestdl URL.
+    assert rows[0]["url"] == f"https://torbox.app/torrent/{TORBOX_TORRENT_ITEM}/1"
+    assert rows[1]["url"] == f"https://torbox.app/torrent/{TORBOX_TORRENT_ITEM}/2"
+
+
+def test_torbox_cached_route_does_not_show_the_p2p_disclosure(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path = queue_env(**_torbox_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _tb_cached())
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    # Materialisation turns the row into SOURCE_TORRENT_FILE, which is
+    # never subject to the local-BitTorrent consent gate.
+    assert queue.tasks[tid].source_type == SOURCE_TORRENT_FILE
+
+
+def test_torbox_materialised_rows_survive_a_restart(queue_env, monkeypatch, torbox_available):
+    queue, rpc, db_path = queue_env(**_torbox_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _tb_cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+
+    restored = [_task_from_persisted_row(row) for row in _rows(db_path)]
+    assert [t.source_type for t in restored] == [SOURCE_TORRENT_FILE] * 2
+    assert [t.debrid_route for t in restored] == [debrid.TORBOX] * 2
+    assert [t.debrid_item_id for t in restored] == [TORBOX_TORRENT_ITEM] * 2
+    assert [t.debrid_file_id for t in restored] == ["1", "2"]
+    assert [t.info_hash for t in restored] == [INFO_HASH] * 2
+
+
+def test_torbox_repeated_materialisation_does_not_duplicate_rows(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path = queue_env(**_torbox_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _tb_cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    assert len(_rows(db_path)) == 2
+
+    second = queue.add_url(MAGNET, source_type=SOURCE_TORRENT, info_hash=INFO_HASH)
+    removed = []
+    queue.task_removed.connect(removed.append)
+    queue._launch(queue.tasks[second])
+
+    assert len(_rows(db_path)) == 2
+    assert second not in queue.tasks
+    assert removed == [second]
+
+
+def _tb_materialised(queue_env, monkeypatch, **settings):
+    queue, rpc, db_path = queue_env(**_torbox_torrent_settings(**settings))
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _tb_cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    return queue, rpc, db_path, tid
+
+
+def test_torbox_torrent_file_relaunch_calls_requestdl_with_item_and_file_id(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path, tid = _tb_materialised(queue_env, monkeypatch)
+    seen = {}
+
+    def fake_refresh(item_id, file_id, token, **kw):
+        seen["item_id"] = item_id
+        seen["file_id"] = file_id
+        seen["token"] = token
+        return TORBOX_TORRENT_CDN_URL
+
+    monkeypatch.setattr(debrid, "torbox_refresh_torrent_file", fake_refresh)
+    task = queue.tasks[tid]
+    queue._launch(task)
+
+    assert seen["item_id"] == TORBOX_TORRENT_ITEM
+    assert seen["file_id"] == "1"
+    assert rpc.added[0]["uris"] == [TORBOX_TORRENT_CDN_URL]
+    # The persisted url/item/file identifiers are untouched by the launch.
+    assert task.url == f"https://torbox.app/torrent/{TORBOX_TORRENT_ITEM}/1"
+    assert task.debrid_item_id == TORBOX_TORRENT_ITEM
+    assert task.debrid_file_id == "1"
+
+
+def test_torbox_torrent_file_cdn_url_is_not_persisted(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path, tid = _tb_materialised(queue_env, monkeypatch)
+    monkeypatch.setattr(
+        debrid, "torbox_refresh_torrent_file",
+        lambda item_id, file_id, token, **kw: TORBOX_TORRENT_CDN_URL,
+    )
+    queue._launch(queue.tasks[tid])
+    queue._persist(queue.tasks[tid])
+    row_text = _persisted_row_text(db_path, tid)
+    assert TORBOX_TORRENT_CDN_URL not in row_text
+    assert "secret" not in row_text
+
+
+def test_torbox_torrent_file_relaunch_generates_a_fresh_url_each_time(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path, tid = _tb_materialised(queue_env, monkeypatch)
+    urls = iter(["https://cdn-01.torbox.app/dl/a", "https://cdn-01.torbox.app/dl/b"])
+    monkeypatch.setattr(
+        debrid, "torbox_refresh_torrent_file",
+        lambda item_id, file_id, token, **kw: next(urls),
+    )
+    task = queue.tasks[tid]
+    queue._launch(task)
+    first = rpc.added[0]["uris"][0]
+    rpc.added.clear()
+    queue._launch(task)
+    second = rpc.added[0]["uris"][0]
+    assert first != second
+
+
+def test_torbox_torrent_file_missing_item_fails_without_recreating(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path, tid = _tb_materialised(queue_env, monkeypatch)
+
+    def boom(*a, **k):
+        raise DebridError(debrid.TORBOX, "missing_item", "this TorBox torrent is no longer in your account.", False, False)
+
+    monkeypatch.setattr(debrid, "torbox_refresh_torrent_file", boom)
+    monkeypatch.setattr(
+        debrid, "resolve_torrent",
+        lambda *a, **k: pytest.fail("must not re-probe a pinned TorBox torrent file"),
+    )
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "no longer in your account" in task.error
+    assert rpc.added == []
+
+
+def test_torbox_torrent_file_bypasses_unlock_torrent_file(
+    queue_env, monkeypatch, torbox_available
+):
+    """The AD/RD unlock path must never be asked to handle a TorBox row."""
+    queue, rpc, db_path, tid = _tb_materialised(queue_env, monkeypatch)
+    monkeypatch.setattr(
+        debrid, "unlock_torrent_file",
+        lambda *a, **k: pytest.fail("unlock_torrent_file must not run for a TorBox row"),
+    )
+    monkeypatch.setattr(
+        debrid, "torbox_refresh_torrent_file",
+        lambda item_id, file_id, token, **kw: TORBOX_TORRENT_CDN_URL,
+    )
+    queue._launch(queue.tasks[tid])
+    assert rpc.added[0]["uris"] == [TORBOX_TORRENT_CDN_URL]
+
+
+def test_pinned_torbox_torrent_file_falls_through_when_gate_is_off(
+    queue_env, monkeypatch, torbox_available
+):
+    """A row materialised during earlier development testing (gate on) must
+    not keep calling into TorBox once the availability gate is off again --
+    it should fail cleanly instead of silently reusing the hidden route."""
+    queue, rpc, db_path, tid = _tb_materialised(queue_env, monkeypatch)
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", False)
+
+    def _refresh_must_not_be_called(*a, **kw):
+        raise AssertionError("torbox_refresh_torrent_file must not run while the gate is off")
+
+    monkeypatch.setattr(debrid, "torbox_refresh_torrent_file", _refresh_must_not_be_called)
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert rpc.added == []
+
+
+def test_ad_torrent_file_relaunch_regression_with_torbox_gate_on(
+    queue_env, monkeypatch, torbox_available
+):
+    """AD/RD cached-torrent relaunch must be unaffected by TorBox's gate."""
+    queue, rpc, db_path, tid = _materialised(queue_env, monkeypatch)
+    monkeypatch.setattr(
+        debrid, "unlock_torrent_file",
+        lambda link, provider, settings, **kw: Unrestricted(
+            TORRENT_NODE_URL, "ep1.mkv", 10, provider
+        ),
+    )
+    queue._launch(queue.tasks[tid])
+    assert rpc.added[0]["uris"] == [TORRENT_NODE_URL]
