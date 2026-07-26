@@ -64,6 +64,7 @@ from .dialogs import (
     ClipboardBatchDialog,
     SchedulerDialog,
     SettingsDialog,
+    torrent_file_problem,
 )
 from .queue import DownloadTask, QueueManager
 from .scheduler import Scheduler
@@ -90,6 +91,19 @@ COL_STATUS = 1
 COL_PROGRESS = 2
 COL_SIZE = 3
 COL_SPEED = 4
+
+
+def torrent_drop_paths(local_paths, enabled: bool) -> list[str]:
+    """Local `.torrent` files Cove will accept from a drag-and-drop.
+
+    Local files are otherwise ignored entirely by the drop handler; a
+    `.torrent` is the single exception, and only while torrent support is
+    switched on. Directories and every other local file still fail
+    torrent_file_problem and stay ignored.
+    """
+    if not enabled:
+        return []
+    return [p for p in local_paths if p and not torrent_file_problem(p)]
 
 
 def _human_bytes(n: int) -> str:
@@ -610,6 +624,12 @@ class MainWindow(QMainWindow):
         dlg = AddDownloadDialog(self.settings, self)
         if dlg.exec() != AddDownloadDialog.Accepted:
             return
+        if dlg.torrent_path:
+            self.settings.download_dir = dlg.get_dir()
+            self.settings.save()
+            self._refresh_folder_chip()
+            self.queue.add_torrent_file(dlg.torrent_path, dlg.get_dir())
+            return
         urls = dlg.get_urls()
         if not urls:
             QMessageBox.information(self, "Nothing to add", "No URLs detected.")
@@ -1081,14 +1101,20 @@ class MainWindow(QMainWindow):
         else:
             event.ignore()
 
+    def _torrent_enabled(self) -> bool:
+        return getattr(self.settings, "torrent_support_enabled", False) is True
+
     def dropEvent(self, event: QDropEvent) -> None:  # type: ignore[override]
         md = event.mimeData()
         urls: list[str] = []
+        locals_: list[str] = []
         if md.hasUrls():
             for u in md.urls():
                 s = u.toString()
                 if s:
                     urls.append(s)
+                locals_.append(u.toLocalFile())
+        torrents = torrent_drop_paths(locals_, self._torrent_enabled())
         # Browsers usually also include text/plain — and on some Linux
         # setups that's the only thing they hand over. Fall back to it.
         if md.hasText():
@@ -1097,11 +1123,13 @@ class MainWindow(QMainWindow):
                 if s and s not in urls:
                     urls.append(s)
         urls = [u for u in urls if not u.startswith("file://")]
-        if not urls:
+        if not urls and not torrents:
             event.ignore()
             return
-        added = self.queue.add_urls(urls)
-        if added:
+        for path in torrents:
+            self.queue.add_torrent_file(path, self.settings.download_dir)
+        added = self.queue.add_urls(urls) if urls else []
+        if added or torrents:
             event.acceptProposedAction()
         else:
             event.ignore()

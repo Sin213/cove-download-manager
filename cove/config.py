@@ -158,6 +158,12 @@ class Settings:
     real_debrid_enabled: bool = False
     real_debrid_api_token: str = ""
     debrid_preferred_provider: str = "alldebrid"  # "alldebrid" | "real_debrid"
+    # Internal development flag. Torrent input stays completely invisible
+    # until the local BitTorrent fallback lands, because with only the
+    # cached-debrid route a user would hit "not cached" with nowhere to go.
+    # There is no Settings UI for it on purpose; flip it by hand in
+    # settings.json to exercise the route.
+    torrent_support_enabled: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -238,6 +244,9 @@ class Settings:
             if not isinstance(getattr(s, credential), str):
                 setattr(s, credential, "")
                 changed = True
+        if not isinstance(s.torrent_support_enabled, bool):
+            s.torrent_support_enabled = False
+            changed = True
         if s.debrid_preferred_provider not in DEBRID_PROVIDERS:
             s.debrid_preferred_provider = DEBRID_DEFAULT_PROVIDER
             changed = True

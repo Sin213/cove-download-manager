@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -187,6 +188,29 @@ def _time_format(use_24h: bool) -> str:
     return "HH:mm" if use_24h else "hh:mm AP"
 
 
+def torrent_file_problem(path) -> str:
+    """Why this path can't be added as a `.torrent`, or "" if it can.
+
+    These are the cheap checks — extension, is-a-file, size — so the GUI
+    thread can reject an obviously wrong drop or pick without reading
+    anything. The real parse still happens on a worker.
+    """
+    import os
+
+    from .torrent import MAX_TORRENT_BYTES
+
+    if not isinstance(path, str) or not path.lower().endswith(".torrent"):
+        return "Cove can only add .torrent files here."
+    try:
+        if not os.path.isfile(path):
+            return "That is not a .torrent file."
+        if os.path.getsize(path) > MAX_TORRENT_BYTES:
+            return "That .torrent file is larger than Cove will read (10 MiB)."
+    except OSError:
+        return "That .torrent file could not be opened."
+    return ""
+
+
 class AddDownloadDialog(QDialog):
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -216,12 +240,38 @@ class AddDownloadDialog(QDialog):
         form.addRow("Save to", row)
         layout.addLayout(form)
 
+        # Torrent input is hidden entirely until the local BitTorrent
+        # fallback ships: with only the cached-debrid route available, an
+        # uncached torrent would have nowhere to go.
+        self.torrent_path = ""
+        self.torrent_enabled = getattr(settings, "torrent_support_enabled", False) is True
+        self.torrent_button = QPushButton("Add torrent file...")
+        self.torrent_button.clicked.connect(self._pick_torrent)
+        self.torrent_button.setVisible(self.torrent_enabled)
+        self.torrent_button.setEnabled(self.torrent_enabled)
+        layout.addWidget(self.torrent_button)
+
         layout.addWidget(_make_buttons(self, ok_text="Add"))
 
     def _browse(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Save downloads to", self.dir_edit.text())
         if path:
             self.dir_edit.setText(path)
+
+    def _pick_torrent(self) -> None:
+        if not self.torrent_enabled:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Add torrent file", self.dir_edit.text(), "Torrent files (*.torrent)"
+        )
+        if not path:
+            return
+        problem = torrent_file_problem(path)
+        if problem:
+            QMessageBox.warning(self, "Cannot add torrent", problem)
+            return
+        self.torrent_path = path
+        self.accept()
 
     def get_urls(self) -> list[str]:
         text = self.urls.toPlainText()

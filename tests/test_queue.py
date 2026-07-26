@@ -181,6 +181,13 @@ class _FakeRpc:
 
     def __init__(self):
         self.added = []
+        self.paused = []
+
+    def pause(self, gid):
+        # The queue pauses a freshly launched gid when the scheduler is
+        # holding the queue, which the tests below drive synchronously.
+        self.paused.append(gid)
+        return gid
 
     def add_uri(self, uris, out_dir, connections, speed_limit_kbps, filename):
         self.added.append({
@@ -605,3 +612,677 @@ def test_ordinary_download_is_unaffected_by_the_share_link_check(queue_env, monk
     queue._launch(queue.tasks[tid])
     assert queue.tasks[tid].status == "active"
     assert spawned == ["add_uri"]
+
+
+# ---------------------------------------------------------------------------
+# Torrent routing (Slice A: cached debrid only)
+# ---------------------------------------------------------------------------
+
+from cove import torrent as torrent_mod          # noqa: E402
+from cove.debrid import CachedTorrent, CachedTorrentFile, REAL_DEBRID  # noqa: E402
+from cove.queue import (                          # noqa: E402
+    SOURCE_TORRENT,
+    SOURCE_TORRENT_FILE,
+    TORRENT_NOT_CACHED,
+    TorrentError,
+)
+
+INFO_HASH = "0123456789abcdef0123456789abcdef01234567"
+MAGNET = (
+    f"magnet:?xt=urn:btih:{INFO_HASH}&dn=Season+1"
+    "&tr=http://tracker.example/announce?passkey=SECRETPASS"
+)
+AD_LOCKED_1 = "https://alldebrid.com/f/LOCKEDONE"
+AD_LOCKED_2 = "https://alldebrid.com/f/LOCKEDTWO"
+TORRENT_NODE_URL = "https://s1.debrid.it/dl/SECRETNODE/ep1.mkv"
+
+
+def _torrent_settings(**extra):
+    base = dict(
+        torrent_support_enabled=True,
+        all_debrid_enabled=True,
+        all_debrid_api_key="ad-key-value",
+    )
+    base.update(extra)
+    return base
+
+
+def _cached(files=None, name="Season 1", provider=ALL_DEBRID):
+    if files is None:
+        files = [
+            CachedTorrentFile(0, ("ep1.mkv",), 10, AD_LOCKED_1),
+            CachedTorrentFile(1, ("extras", "ep2.mkv"), 20, AD_LOCKED_2),
+        ]
+    return CachedTorrent(provider, INFO_HASH, name, tuple(files))
+
+
+def _sync_spawn(queue):
+    """Run worker calls inline so a test can drive _launch end to end."""
+    calls = []
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        calls.append(fn)
+        try:
+            result = fn(*args, **kwargs)
+        except (DebridError, TorrentError) as exc:
+            if on_fail is not None:
+                on_fail(str(exc))
+        else:
+            if on_done is not None:
+                on_done(result)
+
+    queue._spawn = spawn
+    return calls
+
+
+def _rows(db_path):
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute("SELECT * FROM downloads ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+# --- feature flag ----------------------------------------------------------
+
+
+def test_magnet_keeps_head_behaviour_while_the_flag_is_off(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_debrid_settings())
+    called = []
+    monkeypatch.setattr(
+        debrid, "resolve_torrent",
+        lambda *a, **k: called.append(a) or None,
+    )
+    tid = queue.add_url(MAGNET)
+    task = queue.tasks[tid]
+
+    assert task.source_type == ""
+    assert task.info_hash == ""
+    assert task.url == MAGNET
+    assert task.backend == "aria2"
+    assert _persisted_row(db_path, tid)["source_type"] == ""
+    assert called == []
+
+
+def test_magnet_becomes_a_torrent_source_task_when_enabled(queue_env):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    tid = queue.add_url(MAGNET)
+    task = queue.tasks[tid]
+
+    assert task.source_type == SOURCE_TORRENT
+    assert task.info_hash == INFO_HASH
+    assert task.torrent_name == "Season 1"
+    row = _persisted_row(db_path, tid)
+    assert row["source_type"] == SOURCE_TORRENT
+    assert row["info_hash"] == INFO_HASH
+
+
+def test_malformed_magnet_is_rejected_without_a_row(queue_env):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    errors = []
+    queue.error.connect(errors.append)
+    assert queue.add_url("magnet:?xt=urn:btih:nonsense") is None
+    assert _rows(db_path) == []
+    assert errors and "SECRETPASS" not in errors[0]
+
+
+def test_duplicate_info_hash_is_blocked(queue_env):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    first = queue.add_url(MAGNET)
+    errors = []
+    queue.error.connect(errors.append)
+    second = queue.add_url(f"magnet:?xt=urn:btih:{INFO_HASH.upper()}")
+
+    assert first is not None
+    assert second is None
+    assert len(_rows(db_path)) == 1
+    assert errors
+
+
+def test_completed_torrent_does_not_block_a_re_add(queue_env):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    tid = queue.add_url(MAGNET)
+    queue.tasks[tid].status = "completed"
+    assert queue.add_url(MAGNET) is not None
+
+
+# --- probing ---------------------------------------------------------------
+
+
+def test_probing_happens_on_a_worker_not_the_gui_thread(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    calls = _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: None)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue._probe_torrent in calls
+
+
+def test_probe_sends_only_the_info_hash_for_a_magnet(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    seen = {}
+
+    def fake_resolve(info_hash, settings, *, torrent_bytes=None, **kw):
+        seen["hash"] = info_hash
+        seen["bytes"] = torrent_bytes
+        return None
+
+    monkeypatch.setattr(debrid, "resolve_torrent", fake_resolve)
+    tid = queue.add_url(MAGNET)
+    queue._probe_torrent(queue.tasks[tid])
+
+    assert seen == {"hash": INFO_HASH, "bytes": None}
+
+
+def test_probe_reads_a_local_torrent_file_on_the_worker(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    raw = (
+        b"d4:infod6:lengthi7e4:name9:movie.mkv12:piece lengthi16384e"
+        b"6:pieces20:" + b"\x01" * 20 + b"ee"
+    )
+    path = tmp_path / "s.torrent"
+    path.write_bytes(raw)
+    expected = torrent_mod.parse_torrent(raw).info_hash
+
+    seen = {}
+
+    def fake_resolve(info_hash, settings, *, torrent_bytes=None, **kw):
+        seen["hash"] = info_hash
+        seen["bytes"] = torrent_bytes
+        return None
+
+    monkeypatch.setattr(debrid, "resolve_torrent", fake_resolve)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(expected),
+        source_type=SOURCE_TORRENT,
+        info_hash=expected,
+        torrent_name="movie.mkv",
+        torrent_path=str(path),
+    )
+    queue._probe_torrent(queue.tasks[tid])
+
+    assert seen["hash"] == expected
+    assert seen["bytes"] == raw
+
+
+def test_probe_survives_a_deleted_torrent_file(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    seen = {}
+    monkeypatch.setattr(
+        debrid, "resolve_torrent",
+        lambda info_hash, settings, **kw: seen.setdefault("hash", info_hash),
+    )
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(INFO_HASH),
+        source_type=SOURCE_TORRENT,
+        info_hash=INFO_HASH,
+        torrent_path=str(tmp_path / "gone.torrent"),
+    )
+    queue._probe_torrent(queue.tasks[tid])
+    assert seen["hash"] == INFO_HASH
+
+
+# --- uncached --------------------------------------------------------------
+
+
+def test_uncached_torrent_fails_with_the_slice_a_reason(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: None)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert task.error == TORRENT_NOT_CACHED
+    assert _persisted_row(db_path, tid)["error"] == TORRENT_NOT_CACHED
+    # Never handed to plain aria2 as a magnet.
+    assert rpc.added == []
+
+
+def test_no_provider_configured_gives_the_same_reason(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(
+        torrent_support_enabled=True, all_debrid_enabled=False
+    )
+    _sync_spawn(queue)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].error == TORRENT_NOT_CACHED
+    assert rpc.added == []
+
+
+def test_provider_auth_failure_uses_the_task_failure_path(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+
+    def boom(*a, **k):
+        raise DebridError(ALL_DEBRID, 8, "the API key was rejected.", False, False)
+
+    monkeypatch.setattr(debrid, "resolve_torrent", boom)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "API key was rejected" in task.error
+    assert task.error != TORRENT_NOT_CACHED
+
+
+# --- materialisation -------------------------------------------------------
+
+
+def test_cached_multi_file_torrent_becomes_https_tasks(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    rows = _rows(db_path)
+    assert len(rows) == 2
+    assert [r["filename"] for r in rows] == ["ep1.mkv", "ep2.mkv"]
+    assert [r["out_dir"] for r in rows] == [
+        str(tmp_path / "Season 1"),
+        str(tmp_path / "Season 1" / "extras"),
+    ]
+    assert [r["url"] for r in rows] == [AD_LOCKED_1, AD_LOCKED_2]
+    assert [r["total_bytes"] for r in rows] == [10, 20]
+    for row in rows:
+        assert row["source_type"] == SOURCE_TORRENT_FILE
+        assert row["info_hash"] == INFO_HASH
+        assert row["torrent_name"] == "Season 1"
+        assert row["debrid_route"] == ALL_DEBRID
+        assert row["backend"] == "aria2"
+        assert row["torrent_path"] == ""
+        assert row["status"] == "queued"
+    # The source row was reused as the first file, so no orphan remains.
+    assert rows[0]["id"] == tid
+    assert len(queue.tasks) == 2
+
+
+def test_cached_single_file_torrent_writes_into_the_output_dir(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    single = _cached(
+        files=[CachedTorrentFile(0, ("movie.mkv",), 9, AD_LOCKED_1)], name="movie.mkv"
+    )
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: single)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    row = _persisted_row(db_path, tid)
+    assert row["out_dir"] == str(tmp_path)
+    assert row["filename"] == "movie.mkv"
+    assert row["total_bytes"] == 9
+
+
+def test_provider_filesize_seeds_the_task(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    assert queue.tasks[tid].total_bytes == 10
+
+
+def test_repeated_materialisation_does_not_duplicate_rows(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    assert len(_rows(db_path)) == 2
+
+    # A crash-and-retry: a fresh source task for the same torrent probes
+    # again and finds the files already expanded.
+    second = queue.add_url(
+        MAGNET, source_type=SOURCE_TORRENT, info_hash=INFO_HASH
+    )
+    removed = []
+    queue.task_removed.connect(removed.append)
+    queue._launch(queue.tasks[second])
+
+    assert len(_rows(db_path)) == 2
+    assert second not in queue.tasks
+    assert removed == [second]
+
+
+def test_materialised_rows_survive_a_restart(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+
+    restored = [_task_from_persisted_row(row) for row in _rows(db_path)]
+    assert [t.source_type for t in restored] == [SOURCE_TORRENT_FILE] * 2
+    assert [t.url for t in restored] == [AD_LOCKED_1, AD_LOCKED_2]
+    assert [t.debrid_route for t in restored] == [ALL_DEBRID] * 2
+    assert [t.info_hash for t in restored] == [INFO_HASH] * 2
+    assert [t.torrent_name for t in restored] == ["Season 1"] * 2
+
+
+def test_malicious_provider_path_is_refused(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    evil = CachedTorrent(
+        ALL_DEBRID, INFO_HASH, "Season 1",
+        (CachedTorrentFile(0, ("..", "..", "escape.bin"), 1, AD_LOCKED_1),),
+    )
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: evil)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert task.source_type == SOURCE_TORRENT
+    assert len(_rows(db_path)) == 1
+    assert rpc.added == []
+
+
+# --- relaunching a materialised file ---------------------------------------
+
+
+def _materialised(queue_env, monkeypatch, **settings):
+    queue, rpc, db_path = queue_env(**_torrent_settings(**settings))
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    return queue, rpc, db_path, tid
+
+
+def test_torrent_file_relaunch_unlocks_the_stored_link(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _materialised(queue_env, monkeypatch)
+    seen = {}
+
+    def fake_unlock(link, provider, settings, **kw):
+        seen["link"] = link
+        seen["provider"] = provider
+        return Unrestricted(TORRENT_NODE_URL, "ep1.mkv", 10, provider)
+
+    monkeypatch.setattr(debrid, "unlock_torrent_file", fake_unlock)
+
+    task = queue.tasks[tid]
+    queue._launch(task)
+
+    assert seen == {"link": AD_LOCKED_1, "provider": ALL_DEBRID}
+    # The node URL is what aria2 fetches...
+    assert rpc.added[0]["uris"] == [TORRENT_NODE_URL]
+    assert rpc.added[0]["filename"] == "ep1.mkv"
+    # ...and the account-bound link is what stays on disk.
+    assert task.url == AD_LOCKED_1
+    assert _persisted_url(db_path, tid) == AD_LOCKED_1
+    assert "SECRETNODE" not in _persisted_row_text(db_path, tid)
+
+
+def test_torrent_file_relaunch_bypasses_the_share_link_guard(queue_env, monkeypatch):
+    """The stored URL is an alldebrid.com/f/... link by construction."""
+    queue, rpc, db_path, tid = _materialised(queue_env, monkeypatch)
+    assert debrid.share_link_reason(AD_LOCKED_1) != ""
+    monkeypatch.setattr(
+        debrid, "unlock_torrent_file",
+        lambda link, provider, settings, **kw: Unrestricted(
+            TORRENT_NODE_URL, "ep1.mkv", 10, provider
+        ),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].status != "error"
+    assert rpc.added[0]["uris"] == [TORRENT_NODE_URL]
+
+
+def test_pasted_provider_share_link_is_still_rejected(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    tid = queue.add_url(AD_LOCKED_1)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "share links are tied to the account" in task.error
+    assert rpc.added == []
+
+
+def test_provider_domain_exclusion_bypass_is_limited_to_internal_rows(queue_env, monkeypatch):
+    """resolve() refuses provider-owned domains; the torrent route does not
+    go through resolve() at all, and a pasted one still does."""
+    queue, rpc, db_path, tid = _materialised(queue_env, monkeypatch)
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda *a, **k: pytest.fail("torrent_file rows must not use resolve()"),
+    )
+    monkeypatch.setattr(
+        debrid, "unlock_torrent_file",
+        lambda link, provider, settings, **kw: Unrestricted(
+            TORRENT_NODE_URL, "ep1.mkv", 10, provider
+        ),
+    )
+    queue._probe_and_add(queue.tasks[tid])
+    assert rpc.added[0]["uris"] == [TORRENT_NODE_URL]
+
+    # An ordinary task on a provider-owned domain is left alone by resolve.
+    plain = queue.add_url("https://s1.debrid.it/dl/abc/file.zip")
+    assert queue.tasks[plain].source_type == ""
+
+
+def test_unlock_failure_fails_the_task_without_leaking(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _materialised(queue_env, monkeypatch)
+
+    def boom(*a, **k):
+        raise DebridError(ALL_DEBRID, 8, "the API key was rejected.", False, False)
+
+    monkeypatch.setattr(debrid, "unlock_torrent_file", boom)
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert AD_LOCKED_1 not in task.error
+    assert rpc.added == []
+
+
+# --- regressions -----------------------------------------------------------
+
+
+def test_ordinary_http_task_is_untouched_by_the_torrent_route(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: Unrestricted(NODE_URL, "movie.mkv", 4096, ALL_DEBRID),
+    )
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+    assert task.source_type == ""
+
+    queue._probe_and_add(task)
+
+    assert rpc.added[0]["uris"] == [NODE_URL]
+    assert _persisted_url(db_path, tid) == ORIGINAL_URL
+
+
+def test_add_url_refuses_an_unapproved_source_type(queue_env):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    assert queue.add_url("https://example.com/f.zip", source_type="anything") is None
+    assert _rows(db_path) == []
+
+
+def test_add_torrent_file_is_inert_while_the_flag_is_off(queue_env, tmp_path):
+    queue, rpc, db_path = queue_env(**_debrid_settings())
+    spawned = _sync_spawn(queue)
+    queue.add_torrent_file(str(tmp_path / "x.torrent"))
+    assert spawned == []
+    assert _rows(db_path) == []
+
+
+def test_add_torrent_file_creates_a_source_task(queue_env, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    raw = (
+        b"d4:infod6:lengthi7e4:name9:movie.mkv12:piece lengthi16384e"
+        b"6:pieces20:" + b"\x01" * 20 + b"ee"
+    )
+    path = tmp_path / "s.torrent"
+    path.write_bytes(raw)
+    expected = torrent_mod.parse_torrent(raw).info_hash
+
+    queue.add_torrent_file(str(path), str(tmp_path))
+
+    row = _rows(db_path)[0]
+    assert row["source_type"] == SOURCE_TORRENT
+    assert row["info_hash"] == expected
+    assert row["torrent_name"] == "movie.mkv"
+    assert row["torrent_path"] == str(path)
+    # The persisted URL is the minimal magnet: no trackers, no passkey.
+    assert row["url"] == f"magnet:?xt=urn:btih:{expected}"
+
+
+# --- Codex review follow-ups -----------------------------------------------
+
+
+def test_a_replaced_torrent_file_cannot_change_the_task_identity(
+    queue_env, monkeypatch, tmp_path
+):
+    """The persisted info hash is the row's durable identity: swapping the
+    file on disk after queueing must not redirect the task."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    other = (
+        b"d4:infod6:lengthi9e4:name9:other.mkv12:piece lengthi16384e"
+        b"6:pieces20:" + b"\x09" * 20 + b"ee"
+    )
+    path = tmp_path / "s.torrent"
+    path.write_bytes(other)
+    other_hash = torrent_mod.parse_torrent(other).info_hash
+    assert other_hash != INFO_HASH
+
+    seen = {}
+
+    def fake_resolve(info_hash, settings, *, torrent_bytes=None, **kw):
+        seen["hash"] = info_hash
+        seen["bytes"] = torrent_bytes
+        return None
+
+    monkeypatch.setattr(debrid, "resolve_torrent", fake_resolve)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(INFO_HASH),
+        source_type=SOURCE_TORRENT,
+        info_hash=INFO_HASH,
+        torrent_path=str(path),
+    )
+    queue._probe_torrent(queue.tasks[tid])
+
+    assert seen["hash"] == INFO_HASH
+    # The mismatched file's bytes are not uploaded either.
+    assert seen["bytes"] is None
+
+
+def test_containment_check_resolves_symlinks(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    outside = tmp_path.parent / "outside-cove"
+    outside.mkdir(exist_ok=True)
+    root = tmp_path / "Season 1"
+    root.mkdir()
+    (root / "link").symlink_to(outside, target_is_directory=True)
+
+    escaping = CachedTorrent(
+        ALL_DEBRID, INFO_HASH, "Season 1",
+        (CachedTorrentFile(0, ("link", "file.bin"), 1, AD_LOCKED_1),),
+    )
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: escaping)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert task.source_type == SOURCE_TORRENT
+    assert len(_rows(db_path)) == 1
+    assert rpc.added == []
+
+
+def test_containment_check_accepts_ordinary_nesting(tmp_path):
+    from cove.queue import _within
+
+    assert _within(str(tmp_path), str(tmp_path))
+    assert _within(str(tmp_path), str(tmp_path / "a" / "b"))
+    assert not _within(str(tmp_path), str(tmp_path.parent))
+    assert not _within(str(tmp_path), str(tmp_path.parent / "sibling"))
+
+
+def test_only_the_info_dictionary_is_sent_to_providers(queue_env, monkeypatch, tmp_path):
+    """A .torrent's announce URLs (and any private-tracker passkey in them)
+    must not reach a debrid provider."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    announce = b"http://tracker.example/announce?passkey=SECRETPASS"
+    raw = (
+        b"d8:announce%d:%s" % (len(announce), announce)
+        + b"4:infod6:lengthi7e4:name9:movie.mkv12:piece lengthi16384e"
+        b"6:pieces20:" + b"\x01" * 20 + b"ee"
+    )
+    path = tmp_path / "s.torrent"
+    path.write_bytes(raw)
+    expected = torrent_mod.parse_torrent(raw).info_hash
+
+    seen = {}
+
+    def fake_resolve(info_hash, settings, *, torrent_bytes=None, **kw):
+        seen["hash"] = info_hash
+        seen["bytes"] = torrent_bytes
+        return None
+
+    monkeypatch.setattr(debrid, "resolve_torrent", fake_resolve)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(expected),
+        source_type=SOURCE_TORRENT,
+        info_hash=expected,
+        torrent_path=str(path),
+    )
+    queue._probe_torrent(queue.tasks[tid])
+
+    assert seen["hash"] == expected
+    assert seen["bytes"] != raw
+    assert b"SECRETPASS" not in seen["bytes"]
+    assert b"tracker.example" not in seen["bytes"]
+    # ...and it is still the same torrent.
+    assert torrent_mod.parse_torrent(seen["bytes"]).info_hash == expected
+
+
+def test_a_completed_torrent_can_be_downloaded_again(queue_env, monkeypatch):
+    """Idempotence must stop a duplicate in-flight expansion, not turn
+    finished history into a permanent block."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    first = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[first])
+    assert len(_rows(db_path)) == 2
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("UPDATE downloads SET status='completed'")
+    conn.commit()
+    conn.close()
+    for task in list(queue.tasks.values()):
+        task.status = "completed"
+
+    second = queue.add_url(MAGNET)
+    assert second is not None
+    queue._launch(queue.tasks[second])
+
+    rows = _rows(db_path)
+    assert len(rows) == 4
+    fresh = [r for r in rows if r["status"] == "queued"]
+    assert len(fresh) == 2
+    assert [r["filename"] for r in fresh] == ["ep1.mkv", "ep2.mkv"]

@@ -17,12 +17,27 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
-from . import db, debrid
+from . import db, debrid, torrent
 from .aria2 import Aria2Error, Aria2RPC
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
+from .torrent import TorrentError
 
 URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+", re.IGNORECASE)
+
+# Approved `source_type` values (see the v6 migration in cove/db.py).
+SOURCE_PLAIN = ""
+SOURCE_TORRENT = "torrent"
+SOURCE_TORRENT_FILE = "torrent_file"
+SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE)
+
+# Slice A ships the cached-debrid route only. Until the local BitTorrent
+# fallback lands there is nowhere for an uncached torrent to go, which is
+# also why torrent_support_enabled defaults to False.
+TORRENT_NOT_CACHED = (
+    "This torrent is not cached by an enabled debrid provider. Cove's local "
+    "torrent downloader is not enabled in this development slice yet."
+)
 
 
 def _clean_header(value) -> str:
@@ -31,6 +46,28 @@ def _clean_header(value) -> str:
     if not isinstance(value, str):
         return ""
     return value.replace("\r", "").replace("\n", "").strip()
+
+
+def _safe_torrent_name(value) -> str:
+    """A magnet's `dn` reduced to a usable folder name, or ""."""
+    try:
+        return torrent.safe_component(value)
+    except TorrentError:
+        return ""
+
+
+def _within(base: str, target: str) -> bool:
+    """True when `target` is `base` itself or sits underneath it.
+
+    realpath, not abspath: a symlink already sitting inside the output
+    directory would otherwise let a textually-contained provider path
+    resolve to somewhere else entirely. realpath on a path that does not
+    exist yet still resolves the part that does, which is the part a
+    symlink could be hiding in.
+    """
+    base_abs = os.path.realpath(base)
+    target_abs = os.path.realpath(target)
+    return target_abs == base_abs or target_abs.startswith(base_abs + os.sep)
 
 
 def _row_get(row, key, default=None):
@@ -58,6 +95,11 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         cookies=_clean_header(_row_get(row, "cookies", "")),
         referrer=_clean_header(_row_get(row, "referrer", "")),
         user_agent=_clean_header(_row_get(row, "user_agent", "")),
+        source_type=_row_get(row, "source_type", "") or "",
+        info_hash=_row_get(row, "info_hash", "") or "",
+        torrent_name=_row_get(row, "torrent_name", "") or "",
+        torrent_path=_row_get(row, "torrent_path", "") or "",
+        debrid_route=_row_get(row, "debrid_route", "") or "",
     )
 
 
@@ -88,6 +130,18 @@ class DownloadTask:
     cookies: str = ""
     referrer: str = ""
     user_agent: str = ""
+    # Torrent provenance, persisted by the v6 schema.
+    #   source_type == "torrent"       this row is the magnet / .torrent the
+    #                                  user added; it probes the providers
+    #                                  and then becomes the first file.
+    #   source_type == "torrent_file"  an ordinary HTTPS download whose `url`
+    #                                  is the provider's account-bound locked
+    #                                  link, unlocked afresh on every launch.
+    source_type: str = ""
+    info_hash: str = ""
+    torrent_name: str = ""
+    torrent_path: str = ""
+    debrid_route: str = ""
     # Transient debrid state, deliberately absent from the 'downloads'
     # table and from _task_from_persisted_row. `resolved_url` is a
     # short-lived secret on the provider's delivery node: it is handed to
@@ -148,7 +202,7 @@ class _RpcCall(QRunnable):
     def run(self):
         try:
             result = self._fn(*self._args, **self._kwargs)
-        except (Aria2Error, DebridError) as e:
+        except (Aria2Error, DebridError, TorrentError) as e:
             # Both already carry a message written for the user; prefixing
             # the class name would only leak implementation detail into the
             # task row.
@@ -401,13 +455,31 @@ class QueueManager(QObject):
         cookies: str = "",
         referrer: str = "",
         user_agent: str = "",
+        source_type: str = SOURCE_PLAIN,
+        info_hash: str = "",
+        torrent_name: str = "",
+        torrent_path: str = "",
+        debrid_route: str = "",
     ) -> Optional[int]:
+        """Add one URL to the queue.
+
+        The `source_type`/`info_hash`/... arguments are internal: they are
+        set by Cove's own torrent routing below and by `add_torrent_file`,
+        never by anything that carries user input (the local API and the
+        native-messaging drop directory both pass explicit kwargs only).
+        """
         url = url.strip()
         cookies = _clean_header(cookies)
         referrer = _clean_header(referrer)
         user_agent = _clean_header(user_agent)
+        if source_type not in SOURCE_TYPES:
+            return None
         if not URL_RE.match(url):
             return None
+        if source_type == SOURCE_PLAIN and torrent.is_magnet(url) and self._torrent_enabled():
+            return self._add_magnet(
+                url, out_dir=out_dir, speed_limit_kbps=speed_limit_kbps
+            )
         import posixpath
         from urllib.parse import unquote, urlparse
         from .config import categorize
@@ -457,8 +529,10 @@ class QueueManager(QObject):
                 INSERT INTO downloads
                     (url, out_dir, connections, speed_limit_kbps, status,
                      created_at, category, backend, filename,
-                     cookies, referrer, user_agent)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     cookies, referrer, user_agent,
+                     source_type, info_hash, torrent_name, torrent_path,
+                     debrid_route)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     url,
@@ -473,6 +547,11 @@ class QueueManager(QObject):
                     cookies,
                     referrer,
                     user_agent,
+                    source_type,
+                    info_hash,
+                    torrent_name,
+                    torrent_path,
+                    debrid_route,
                 ),
             )
             tid = cur.lastrowid
@@ -487,6 +566,11 @@ class QueueManager(QObject):
             cookies=cookies,
             referrer=referrer,
             user_agent=user_agent,
+            source_type=source_type,
+            info_hash=info_hash,
+            torrent_name=torrent_name,
+            torrent_path=torrent_path,
+            debrid_route=debrid_route,
         )
         self.tasks[tid] = t
         self.task_added.emit(tid)
@@ -501,6 +585,271 @@ class QueueManager(QObject):
             for u in urls
             if (tid := self.add_url(u, out_dir)) is not None
         ]
+
+    # ---- torrent input ------------------------------------------------
+
+    def _torrent_enabled(self) -> bool:
+        return getattr(self.settings, "torrent_support_enabled", False) is True
+
+    def _live_torrent(self, info_hash: str) -> bool:
+        """True when this info hash is already represented in the queue.
+
+        Completed rows are deliberately not counted: re-adding a torrent
+        you finished last month is a legitimate thing to do, and matches
+        how the queue already treats a finished HTTP download.
+        """
+        if not info_hash:
+            return False
+        return any(
+            t.info_hash == info_hash
+            and t.source_type in (SOURCE_TORRENT, SOURCE_TORRENT_FILE)
+            and t.status in {"queued", "active", "paused", "error"}
+            for t in self.tasks.values()
+        )
+
+    def _add_magnet(
+        self, url: str, *, out_dir: str | None = None, speed_limit_kbps: int = 0
+    ) -> Optional[int]:
+        """Route a magnet to a torrent source task.
+
+        Only the info hash survives parsing, but the original magnet is
+        still what gets persisted as the task's URL: it is local-only, and
+        the trackers in it are what Slice B's local downloader will need.
+        """
+        try:
+            magnet = torrent.parse_magnet(url)
+        except TorrentError as exc:
+            self.error.emit(str(exc))
+            return None
+        if self._live_torrent(magnet.info_hash):
+            self.error.emit("That torrent is already in Cove's queue.")
+            return None
+        return self.add_url(
+            url,
+            out_dir=out_dir,
+            speed_limit_kbps=speed_limit_kbps,
+            source_type=SOURCE_TORRENT,
+            info_hash=magnet.info_hash,
+            torrent_name=_safe_torrent_name(magnet.display_name),
+        )
+
+    def add_torrent_file(self, path: str, out_dir: str | None = None) -> None:
+        """Queue a local `.torrent`.
+
+        Reading, bencode parsing and the info-dictionary SHA-1 all happen
+        on a worker; the GUI thread only ever sees the finished metadata.
+        """
+        if not self._torrent_enabled():
+            return
+        dest = out_dir or self.settings.download_dir
+        source = str(path)
+
+        def on_done(meta) -> None:
+            if self._live_torrent(meta.info_hash):
+                self.error.emit("That torrent is already in Cove's queue.")
+                return
+            # The minimal magnet is the task URL: it identifies the torrent
+            # without persisting anything the .torrent might carry, and the
+            # file itself stays where the user put it.
+            self.add_url(
+                torrent.minimal_magnet(meta.info_hash),
+                out_dir=dest,
+                source_type=SOURCE_TORRENT,
+                info_hash=meta.info_hash,
+                torrent_name=meta.name,
+                torrent_path=source,
+            )
+
+        self._spawn(
+            torrent.read_torrent_file, source,
+            on_done=on_done, on_fail=self.error.emit,
+        )
+
+    def _launch_torrent(self, t: DownloadTask) -> None:
+        self._spawn(
+            self._probe_torrent,
+            t,
+            on_done=lambda cached, tid=t.id: self._on_torrent_probed(tid, cached),
+            on_fail=lambda msg, tid=t.id: self._fail_task(tid, msg),
+        )
+
+    def _probe_torrent(self, t: DownloadTask):
+        """Ask the providers whether they already hold this torrent.
+
+        Runs on a QThreadPool worker; never call it from the GUI thread.
+        """
+        torrent_bytes = None
+        info_hash = t.info_hash
+        if t.torrent_path:
+            try:
+                meta = torrent.read_torrent_file(t.torrent_path)
+            except TorrentError:
+                # The user moved or deleted the .torrent since adding it.
+                # The info hash is enough to ask with, so don't fail here.
+                meta = None
+            if meta is not None and info_hash and meta.info_hash != info_hash:
+                # Something else lives at that path now. The persisted hash
+                # is the task's durable identity, so a replaced file must
+                # not be able to redirect the row at a different torrent.
+                meta = None
+            if meta is not None:
+                info_hash = meta.info_hash
+                # Never the user's original file: it carries the announce
+                # URLs, and a private-tracker announce URL carries their
+                # passkey. The info-only document hashes identically.
+                torrent_bytes = meta.info_only_document()
+        return debrid.resolve_torrent(
+            info_hash, self.settings, torrent_bytes=torrent_bytes
+        )
+
+    def _on_torrent_probed(self, tid: int, cached) -> None:
+        t = self.tasks.get(tid)
+        if t is None or t.source_type != SOURCE_TORRENT:
+            return
+        if cached is None:
+            self._fail_task(tid, TORRENT_NOT_CACHED)
+            return
+        try:
+            self._materialize_cached_torrent(t, cached)
+        except TorrentError as exc:
+            self._fail_task(tid, str(exc))
+
+    def _materialize_cached_torrent(self, t: DownloadTask, cached) -> None:
+        """Turn a cached provider torrent into ordinary HTTPS tasks.
+
+        The source row becomes the torrent's first file and the remaining
+        files are inserted next to it, all inside one transaction. That is
+        what makes the step idempotent: either every row exists or none
+        does, and a second probe of the same info hash finds the rows and
+        drops the redundant source instead of expanding twice.
+
+        Only the provider's account-bound *locked* link is stored. The
+        short-lived delivery URL is generated per launch and never reaches
+        the database, exactly as for a hoster link.
+        """
+        from .config import categorize
+
+        base = t.out_dir
+        rows = []
+        for f in cached.files:
+            parts = cached.destination_parts(f)
+            dest_dir = os.path.join(base, *parts[:-1]) if len(parts) > 1 else base
+            # The components are already validated, so this is a second
+            # gate rather than the only one — but the only one that knows
+            # the actual destination.
+            if not _within(base, dest_dir):
+                raise TorrentError(
+                    "This torrent contains a file path Cove will not write to."
+                )
+            rows.append((dest_dir, parts[-1], f))
+
+        now = time.time()
+        first_dir, first_name, first_file = rows[0]
+        new_rows: list[tuple] = []
+        with db.connect() as conn:
+            # Terminal rows are excluded on purpose, matching _live_torrent:
+            # idempotence has to stop a duplicate expansion that is still in
+            # flight, not turn finished history into a permanent block on
+            # re-downloading the same torrent.
+            existing = conn.execute(
+                "SELECT id FROM downloads WHERE source_type=? AND info_hash=? "
+                "AND status NOT IN ('completed','removed') LIMIT 1",
+                (SOURCE_TORRENT_FILE, cached.info_hash),
+            ).fetchone()
+            if existing is not None:
+                # Already expanded by an earlier run. Drop the redundant
+                # source row rather than leave a permanently stuck task.
+                conn.execute("DELETE FROM downloads WHERE id=?", (t.id,))
+            else:
+                conn.execute(
+                    """
+                    UPDATE downloads
+                    SET url=?, filename=?, out_dir=?, total_bytes=?,
+                        completed_bytes=0, status='queued', error=NULL,
+                        gid=NULL, finished_at=NULL, category=?,
+                        source_type=?, info_hash=?, torrent_name=?,
+                        torrent_path='', debrid_route=?
+                    WHERE id=?
+                    """,
+                    (
+                        first_file.locked_link, first_name, first_dir,
+                        first_file.size, categorize(first_name),
+                        SOURCE_TORRENT_FILE, cached.info_hash, cached.name,
+                        cached.provider, t.id,
+                    ),
+                )
+                for dest_dir, name, f in rows[1:]:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO downloads
+                            (url, out_dir, connections, speed_limit_kbps,
+                             status, created_at, category, backend, filename,
+                             total_bytes, source_type, info_hash,
+                             torrent_name, debrid_route)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            f.locked_link, dest_dir, t.connections,
+                            t.speed_limit_kbps, "queued", now,
+                            categorize(name), "aria2", name, f.size,
+                            SOURCE_TORRENT_FILE, cached.info_hash,
+                            cached.name, cached.provider,
+                        ),
+                    )
+                    new_rows.append((cur.lastrowid, dest_dir, name, f))
+
+        if existing is not None:
+            self.tasks.pop(t.id, None)
+            self.task_removed.emit(t.id)
+            self._maybe_start_next()
+            return
+
+        t.url = first_file.locked_link
+        t.filename = first_name
+        t.out_dir = first_dir
+        t.total_bytes = first_file.size
+        t.completed_bytes = 0
+        t.status = "queued"
+        t.error = None
+        t.gid = None
+        t.finished_at = None
+        t.source_type = SOURCE_TORRENT_FILE
+        t.info_hash = cached.info_hash
+        t.torrent_name = cached.name
+        t.torrent_path = ""
+        t.debrid_route = cached.provider
+        t.clear_debrid()
+        self.task_changed.emit(t.id)
+
+        for tid, dest_dir, name, f in new_rows:
+            nt = DownloadTask(
+                id=tid,
+                url=f.locked_link,
+                out_dir=dest_dir,
+                connections=t.connections,
+                speed_limit_kbps=t.speed_limit_kbps,
+                filename=name,
+                total_bytes=f.size,
+                created_at=now,
+                source_type=SOURCE_TORRENT_FILE,
+                info_hash=cached.info_hash,
+                torrent_name=cached.name,
+                debrid_route=cached.provider,
+            )
+            self.tasks[tid] = nt
+            self.task_added.emit(tid)
+        self._maybe_start_next()
+
+    def _fail_task(self, tid: int, msg: str) -> None:
+        t = self.tasks.get(tid)
+        if not t:
+            return
+        t.status = "error"
+        t.error = msg
+        t.finished_at = time.time()
+        self._persist(t)
+        self.task_changed.emit(tid)
+        self._maybe_start_next()
 
     def pause(self, tid: int) -> None:
         t = self.tasks.get(tid)
@@ -962,10 +1311,22 @@ class QueueManager(QObject):
         if t.backend == "yt-dlp":
             self._launch_extractor(t)
             return
+        if t.source_type == SOURCE_TORRENT:
+            self._launch_torrent(t)
+            return
         # An account-bound provider share link would otherwise "succeed" by
         # saving the provider's forbidden HTML page as the file. Fail the
         # task instead so the row carries a reason the user can act on.
-        share_reason = debrid.share_link_reason(t.url)
+        #
+        # A materialised torrent file row is the one exception: its URL is
+        # an account-bound provider link *by construction*, issued to this
+        # user's own account and unlocked through the API below. The bypass
+        # is keyed on source_type, which only Cove's own materialisation
+        # sets — a pasted share link still lands in the branch below.
+        share_reason = (
+            "" if t.source_type == SOURCE_TORRENT_FILE
+            else debrid.share_link_reason(t.url)
+        )
         if share_reason:
             t.status = "error"
             t.error = share_reason
@@ -1057,7 +1418,13 @@ class QueueManager(QObject):
         # _probe_and_add is the only off-GUI-thread path that can do network
         # work, so debrid resolution has to route through it too — otherwise
         # turning off intelligent segments would silently disable debrid.
-        needs_worker = self.settings.intelligent_segments or self._debrid_enabled()
+        # A torrent file row always needs the worker: its stored link has to
+        # be unlocked before aria2 can be handed anything.
+        needs_worker = (
+            self.settings.intelligent_segments
+            or self._debrid_enabled()
+            or t.source_type == SOURCE_TORRENT_FILE
+        )
         if is_http and needs_worker:
             self._spawn(
                 self._probe_and_add,
@@ -1102,6 +1469,21 @@ class QueueManager(QObject):
 
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
+        if t.source_type == SOURCE_TORRENT_FILE:
+            # The persisted URL is the provider's stable account-bound link
+            # for this file. It is not fetchable as-is and is not a hoster
+            # link either, so it bypasses both the share-link guard and the
+            # provider-domain exclusion and goes straight to the provider
+            # that issued it. t.url is left untouched: the generated node
+            # URL expires, this link doesn't.
+            result = debrid.unlock_torrent_file(
+                t.url, t.debrid_route, self.settings
+            )
+            t.resolved_url = result.download
+            t.debrid_provider = result.provider
+            if result.filesize > 0:
+                t.total_bytes = result.filesize
+            return result.download
         if not self._debrid_enabled():
             return t.url
         result = debrid.resolve(t.url, self.settings)

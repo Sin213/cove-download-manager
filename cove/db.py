@@ -52,6 +52,29 @@ _MIGRATIONS = [
         "ALTER TABLE downloads ADD COLUMN referrer TEXT DEFAULT ''",
         "ALTER TABLE downloads ADD COLUMN user_agent TEXT DEFAULT ''",
     ],
+    # v5 -> v6: torrent support. Purely additive; every existing row keeps
+    # source_type='' and behaves exactly as before.
+    #
+    #   source_type   ''             a normal HTTP/HLS/yt-dlp download
+    #                 'torrent'      the magnet or .torrent the user added
+    #                 'torrent_file' one HTTPS file materialised from a
+    #                                cached debrid torrent
+    #   debrid_route  '' | 'alldebrid' | 'real_debrid' -- which provider
+    #                 issued the locked link stored in `url`
+    #   torrent_path  local .torrent the source task came from, if any
+    #   selected_files reserved for per-file selection (Slice C); always ''
+    #
+    # Note what is NOT here: no column holds a credential or a generated
+    # delivery URL. Those stay transient, as they do for hoster links.
+    [
+        "ALTER TABLE downloads ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN info_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN torrent_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN torrent_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN debrid_route TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN selected_files TEXT NOT NULL DEFAULT ''",
+        "CREATE INDEX IF NOT EXISTS idx_downloads_info_hash ON downloads(info_hash)",
+    ],
 ]
 
 

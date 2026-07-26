@@ -52,6 +52,12 @@ class FakeSession:
     def head(self, url, **kwargs):  # pragma: no cover - unused here
         return self._handle("HEAD", url, kwargs)
 
+    def put(self, url, **kwargs):
+        return self._handle("PUT", url, kwargs)
+
+    def delete(self, url, **kwargs):
+        return self._handle("DELETE", url, kwargs)
+
     def _handle(self, method, url, kwargs):
         self.calls.append((method, url, kwargs))
         for suffix, value in self.routes.items():
@@ -1216,3 +1222,589 @@ def test_account_bound_share_links_are_identified(url, expected_label):
 )
 def test_non_share_links_are_left_alone(url):
     assert debrid.share_link_reason(url) == ""
+
+
+# ---------------------------------------------------------------------------
+# Cached torrents
+# ---------------------------------------------------------------------------
+#
+# Two things must never happen on this route: Cove sitting through a
+# provider cloud-download and calling the result "cached", and Cove leaving
+# probe entries behind in the user's provider account.
+
+INFO_HASH = "0123456789abcdef0123456789abcdef01234567"
+MINIMAL_MAGNET = f"magnet:?xt=urn:btih:{INFO_HASH}"
+# A tracker passkey that must never reach a provider.
+TRACKER_MAGNET = (
+    f"magnet:?xt=urn:btih:{INFO_HASH}&dn=Season+1"
+    "&tr=http://tracker.example/announce?passkey=SECRETPASS"
+)
+AD_LOCKED_1 = "https://alldebrid.com/f/LOCKEDONE"
+AD_LOCKED_2 = "https://alldebrid.com/f/LOCKEDTWO"
+RD_LOCKED_1 = "https://real-debrid.com/d/LOCKEDONE"
+RD_LOCKED_2 = "https://real-debrid.com/d/LOCKEDTWO"
+
+
+def _ad_upload(ready=True, name="Season 1", magnet_id=42):
+    return _Resp({"status": "success", "data": {"magnets": [
+        {"magnet": MINIMAL_MAGNET, "hash": INFO_HASH, "name": name,
+         "size": 30, "ready": ready, "id": magnet_id},
+    ]}})
+
+
+def _ad_upload_file(ready=True, name="Season 1", magnet_id=42):
+    return _Resp({"status": "success", "data": {"files": [
+        {"file": "cove.torrent", "hash": INFO_HASH, "name": name,
+         "size": 30, "ready": ready, "id": magnet_id},
+    ]}})
+
+
+def _ad_files(tree=None):
+    if tree is None:
+        tree = [{"n": "Season 1", "e": [
+            {"n": "ep1.mkv", "s": 10, "l": AD_LOCKED_1},
+            {"n": "extras", "e": [{"n": "ep2.mkv", "s": 20, "l": AD_LOCKED_2}]},
+        ]}]
+    return _Resp({"status": "success", "data": {"magnets": [
+        {"id": 42, "files": tree},
+    ]}})
+
+
+_AD_DELETED = _Resp({"status": "success", "data": {"message": "deleted"}})
+
+
+def _ad_calls(session, suffix):
+    return [c for c in session.calls if c[1].endswith(suffix)]
+
+
+def test_all_debrid_cached_magnet_returns_the_file_tree():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files(),
+    })
+    cached = debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session)
+
+    assert cached.provider == ALL_DEBRID
+    assert cached.info_hash == INFO_HASH
+    assert cached.name == "Season 1"
+    assert [f.path for f in cached.files] == [("ep1.mkv",), ("extras", "ep2.mkv")]
+    assert [f.size for f in cached.files] == [10, 20]
+    assert [f.locked_link for f in cached.files] == [AD_LOCKED_1, AD_LOCKED_2]
+    # The tree's own root folder is dropped; the queue adds it back once.
+    assert cached.multi_file is True
+    assert cached.destination_parts(cached.files[1]) == ("Season 1", "extras", "ep2.mkv")
+    # A cached entry stays: its links are what the download uses.
+    assert _ad_calls(session, "/magnet/delete") == []
+
+
+def test_all_debrid_uncached_magnet_returns_none_and_deletes_the_entry():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(ready=False),
+        "/magnet/delete": _AD_DELETED,
+    })
+    assert debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session) is None
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+    # Cove never waits for AllDebrid to fetch it.
+    assert _ad_calls(session, "/magnet/files") == []
+
+
+def test_all_debrid_only_ever_receives_the_minimal_magnet():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files(),
+    })
+    parsed = debrid._torrent.parse_magnet(TRACKER_MAGNET)
+    debrid.all_debrid_cached_torrent(parsed.info_hash, APIKEY, session=session)
+
+    sent = repr(session.calls)
+    assert MINIMAL_MAGNET in sent
+    for leaked in ("SECRETPASS", "tracker.example", "dn=", "Season+1"):
+        assert leaked not in sent
+
+
+def test_all_debrid_torrent_file_upload_uses_multipart():
+    session = FakeSession({
+        "/magnet/upload/file": _ad_upload_file(),
+        "/magnet/files": _ad_files(),
+    })
+    cached = debrid.all_debrid_cached_torrent(
+        INFO_HASH, APIKEY, torrent_bytes=b"d4:infod1:xi1eee", session=session
+    )
+    assert cached is not None
+    upload = _ad_calls(session, "/magnet/upload/file")[0]
+    assert "files" in upload[2]
+
+
+def test_all_debrid_torrent_file_not_ready_is_deleted():
+    session = FakeSession({
+        "/magnet/upload/file": _ad_upload_file(ready=False),
+        "/magnet/delete": _AD_DELETED,
+    })
+    assert debrid.all_debrid_cached_torrent(
+        INFO_HASH, APIKEY, torrent_bytes=b"x", session=session
+    ) is None
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_all_debrid_malformed_file_tree_deletes_the_entry():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _Resp({"status": "success", "data": {"magnets": "nope"}}),
+        "/magnet/delete": _AD_DELETED,
+    })
+    with pytest.raises(DebridError):
+        debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session)
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_all_debrid_missing_locked_link_deletes_the_entry():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files([{"n": "ep1.mkv", "s": 10}]),
+        "/magnet/delete": _AD_DELETED,
+    })
+    with pytest.raises(DebridError) as excinfo:
+        debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session)
+    assert excinfo.value.code == "missing_link"
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_all_debrid_unsafe_provider_path_is_refused_and_cleaned_up():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files([{"n": "../escape.bin", "s": 1, "l": AD_LOCKED_1}]),
+        "/magnet/delete": _AD_DELETED,
+    })
+    with pytest.raises(DebridError) as excinfo:
+        debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session)
+    assert excinfo.value.code == "unsafe_path"
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_all_debrid_transport_failure_after_creation_still_deletes():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": RuntimeError("boom"),
+        "/magnet/delete": _AD_DELETED,
+    })
+    with pytest.raises(DebridError):
+        debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session)
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_all_debrid_delete_retries_once_then_gives_up():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(ready=False),
+        "/magnet/delete": RuntimeError("boom"),
+    })
+    assert debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session) is None
+    # One retry for a transport blip, then it stops. Never an unbounded loop.
+    assert len(_ad_calls(session, "/magnet/delete")) == 2
+
+
+def test_all_debrid_delete_is_not_retried_for_a_refusal():
+    refused = _Resp({"status": "error", "error": {"code": "AUTH_BAD_APIKEY"}})
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(ready=False),
+        "/magnet/delete": refused,
+    })
+    assert debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session) is None
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_all_debrid_single_file_torrent_keeps_a_flat_destination():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(name="movie.mkv"),
+        "/magnet/files": _ad_files([{"n": "movie.mkv", "s": 7, "l": AD_LOCKED_1}]),
+    })
+    cached = debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session)
+    assert cached.multi_file is False
+    assert cached.destination_parts(cached.files[0]) == ("movie.mkv",)
+
+
+# --- Real-Debrid -----------------------------------------------------------
+
+
+def _rd_added(torrent_id="rd-1"):
+    return _Resp({"id": torrent_id, "uri": "/torrents/info/rd-1"}, status_code=201)
+
+
+def _rd_info(status, files=None, links=None, filename="Season 1"):
+    if files is None:
+        files = [
+            {"id": 1, "path": "/ep1.mkv", "bytes": 10, "selected": 1},
+            {"id": 2, "path": "/extras/ep2.mkv", "bytes": 20, "selected": 1},
+        ]
+    if links is None:
+        links = [RD_LOCKED_1, RD_LOCKED_2]
+    return _Resp({
+        "id": "rd-1", "filename": filename, "status": status,
+        "files": files, "links": links,
+    })
+
+
+_RD_NO_CONTENT = _Resp(ValueError("no body"), status_code=204)
+
+
+def _rd_calls(session, suffix):
+    return [c for c in session.calls if c[1].endswith(suffix)]
+
+
+def _rd_env(info_responses, **extra):
+    routes = {
+        "/torrents/addMagnet": _rd_added(),
+        "/torrents/info/rd-1": list(info_responses),
+        "/torrents/selectFiles/rd-1": _RD_NO_CONTENT,
+        "/torrents/delete/rd-1": _RD_NO_CONTENT,
+    }
+    routes.update(extra)
+    return FakeSession(routes)
+
+
+def test_real_debrid_cached_magnet_returns_the_file_tree():
+    session = _rd_env([_rd_info("downloaded")])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached.provider == REAL_DEBRID
+    assert cached.name == "Season 1"
+    assert [f.path for f in cached.files] == [("ep1.mkv",), ("extras", "ep2.mkv")]
+    assert [f.locked_link for f in cached.files] == [RD_LOCKED_1, RD_LOCKED_2]
+    assert clock.slept == []
+    # A cached entry is kept: the download uses its links.
+    assert _rd_calls(session, "/torrents/delete/rd-1") == []
+
+
+def test_real_debrid_only_ever_receives_the_minimal_magnet():
+    session = _rd_env([_rd_info("downloaded")])
+    clock = FakeClock()
+    parsed = debrid._torrent.parse_magnet(TRACKER_MAGNET)
+    debrid.real_debrid_cached_torrent(
+        parsed.info_hash, TOKEN, session=session,
+        sleep=clock.sleep, clock=clock.monotonic,
+    )
+    sent = repr(session.calls)
+    assert MINIMAL_MAGNET in sent
+    for leaked in ("SECRETPASS", "tracker.example", "Season+1"):
+        assert leaked not in sent
+
+
+def test_real_debrid_waits_only_for_magnet_conversion():
+    session = _rd_env([
+        _rd_info("magnet_conversion"),
+        _rd_info("magnet_conversion"),
+        _rd_info("downloaded"),
+    ])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    assert clock.slept == [debrid.RD_TORRENT_POLL_INTERVAL] * 2
+
+
+def test_real_debrid_conversion_timeout_is_uncached_and_cleaned_up():
+    session = _rd_env([_rd_info("magnet_conversion")] * 40)
+    clock = FakeClock()
+    assert debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    ) is None
+    assert sum(clock.slept) <= debrid.RD_TORRENT_MAX_WAIT + debrid.RD_TORRENT_POLL_INTERVAL
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_selects_all_files_then_rechecks():
+    session = _rd_env([_rd_info("waiting_files_selection"), _rd_info("downloaded")])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    select = _rd_calls(session, "/torrents/selectFiles/rd-1")
+    assert len(select) == 1
+    assert select[0][2]["data"] == {"files": "all"}
+
+
+def test_real_debrid_repeated_selection_state_is_not_a_loop():
+    session = _rd_env([_rd_info("waiting_files_selection")] * 5)
+    clock = FakeClock()
+    assert debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    ) is None
+    assert len(_rd_calls(session, "/torrents/selectFiles/rd-1")) == 1
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+@pytest.mark.parametrize("status", [
+    "queued", "downloading", "compressing", "uploading",
+    "error", "virus", "dead", "magnet_error",
+])
+def test_real_debrid_non_cached_states_return_none_and_delete(status):
+    session = _rd_env([_rd_info(status)])
+    clock = FakeClock()
+    assert debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    ) is None
+    assert clock.slept == []
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_never_waits_for_a_cloud_download_to_finish():
+    """Downloading first, downloaded later, must still be "not cached"."""
+    session = _rd_env([_rd_info("downloading"), _rd_info("downloaded")])
+    clock = FakeClock()
+    assert debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    ) is None
+
+
+def test_real_debrid_link_count_mismatch_is_refused_and_cleaned_up():
+    session = _rd_env([_rd_info("downloaded", links=[RD_LOCKED_1])])
+    clock = FakeClock()
+    with pytest.raises(DebridError):
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_unselected_files_are_ignored():
+    session = _rd_env([_rd_info("downloaded", files=[
+        {"id": 1, "path": "/ep1.mkv", "bytes": 10, "selected": 1},
+        {"id": 2, "path": "/sample.mkv", "bytes": 1, "selected": 0},
+    ], links=[RD_LOCKED_1])])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert [f.path for f in cached.files] == [("ep1.mkv",)]
+
+
+def test_real_debrid_unsafe_provider_path_is_refused_and_cleaned_up():
+    session = _rd_env([_rd_info("downloaded", files=[
+        {"id": 1, "path": "/../escape.bin", "bytes": 1, "selected": 1},
+    ], links=[RD_LOCKED_1])])
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert excinfo.value.code == "unsafe_path"
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_exception_during_parsing_still_deletes():
+    session = _rd_env([_Resp({"id": "rd-1", "status": 5})])
+    clock = FakeClock()
+    with pytest.raises(DebridError):
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_delete_retries_once_then_gives_up():
+    session = _rd_env([_rd_info("queued")], **{"/torrents/delete/rd-1": RuntimeError("boom")})
+    clock = FakeClock()
+    assert debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    ) is None
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 2
+
+
+def test_real_debrid_torrent_file_uploads_raw_bytes():
+    session = FakeSession({
+        "/torrents/addTorrent": _rd_added(),
+        "/torrents/info/rd-1": [_rd_info("downloaded")],
+        "/torrents/delete/rd-1": _RD_NO_CONTENT,
+    })
+    clock = FakeClock()
+    raw = b"d4:infod1:xi1eee"
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, torrent_bytes=raw, session=session,
+        sleep=clock.sleep, clock=clock.monotonic,
+    )
+    assert cached is not None
+    put = _rd_calls(session, "/torrents/addTorrent")[0]
+    assert put[0] == "PUT"
+    assert put[2]["data"] == raw
+
+
+# --- Shared torrent routing ------------------------------------------------
+
+
+def _torrent_settings(**extra):
+    base = dict(
+        all_debrid_enabled=True, all_debrid_api_key=APIKEY,
+        real_debrid_enabled=True, real_debrid_api_token=TOKEN,
+        debrid_preferred_provider="alldebrid",
+    )
+    base.update(extra)
+    return _settings(**base)
+
+
+def _both_providers_session(ad_ready, rd_status):
+    return FakeSession({
+        "/magnet/upload": _ad_upload(ready=ad_ready),
+        "/magnet/files": _ad_files(),
+        "/magnet/delete": _AD_DELETED,
+        "/torrents/addMagnet": _rd_added(),
+        "/torrents/info/rd-1": [_rd_info(rd_status)],
+        "/torrents/delete/rd-1": _RD_NO_CONTENT,
+    })
+
+
+def _resolve(settings, session):
+    clock = FakeClock()
+    return debrid.resolve_torrent(
+        INFO_HASH, settings, session=session,
+        sleep=clock.sleep, clock=clock.monotonic,
+    )
+
+
+def test_resolve_torrent_prefers_all_debrid():
+    session = _both_providers_session(True, "downloaded")
+    cached = _resolve(_torrent_settings(), session)
+    assert cached.provider == ALL_DEBRID
+    assert _rd_calls(session, "/torrents/addMagnet") == []
+
+
+def test_resolve_torrent_prefers_real_debrid_when_asked():
+    session = _both_providers_session(True, "downloaded")
+    cached = _resolve(_torrent_settings(debrid_preferred_provider="real_debrid"), session)
+    assert cached.provider == REAL_DEBRID
+    assert _ad_calls(session, "/magnet/upload") == []
+
+
+def test_resolve_torrent_falls_through_to_the_second_provider():
+    session = _both_providers_session(False, "downloaded")
+    cached = _resolve(_torrent_settings(), session)
+    assert cached.provider == REAL_DEBRID
+    # The uncached AllDebrid probe entry is still cleaned up.
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+
+
+def test_resolve_torrent_returns_none_when_neither_has_it():
+    session = _both_providers_session(False, "queued")
+    assert _resolve(_torrent_settings(), session) is None
+    assert len(_ad_calls(session, "/magnet/delete")) == 1
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_resolve_torrent_with_one_provider_enabled():
+    session = FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files(),
+    })
+    settings = _torrent_settings(real_debrid_enabled=False, real_debrid_api_token="")
+    assert _resolve(settings, session).provider == ALL_DEBRID
+
+
+def test_resolve_torrent_with_no_provider_configured_returns_none():
+    session = FakeSession({})
+    assert _resolve(_settings(), session) is None
+    assert session.calls == []
+
+
+def test_resolve_torrent_falls_back_past_a_temporary_provider_failure():
+    session = FakeSession({
+        "/magnet/upload": _Resp({"status": "error", "error": {"code": "MAINTENANCE"}}),
+        "/torrents/addMagnet": _rd_added(),
+        "/torrents/info/rd-1": [_rd_info("downloaded")],
+    })
+    assert _resolve(_torrent_settings(), session).provider == REAL_DEBRID
+
+
+def test_resolve_torrent_does_not_hide_a_credential_failure():
+    session = FakeSession({
+        "/magnet/upload": _Resp({"status": "error", "error": {"code": "AUTH_BAD_APIKEY"}}),
+    })
+    with pytest.raises(DebridError) as excinfo:
+        _resolve(_torrent_settings(), session)
+    assert excinfo.value.provider == ALL_DEBRID
+    # Never silently retried against the other provider.
+    assert "/torrents/addMagnet" not in repr(session.calls)
+
+
+def test_resolve_torrent_reports_a_missing_credential():
+    settings = _torrent_settings(all_debrid_api_key="  ")
+    with pytest.raises(DebridError) as excinfo:
+        _resolve(settings, FakeSession({}))
+    assert excinfo.value.code == "missing_credential"
+
+
+def test_resolve_torrent_raises_the_last_error_when_all_fall_back():
+    session = FakeSession({
+        "/magnet/upload": _Resp({"status": "error", "error": {"code": "MAINTENANCE"}}),
+        "/torrents/addMagnet": _Resp({"error_code": 25}),
+    })
+    with pytest.raises(DebridError) as excinfo:
+        _resolve(_torrent_settings(), session)
+    assert excinfo.value.provider == REAL_DEBRID
+
+
+def test_resolve_torrent_uses_pure_provider_identifiers():
+    session = _both_providers_session(True, "downloaded")
+    assert _resolve(_torrent_settings(), session).provider in config.DEBRID_PROVIDERS
+
+
+# --- Unlocking a stored torrent file link ----------------------------------
+
+
+def test_unlock_torrent_file_uses_the_recorded_provider():
+    session = FakeSession({"/link/unlock": _Resp({"status": "success", "data": {
+        "link": "https://s1.debrid.it/dl/NODE/ep1.mkv",
+        "filename": "ep1.mkv", "filesize": 10,
+    }})})
+    result = debrid.unlock_torrent_file(
+        AD_LOCKED_1, ALL_DEBRID, _torrent_settings(), session=session
+    )
+    assert result.provider == ALL_DEBRID
+    assert result.download == "https://s1.debrid.it/dl/NODE/ep1.mkv"
+    assert session.calls[0][2]["data"] == {"link": AD_LOCKED_1}
+
+
+def test_unlock_torrent_file_reports_a_missing_credential():
+    settings = _torrent_settings(real_debrid_api_token="")
+    with pytest.raises(DebridError) as excinfo:
+        debrid.unlock_torrent_file(RD_LOCKED_1, REAL_DEBRID, settings, session=FakeSession({}))
+    assert excinfo.value.code == "missing_credential"
+
+
+def test_unlock_torrent_file_rejects_an_unknown_provider():
+    with pytest.raises(DebridError):
+        debrid.unlock_torrent_file(RD_LOCKED_1, "nope", _torrent_settings(), session=FakeSession({}))
+
+
+# --- Leak checks -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("session,kwargs", [
+    (FakeSession({
+        "/magnet/upload": _ad_upload(),
+        "/magnet/files": _ad_files([{"n": "ep1.mkv", "s": 10}]),
+        "/magnet/delete": _AD_DELETED,
+    }), {}),
+    (FakeSession({
+        "/magnet/upload": _Resp({"status": "error", "error": {"code": "AUTH_BAD_APIKEY"}}),
+    }), {}),
+])
+def test_torrent_errors_never_carry_secrets(session, kwargs):
+    with pytest.raises(DebridError) as excinfo:
+        debrid.all_debrid_cached_torrent(INFO_HASH, APIKEY, session=session, **kwargs)
+    text = f"{excinfo.value} {excinfo.value.user_message}"
+    for leaked in ("SECRET", APIKEY, TOKEN, INFO_HASH, AD_LOCKED_1, "LOCKED"):
+        assert leaked not in text
+
+
+def test_real_debrid_torrent_errors_never_carry_secrets():
+    session = _rd_env([_rd_info("downloaded", links=[RD_LOCKED_1])])
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    text = f"{excinfo.value} {excinfo.value.user_message}"
+    for leaked in ("SECRET", TOKEN, INFO_HASH, RD_LOCKED_1, "rd-1"):
+        assert leaked not in text

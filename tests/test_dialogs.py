@@ -300,3 +300,194 @@ def test_debrid_account_labels_never_render_provider_markup(tmp_path):
     assert m["rd_result_plain"] is True
     # The markup survives verbatim as literal text rather than being rendered.
     assert "<b>admin</b><img src=x>" in m["spoof_text"]
+
+
+# ---------------------------------------------------------------------------
+# Torrent input (hidden unless torrent_support_enabled)
+# ---------------------------------------------------------------------------
+
+
+def _torrent_bytes() -> bytes:
+    return (
+        b"d4:infod6:lengthi7e4:name9:movie.mkv12:piece lengthi16384e"
+        b"6:pieces20:" + b"\x01" * 20 + b"ee"
+    )
+
+
+def test_torrent_file_problem_accepts_a_real_torrent(tmp_path):
+    from cove.dialogs import torrent_file_problem
+
+    path = tmp_path / "ok.torrent"
+    path.write_bytes(_torrent_bytes())
+    assert torrent_file_problem(str(path)) == ""
+
+
+def test_torrent_file_problem_rejects_other_local_files(tmp_path):
+    from cove.dialogs import torrent_file_problem
+
+    other = tmp_path / "notes.txt"
+    other.write_text("hello")
+    assert torrent_file_problem(str(other)) != ""
+    assert torrent_file_problem(str(tmp_path)) != ""
+    assert torrent_file_problem(str(tmp_path / "missing.torrent")) != ""
+    assert torrent_file_problem(None) != ""
+
+
+def test_torrent_file_problem_rejects_an_oversized_file(tmp_path):
+    from cove.dialogs import torrent_file_problem
+    from cove.torrent import MAX_TORRENT_BYTES
+
+    big = tmp_path / "big.torrent"
+    big.write_bytes(b"d" * (MAX_TORRENT_BYTES + 1))
+    problem = torrent_file_problem(str(big))
+    assert "10 MiB" in problem
+
+
+def test_dropped_torrent_is_accepted_only_while_enabled(tmp_path):
+    from cove.main_window import torrent_drop_paths
+
+    good = tmp_path / "ok.torrent"
+    good.write_bytes(_torrent_bytes())
+    other = tmp_path / "notes.txt"
+    other.write_text("hello")
+    drops = [str(good), str(other), str(tmp_path), "", str(tmp_path / "gone.torrent")]
+
+    assert torrent_drop_paths(drops, True) == [str(good)]
+    # Flag off: a dropped .torrent is ignored exactly like any other local
+    # file, so the drop handler behaves as it does at HEAD.
+    assert torrent_drop_paths(drops, False) == []
+
+
+def test_add_download_dialog_torrent_button_follows_the_flag(tmp_path):
+    script = r'''
+import json, sys
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+from pathlib import Path
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import AddDownloadDialog
+
+app = QApplication([])
+out = {}
+for flag in (False, True):
+    dialog = AddDownloadDialog(Settings(
+        download_dir=str(tmp), torrent_support_enabled=flag
+    ))
+    dialog.show()
+    app.processEvents()
+    out[str(flag)] = {
+        "visible": dialog.torrent_button.isVisible(),
+        "enabled": dialog.torrent_button.isEnabled(),
+        "text": dialog.torrent_button.text(),
+        "path": dialog.torrent_path,
+    }
+    if not flag:
+        # A picker the user cannot reach must also refuse to act: no file
+        # dialog is opened at all, so this returns without blocking.
+        dialog._pick_torrent()
+        out[str(flag)]["path_after_direct_call"] = dialog.torrent_path
+    dialog.close()
+print(json.dumps(out))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    out = json.loads(result.stdout)
+
+    assert out["False"]["visible"] is False
+    assert out["False"]["enabled"] is False
+    assert out["True"]["visible"] is True
+    assert out["True"]["enabled"] is True
+    assert out["True"]["text"] == "Add torrent file..."
+    # Nothing is selected until the user picks a file.
+    assert out["False"]["path"] == ""
+    assert out["True"]["path"] == ""
+    assert out["False"]["path_after_direct_call"] == ""
+
+
+def test_torrent_picker_uses_a_torrent_filter_and_rejects_bad_files(tmp_path):
+    script = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove import dialogs
+from cove.dialogs import AddDownloadDialog
+
+app = QApplication([])
+out = {"filters": [], "warnings": []}
+
+chosen = {"path": ""}
+def fake_open(parent, title, start, filt):
+    out["filters"].append(filt)
+    return chosen["path"], filt
+QFileDialog.getOpenFileName = staticmethod(fake_open)
+QMessageBox.warning = staticmethod(
+    lambda *a, **k: out["warnings"].append(a[2]) or QMessageBox.Ok
+)
+
+dialog = AddDownloadDialog(Settings(download_dir=str(tmp), torrent_support_enabled=True))
+
+# An oversized file is refused before anything is read.
+big = tmp / "big.torrent"
+big.write_bytes(b"d" * (10 * 1024 * 1024 + 1))
+chosen["path"] = str(big)
+dialog._pick_torrent()
+out["after_big"] = dialog.torrent_path
+
+# A plain file with the wrong extension is refused too.
+chosen["path"] = str(tmp / "notes.txt")
+(tmp / "notes.txt").write_text("hi")
+dialog._pick_torrent()
+out["after_txt"] = dialog.torrent_path
+
+# A real one is accepted and closes the dialog.
+good = tmp / "ok.torrent"
+good.write_bytes(b"d4:infod6:lengthi7e4:name9:movie.mkv12:piece lengthi16384e6:pieces20:" + b"\x01" * 20 + b"ee")
+chosen["path"] = str(good)
+dialog._pick_torrent()
+out["after_good"] = dialog.torrent_path
+out["accepted"] = dialog.result() == AddDownloadDialog.Accepted
+print(json.dumps(out))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    out = json.loads(result.stdout)
+
+    assert out["filters"] and all(f == "Torrent files (*.torrent)" for f in out["filters"])
+    assert out["after_big"] == ""
+    assert out["after_txt"] == ""
+    assert out["after_good"].endswith("ok.torrent")
+    assert out["accepted"] is True
+    assert len(out["warnings"]) == 2
+    assert "10 MiB" in out["warnings"][0]
