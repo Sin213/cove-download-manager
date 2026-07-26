@@ -3,7 +3,7 @@ subtitle, sections / form rows, accent OK / ghost Cancel.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QTime, Qt
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTime, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,13 +29,69 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import debrid
 from .clipboard import extract_urls
-from .config import CATEGORY_NAMES, CONNECTION_CHOICES, ScheduleWindow, Settings
+from .config import (
+    CATEGORY_NAMES,
+    CONNECTION_CHOICES,
+    DEBRID_ALL_DEBRID,
+    DEBRID_REAL_DEBRID,
+    ScheduleWindow,
+    Settings,
+)
+from .debrid import DebridError
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
     configure_speed_spin,
     speed_value_to_kbps,
 )
+
+ALL_DEBRID_KEY_URL = "https://alldebrid.com/apikeys/"
+REAL_DEBRID_TOKEN_URL = "https://real-debrid.com/apitoken"
+
+# Account tests are pinned here rather than on the dialog so a runnable
+# still in flight survives the dialog closing. The queue module documents
+# the same hazard: letting the pool reap a runnable whose signal object the
+# C++ side still references crashes the process.
+_INFLIGHT_ACCOUNT_TESTS: set = set()
+
+
+class _AccountTest(QRunnable):
+    """Run one provider account check off the GUI thread.
+
+    Emits the provider name alongside the result so the dialog can route
+    it without a closure — connecting bound methods lets Qt drop the
+    connection automatically if the dialog is destroyed mid-flight.
+    """
+
+    class _Sig(QObject):
+        done = Signal(str, object)   # provider, sanitized account dict
+        failed = Signal(str, str)    # provider, displayable message
+        finished = Signal()
+
+    def __init__(self, provider: str, fn):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.provider = provider
+        self.signals = self._Sig()
+        self._fn = fn
+
+    def run(self):
+        try:
+            account = self._fn()
+        except DebridError as e:
+            self.signals.failed.emit(self.provider, str(e))
+        except Exception:
+            # Never surface the raw exception: it may quote the request,
+            # and the request carries the API credential.
+            self.signals.failed.emit(
+                self.provider,
+                f"{debrid.provider_label(self.provider)}: the account test "
+                f"could not be completed.",
+            )
+        else:
+            self.signals.done.emit(self.provider, account)
+        self.signals.finished.emit()
 
 
 def _make_buttons(parent: QDialog, ok_text: str = "Save") -> QDialogButtonBox:
@@ -46,6 +102,65 @@ def _make_buttons(parent: QDialog, ok_text: str = "Save") -> QDialogButtonBox:
     bb.accepted.connect(parent.accept)
     bb.rejected.connect(parent.reject)
     return bb
+
+
+def _link_label(text: str, url: str) -> QLabel:
+    label = QLabel(f'<a href="{url}">{text}</a>')
+    label.setProperty("role", "muted")
+    label.setOpenExternalLinks(True)
+    label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+    return label
+
+
+def _account_summary(provider: str, account: object) -> str:
+    """One line describing a verified account.
+
+    Only the whitelisted fields the debrid module already sanitized are
+    read, so no provider payload can reach the label verbatim.
+    """
+    label = debrid.provider_label(provider)
+    if not isinstance(account, dict):
+        return f"{label}: connected."
+    parts = []
+    username = account.get("username")
+    if isinstance(username, str) and username:
+        parts.append(username)
+    if provider == DEBRID_ALL_DEBRID:
+        if account.get("is_premium") is True:
+            parts.append("Premium")
+        elif account.get("is_trial") is True:
+            parts.append("Trial")
+        else:
+            parts.append("Free")
+        expires = _format_epoch(account.get("premium_until"))
+        if expires:
+            parts.append(f"until {expires}")
+    else:
+        account_type = account.get("type")
+        if isinstance(account_type, str) and account_type:
+            parts.append(account_type)
+        expires = _format_iso_date(account.get("expiration"))
+        if expires:
+            parts.append(f"until {expires}")
+    return f"{label}: connected as " + ", ".join(parts) if parts else f"{label}: connected."
+
+
+def _format_epoch(value) -> str:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return ""
+    from datetime import datetime
+
+    try:
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d")
+    except (OSError, OverflowError, ValueError):
+        return ""
+
+
+def _format_iso_date(value) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    date_part = value.split("T", 1)[0]
+    return date_part if len(date_part) == 10 else ""
 
 
 def _title_block(layout: QVBoxLayout, title: str, subtitle: str | None = None) -> None:
@@ -397,6 +512,69 @@ class SettingsDialog(QDialog):
         scroll_layout.addWidget(proxy_group)
         self._on_proxy_type_changed()
 
+        # Debrid services
+        debrid_group = QGroupBox("Debrid services")
+        debrid_lay = QFormLayout(debrid_group)
+        debrid_lay.setSpacing(8)
+
+        self.ad_enabled = QCheckBox("Enable AllDebrid")
+        self.ad_enabled.setChecked(settings.all_debrid_enabled)
+        self.ad_enabled.toggled.connect(self._on_debrid_toggled)
+        debrid_lay.addRow(self.ad_enabled)
+        self.ad_key = QLineEdit(settings.all_debrid_api_key)
+        self.ad_key.setEchoMode(QLineEdit.Password)
+        self.ad_key.setPlaceholderText("API key")
+        self.ad_test = QPushButton("Test")
+        self.ad_test.clicked.connect(self._test_all_debrid)
+        ad_row = QHBoxLayout()
+        ad_row.addWidget(self.ad_key, 1)
+        ad_row.addWidget(self.ad_test)
+        debrid_lay.addRow("AllDebrid API key", ad_row)
+        self.ad_result = QLabel("")
+        self.ad_result.setProperty("role", "muted")
+        self.ad_result.setWordWrap(True)
+        # Account names come from the provider. QLabel auto-detects rich
+        # text, so a markup-shaped username could restyle or spoof this row.
+        self.ad_result.setTextFormat(Qt.PlainText)
+        debrid_lay.addRow("", self.ad_result)
+        debrid_lay.addRow("", _link_label("Get an AllDebrid API key", ALL_DEBRID_KEY_URL))
+
+        self.rd_enabled = QCheckBox("Enable Real-Debrid")
+        self.rd_enabled.setChecked(settings.real_debrid_enabled)
+        self.rd_enabled.toggled.connect(self._on_debrid_toggled)
+        debrid_lay.addRow(self.rd_enabled)
+        self.rd_token = QLineEdit(settings.real_debrid_api_token)
+        self.rd_token.setEchoMode(QLineEdit.Password)
+        self.rd_token.setPlaceholderText("API token")
+        self.rd_test = QPushButton("Test")
+        self.rd_test.clicked.connect(self._test_real_debrid)
+        rd_row = QHBoxLayout()
+        rd_row.addWidget(self.rd_token, 1)
+        rd_row.addWidget(self.rd_test)
+        debrid_lay.addRow("Real-Debrid API token", rd_row)
+        self.rd_result = QLabel("")
+        self.rd_result.setProperty("role", "muted")
+        self.rd_result.setWordWrap(True)
+        self.rd_result.setTextFormat(Qt.PlainText)
+        debrid_lay.addRow("", self.rd_result)
+        debrid_lay.addRow("", _link_label("Get a Real-Debrid API token", REAL_DEBRID_TOKEN_URL))
+
+        self.debrid_preferred = QComboBox()
+        self.debrid_preferred.addItem("AllDebrid first", DEBRID_ALL_DEBRID)
+        self.debrid_preferred.addItem("Real-Debrid first", DEBRID_REAL_DEBRID)
+        idx = self.debrid_preferred.findData(settings.debrid_preferred_provider)
+        self.debrid_preferred.setCurrentIndex(idx if idx >= 0 else 0)
+        debrid_lay.addRow("Try first", self.debrid_preferred)
+        debrid_note = QLabel(
+            "Supported hoster links are resolved through your account before "
+            "downloading. Other links download normally."
+        )
+        debrid_note.setProperty("role", "muted")
+        debrid_note.setWordWrap(True)
+        debrid_lay.addRow(debrid_note)
+        scroll_layout.addWidget(debrid_group)
+        self._on_debrid_toggled()
+
         # Category folders
         cat_group = QGroupBox("Category folders")
         cat_lay = QFormLayout(cat_group)
@@ -468,6 +646,68 @@ class SettingsDialog(QDialog):
         self.proxy_user.setEnabled(enabled)
         self.proxy_pass.setEnabled(enabled)
 
+    # ---- debrid -------------------------------------------------------
+
+    def _on_debrid_toggled(self, _checked: bool = False) -> None:
+        """Mirror the proxy section: the credential row follows its switch."""
+        for enabled_box, edit, test in (
+            (self.ad_enabled, self.ad_key, self.ad_test),
+            (self.rd_enabled, self.rd_token, self.rd_test),
+        ):
+            on = enabled_box.isChecked()
+            edit.setEnabled(on)
+            # Don't re-enable a Test button that is currently mid-request.
+            test.setEnabled(on and test.property("testing") is not True)
+
+    def _test_all_debrid(self) -> None:
+        self._run_account_test(
+            DEBRID_ALL_DEBRID, self.ad_test, self.ad_result,
+            self.ad_key.text().strip(), debrid.all_debrid_account,
+        )
+
+    def _test_real_debrid(self) -> None:
+        self._run_account_test(
+            DEBRID_REAL_DEBRID, self.rd_test, self.rd_result,
+            self.rd_token.text().strip(), debrid.real_debrid_account,
+        )
+
+    def _run_account_test(self, provider, button, result, credential, fn) -> None:
+        label = debrid.provider_label(provider)
+        if not credential:
+            result.setText(f"{label}: enter an API key first.")
+            return
+        result.setText(f"Checking {label}...")
+        button.setProperty("testing", True)
+        button.setEnabled(False)
+
+        # Resolve the callable through the module at call time so the test
+        # runs against whatever cove.debrid currently exposes.
+        call = _AccountTest(provider, lambda: fn(credential))
+        _INFLIGHT_ACCOUNT_TESTS.add(call)
+        call.signals.done.connect(self._on_account_test_done)
+        call.signals.failed.connect(self._on_account_test_failed)
+        call.signals.finished.connect(
+            lambda c=call: _INFLIGHT_ACCOUNT_TESTS.discard(c)
+        )
+        QThreadPool.globalInstance().start(call)
+
+    def _debrid_widgets(self, provider):
+        if provider == DEBRID_ALL_DEBRID:
+            return self.ad_test, self.ad_result
+        return self.rd_test, self.rd_result
+
+    def _finish_account_test(self, provider, message: str) -> None:
+        button, result = self._debrid_widgets(provider)
+        result.setText(message)
+        button.setProperty("testing", False)
+        self._on_debrid_toggled()
+
+    def _on_account_test_done(self, provider: str, account: object) -> None:
+        self._finish_account_test(provider, _account_summary(provider, account))
+
+    def _on_account_test_failed(self, provider: str, message: str) -> None:
+        self._finish_account_test(provider, message)
+
     def _on_speed_unit_changed(self, unit: str) -> None:
         self._speed_display_unit = unit
         configure_speed_spin(
@@ -499,6 +739,11 @@ class SettingsDialog(QDialog):
         self.settings.proxy_username = self.proxy_user.text().strip()
         self.settings.proxy_password = self.proxy_pass.text()
         self.settings.auto_sort_by_category = self.auto_sort.isChecked()
+        self.settings.all_debrid_enabled = self.ad_enabled.isChecked()
+        self.settings.all_debrid_api_key = self.ad_key.text().strip()
+        self.settings.real_debrid_enabled = self.rd_enabled.isChecked()
+        self.settings.real_debrid_api_token = self.rd_token.text().strip()
+        self.settings.debrid_preferred_provider = self.debrid_preferred.currentData()
         for name, edit in self._cat_edits.items():
             setattr(self.settings.category_dirs, name, edit.text().strip())
         self.settings.save()

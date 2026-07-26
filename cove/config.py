@@ -29,6 +29,13 @@ MAX_CONNECTIONS_PER_SERVER = 16
 # random secret so existing installs stop using the predictable token.
 _LEGACY_RPC_SECRET = "cove"
 
+# Debrid providers Cove can resolve links through. cove.debrid imports these
+# so the accepted setting values and the resolver can't drift apart.
+DEBRID_ALL_DEBRID = "alldebrid"
+DEBRID_REAL_DEBRID = "real_debrid"
+DEBRID_PROVIDERS = (DEBRID_ALL_DEBRID, DEBRID_REAL_DEBRID)
+DEBRID_DEFAULT_PROVIDER = DEBRID_ALL_DEBRID
+
 
 @dataclass
 class ScheduleWindow:
@@ -143,6 +150,14 @@ class Settings:
     api_enabled: bool = True
     api_port: int = DEFAULT_API_PORT
     api_token: str = ""  # distinct from rpc_secret; never returned by the API
+    # Debrid accounts. Credentials live here alongside the other secrets in
+    # the 0600 settings file; the local API never serializes Settings, so
+    # they are not reachable over the loopback API.
+    all_debrid_enabled: bool = False
+    all_debrid_api_key: str = ""
+    real_debrid_enabled: bool = False
+    real_debrid_api_token: str = ""
+    debrid_preferred_provider: str = "alldebrid"  # "alldebrid" | "real_debrid"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -211,6 +226,20 @@ class Settings:
             changed = True
         if not isinstance(s.api_enabled, bool):
             s.api_enabled = True
+            changed = True
+        # Debrid: a hand-edited or partially-written file must never leave a
+        # provider enabled with a non-string credential, or the resolver
+        # would try to send it as a bearer header.
+        for flag in ("all_debrid_enabled", "real_debrid_enabled"):
+            if not isinstance(getattr(s, flag), bool):
+                setattr(s, flag, False)
+                changed = True
+        for credential in ("all_debrid_api_key", "real_debrid_api_token"):
+            if not isinstance(getattr(s, credential), str):
+                setattr(s, credential, "")
+                changed = True
+        if s.debrid_preferred_provider not in DEBRID_PROVIDERS:
+            s.debrid_preferred_provider = DEBRID_DEFAULT_PROVIDER
             changed = True
         if s.speed_limit_unit not in ("KB/s", "MB/s"):
             s.speed_limit_unit = "KB/s"

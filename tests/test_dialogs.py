@@ -72,3 +72,231 @@ dialog.close()
     assert metrics["speed_units"] == ["KB/s", "MB/s"]
     assert metrics["speed_enabled_text"] == "Enable speed limiter"
     assert metrics["speed_enabled"] is True
+
+
+DEBRID_SCRIPT = r'''
+import json, sys
+from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = sys.argv[1]
+config.CONFIG_DIR = __import__("pathlib").Path(tmp)
+config.DATA_DIR = __import__("pathlib").Path(tmp)
+config.CONFIG_FILE = __import__("pathlib").Path(tmp) / "settings.json"
+
+from cove import debrid
+from cove.config import Settings
+from cove.debrid import ALL_DEBRID, REAL_DEBRID, DebridError
+from cove.dialogs import SettingsDialog
+
+# Any real network call is a test failure, not a slow test.
+def _no_network(*a, **k):
+    raise AssertionError("live provider request attempted")
+for name in ("get", "post", "head", "put", "request"):
+    setattr(debrid.requests, name, _no_network)
+
+AD_KEY = "ad-key-SECRETVALUE"
+RD_TOKEN = "rd-token-SECRETVALUE"
+
+app = QApplication([])
+out = {}
+
+# ---- load ---------------------------------------------------------------
+loaded = SettingsDialog(Settings(
+    all_debrid_enabled=True,
+    all_debrid_api_key=AD_KEY,
+    real_debrid_enabled=False,
+    real_debrid_api_token=RD_TOKEN,
+    debrid_preferred_provider="real_debrid",
+))
+out["ad_enabled"] = loaded.ad_enabled.isChecked()
+out["ad_key"] = loaded.ad_key.text()
+out["ad_masked"] = loaded.ad_key.echoMode() == loaded.ad_key.EchoMode.Password
+out["rd_enabled"] = loaded.rd_enabled.isChecked()
+out["rd_token"] = loaded.rd_token.text()
+out["rd_masked"] = loaded.rd_token.echoMode() == loaded.rd_token.EchoMode.Password
+out["preferred"] = loaded.debrid_preferred.currentData()
+out["preferred_options"] = [
+    loaded.debrid_preferred.itemData(i) for i in range(loaded.debrid_preferred.count())
+]
+loaded.close()
+
+# ---- save ---------------------------------------------------------------
+settings = Settings()
+dialog = SettingsDialog(settings)
+dialog.ad_enabled.setChecked(True)
+dialog.ad_key.setText("  " + AD_KEY + "  ")
+dialog.rd_enabled.setChecked(True)
+dialog.rd_token.setText(RD_TOKEN)
+dialog.debrid_preferred.setCurrentIndex(
+    dialog.debrid_preferred.findData("real_debrid"))
+dialog._on_accept()
+out["saved"] = {
+    "ad_enabled": settings.all_debrid_enabled,
+    "ad_key": settings.all_debrid_api_key,
+    "rd_enabled": settings.real_debrid_enabled,
+    "rd_token": settings.real_debrid_api_token,
+    "preferred": settings.debrid_preferred_provider,
+}
+
+# Providers are independent: enabling only Real-Debrid leaves AllDebrid off.
+only_rd_settings = Settings()
+only_rd = SettingsDialog(only_rd_settings)
+only_rd.rd_enabled.setChecked(True)
+only_rd.rd_token.setText(RD_TOKEN)
+only_rd._on_accept()
+out["only_rd"] = {
+    "ad_enabled": only_rd_settings.all_debrid_enabled,
+    "ad_key": only_rd_settings.all_debrid_api_key,
+    "rd_enabled": only_rd_settings.real_debrid_enabled,
+    "preferred": only_rd_settings.debrid_preferred_provider,
+}
+
+# ---- account test: success ----------------------------------------------
+def _drain():
+    for _ in range(100):
+        app.processEvents()
+        if QThreadPool.globalInstance().waitForDone(200):
+            break
+    app.processEvents()
+    app.processEvents()
+
+debrid.all_debrid_account = lambda key, **kw: {
+    "username": "coveuser", "is_premium": True, "is_trial": False,
+    "premium_until": 1800000000,
+}
+tester = SettingsDialog(Settings(all_debrid_enabled=True, all_debrid_api_key=AD_KEY))
+tester.ad_test.click()
+out["ad_button_disabled_during_test"] = not tester.ad_test.isEnabled()
+_drain()
+out["ad_success_text"] = tester.ad_result.text()
+out["ad_button_restored"] = tester.ad_test.isEnabled()
+
+# ---- account test: failure ----------------------------------------------
+def _bad_key(key, **kw):
+    raise DebridError(ALL_DEBRID, "AUTH_BAD_APIKEY",
+                      "the API key was rejected. Check the key in Settings.")
+debrid.all_debrid_account = _bad_key
+tester.ad_test.click()
+_drain()
+out["ad_failure_text"] = tester.ad_result.text()
+out["ad_button_restored_after_failure"] = tester.ad_test.isEnabled()
+
+# ---- Real-Debrid test is independent ------------------------------------
+debrid.real_debrid_account = lambda token, **kw: {
+    "username": "rduser", "type": "premium", "expiration": "2027-01-01T00:00:00.000Z",
+}
+rd_tester = SettingsDialog(Settings(real_debrid_enabled=True, real_debrid_api_token=RD_TOKEN))
+rd_tester.rd_test.click()
+_drain()
+out["rd_success_text"] = rd_tester.rd_result.text()
+out["ad_result_untouched"] = rd_tester.ad_result.text()
+
+# ---- an unexpected provider crash is still sanitized --------------------
+def _explode(token, **kw):
+    raise RuntimeError("boom with token " + RD_TOKEN)
+debrid.real_debrid_account = _explode
+rd_tester.rd_test.click()
+_drain()
+out["rd_crash_text"] = rd_tester.rd_result.text()
+
+# ---- provider-controlled account text is never rendered as markup -------
+debrid.all_debrid_account = lambda key, **kw: {
+    "username": "<b>admin</b><img src=x>", "is_premium": True, "is_trial": False,
+}
+spoof = SettingsDialog(Settings(all_debrid_enabled=True, all_debrid_api_key=AD_KEY))
+spoof.ad_test.click()
+_drain()
+out["spoof_text"] = spoof.ad_result.text()
+out["ad_result_plain"] = spoof.ad_result.textFormat() == Qt.PlainText
+out["rd_result_plain"] = spoof.rd_result.textFormat() == Qt.PlainText
+
+tester.close()
+rd_tester.close()
+spoof.close()
+print(json.dumps(out))
+'''
+
+
+def _run_debrid_dialog_script(tmp_path):
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", DEBRID_SCRIPT, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr[-4000:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_debrid_settings_controls_load_save_and_test(tmp_path):
+    m = _run_debrid_dialog_script(tmp_path)
+
+    # Controls reflect the settings they were built from.
+    assert m["ad_enabled"] is True
+    assert m["ad_key"] == "ad-key-SECRETVALUE"
+    assert m["ad_masked"] is True
+    assert m["rd_enabled"] is False
+    assert m["rd_token"] == "rd-token-SECRETVALUE"
+    assert m["rd_masked"] is True
+    assert m["preferred"] == "real_debrid"
+    assert m["preferred_options"] == ["alldebrid", "real_debrid"]
+
+    # Save writes every field back, trimming stray whitespace on the key.
+    assert m["saved"] == {
+        "ad_enabled": True,
+        "ad_key": "ad-key-SECRETVALUE",
+        "rd_enabled": True,
+        "rd_token": "rd-token-SECRETVALUE",
+        "preferred": "real_debrid",
+    }
+
+    # Each provider is configurable on its own.
+    assert m["only_rd"]["rd_enabled"] is True
+    assert m["only_rd"]["ad_enabled"] is False
+    assert m["only_rd"]["ad_key"] == ""
+    assert m["only_rd"]["preferred"] == "alldebrid"
+
+
+def test_debrid_account_test_reports_sanitized_results(tmp_path):
+    m = _run_debrid_dialog_script(tmp_path)
+
+    assert m["ad_button_disabled_during_test"] is True
+    assert m["ad_button_restored"] is True
+    assert "coveuser" in m["ad_success_text"]
+    assert "Premium" in m["ad_success_text"]
+
+    assert "AllDebrid" in m["ad_failure_text"]
+    assert "API key was rejected" in m["ad_failure_text"]
+    assert m["ad_button_restored_after_failure"] is True
+
+    # Real-Debrid runs independently and leaves the AllDebrid row alone.
+    assert "rduser" in m["rd_success_text"]
+    assert "premium" in m["rd_success_text"].lower()
+    assert m["ad_result_untouched"] == ""
+
+    # An unexpected exception must not leak the credential into the UI.
+    assert "SECRETVALUE" not in m["rd_crash_text"]
+    assert "RuntimeError" not in m["rd_crash_text"]
+    assert m["rd_crash_text"]
+
+    # No credential text appears in any result label.
+    for key in ("ad_success_text", "ad_failure_text", "rd_success_text", "rd_crash_text"):
+        assert "SECRETVALUE" not in m[key], key
+
+
+def test_debrid_account_labels_never_render_provider_markup(tmp_path):
+    """A provider-controlled username must not be able to style or spoof the
+    settings dialog. QLabel defaults to auto-detecting rich text."""
+    m = _run_debrid_dialog_script(tmp_path)
+
+    assert m["ad_result_plain"] is True
+    assert m["rd_result_plain"] is True
+    # The markup survives verbatim as literal text rather than being rendered.
+    assert "<b>admin</b><img src=x>" in m["spoof_text"]

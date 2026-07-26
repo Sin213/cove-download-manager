@@ -17,9 +17,10 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
-from . import db
+from . import db, debrid
 from .aria2 import Aria2Error, Aria2RPC
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
+from .debrid import DebridError
 
 URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+", re.IGNORECASE)
 
@@ -87,6 +88,17 @@ class DownloadTask:
     cookies: str = ""
     referrer: str = ""
     user_agent: str = ""
+    # Transient debrid state, deliberately absent from the 'downloads'
+    # table and from _task_from_persisted_row. `resolved_url` is a
+    # short-lived secret on the provider's delivery node: it is handed to
+    # aria2 and nowhere else, and is re-derived from `url` on every
+    # relaunch because the previous one expires.
+    resolved_url: str = ""
+    debrid_provider: str = ""
+
+    def clear_debrid(self) -> None:
+        self.resolved_url = ""
+        self.debrid_provider = ""
 
     @property
     def progress(self) -> float:
@@ -136,7 +148,10 @@ class _RpcCall(QRunnable):
     def run(self):
         try:
             result = self._fn(*self._args, **self._kwargs)
-        except Aria2Error as e:
+        except (Aria2Error, DebridError) as e:
+            # Both already carry a message written for the user; prefixing
+            # the class name would only leak implementation detail into the
+            # task row.
             self.signals.failed.emit(str(e))
         except Exception as e:  # pragma: no cover - defensive
             self.signals.failed.emit(f"{type(e).__name__}: {e}")
@@ -936,6 +951,9 @@ class QueueManager(QObject):
     def _launch(self, t: DownloadTask) -> None:
         t.status = "active"
         t.error = None
+        # Any previously generated debrid link has expired by now; a fresh
+        # one is resolved from t.url below.
+        t.clear_debrid()
         self._persist(t)
         self.task_changed.emit(t.id)
         if t.backend == "ffmpeg":
@@ -1024,7 +1042,11 @@ class QueueManager(QObject):
             self._maybe_start_next()
 
         is_http = t.url.startswith("http://") or t.url.startswith("https://")
-        if self.settings.intelligent_segments and is_http:
+        # _probe_and_add is the only off-GUI-thread path that can do network
+        # work, so debrid resolution has to route through it too — otherwise
+        # turning off intelligent segments would silently disable debrid.
+        needs_worker = self.settings.intelligent_segments or self._debrid_enabled()
+        if is_http and needs_worker:
             self._spawn(
                 self._probe_and_add,
                 t,
@@ -1055,29 +1077,69 @@ class QueueManager(QObject):
             return min(8, max_conn)
         return max_conn
 
+    def _debrid_enabled(self) -> bool:
+        return debrid.is_enabled(self.settings)
+
+    def _resolve_debrid(self, t: DownloadTask) -> str:
+        """Swap the original hoster URL for a provider node URL, if any.
+
+        Returns the URL aria2 should actually fetch. Raises DebridError
+        when a configured provider should have handled the link but
+        couldn't — that reaches the user through the normal task-failure
+        path rather than being papered over with a direct download.
+
+        Runs on a QThreadPool worker; never call it from the GUI thread.
+        """
+        if not self._debrid_enabled():
+            return t.url
+        result = debrid.resolve(t.url, self.settings)
+        if result is None:
+            return t.url
+        # t.url stays the original hoster link: it is the task's identity,
+        # it is what gets persisted, and it is what a later relaunch
+        # re-resolves. Only the transient fields learn about the node URL.
+        t.resolved_url = result.download
+        t.debrid_provider = result.provider
+        if not t.filename and result.filename:
+            # Empty means nobody chose a name: add_url stores None unless the
+            # user (or the extension) explicitly supplied one, so a non-empty
+            # filename here is always an explicit choice and is left alone.
+            t.filename = result.filename
+        if result.filesize > 0:
+            t.total_bytes = result.filesize
+        return result.download
+
     def _probe_and_add(self, t: DownloadTask) -> str:
         import requests as _requests
+        target = self._resolve_debrid(t)
         probed = False
         supports_range = False
         content_length = 0
-        try:
-            resp = _requests.head(t.url, timeout=5, allow_redirects=True)
-            if resp.ok:
-                probed = True
-                supports_range = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
-                try:
-                    content_length = int(resp.headers.get("Content-Length", 0))
-                except (TypeError, ValueError):
-                    content_length = 0
-        except Exception:
-            pass
+        # A provider that reported a size has already told us everything the
+        # probe would; skip it rather than send the node URL a second time.
+        if not (t.resolved_url and t.total_bytes > 0):
+            try:
+                resp = _requests.head(target, timeout=5, allow_redirects=True)
+                if resp.ok:
+                    probed = True
+                    supports_range = resp.headers.get("Accept-Ranges", "").lower() == "bytes"
+                    try:
+                        content_length = int(resp.headers.get("Content-Length", 0))
+                    except (TypeError, ValueError):
+                        content_length = 0
+            except Exception:
+                pass
         if probed:
             segments = self._compute_segments(supports_range, content_length, t.connections)
         else:
             segments = t.connections
         t.segments = segments
+        # Seed the progress denominator so the bar moves before aria2's first
+        # status poll. Never overwrite a size the provider or user already set.
+        if content_length > 0 and t.total_bytes <= 0:
+            t.total_bytes = content_length
         return self.rpc.add_uri(
-            [t.url], t.out_dir, segments,
+            [target], t.out_dir, segments,
             t.speed_limit_kbps, t.filename,
         )
 
@@ -1129,7 +1191,14 @@ class QueueManager(QObject):
         if not t:
             return
         try:
-            t.total_bytes = int(status.get("totalLength", 0))
+            # aria2 reports totalLength=0 until it has read the response
+            # headers, and permanently for servers that send no length.
+            # Overwriting unconditionally wiped out a size seeded from the
+            # debrid provider or the HEAD probe, leaving the progress bar
+            # stuck at 0%.
+            total = int(status.get("totalLength", 0))
+            if total > 0:
+                t.total_bytes = total
             t.completed_bytes = int(status.get("completedLength", 0))
             t.download_speed = int(status.get("downloadSpeed", 0))
             t.last_status_at = time.time()
@@ -1149,6 +1218,7 @@ class QueueManager(QObject):
                 return
             t.status = "completed"
             t.finished_at = time.time()
+            t.clear_debrid()
             self._persist(t)
             self.task_changed.emit(tid)
             self._maybe_start_next()
@@ -1156,6 +1226,7 @@ class QueueManager(QObject):
             t.status = "error"
             t.error = status.get("errorMessage") or f"aria2 error {status.get('errorCode')}"
             t.finished_at = time.time()
+            t.clear_debrid()
             self._persist(t)
             self.task_changed.emit(tid)
             self._maybe_start_next()
