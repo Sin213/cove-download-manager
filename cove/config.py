@@ -36,6 +36,14 @@ DEBRID_REAL_DEBRID = "real_debrid"
 DEBRID_PROVIDERS = (DEBRID_ALL_DEBRID, DEBRID_REAL_DEBRID)
 DEBRID_DEFAULT_PROVIDER = DEBRID_ALL_DEBRID
 
+# What Cove does with a torrent no enabled debrid provider has cached.
+#   "automatic"  download it locally through Cove's own aria2 BitTorrent
+#   "never"      fail the task instead of joining a swarm
+# There is deliberately no "ask every time" mode yet.
+TORRENT_FALLBACK_AUTOMATIC = "automatic"
+TORRENT_FALLBACK_NEVER = "never"
+TORRENT_FALLBACK_MODES = (TORRENT_FALLBACK_AUTOMATIC, TORRENT_FALLBACK_NEVER)
+
 
 @dataclass
 class ScheduleWindow:
@@ -158,12 +166,18 @@ class Settings:
     real_debrid_enabled: bool = False
     real_debrid_api_token: str = ""
     debrid_preferred_provider: str = "alldebrid"  # "alldebrid" | "real_debrid"
-    # Internal development flag. Torrent input stays completely invisible
-    # until the local BitTorrent fallback lands, because with only the
-    # cached-debrid route a user would hit "not cached" with nowhere to go.
-    # There is no Settings UI for it on purpose; flip it by hand in
-    # settings.json to exercise the route.
+    # Torrent support. Magnets and .torrent files are checked against the
+    # enabled debrid providers first; anything they don't have cached falls
+    # back to Cove's own aria2 BitTorrent engine (see torrent_fallback_mode).
     torrent_support_enabled: bool = False
+    torrent_fallback_mode: str = TORRENT_FALLBACK_AUTOMATIC
+    # Cove's HTTP proxy settings cannot cover peer, DHT and UDP tracker
+    # traffic, so a configured proxy blocks local BitTorrent unless the user
+    # explicitly overrides it.
+    torrent_allow_with_proxy: bool = False
+    # Set once the user has accepted the one-time P2P privacy disclosure.
+    # Not a user-facing checkbox: it records a decision, it isn't an option.
+    torrent_ip_disclosure_shown: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -244,8 +258,19 @@ class Settings:
             if not isinstance(getattr(s, credential), str):
                 setattr(s, credential, "")
                 changed = True
-        if not isinstance(s.torrent_support_enabled, bool):
-            s.torrent_support_enabled = False
+        # Torrent flags: a hand-edited file must never leave local
+        # BitTorrent enabled, unblocked by the proxy guard, or holding a
+        # consent Cove never actually asked for.
+        for flag in (
+            "torrent_support_enabled",
+            "torrent_allow_with_proxy",
+            "torrent_ip_disclosure_shown",
+        ):
+            if not isinstance(getattr(s, flag), bool):
+                setattr(s, flag, False)
+                changed = True
+        if s.torrent_fallback_mode not in TORRENT_FALLBACK_MODES:
+            s.torrent_fallback_mode = TORRENT_FALLBACK_AUTOMATIC
             changed = True
         if s.debrid_preferred_provider not in DEBRID_PROVIDERS:
             s.debrid_preferred_provider = DEBRID_DEFAULT_PROVIDER

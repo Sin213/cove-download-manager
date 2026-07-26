@@ -513,3 +513,154 @@ def test_info_only_document_reuses_the_original_span_verbatim():
     meta = torrent.parse_torrent(raw)
     assert meta.info_bytes == benc(unsorted_info)
     assert torrent.parse_torrent(meta.info_only_document()).info_hash == meta.info_hash
+
+
+# ---------------------------------------------------------------------------
+# Managed .torrent storage (Slice B)
+# ---------------------------------------------------------------------------
+
+
+def _meta(name="movie.mkv"):
+    raw = benc({
+        b"info": {
+            b"length": 7,
+            b"name": name,
+            b"piece length": 16384,
+            b"pieces": b"\x01" * 20,
+        }
+    })
+    return torrent.parse_torrent(raw)
+
+
+@pytest.fixture
+def managed(tmp_path, monkeypatch):
+    from cove import config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    return tmp_path / "torrents"
+
+
+def test_store_managed_torrent_writes_under_the_data_dir(managed):
+    meta = _meta()
+    path = torrent.store_managed_torrent(meta)
+
+    assert path == str(managed / f"{meta.info_hash}.torrent")
+    assert (managed / f"{meta.info_hash}.torrent").read_bytes() == meta.raw_bytes
+    # The original file the user picked is never depended on again.
+    assert torrent.read_managed_torrent(path, meta.info_hash) == meta.raw_bytes
+
+
+def test_store_managed_torrent_uses_owner_only_permissions(managed):
+    import os
+    import stat
+
+    if os.name != "posix":
+        pytest.skip("POSIX mode bits only")
+    path = torrent.store_managed_torrent(_meta())
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(managed).st_mode) == 0o700
+
+
+def test_store_managed_torrent_leaves_no_partial_file(managed):
+    torrent.store_managed_torrent(_meta())
+    assert sorted(p.suffix for p in managed.iterdir()) == [".torrent"]
+
+
+def test_store_managed_torrent_reuses_an_identical_copy(managed):
+    meta = _meta()
+    first = torrent.store_managed_torrent(meta)
+    before = (managed / f"{meta.info_hash}.torrent").stat().st_mtime_ns
+    second = torrent.store_managed_torrent(meta)
+    after = (managed / f"{meta.info_hash}.torrent").stat().st_mtime_ns
+
+    assert first == second
+    assert before == after
+
+
+def test_store_managed_torrent_replaces_junk_under_its_own_name(managed):
+    meta = _meta()
+    managed.mkdir(parents=True, exist_ok=True)
+    target = managed / f"{meta.info_hash}.torrent"
+    target.write_bytes(b"not a torrent")
+
+    path = torrent.store_managed_torrent(meta)
+    assert torrent.read_managed_torrent(path, meta.info_hash) == meta.raw_bytes
+
+
+def test_store_managed_torrent_refuses_a_symlinked_target(managed, tmp_path):
+    import os
+
+    if not hasattr(os, "symlink"):
+        pytest.skip("no symlinks here")
+    meta = _meta()
+    managed.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "victim.bin"
+    outside.write_bytes(b"important")
+    os.symlink(outside, managed / f"{meta.info_hash}.torrent")
+
+    with pytest.raises(TorrentError):
+        torrent.store_managed_torrent(meta)
+    # The attacker-controlled target is untouched.
+    assert outside.read_bytes() == b"important"
+
+
+def test_read_managed_torrent_rejects_a_missing_copy(managed):
+    meta = _meta()
+    with pytest.raises(TorrentError):
+        torrent.read_managed_torrent(
+            str(managed / f"{meta.info_hash}.torrent"), meta.info_hash
+        )
+
+
+def test_read_managed_torrent_rejects_a_replaced_torrent(managed):
+    meta = _meta()
+    other = _meta("other.mkv")
+    path = torrent.store_managed_torrent(meta)
+    open(path, "wb").write(other.raw_bytes)
+
+    with pytest.raises(TorrentError):
+        torrent.read_managed_torrent(path, meta.info_hash)
+
+
+def test_read_managed_torrent_rejects_a_corrupted_copy(managed):
+    meta = _meta()
+    path = torrent.store_managed_torrent(meta)
+    open(path, "wb").write(b"garbage")
+
+    with pytest.raises(TorrentError) as exc:
+        torrent.read_managed_torrent(path, meta.info_hash)
+    assert "garbage" not in str(exc.value)
+
+
+def test_managed_torrent_errors_never_echo_the_bytes(managed):
+    meta = _meta()
+    path = torrent.store_managed_torrent(meta)
+    open(path, "wb").write(b"d4:infod6:secretsSECRETPASSee")
+
+    with pytest.raises(TorrentError) as exc:
+        torrent.read_managed_torrent(path, meta.info_hash)
+    assert "SECRETPASS" not in str(exc.value)
+
+
+def test_discard_managed_torrent_only_deletes_inside_the_managed_dir(managed, tmp_path):
+    meta = _meta()
+    path = torrent.store_managed_torrent(meta)
+    torrent.discard_managed_torrent(path)
+    assert not (managed / f"{meta.info_hash}.torrent").exists()
+
+    outside = tmp_path / "user.torrent"
+    outside.write_bytes(meta.raw_bytes)
+    torrent.discard_managed_torrent(str(outside))
+    assert outside.exists()
+    # Missing paths and junk are no-ops rather than errors.
+    torrent.discard_managed_torrent(path)
+    torrent.discard_managed_torrent("")
+    torrent.discard_managed_torrent(None)
+
+
+def test_is_managed_torrent_path(managed, tmp_path):
+    meta = _meta()
+    path = torrent.store_managed_torrent(meta)
+    assert torrent.is_managed_torrent_path(path) is True
+    assert torrent.is_managed_torrent_path(str(tmp_path / "x.torrent")) is False
+    assert torrent.is_managed_torrent_path("") is False

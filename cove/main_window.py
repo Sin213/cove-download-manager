@@ -66,7 +66,7 @@ from .dialogs import (
     SettingsDialog,
     torrent_file_problem,
 )
-from .queue import DownloadTask, QueueManager
+from .queue import PHASE_METADATA, DownloadTask, QueueManager
 from .scheduler import Scheduler
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
@@ -104,6 +104,39 @@ def torrent_drop_paths(local_paths, enabled: bool) -> list[str]:
     if not enabled:
         return []
     return [p for p in local_paths if p and not torrent_file_problem(p)]
+
+
+# Shown once, immediately before Cove's first local BitTorrent transfer.
+# Every sentence here is something Cove can actually stand behind: it does
+# not claim anonymity, VPN protection or proxy coverage it cannot deliver.
+P2P_DISCLOSURE_TITLE = "Local BitTorrent privacy notice"
+P2P_DISCLOSURE_TEXT = (
+    "This torrent was not available through an enabled debrid service, so "
+    "Cove is ready to download it directly through BitTorrent.\n\n"
+    "Direct BitTorrent connections expose your IP address to peers and "
+    "trackers. Cove may upload pieces to peers while the download is "
+    "active, but it stops seeding when the download completes.\n\n"
+    "Cove cannot verify that a VPN is active. Standard HTTP proxy settings "
+    "may not cover peer, DHT or UDP tracker traffic.\n\n"
+    "Continue with local BitTorrent?"
+)
+
+
+def build_p2p_consent_box(parent):
+    """The one-time local-BitTorrent modal, and its Continue button.
+
+    Cancel is the default: a user who dismisses this dialog has not agreed
+    to join a swarm.
+    """
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Warning)
+    box.setWindowTitle(P2P_DISCLOSURE_TITLE)
+    box.setText(P2P_DISCLOSURE_TEXT)
+    continue_button = box.addButton("Continue", QMessageBox.AcceptRole)
+    cancel_button = box.addButton("Cancel", QMessageBox.RejectRole)
+    box.setDefaultButton(cancel_button)
+    box.setEscapeButton(cancel_button)
+    return box, continue_button
 
 
 def _human_bytes(n: int) -> str:
@@ -616,6 +649,7 @@ class MainWindow(QMainWindow):
         self.queue.task_removed.connect(self._on_task_removed)
         self.queue.queue_running_changed.connect(self._on_queue_running_changed)
         self.queue.error.connect(self._on_error)
+        self.queue.torrent_consent_needed.connect(self._on_torrent_consent_needed)
         self.scheduler.allowed_changed.connect(self._on_scheduler_changed)
 
     # ---- actions --------------------------------------------------------
@@ -638,6 +672,17 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self._refresh_folder_chip()
         self.queue.add_urls(urls)
+
+    def _on_torrent_consent_needed(self, tid: int) -> None:
+        """Ask once, before Cove's first local BitTorrent transfer.
+
+        The queue emits this signal from the GUI thread and starts nothing
+        until the answer comes back, so no worker ever waits on a modal and
+        no peer connection is opened before the user has said yes.
+        """
+        box, continue_button = build_p2p_consent_box(self)
+        box.exec()
+        self.queue.torrent_consent(tid, box.clickedButton() is continue_button)
 
     def _add_from_clipboard(self) -> None:
         text = QGuiApplication.clipboard().text() or ""
@@ -950,7 +995,7 @@ class MainWindow(QMainWindow):
         name = task.filename or task.url
         item.setText(COL_NAME, name)
         item.setToolTip(COL_NAME, task.error or task.url)
-        item.setText(COL_STATUS, _status_label(task.status))
+        item.setText(COL_STATUS, task_status_label(task))
         # Persistent state coloring on the Status column so an error (or
         # paused) row stays visually distinct after the StatusPill flash
         # has reverted.
@@ -1151,3 +1196,15 @@ def _status_label(s: str) -> str:
         "completed": "Done",
         "error": "Error",
     }.get(s, s)
+
+
+def task_status_label(task) -> str:
+    """The status column for one task.
+
+    A magnet whose metadata aria2 is still fetching is active but has no
+    byte count yet; showing it as "Downloading" against an empty progress
+    bar reads as a stall, and showing 0 of 0 bytes reads as finished.
+    """
+    if task.status == "active" and getattr(task, "phase", "") == PHASE_METADATA:
+        return "Fetching metadata"
+    return _status_label(task.status)

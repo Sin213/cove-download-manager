@@ -7,6 +7,7 @@ should never block on these.
 """
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import signal
@@ -39,6 +40,27 @@ class Aria2Error(RuntimeError):
 # GUI queue below its configurable "up to 16 parallel". Lift it well above
 # both; downloads beyond this still queue inside aria2 but are uncommon.
 MAX_CONCURRENT_DOWNLOADS = 20
+
+# The aria2 feature name for BitTorrent support, as reported by
+# aria2.getVersion's "enabledFeatures" list.
+_BITTORRENT_FEATURE = "bittorrent"
+
+
+def bittorrent_enabled(version: object) -> bool:
+    """True when this aria2 build reports BitTorrent in enabledFeatures.
+
+    Anything unexpected (missing key, wrong type, non-string entries) is
+    treated as "no": Cove must not start a local torrent on a guess.
+    """
+    if not isinstance(version, dict):
+        return False
+    features = version.get("enabledFeatures")
+    if not isinstance(features, list):
+        return False
+    return any(
+        isinstance(f, str) and f.strip().lower() == _BITTORRENT_FEATURE
+        for f in features
+    )
 
 
 def _bundled_aria2c() -> str | None:
@@ -149,6 +171,12 @@ class Aria2Daemon:
             f"--dir={self.settings.download_dir}",
             f"--save-session={ARIA2_SESSION}",
             "--save-session-interval=10",
+            # Cove participates in the swarm only while a torrent is still
+            # downloading. Once aria2 reports the download complete it must
+            # stop seeding, so the UI's "done" is the truth. Everything else
+            # about BitTorrent (DHT, PEX, ports, encryption) stays on aria2's
+            # defaults on purpose.
+            "--seed-time=0",
             f"--log={ARIA2_LOG}",
             "--log-level=warn",
             "--summary-interval=0",
@@ -315,6 +343,51 @@ class Aria2RPC:
             opts["header"] = headers
         return self._call("aria2.addUri", [uris, opts])
 
+    def add_magnet(self, uri: str, out_dir: str, speed_limit_kbps: int = 0) -> str:
+        """Start a magnet locally. Returns aria2's *metadata* gid.
+
+        aria2 fetches the torrent metadata as its own download and then
+        reports the real torrent under `followedBy`; the caller is
+        responsible for following that transition.
+        """
+        opts: dict[str, str] = {"dir": out_dir, "seed-time": "0"}
+        if speed_limit_kbps > 0:
+            opts["max-download-limit"] = f"{speed_limit_kbps}K"
+        return self._call("aria2.addUri", [[uri], opts])
+
+    def add_torrent(
+        self,
+        data: bytes,
+        out_dir: str,
+        speed_limit_kbps: int = 0,
+        select_file: str | None = None,
+    ) -> str:
+        """Start a validated `.torrent` locally via aria2.addTorrent.
+
+        `data` is base64-encoded for JSON-RPC. Neither the raw bytes nor
+        their encoding appear in any exception raised here: an aria2 error
+        message is already user-facing, and the payload is not.
+        """
+        if not isinstance(data, (bytes, bytearray)):
+            raise Aria2Error("Cove could not read this torrent file.")
+        encoded = base64.b64encode(bytes(data)).decode("ascii")
+        opts: dict[str, str] = {"dir": out_dir, "seed-time": "0"}
+        if speed_limit_kbps > 0:
+            opts["max-download-limit"] = f"{speed_limit_kbps}K"
+        if select_file:
+            # Forward-compatible plumbing only; Slice B always downloads
+            # every file, so nothing passes this today.
+            opts["select-file"] = select_file
+        return self._call("aria2.addTorrent", [encoded, [], opts])
+
+    def get_files(self, gid: str) -> list[dict]:
+        """The files aria2 actually writes for `gid`.
+
+        Used by removal: a torrent's real paths come from aria2, never from
+        a path Cove reconstructed itself.
+        """
+        return self._call("aria2.getFiles", [gid])
+
     def pause(self, gid: str) -> str:
         return self._call("aria2.pause", [gid])
 
@@ -356,12 +429,22 @@ class Aria2RPC:
                     "dir",
                     "bitfield",
                     "numPieces",
+                    # Torrent lifecycle: a magnet's metadata download points
+                    # at the real torrent through followedBy/following, and
+                    # infoHash/bittorrent identify what aria2 is actually on.
+                    "followedBy",
+                    "following",
+                    "infoHash",
+                    "bittorrent",
                 ],
             ],
         )
 
     _EXTERNAL_KEYS = [
         "gid", "status", "totalLength", "completedLength", "downloadSpeed", "files",
+        # Adoption guard: a torrent child gid names its metadata parent in
+        # `following`, and any torrent job at all carries infoHash/bittorrent.
+        "following", "followedBy", "infoHash", "bittorrent",
     ]
 
     def tell_active(self) -> list[dict]:

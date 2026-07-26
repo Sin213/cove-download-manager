@@ -18,7 +18,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
 from . import db, debrid, torrent
-from .aria2 import Aria2Error, Aria2RPC
+from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
 from .torrent import TorrentError
@@ -31,13 +31,51 @@ SOURCE_TORRENT = "torrent"
 SOURCE_TORRENT_FILE = "torrent_file"
 SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE)
 
-# Slice A ships the cached-debrid route only. Until the local BitTorrent
-# fallback lands there is nowhere for an uncached torrent to go, which is
-# also why torrent_support_enabled defaults to False.
-TORRENT_NOT_CACHED = (
-    "This torrent is not cached by an enabled debrid provider. Cove's local "
-    "torrent downloader is not enabled in this development slice yet."
+# Task failures on the local BitTorrent path. Every one of these is a fixed
+# sentence: a torrent carries tracker passkeys and peer addresses, and none
+# of that may reach a task row, a log line or an error dialog.
+TORRENT_LOCAL_DISABLED = (
+    "This torrent is not cached by an enabled debrid service, and local "
+    "BitTorrent downloading is turned off in Settings."
 )
+TORRENT_PROXY_BLOCKED = (
+    "Local BitTorrent is blocked while Cove's proxy is configured because "
+    "peer, DHT and UDP tracker traffic may bypass the proxy. Enable the "
+    "BitTorrent proxy override in Settings only after understanding this "
+    "limitation."
+)
+TORRENT_NO_BITTORRENT = (
+    "This aria2 build does not include BitTorrent support. Install or "
+    "reinstall a BitTorrent-enabled aria2 build."
+)
+TORRENT_CONSENT_DECLINED = (
+    "Local BitTorrent was declined, so this torrent was not downloaded."
+)
+TORRENT_METADATA_FAILED = "Cove could not read this torrent's metadata."
+# aria2's own message for a failed torrent may quote the magnet it was
+# given, a tracker announce URL (and therefore a private-tracker passkey)
+# or a peer address, and a task error is persisted and shown in the UI. Only
+# aria2's numeric code — which carries no torrent data — is kept.
+TORRENT_ARIA2_FAILED = "Cove's BitTorrent engine could not download this torrent."
+
+# Transient display phase for a magnet whose metadata aria2 is still
+# fetching. Deliberately not a database status: it lasts seconds and a
+# restart re-derives it.
+PHASE_METADATA = "metadata"
+
+
+def _torrent_error_text(code) -> str:
+    """A torrent failure the user can report, carrying no swarm data.
+
+    aria2's numeric code is safe (it is an enum) and is worth keeping;
+    everything else aria2 says about a torrent may quote the magnet, a
+    tracker URL or a peer address.
+    """
+    try:
+        numeric = int(code)
+    except (TypeError, ValueError):
+        return TORRENT_ARIA2_FAILED
+    return f"{TORRENT_ARIA2_FAILED} (aria2 error {numeric})"
 
 
 def _clean_header(value) -> str:
@@ -149,6 +187,9 @@ class DownloadTask:
     # relaunch because the previous one expires.
     resolved_url: str = ""
     debrid_provider: str = ""
+    # "metadata" while aria2 is still fetching a magnet's torrent metadata.
+    # Transient by design: it is re-derived when the magnet is re-added.
+    phase: str = ""
 
     def clear_debrid(self) -> None:
         self.resolved_url = ""
@@ -220,6 +261,10 @@ class QueueManager(QObject):
     task_removed = Signal(int)          # task id
     queue_running_changed = Signal(bool)
     error = Signal(str)
+    # A task needs the one-time local-BitTorrent privacy disclosure before
+    # it can start. Emitted on the GUI thread; the window answers with
+    # torrent_consent(tid, accepted). No modal is ever raised from here.
+    torrent_consent_needed = Signal(int)  # task id
 
     def __init__(self, settings: Settings, rpc: Aria2RPC, parent: QObject | None = None):
         super().__init__(parent)
@@ -244,6 +289,11 @@ class QueueManager(QObject):
         # guards against re-adopting one the user already cleared from the
         # list, and against adopting Cove's own downloads as "external".
         self._seen_gids: set[str] = set()
+        # Whether this aria2 reports BitTorrent support. Asked once and
+        # cached for the daemon's lifetime rather than on every poll.
+        self._bt_capable: bool | None = None
+        # Tasks parked on the one-time P2P disclosure.
+        self._awaiting_consent: set[int] = set()
         self._hls_procs: dict[int, QProcess] = {}
         self._hls_duration: dict[int, float] = {}
         self._hls_stderr: dict[int, str] = {}
@@ -347,6 +397,15 @@ class QueueManager(QObject):
                     continue
                 status = self._ARIA2_STATUS.get(dl.get("status"))
                 if status is None:
+                    continue
+                if dl.get("infoHash") or dl.get("bittorrent") or dl.get("following"):
+                    # A torrent job, not an ordinary download. Cove's own
+                    # torrents already own their gids; a stranger's torrent
+                    # cannot be represented by a single-file adopted row
+                    # without lying about what it is, and a metadata child
+                    # adopted here would appear as a ghost second task.
+                    # Remember it so the guard runs once, then leave it be.
+                    self._seen_gids.add(gid)
                     continue
                 # Mark seen immediately so a gid appearing in both the active
                 # and stopped lists of one snapshot is only adopted once.
@@ -636,34 +695,46 @@ class QueueManager(QObject):
     def add_torrent_file(self, path: str, out_dir: str | None = None) -> None:
         """Queue a local `.torrent`.
 
-        Reading, bencode parsing and the info-dictionary SHA-1 all happen
-        on a worker; the GUI thread only ever sees the finished metadata.
+        Reading, bencode parsing, the info-dictionary SHA-1 and the copy
+        into Cove's own store all happen on a worker; the GUI thread only
+        ever sees the finished metadata and the managed path.
         """
         if not self._torrent_enabled():
             return
         dest = out_dir or self.settings.download_dir
         source = str(path)
 
-        def on_done(meta) -> None:
+        def on_done(result) -> None:
+            meta, managed_path = result
             if self._live_torrent(meta.info_hash):
                 self.error.emit("That torrent is already in Cove's queue.")
                 return
             # The minimal magnet is the task URL: it identifies the torrent
-            # without persisting anything the .torrent might carry, and the
-            # file itself stays where the user put it.
+            # without persisting anything the .torrent might carry. The
+            # persisted path is Cove's own copy, not the user's file, so a
+            # restart or a retry cannot depend on where they put it.
             self.add_url(
                 torrent.minimal_magnet(meta.info_hash),
                 out_dir=dest,
                 source_type=SOURCE_TORRENT,
                 info_hash=meta.info_hash,
                 torrent_name=meta.name,
-                torrent_path=source,
+                torrent_path=managed_path,
             )
 
         self._spawn(
-            torrent.read_torrent_file, source,
+            self._read_and_store_torrent, source,
             on_done=on_done, on_fail=self.error.emit,
         )
+
+    @staticmethod
+    def _read_and_store_torrent(source: str):
+        """Parse the user's `.torrent` and copy it into Cove's store.
+
+        Runs on a QThreadPool worker; never call it from the GUI thread.
+        """
+        meta = torrent.read_torrent_file(source)
+        return meta, torrent.store_managed_torrent(meta)
 
     def _launch_torrent(self, t: DownloadTask) -> None:
         self._spawn(
@@ -707,7 +778,9 @@ class QueueManager(QObject):
         if t is None or t.source_type != SOURCE_TORRENT:
             return
         if cached is None:
-            self._fail_task(tid, TORRENT_NOT_CACHED)
+            # No enabled provider holds it. Cove downloads it itself rather
+            # than handing the user off to another torrent client.
+            self._start_local_torrent(tid)
             return
         try:
             self._materialize_cached_torrent(t, cached)
@@ -840,10 +913,273 @@ class QueueManager(QObject):
             self.task_added.emit(tid)
         self._maybe_start_next()
 
+    # ---- local BitTorrent ---------------------------------------------
+    #
+    # Reached only when no enabled provider has the torrent cached. Three
+    # gates stand in front of the first byte of peer traffic — the user's
+    # fallback preference, the proxy honesty check, and the one-time IP
+    # disclosure — and a fourth (aria2's own BitTorrent support) in front
+    # of the RPC call itself.
+
+    def _proxy_configured(self) -> bool:
+        return (
+            getattr(self.settings, "proxy_type", "none") != "none"
+            and bool(getattr(self.settings, "proxy_host", ""))
+        )
+
+    def _local_fallback_allowed(self) -> bool:
+        from .config import TORRENT_FALLBACK_AUTOMATIC
+
+        mode = getattr(self.settings, "torrent_fallback_mode", TORRENT_FALLBACK_AUTOMATIC)
+        return mode == TORRENT_FALLBACK_AUTOMATIC
+
+    def _start_local_torrent(self, tid: int) -> None:
+        t = self.tasks.get(tid)
+        if t is None or t.source_type != SOURCE_TORRENT:
+            return
+        if not self._local_fallback_allowed():
+            self._fail_task(tid, TORRENT_LOCAL_DISABLED)
+            return
+        if self._proxy_configured() and not getattr(
+            self.settings, "torrent_allow_with_proxy", False
+        ):
+            # aria2's --all-proxy covers HTTP(S) trackers and web seeds; it
+            # says nothing about peer connections, DHT or UDP announces. A
+            # user who set a proxy did not agree to leak around it.
+            self._fail_task(tid, TORRENT_PROXY_BLOCKED)
+            return
+        if not getattr(self.settings, "torrent_ip_disclosure_shown", False):
+            # Park the task and ask the window. Nothing has been sent to
+            # aria2 yet, so declining costs the swarm nothing.
+            self._awaiting_consent.add(tid)
+            self.torrent_consent_needed.emit(tid)
+            return
+        self._verify_bittorrent_then_add(tid)
+
+    def torrent_consent(self, tid: int, accepted: bool) -> None:
+        """The user's answer to the one-time P2P disclosure.
+
+        Called from the GUI thread by the window that showed the modal.
+        Consent is persisted *before* anything reaches aria2.
+        """
+        if tid not in self._awaiting_consent:
+            return
+        self._awaiting_consent.discard(tid)
+        if not accepted:
+            self._fail_task(tid, TORRENT_CONSENT_DECLINED)
+            return
+        self.settings.torrent_ip_disclosure_shown = True
+        self.settings.save()
+        self._verify_bittorrent_then_add(tid)
+
+    def _verify_bittorrent_then_add(self, tid: int) -> None:
+        if self._bt_capable is True:
+            self._add_local_torrent(tid)
+            return
+        if self._bt_capable is False:
+            self._fail_task(tid, TORRENT_NO_BITTORRENT)
+            return
+        self._spawn(
+            self._bittorrent_capable,
+            on_done=lambda ok, tid=tid: self._on_bittorrent_capability(tid, ok),
+            # A capability check that cannot complete is not permission to
+            # start a torrent anyway.
+            on_fail=lambda _msg, tid=tid: self._fail_task(tid, TORRENT_NO_BITTORRENT),
+        )
+
+    def _bittorrent_capable(self) -> bool:
+        """Runs on a QThreadPool worker; never call it from the GUI thread."""
+        return bittorrent_enabled(self.rpc.get_version())
+
+    def _on_bittorrent_capability(self, tid: int, ok: bool) -> None:
+        self._bt_capable = bool(ok)
+        if ok:
+            self._add_local_torrent(tid)
+        else:
+            self._fail_task(tid, TORRENT_NO_BITTORRENT)
+
+    def _add_local_torrent(self, tid: int) -> None:
+        t = self.tasks.get(tid)
+        if t is None or t.source_type != SOURCE_TORRENT:
+            return
+        # The disclosure and the capability check both take time, and the
+        # user may have stopped the queue (or the scheduler window may have
+        # closed, or they may have paused this task) while they ran. This
+        # RPC is where peer and tracker exposure begins, so it stays behind
+        # the same lifecycle gates as any other download: defer, and let
+        # start_queue / the scheduler / resume relaunch it.
+        queue_held = not self._running or not self._scheduler_allows
+        if queue_held or t.status == "paused":
+            # No add RPC is being issued, so nothing may be left claiming
+            # one is in flight: pause() records that intent for any active
+            # gid-less aria2 task, including one parked on the disclosure,
+            # and a stale entry here would make resume() wait forever for a
+            # gid callback that never comes.
+            self._pending_launch.pop(tid, None)
+            t.status = "paused"
+            if queue_held:
+                # Queue-driven, not user-driven, so start_queue and the
+                # scheduler resume it the way they resume anything else.
+                self._auto_paused.add(tid)
+            self._persist(t)
+            self.task_changed.emit(tid)
+            return
+        t.status = "active"
+        t.error = None
+        if not t.filename and t.torrent_name:
+            # One row stands for the whole torrent, so the row is named
+            # after the torrent rather than after a file inside it.
+            t.filename = t.torrent_name
+        if t.torrent_path:
+            t.phase = ""
+            self._pending_launch.setdefault(tid, {})
+            self._spawn(
+                self._add_managed_torrent,
+                t,
+                on_done=lambda gid, tid=tid: self._on_local_torrent_gid(tid, gid),
+                on_fail=lambda msg, tid=tid: self._fail_task(tid, msg),
+            )
+            return
+        # A magnet has no metadata yet: aria2 fetches it as its own download
+        # and reports the real torrent through followedBy.
+        t.phase = PHASE_METADATA
+        self._persist(t)
+        self.task_changed.emit(tid)
+        self._pending_launch.setdefault(tid, {})
+        self._spawn(
+            self._add_local_magnet,
+            t,
+            on_done=lambda gid, tid=tid: self._on_local_torrent_gid(tid, gid),
+            on_fail=lambda msg, tid=tid: self._fail_task(tid, msg),
+        )
+
+    def _add_local_magnet(self, t: DownloadTask) -> str:
+        """Hand the magnet to aria2, keeping its failures unquotable.
+
+        Runs on a QThreadPool worker. aria2's error text for a bad magnet
+        tends to include the magnet, so it is replaced with a fixed sentence
+        before it can reach a task row.
+        """
+        try:
+            return self.rpc.add_magnet(t.url, t.out_dir, t.speed_limit_kbps)
+        except Aria2Error:
+            raise TorrentError(TORRENT_ARIA2_FAILED) from None
+
+    def _add_managed_torrent(self, t: DownloadTask) -> str:
+        """Re-read Cove's own `.torrent` copy and hand it to aria2.
+
+        Runs on a QThreadPool worker. The stored copy is re-hashed every
+        time: a replaced or corrupted file must fail the task, never start
+        a different torrent.
+        """
+        # A TorrentError from the read is one of Cove's own fixed sentences
+        # and is the more useful diagnosis, so it is left alone; only
+        # aria2's message is replaced.
+        data = torrent.read_managed_torrent(t.torrent_path, t.info_hash)
+        try:
+            return self.rpc.add_torrent(data, t.out_dir, t.speed_limit_kbps)
+        except Aria2Error:
+            raise TorrentError(TORRENT_ARIA2_FAILED) from None
+
+    def _on_local_torrent_gid(self, tid: int, gid: str) -> None:
+        # Record the gid before anything else so the external-download poll
+        # can never adopt Cove's own torrent as a stranger's.
+        self._seen_gids.add(gid)
+        pending = self._pending_launch.pop(tid, {})
+        t = self.tasks.get(tid)
+        if t is None:
+            # Removed while the add was in flight; don't leak the download,
+            # and honour a remove-and-delete the user already chose.
+            self._finish_inflight_torrent_removal(
+                gid,
+                pending.get("out_dir", ""),
+                bool(pending.get("delete_file")),
+            )
+            return
+        t.gid = gid
+        if (
+            pending.get("pause")
+            or t.status == "paused"
+            or not self._running
+            or not self._scheduler_allows
+        ):
+            # Paused, or the queue stopped, while the add was in flight.
+            t.status = "paused"
+            self._spawn(self.rpc.pause, gid, on_fail=lambda *_: None)
+        else:
+            # Covers a pause-then-resume during the add: resume left the
+            # task "queued", which _maybe_start_next skips once a gid
+            # exists and _poll_active ignores entirely. The gid callback is
+            # where Cove reconciles with aria2, so put it back in a
+            # pollable state.
+            t.status = "active"
+            t.error = None
+        self._persist(t)
+        self.task_changed.emit(tid)
+
+    def _on_torrent_metadata(self, t: DownloadTask, status: dict) -> bool:
+        """Follow a magnet's metadata gid onto the real torrent gid.
+
+        Returns True when this status was the metadata transition and the
+        caller must not treat it as ordinary progress — in particular, the
+        metadata download completing is not the task completing.
+        """
+        followed = status.get("followedBy")
+        children = [
+            g for g in followed if isinstance(g, str) and g
+        ] if isinstance(followed, list) else []
+        if children:
+            child = children[0]
+            self._seen_gids.add(child)
+            t.gid = child
+            t.phase = ""
+            t.error = None
+            t.finished_at = None
+            t.completed_bytes = 0
+            # The child gid is the actual transfer, and aria2 starts it
+            # running. A pause taken during the metadata fetch — by the
+            # user, by stop_queue or by the scheduler — has to be re-applied
+            # here, or the swarm would resume behind the user's back.
+            queue_held = not self._running or not self._scheduler_allows
+            if t.status == "paused" or queue_held:
+                t.status = "paused"
+                if queue_held:
+                    self._auto_paused.add(t.id)
+                self._spawn(self.rpc.pause, child, on_fail=lambda *_: None)
+            else:
+                t.status = "active"
+            self._persist(t)
+            self.task_changed.emit(t.id)
+            return True
+        if t.phase == PHASE_METADATA and status.get("status") in ("complete", "error"):
+            # aria2 finished with the metadata download but named no
+            # torrent to follow. There is nothing to download.
+            self._fail_task(t.id, TORRENT_METADATA_FAILED)
+            return True
+        return False
+
+    def _apply_torrent_status(self, t: DownloadTask, status: dict) -> None:
+        """Torrent-shaped fields of a status poll: name and info hash."""
+        info_hash = status.get("infoHash")
+        if isinstance(info_hash, str) and info_hash:
+            try:
+                t.info_hash = torrent.normalize_info_hash(info_hash)
+            except TorrentError:
+                pass
+        bt = status.get("bittorrent") if isinstance(status.get("bittorrent"), dict) else {}
+        info = bt.get("info") if isinstance(bt.get("info"), dict) else {}
+        safe = _safe_torrent_name(info.get("name"))
+        if safe:
+            t.torrent_name = safe
+            t.filename = safe
+
     def _fail_task(self, tid: int, msg: str) -> None:
         t = self.tasks.get(tid)
         if not t:
             return
+        # Nothing is in flight for a failed task; a leftover entry would
+        # make _maybe_start_next skip it forever on retry.
+        self._pending_launch.pop(tid, None)
         t.status = "error"
         t.error = msg
         t.finished_at = time.time()
@@ -900,6 +1236,16 @@ class QueueManager(QObject):
                 t.gid,
                 on_fail=lambda msg, tid=tid: self._on_unpause_failed(tid, msg),
             )
+        elif not t.gid and tid in self._pending_launch:
+            # The add RPC is still in flight, so there is nothing to unpause
+            # and nothing to relaunch — a relaunch would add it to aria2
+            # twice. Cancel the deferred pause instead and let the gid
+            # callback finish the transition back to active.
+            self._pending_launch[tid].pop("pause", None)
+            t.status = "active"
+            t.error = None
+            self._persist(t)
+            self.task_changed.emit(tid)
         else:
             if t.gid:
                 # Errored aria2 download: _maybe_start_next skips tasks that
@@ -922,6 +1268,14 @@ class QueueManager(QObject):
     def remove(self, tid: int, delete_file: bool = False) -> None:
         t = self.tasks.get(tid)
         if not t:
+            return
+
+        # Torrents first: a torrent has its own removal path, and it also
+        # covers the two states the generic in-flight handling below cannot
+        # see — an add_magnet/addTorrent RPC still on its way back, and a
+        # task parked on the privacy disclosure.
+        if t.source_type == SOURCE_TORRENT:
+            self._remove_torrent(t, delete_file)
             return
 
         # Special case: add_uri RPC is in flight. We can't ask aria2 to
@@ -981,6 +1335,142 @@ class QueueManager(QObject):
             self._maybe_start_next()
 
         self.task_removed.emit(tid)
+
+    # ---- torrent removal ----------------------------------------------
+
+    def _remove_torrent(self, t: DownloadTask, delete_file: bool) -> None:
+        """Drop a local torrent task, optionally deleting what it wrote.
+
+        A torrent is a tree, not a file, so the paths to delete come from
+        aria2 rather than from anything Cove reconstructed — and even those
+        are re-checked against the task's destination before anything is
+        unlinked. The torrent's own folder is never handed to rmtree: only
+        the files aria2 named, their `.aria2` control files, and directories
+        that those deletions left empty.
+        """
+        tid = t.id
+        gid = t.gid
+        base = t.out_dir
+        self.tasks.pop(tid, None)
+        self._awaiting_consent.discard(tid)
+        with db.connect() as conn:
+            conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
+        self.task_removed.emit(tid)
+        # The managed .torrent belongs to this torrent, not to this row;
+        # another live task for the same info hash still needs it.
+        if t.torrent_path and not self._info_hash_in_use(t.info_hash):
+            torrent.discard_managed_torrent(t.torrent_path)
+
+        if not gid:
+            if tid in self._pending_launch:
+                # The add RPC is still on its way back. Leave a tombstone so
+                # the gid callback can finish the job — including the delete
+                # the user asked for, which would otherwise be dropped along
+                # with any partial data aria2 wrote in the meantime.
+                self._pending_launch[tid] = {
+                    "remove": True,
+                    "delete_file": bool(delete_file),
+                    "out_dir": base,
+                }
+            self._maybe_start_next()
+            return
+
+        def _drop_gid(paths=()):
+            def _after(*_args):
+                if delete_file:
+                    self._delete_torrent_files(paths, base)
+                self._maybe_start_next()
+
+            self._spawn(self.rpc.remove, gid, on_done=_after, on_fail=_after)
+
+        if not delete_file:
+            _drop_gid()
+            return
+        # Ask aria2 what it wrote *before* removing the gid; afterwards it
+        # no longer knows.
+        self._spawn(
+            self.rpc.get_files,
+            gid,
+            on_done=lambda files: _drop_gid(self._torrent_file_paths(files)),
+            on_fail=lambda *_: _drop_gid(),
+        )
+
+    def _finish_inflight_torrent_removal(
+        self, gid: str, base: str, delete_file: bool
+    ) -> None:
+        """Drop a gid that landed after its task was removed.
+
+        Reuses the same bounded deletion path as an ordinary removal, so
+        anything aria2 wrote during the race is cleaned up under exactly the
+        same containment checks.
+        """
+        def _drop(paths=()):
+            def _after(*_args):
+                if paths and base:
+                    self._delete_torrent_files(paths, base)
+                self._maybe_start_next()
+
+            self._spawn(self.rpc.remove, gid, on_done=_after, on_fail=_after)
+
+        if not (delete_file and base):
+            _drop()
+            return
+        self._spawn(
+            self.rpc.get_files,
+            gid,
+            on_done=lambda files: _drop(self._torrent_file_paths(files)),
+            on_fail=lambda *_: _drop(),
+        )
+
+    def _info_hash_in_use(self, info_hash: str) -> bool:
+        return bool(info_hash) and any(
+            t.info_hash == info_hash for t in self.tasks.values()
+        )
+
+    @staticmethod
+    def _torrent_file_paths(files) -> tuple[str, ...]:
+        if not isinstance(files, list):
+            return ()
+        return tuple(
+            f["path"] for f in files
+            if isinstance(f, dict) and isinstance(f.get("path"), str) and f["path"]
+        )
+
+    @staticmethod
+    def _delete_torrent_files(paths, base: str) -> None:
+        """Unlink aria2's files for a torrent, staying under `base`.
+
+        Every path is checked with realpath containment, which also rejects
+        a symlink that points out of the tree: deleting the link itself
+        would be harmless, but a link Cove followed would not be, so
+        anything whose real location escapes is skipped entirely.
+        """
+        from pathlib import Path
+
+        deleted_dirs: set[str] = set()
+        for raw in paths:
+            if not _within(base, raw):
+                continue
+            p = Path(raw)
+            for candidate in (p, p.with_name(p.name + ".aria2")):
+                try:
+                    candidate.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            deleted_dirs.add(str(p.parent))
+
+        # Deepest first, so a directory emptied by its children's removal is
+        # itself considered. rmdir only ever removes an empty directory, so
+        # an unrelated file left in one keeps it.
+        base_real = os.path.realpath(base)
+        for directory in sorted(deleted_dirs, key=lambda d: -d.count(os.sep)):
+            current = Path(directory)
+            while _within(base, str(current)) and os.path.realpath(current) != base_real:
+                try:
+                    current.rmdir()
+                except OSError:
+                    break
+                current = current.parent
 
     @staticmethod
     def _make_unlinker(path):
@@ -1118,8 +1608,16 @@ class QueueManager(QObject):
         ready = sorted(
             # `not t.gid` guards against relaunching a task that already has
             # an aria2 gid (e.g. an adopted external download) — doing so
-            # would start a duplicate download.
-            (t for t in self.tasks.values() if t.status == "queued" and not t.gid),
+            # would start a duplicate download. A task whose add RPC is
+            # still in flight has no gid *yet* and needs the same guard:
+            # resuming it before the gid lands would otherwise add it to
+            # aria2 twice.
+            (
+                t for t in self.tasks.values()
+                if t.status == "queued"
+                and not t.gid
+                and t.id not in self._pending_launch
+            ),
             key=lambda t: t.created_at,
         )
         for t in ready[:slots]:
@@ -1584,6 +2082,14 @@ class QueueManager(QObject):
         t = self.tasks.get(tid)
         if not t:
             return
+        is_torrent = t.source_type == SOURCE_TORRENT
+        if is_torrent:
+            # The metadata gid completing is a transition, not a finished
+            # download, so this has to run before anything below can read
+            # status == "complete" as success.
+            if self._on_torrent_metadata(t, status):
+                return
+            self._apply_torrent_status(t, status)
         try:
             # aria2 reports totalLength=0 until it has read the response
             # headers, and permanently for servers that send no length.
@@ -1601,7 +2107,7 @@ class QueueManager(QObject):
         t.bitfield = status.get("bitfield", "")
         t.num_pieces = int(status.get("numPieces", 0) or 0)
         files = status.get("files") or []
-        if files and not t.filename:
+        if files and not t.filename and not is_torrent:
             path = files[0].get("path") or ""
             if path:
                 from pathlib import Path
@@ -1618,7 +2124,11 @@ class QueueManager(QObject):
             self._maybe_start_next()
         elif a2_status == "error":
             t.status = "error"
-            t.error = status.get("errorMessage") or f"aria2 error {status.get('errorCode')}"
+            if is_torrent:
+                # Never aria2's own text for a torrent: see TORRENT_ARIA2_FAILED.
+                t.error = _torrent_error_text(status.get("errorCode"))
+            else:
+                t.error = status.get("errorMessage") or f"aria2 error {status.get('errorCode')}"
             t.finished_at = time.time()
             t.clear_debrid()
             self._persist(t)

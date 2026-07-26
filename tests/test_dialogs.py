@@ -491,3 +491,282 @@ print(json.dumps(out))
     assert out["accepted"] is True
     assert len(out["warnings"]) == 2
     assert "10 MiB" in out["warnings"][0]
+
+
+# ---------------------------------------------------------------------------
+# BitTorrent settings (Slice B)
+# ---------------------------------------------------------------------------
+
+
+def _load_settings_from(tmp_path, raw: dict):
+    """Settings.load() against a throwaway config directory."""
+    script = r'''
+import json, sys
+from pathlib import Path
+import cove.config as config
+
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+config.CONFIG_FILE.write_text(sys.argv[2])
+
+from cove.config import Settings
+s = Settings.load()
+print(json.dumps({
+    "mode": s.torrent_fallback_mode,
+    "allow_with_proxy": s.torrent_allow_with_proxy,
+    "disclosure": s.torrent_ip_disclosure_shown,
+    "support": s.torrent_support_enabled,
+}))
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), json.dumps(raw)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=dict(os.environ),
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_bittorrent_settings_defaults():
+    from cove.config import Settings
+
+    s = Settings()
+    assert s.torrent_fallback_mode == "automatic"
+    assert s.torrent_allow_with_proxy is False
+    assert s.torrent_ip_disclosure_shown is False
+
+
+def test_bittorrent_settings_round_trip(tmp_path):
+    out = _load_settings_from(tmp_path, {
+        "torrent_fallback_mode": "never",
+        "torrent_allow_with_proxy": True,
+        "torrent_ip_disclosure_shown": True,
+    })
+    assert out == {
+        "mode": "never", "allow_with_proxy": True,
+        "disclosure": True, "support": False,
+    }
+
+
+def test_invalid_fallback_mode_resets_to_automatic(tmp_path):
+    for bad in ("ask", "", "AUTOMATIC ", 7, None, True):
+        out = _load_settings_from(tmp_path, {"torrent_fallback_mode": bad})
+        assert out["mode"] == "automatic"
+
+
+def test_invalid_torrent_booleans_reset_safely(tmp_path):
+    out = _load_settings_from(tmp_path, {
+        "torrent_allow_with_proxy": "yes",
+        "torrent_ip_disclosure_shown": 1,
+        "torrent_support_enabled": "true",
+    })
+    assert out["allow_with_proxy"] is False
+    assert out["disclosure"] is False
+    assert out["support"] is False
+
+
+def test_settings_dialog_bittorrent_group(tmp_path):
+    script = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication, QGroupBox
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import SettingsDialog
+
+app = QApplication([])
+settings = Settings(
+    download_dir=str(tmp),
+    torrent_support_enabled=True,
+    torrent_fallback_mode="never",
+    torrent_allow_with_proxy=True,
+    torrent_ip_disclosure_shown=True,
+)
+dialog = SettingsDialog(settings)
+groups = [g.title() for g in dialog.findChildren(QGroupBox)]
+notes = " ".join(
+    lbl.text() for lbl in dialog.torrent_group.findChildren(type(dialog.proxy_note))
+)
+out = {
+    "groups": groups,
+    "loaded_support": dialog.torrent_enabled.isChecked(),
+    "loaded_mode": dialog.torrent_fallback.currentData(),
+    "loaded_proxy_override": dialog.torrent_proxy_override.isChecked(),
+    "modes": [dialog.torrent_fallback.itemData(i)
+              for i in range(dialog.torrent_fallback.count())],
+    "notes": notes,
+    "has_disclosure_checkbox": any(
+        "disclosure" in cb.objectName().lower() or "notice" in cb.text().lower()
+        for cb in dialog.torrent_group.findChildren(type(dialog.torrent_enabled))
+    ),
+}
+
+# Saving writes the group back without disturbing the consent flag.
+dialog.torrent_enabled.setChecked(False)
+dialog.torrent_fallback.setCurrentIndex(dialog.torrent_fallback.findData("automatic"))
+dialog.torrent_proxy_override.setChecked(False)
+dialog._on_accept()
+out["saved_support"] = settings.torrent_support_enabled
+out["saved_mode"] = settings.torrent_fallback_mode
+out["saved_proxy_override"] = settings.torrent_allow_with_proxy
+out["saved_disclosure"] = settings.torrent_ip_disclosure_shown
+print(json.dumps(out))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    out = json.loads(result.stdout)
+
+    assert "BitTorrent" in out["groups"]
+    assert "Debrid services" in out["groups"]
+    assert out["loaded_support"] is True
+    assert out["loaded_mode"] == "never"
+    assert out["loaded_proxy_override"] is True
+    assert out["modes"] == ["automatic", "never"]
+    assert out["saved_support"] is False
+    assert out["saved_mode"] == "automatic"
+    assert out["saved_proxy_override"] is False
+    # Consent is not a normal checkbox and must survive a Save untouched.
+    assert out["has_disclosure_checkbox"] is False
+    assert out["saved_disclosure"] is True
+
+    notes = out["notes"].lower()
+    assert "https" in notes and "swarm" in notes
+    assert "ip address" in notes
+    assert "stops seeding" in notes or "no seeding" in notes
+    assert "proxy" in notes and ("dht" in notes or "peer" in notes)
+
+
+# ---------------------------------------------------------------------------
+# One-time local BitTorrent privacy disclosure
+# ---------------------------------------------------------------------------
+
+
+def test_disclosure_wording_is_honest_about_what_cove_can_promise():
+    from cove.main_window import P2P_DISCLOSURE_TEXT, P2P_DISCLOSURE_TITLE
+
+    text = P2P_DISCLOSURE_TEXT.lower()
+    assert "privacy notice" in P2P_DISCLOSURE_TITLE.lower()
+    assert "ip address" in text
+    assert "peers and trackers" in text
+    assert "stops seeding" in text
+    assert "vpn" in text and "cannot verify" in text
+    assert "proxy" in text
+    # No promise Cove cannot keep.
+    for claim in ("anonymous", "anonymity", "kill switch", "fully protected",
+                  "you are protected", "encrypted end-to-end"):
+        assert claim not in text
+
+
+def test_metadata_phase_has_its_own_status_label():
+    from types import SimpleNamespace
+
+    from cove.main_window import task_status_label
+
+    fetching = SimpleNamespace(status="active", phase="metadata")
+    assert task_status_label(fetching) == "Fetching metadata"
+    downloading = SimpleNamespace(status="active", phase="")
+    assert task_status_label(downloading) == "Downloading"
+    # A completed torrent never reads as still fetching.
+    done = SimpleNamespace(status="completed", phase="metadata")
+    assert task_status_label(done) == "Done"
+    # Rows without the attribute (plain HTTP tasks) behave as before.
+    assert task_status_label(SimpleNamespace(status="paused")) == "Paused"
+
+
+def test_consent_modal_runs_on_the_gui_thread_and_answers_the_queue(tmp_path):
+    script = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtCore import QThread
+from PySide6.QtWidgets import QApplication, QMessageBox, QWidget
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+import cove.main_window as mw
+
+app = QApplication([])
+out = {"on_gui_thread": [], "texts": [], "titles": [], "buttons": []}
+
+class FakeQueue:
+    def __init__(self):
+        self.answers = []
+    def torrent_consent(self, tid, accepted):
+        self.answers.append((tid, accepted))
+
+class Host(QWidget):
+    pass
+
+host = Host()
+host.queue = FakeQueue()
+
+real_build = mw.build_p2p_consent_box
+choice = {"continue": True}
+
+def build(parent):
+    box, cont = real_build(parent)
+    out["on_gui_thread"].append(QThread.currentThread() is app.thread())
+    out["texts"].append(box.text())
+    out["titles"].append(box.windowTitle())
+    out["buttons"].append([
+        (b.text(), int(box.buttonRole(b).value)) for b in box.buttons()
+    ])
+    out["default_is_cancel"] = box.defaultButton().text() == "Cancel"
+    clicked = cont if choice["continue"] else box.buttons()[1]
+    box.exec = lambda: 0
+    box.clickedButton = lambda: clicked
+    return box, cont
+
+mw.build_p2p_consent_box = build
+
+mw.MainWindow._on_torrent_consent_needed(host, 7)
+choice["continue"] = False
+mw.MainWindow._on_torrent_consent_needed(host, 9)
+
+out["answers"] = host.queue.answers
+out["text_matches"] = [t == mw.P2P_DISCLOSURE_TEXT for t in out["texts"]]
+out["title_matches"] = [t == mw.P2P_DISCLOSURE_TITLE for t in out["titles"]]
+print(json.dumps(out))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    out = json.loads(result.stdout)
+
+    assert all(out["on_gui_thread"])
+    assert all(out["text_matches"])
+    assert all(out["title_matches"])
+    assert [b[0] for b in out["buttons"][0]] == ["Continue", "Cancel"]
+    assert out["default_is_cancel"] is True
+    assert out["answers"] == [[7, True], [9, False]]

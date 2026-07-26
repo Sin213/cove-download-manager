@@ -1,8 +1,17 @@
 """Tests for the concurrency cap and external-download discovery."""
+import base64
 import threading
 from unittest.mock import MagicMock, patch
 
-from cove.aria2 import Aria2Daemon, Aria2RPC, MAX_CONCURRENT_DOWNLOADS
+import pytest
+
+from cove.aria2 import (
+    Aria2Daemon,
+    Aria2Error,
+    Aria2RPC,
+    MAX_CONCURRENT_DOWNLOADS,
+    bittorrent_enabled,
+)
 from cove.config import MAX_CONNECTIONS_PER_SERVER, Settings
 
 
@@ -36,6 +45,36 @@ def test_daemon_caps_per_server_connections_for_stock_aria2():
     assert f"--split={MAX_CONNECTIONS_PER_SERVER}" in args
 
 
+def test_daemon_stops_seeding_when_the_download_completes():
+    """Local BitTorrent must not keep uploading after Cove says "done"."""
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
+        daemon.start()
+
+    args = popen.call_args[0][0]
+    assert "--seed-time=0" in args
+
+
+def test_daemon_adds_no_speculative_bittorrent_flags():
+    """Only --seed-time=0 is new; DHT/PEX/ports stay on aria2 defaults."""
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
+        daemon.start()
+
+    args = " ".join(popen.call_args[0][0])
+    for flag in ("--enable-dht", "--enable-peer-exchange", "--bt-",
+                 "--listen-port", "--dht-listen-port", "--seed-ratio"):
+        assert flag not in args
+
+
 def _rpc() -> Aria2RPC:
     s = Settings()
     s.rpc_secret = "test"
@@ -59,6 +98,127 @@ def test_tell_stopped_passes_offset_num_keys():
     assert method == "aria2.tellStopped"
     assert params[0] == 0 and params[1] == 1000
     assert "gid" in params[2] and "status" in params[2]
+
+
+# ---------------------------------------------------------------------------
+# BitTorrent RPC surface
+# ---------------------------------------------------------------------------
+
+TORRENT_BYTES = b"d4:infod6:lengthi7e4:name5:a.bin12:piece lengthi16384eee"
+
+
+def test_add_torrent_base64_encodes_the_payload():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value="gid-t") as m:
+        gid = rpc.add_torrent(TORRENT_BYTES, "/dl")
+    method, params = m.call_args[0]
+    assert method == "aria2.addTorrent"
+    assert gid == "gid-t"
+    assert params[0] == base64.b64encode(TORRENT_BYTES).decode("ascii")
+    assert params[1] == []          # no selective files in Slice B
+    assert params[2]["dir"] == "/dl"
+
+
+def test_add_torrent_never_seeds_after_completion():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value="gid-t") as m:
+        rpc.add_torrent(TORRENT_BYTES, "/dl")
+    assert m.call_args[0][1][2]["seed-time"] == "0"
+
+
+def test_add_torrent_applies_the_speed_limit():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value="gid-t") as m:
+        rpc.add_torrent(TORRENT_BYTES, "/dl", speed_limit_kbps=256)
+    assert m.call_args[0][1][2]["max-download-limit"] == "256K"
+
+
+def test_add_torrent_can_carry_a_forward_compatible_file_selection():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value="gid-t") as m:
+        rpc.add_torrent(TORRENT_BYTES, "/dl", select_file="1,2")
+    params = m.call_args[0][1]
+    assert params[2]["select-file"] == "1,2"
+
+
+def test_add_torrent_rejects_non_bytes_without_echoing_the_payload():
+    rpc = _rpc()
+    with pytest.raises(Aria2Error) as exc:
+        rpc.add_torrent("not bytes", "/dl")
+    assert "not bytes" not in str(exc.value)
+
+
+def test_add_torrent_failure_does_not_leak_the_torrent_data():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", side_effect=Aria2Error("RPC aria2.addTorrent failed")):
+        with pytest.raises(Aria2Error) as exc:
+            rpc.add_torrent(TORRENT_BYTES, "/dl")
+    text = str(exc.value)
+    assert base64.b64encode(TORRENT_BYTES).decode("ascii") not in text
+    assert "piece length" not in text
+
+
+def test_add_magnet_uses_add_uri_and_does_not_seed():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value="gid-m") as m:
+        gid = rpc.add_magnet("magnet:?xt=urn:btih:" + "a" * 40, "/dl")
+    method, params = m.call_args[0]
+    assert method == "aria2.addUri"
+    assert gid == "gid-m"
+    assert params[0] == ["magnet:?xt=urn:btih:" + "a" * 40]
+    assert params[1]["dir"] == "/dl"
+    assert params[1]["seed-time"] == "0"
+
+
+def test_tell_status_requests_the_torrent_lifecycle_keys():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value={}) as m:
+        rpc.tell_status("gid-1")
+    keys = m.call_args[0][1][1]
+    for required in ("followedBy", "following", "infoHash", "bittorrent", "files"):
+        assert required in keys
+    # Existing keys must survive.
+    for existing in ("gid", "status", "totalLength", "completedLength",
+                     "downloadSpeed", "errorCode", "errorMessage",
+                     "connections", "dir", "bitfield", "numPieces"):
+        assert existing in keys
+
+
+def test_external_snapshot_keys_expose_torrent_relationships():
+    """The adoption guard needs these to spot a torrent child gid."""
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value=[]) as m:
+        rpc.tell_active()
+    keys = m.call_args[0][1][0]
+    for required in ("following", "followedBy", "infoHash", "bittorrent"):
+        assert required in keys
+
+
+def test_get_files_returns_the_aria2_file_list():
+    rpc = _rpc()
+    with patch.object(rpc, "_call", return_value=[{"path": "/dl/a.bin"}]) as m:
+        files = rpc.get_files("gid-1")
+    assert m.call_args[0] == ("aria2.getFiles", ["gid-1"])
+    assert files == [{"path": "/dl/a.bin"}]
+
+
+# ---------------------------------------------------------------------------
+# BitTorrent capability
+# ---------------------------------------------------------------------------
+
+
+def test_bittorrent_enabled_reads_the_feature_list():
+    assert bittorrent_enabled({"enabledFeatures": ["Async DNS", "BitTorrent"]}) is True
+
+
+def test_bittorrent_enabled_false_when_the_build_lacks_it():
+    assert bittorrent_enabled({"enabledFeatures": ["Async DNS", "HTTPS"]}) is False
+
+
+def test_bittorrent_enabled_false_for_a_malformed_response():
+    for bad in (None, {}, {"enabledFeatures": "BitTorrent"},
+                {"enabledFeatures": [None, 3]}, "BitTorrent"):
+        assert bittorrent_enabled(bad) is False
 
 
 def test_rpc_session_is_thread_local():

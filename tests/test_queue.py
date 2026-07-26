@@ -5,6 +5,7 @@ was accessed with row.get("backend", ...), raising AttributeError whenever
 a persisted queued/active/paused task was restored on startup.
 """
 
+import os
 import sqlite3
 import time
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from PySide6.QtCore import QCoreApplication
 
 from cove import config, db, debrid
 from cove.config import CategoryDirs, Settings
+from cove.aria2 import Aria2Error
 from cove.debrid import ALL_DEBRID, DebridError, Unrestricted
 from cove.queue import QueueManager, _row_get, _task_from_persisted_row
 
@@ -197,6 +199,44 @@ class _FakeRpc:
             "filename": filename,
         })
         return "gid-1"
+
+    # ---- BitTorrent (Slice B) -----------------------------------------
+
+    version = {"version": "1.37.0", "enabledFeatures": ["BitTorrent", "HTTPS"]}
+
+    def __getattr__(self, name):
+        # Torrent state lives in lazily created lists so the plain HTTP
+        # tests above keep their tiny stub.
+        if name in ("magnets", "torrents", "removed", "unpaused", "version_calls"):
+            value = []
+            setattr(self, name, value)
+            return value
+        raise AttributeError(name)
+
+    def get_version(self):
+        self.version_calls.append(True)
+        return self.version
+
+    def add_magnet(self, uri, out_dir, speed_limit_kbps=0):
+        self.magnets.append({"uri": uri, "out_dir": out_dir,
+                             "speed_limit_kbps": speed_limit_kbps})
+        return "gid-meta"
+
+    def add_torrent(self, data, out_dir, speed_limit_kbps=0, select_file=None):
+        self.torrents.append({"data": data, "out_dir": out_dir,
+                              "speed_limit_kbps": speed_limit_kbps})
+        return "gid-file"
+
+    def get_files(self, gid):
+        return getattr(self, "files_result", [])
+
+    def remove(self, gid, force=True):
+        self.removed.append(gid)
+        return gid
+
+    def unpause(self, gid):
+        self.unpaused.append(gid)
+        return gid
 
 
 @pytest.fixture
@@ -623,7 +663,12 @@ from cove.debrid import CachedTorrent, CachedTorrentFile, REAL_DEBRID  # noqa: E
 from cove.queue import (                          # noqa: E402
     SOURCE_TORRENT,
     SOURCE_TORRENT_FILE,
-    TORRENT_NOT_CACHED,
+    TORRENT_ARIA2_FAILED,
+    TORRENT_CONSENT_DECLINED,
+    TORRENT_LOCAL_DISABLED,
+    TORRENT_NO_BITTORRENT,
+    TORRENT_METADATA_FAILED,
+    TORRENT_PROXY_BLOCKED,
     TorrentError,
 )
 
@@ -664,7 +709,7 @@ def _sync_spawn(queue):
         calls.append(fn)
         try:
             result = fn(*args, **kwargs)
-        except (DebridError, TorrentError) as exc:
+        except (Aria2Error, DebridError, TorrentError) as exc:
             if on_fail is not None:
                 on_fail(str(exc))
         else:
@@ -828,32 +873,38 @@ def test_probe_survives_a_deleted_torrent_file(queue_env, monkeypatch, tmp_path)
 # --- uncached --------------------------------------------------------------
 
 
-def test_uncached_torrent_fails_with_the_slice_a_reason(queue_env, monkeypatch):
-    queue, rpc, db_path = queue_env(**_torrent_settings())
+def test_uncached_torrent_falls_back_to_local_bittorrent(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
     _sync_spawn(queue)
     monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: None)
     tid = queue.add_url(MAGNET)
 
+    _running(queue)
     queue._launch(queue.tasks[tid])
 
     task = queue.tasks[tid]
-    assert task.status == "error"
-    assert task.error == TORRENT_NOT_CACHED
-    assert _persisted_row(db_path, tid)["error"] == TORRENT_NOT_CACHED
-    # Never handed to plain aria2 as a magnet.
+    assert task.status == "active"
+    assert task.error is None
+    assert task.gid == "gid-meta"
+    assert rpc.magnets[0]["uri"] == MAGNET
+    # Never handed to the plain HTTP add path.
     assert rpc.added == []
 
 
-def test_no_provider_configured_gives_the_same_reason(queue_env, monkeypatch):
+def test_no_provider_configured_goes_straight_to_local(queue_env):
     queue, rpc, db_path = queue_env(
-        torrent_support_enabled=True, all_debrid_enabled=False
+        torrent_support_enabled=True,
+        all_debrid_enabled=False,
+        torrent_ip_disclosure_shown=True,
     )
     _sync_spawn(queue)
     tid = queue.add_url(MAGNET)
 
+    _running(queue)
     queue._launch(queue.tasks[tid])
 
-    assert queue.tasks[tid].error == TORRENT_NOT_CACHED
+    assert queue.tasks[tid].status == "active"
+    assert len(rpc.magnets) == 1
     assert rpc.added == []
 
 
@@ -872,7 +923,7 @@ def test_provider_auth_failure_uses_the_task_failure_path(queue_env, monkeypatch
     task = queue.tasks[tid]
     assert task.status == "error"
     assert "API key was rejected" in task.error
-    assert task.error != TORRENT_NOT_CACHED
+    assert rpc.magnets == []
 
 
 # --- materialisation -------------------------------------------------------
@@ -1144,7 +1195,10 @@ def test_add_torrent_file_creates_a_source_task(queue_env, tmp_path):
     assert row["source_type"] == SOURCE_TORRENT
     assert row["info_hash"] == expected
     assert row["torrent_name"] == "movie.mkv"
-    assert row["torrent_path"] == str(path)
+    # Slice B: the row points at Cove's own copy, not at the file the user
+    # picked, which they are free to move or delete afterwards.
+    assert row["torrent_path"] == torrent_mod.managed_torrent_path(expected)
+    assert open(row["torrent_path"], "rb").read() == raw
     # The persisted URL is the minimal magnet: no trackers, no passkey.
     assert row["url"] == f"magnet:?xt=urn:btih:{expected}"
 
@@ -1286,3 +1340,1084 @@ def test_a_completed_torrent_can_be_downloaded_again(queue_env, monkeypatch):
     fresh = [r for r in rows if r["status"] == "queued"]
     assert len(fresh) == 2
     assert [r["filename"] for r in fresh] == ["ep1.mkv", "ep2.mkv"]
+
+
+# ---------------------------------------------------------------------------
+# Slice B: local BitTorrent fallback
+# ---------------------------------------------------------------------------
+
+
+def _local_settings(**extra):
+    """Torrent support on, with the one-time P2P consent already given."""
+    base = _torrent_settings(torrent_ip_disclosure_shown=True)
+    base.update(extra)
+    return base
+
+
+def _uncached(queue, monkeypatch):
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: None)
+
+
+def _running(queue):
+    """The fixture parks the scheduler; a launch under test must not be
+    auto-paused the moment its gid lands."""
+    queue._running = True
+    queue._scheduler_allows = True
+    return queue
+
+
+def _torrent_bytes(name=b"movie.mkv"):
+    return (
+        b"d4:infod6:lengthi7e4:name" + str(len(name)).encode() + b":" + name
+        + b"12:piece lengthi16384e6:pieces20:" + b"\x01" * 20 + b"ee"
+    )
+
+
+def _local_torrent_file(queue_env, monkeypatch, tmp_path, **settings):
+    """Queue a local .torrent through the managed-copy path."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    queue, rpc, db_path = queue_env(**_local_settings(**settings))
+    calls = _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    raw = _torrent_bytes()
+    src = tmp_path / "picked.torrent"
+    src.write_bytes(raw)
+    queue.add_torrent_file(str(src), str(tmp_path))
+    tid = next(iter(queue.tasks))
+    _running(queue)
+    return queue, rpc, db_path, tid, raw, calls
+
+
+# --- policy gates ----------------------------------------------------------
+
+
+def test_fallback_mode_never_refuses_without_touching_the_swarm(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings(torrent_fallback_mode="never"))
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert task.error == TORRENT_LOCAL_DISABLED
+    assert rpc.magnets == [] and rpc.torrents == [] and rpc.added == []
+
+
+def test_configured_proxy_blocks_local_bittorrent(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(
+        **_local_settings(proxy_type="socks5", proxy_host="127.0.0.1", proxy_port=1080)
+    )
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].error == TORRENT_PROXY_BLOCKED
+    assert rpc.magnets == []
+
+
+def test_proxy_override_permits_local_bittorrent(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(
+        **_local_settings(
+            proxy_type="socks5", proxy_host="127.0.0.1", proxy_port=1080,
+            torrent_allow_with_proxy=True,
+        )
+    )
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].status == "active"
+    assert len(rpc.magnets) == 1
+
+
+def test_cached_debrid_route_still_works_while_the_proxy_blocks_local(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(
+        **_local_settings(proxy_type="http", proxy_host="proxy.example", proxy_port=8080)
+    )
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    rows = _rows(db_path)
+    assert [r["source_type"] for r in rows] == [SOURCE_TORRENT_FILE] * 2
+    assert rpc.magnets == []
+
+
+# --- privacy disclosure ----------------------------------------------------
+
+
+def test_first_local_torrent_asks_for_consent_before_any_connection(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    asked = []
+    queue.torrent_consent_needed.connect(asked.append)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert asked == [tid]
+    assert rpc.magnets == [] and rpc.torrents == []
+    assert queue.settings.torrent_ip_disclosure_shown is False
+
+
+def test_declining_consent_fails_the_task_without_downloading(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+
+    queue.torrent_consent(tid, False)
+
+    assert queue.tasks[tid].status == "error"
+    assert queue.tasks[tid].error == TORRENT_CONSENT_DECLINED
+    assert rpc.magnets == []
+    assert queue.settings.torrent_ip_disclosure_shown is False
+
+
+def test_accepting_consent_saves_it_before_the_torrent_starts(queue_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+
+    order = []
+    real_save = queue.settings.save
+    monkeypatch.setattr(
+        queue.settings, "save",
+        lambda: (order.append("save"), real_save())[1],
+    )
+    original_add = rpc.add_magnet
+    rpc.add_magnet = lambda *a, **k: (order.append("add"), original_add(*a, **k))[1]
+
+    queue.torrent_consent(tid, True)
+
+    assert queue.settings.torrent_ip_disclosure_shown is True
+    assert order == ["save", "add"]
+    assert queue.tasks[tid].gid == "gid-meta"
+
+
+def test_consent_is_asked_once(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    asked = []
+    queue.torrent_consent_needed.connect(asked.append)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+
+    queue._launch(queue.tasks[tid])
+
+    assert asked == []
+    assert len(rpc.magnets) == 1
+
+
+def test_cached_torrent_never_asks_for_p2p_consent(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    asked = []
+    queue.torrent_consent_needed.connect(asked.append)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert asked == []
+    assert queue.settings.torrent_ip_disclosure_shown is False
+
+
+# --- BitTorrent capability -------------------------------------------------
+
+
+def test_missing_bittorrent_support_fails_with_an_actionable_reason(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    rpc.version = {"version": "1.37.0", "enabledFeatures": ["HTTPS"]}
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].error == TORRENT_NO_BITTORRENT
+    assert rpc.magnets == []
+
+
+def test_malformed_capability_response_is_treated_as_missing(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    rpc.version = {"enabledFeatures": "BitTorrent"}
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].error == TORRENT_NO_BITTORRENT
+
+
+def test_capability_rpc_failure_fails_the_task(queue_env, monkeypatch):
+    from cove.aria2 import Aria2Error
+
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+
+    def boom():
+        raise Aria2Error("RPC transport error")
+
+    rpc.get_version = boom
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].error == TORRENT_NO_BITTORRENT
+    assert rpc.magnets == []
+
+
+def test_capability_is_checked_once_per_daemon(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    first = queue.add_url(MAGNET)
+    second = queue.add_url(f"magnet:?xt=urn:btih:{'b' * 40}")
+    _running(queue)
+    queue._launch(queue.tasks[first])
+    queue._launch(queue.tasks[second])
+
+    assert len(rpc.version_calls) == 1
+    assert len(rpc.magnets) == 2
+
+
+# --- magnet metadata lifecycle --------------------------------------------
+
+
+def _start_local_magnet(queue_env, monkeypatch, **settings):
+    queue, rpc, db_path = queue_env(**_local_settings(**settings))
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+    return queue, rpc, db_path, tid
+
+
+def test_magnet_shows_a_metadata_phase_before_the_torrent_starts(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    task = queue.tasks[tid]
+
+    assert task.phase == "metadata"
+    queue._apply_status(tid, {"status": "active", "totalLength": "0",
+                              "completedLength": "0", "downloadSpeed": "0"})
+    assert task.status == "active"
+    assert task.phase == "metadata"
+
+
+def test_metadata_completion_swaps_to_the_child_gid(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    queue._apply_status(tid, {
+        "status": "complete", "totalLength": "0", "completedLength": "0",
+        "downloadSpeed": "0", "followedBy": ["gid-child"],
+    })
+
+    task = queue.tasks[tid]
+    assert task.status == "active"
+    assert task.gid == "gid-child"
+    assert task.phase == ""
+    assert task.finished_at is None
+    assert _persisted_row(db_path, tid)["gid"] == "gid-child"
+    assert "gid-child" in queue._seen_gids
+
+
+def test_child_gid_completion_completes_the_task(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue._apply_status(tid, {
+        "status": "complete", "totalLength": "100", "completedLength": "100",
+        "downloadSpeed": "0",
+    })
+
+    assert queue.tasks[tid].status == "completed"
+    assert queue.tasks[tid].total_bytes == 100
+
+
+def test_empty_followed_by_at_metadata_completion_is_an_error(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    queue._apply_status(tid, {"status": "complete", "followedBy": [],
+                              "totalLength": "0", "completedLength": "0"})
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert task.error == TORRENT_METADATA_FAILED
+
+
+def test_malformed_followed_by_is_an_error_not_a_crash(queue_env, monkeypatch):
+    for bad in ("gid-child", [None], [""], 7, {}):
+        queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+        queue._apply_status(tid, {"status": "complete", "followedBy": bad})
+        assert queue.tasks[tid].status == "error"
+        assert queue.tasks[tid].error == TORRENT_METADATA_FAILED
+
+
+def test_pause_and_resume_target_the_child_gid(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue.pause(tid)
+    assert rpc.paused == ["gid-child"]
+    queue.resume(tid)
+    assert rpc.unpaused == ["gid-child"]
+    assert "gid-meta" not in rpc.unpaused
+
+
+def test_torrent_name_becomes_the_display_name(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue._apply_status(tid, {
+        "status": "active", "totalLength": "300", "completedLength": "10",
+        "downloadSpeed": "5", "infoHash": INFO_HASH,
+        "bittorrent": {"info": {"name": "Season 1"}},
+        "files": [{"path": "/dl/Season 1/ep1.mkv"}],
+    })
+
+    task = queue.tasks[tid]
+    # Never the first inner file: this row is the whole torrent.
+    assert task.filename == "Season 1"
+    assert task.torrent_name == "Season 1"
+    assert task.total_bytes == 300
+
+
+def test_aggregate_progress_survives_a_zero_total(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+    queue._apply_status(tid, {"status": "active", "totalLength": "500",
+                              "completedLength": "100", "downloadSpeed": "1"})
+    queue._apply_status(tid, {"status": "active", "totalLength": "0",
+                              "completedLength": "120", "downloadSpeed": "1"})
+
+    assert queue.tasks[tid].total_bytes == 500
+    assert queue.tasks[tid].completed_bytes == 120
+
+
+def test_hash_checking_is_not_reported_as_complete(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue._apply_status(tid, {"status": "active", "totalLength": "500",
+                              "completedLength": "500", "downloadSpeed": "0",
+                              "verifiedLength": "120"})
+
+    assert queue.tasks[tid].status == "active"
+
+
+def test_completed_local_torrent_is_not_left_seeding(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+    queue._apply_status(tid, {"status": "complete", "totalLength": "500",
+                              "completedLength": "500", "downloadSpeed": "0"})
+
+    assert queue.tasks[tid].status == "completed"
+    assert _persisted_row(db_path, tid)["status"] == "completed"
+
+
+# --- external adoption guard ----------------------------------------------
+
+
+def test_torrent_child_gid_is_never_adopted_as_an_external_download(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    before = len(queue.tasks)
+
+    rpc.tell_external_snapshot = lambda: [
+        {"gid": "gid-child", "status": "active", "following": "gid-meta",
+         "infoHash": INFO_HASH, "totalLength": "500", "completedLength": "1",
+         "files": [{"path": "/dl/Season 1/ep1.mkv", "uris": []}]},
+    ]
+    queue._check_external()
+
+    assert len(queue.tasks) == before
+    assert len(_rows(db_path)) == 1
+
+
+def test_external_torrent_jobs_are_not_adopted_as_one_file_tasks(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    rpc.tell_external_snapshot = lambda: [
+        {"gid": "gid-foreign", "status": "active", "infoHash": "f" * 40,
+         "bittorrent": {"info": {"name": "Someone else"}},
+         "totalLength": "9", "completedLength": "1",
+         "files": [{"path": "/dl/x/a.bin", "uris": []},
+                   {"path": "/dl/x/b.bin", "uris": []}]},
+    ]
+
+    queue._check_external()
+
+    assert queue.tasks == {}
+    assert _rows(db_path) == []
+
+
+def test_plain_external_http_download_is_still_adopted(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    rpc.tell_external_snapshot = lambda: [
+        {"gid": "gid-ext", "status": "active", "totalLength": "9",
+         "completedLength": "1", "downloadSpeed": "2",
+         "files": [{"path": "/dl/a.bin",
+                    "uris": [{"uri": "https://example.com/a.bin"}]}]},
+    ]
+
+    queue._check_external()
+
+    assert len(queue.tasks) == 1
+    adopted = next(iter(queue.tasks.values()))
+    assert adopted.gid == "gid-ext"
+    assert adopted.url == "https://example.com/a.bin"
+
+
+# --- local .torrent files --------------------------------------------------
+
+
+def test_local_torrent_file_is_copied_into_coves_store(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    task = queue.tasks[tid]
+
+    assert task.torrent_path == torrent_mod.managed_torrent_path(task.info_hash)
+    assert torrent_mod.is_managed_torrent_path(task.torrent_path)
+    assert open(task.torrent_path, "rb").read() == raw
+    assert _persisted_row(db_path, tid)["torrent_path"] == task.torrent_path
+
+
+def test_local_torrent_file_survives_the_original_being_deleted(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    (tmp_path / "picked.torrent").unlink()
+
+    queue._launch(queue.tasks[tid])
+
+    assert rpc.torrents[0]["data"] == raw
+    assert rpc.torrents[0]["out_dir"] == str(tmp_path)
+    assert queue.tasks[tid].gid == "gid-file"
+    # A .torrent has its metadata already; there is no metadata phase.
+    assert queue.tasks[tid].phase == ""
+
+
+def test_missing_managed_torrent_fails_safely(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    os.unlink(queue.tasks[tid].torrent_path)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].status == "error"
+    assert queue.tasks[tid].error
+    assert rpc.torrents == []
+
+
+def test_corrupted_managed_torrent_fails_without_starting_a_download(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    open(queue.tasks[tid].torrent_path, "wb").write(b"SECRETPASS junk")
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "SECRETPASS" not in task.error
+    assert rpc.torrents == []
+
+
+def test_replaced_managed_torrent_is_refused(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    open(queue.tasks[tid].torrent_path, "wb").write(_torrent_bytes(b"other.mkv"))
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].status == "error"
+    assert rpc.torrents == []
+
+
+# --- restart ---------------------------------------------------------------
+
+
+def _restart(queue_env, db_path, monkeypatch, **settings):
+    """A second QueueManager over the same database, as startup does."""
+    queue, rpc, _ = queue_env(**_local_settings(**settings))
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    return queue, rpc
+
+
+def test_restart_during_metadata_re_adds_the_magnet_once(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    assert list(queue2.tasks) == [tid]
+    restored = queue2.tasks[tid]
+    assert restored.source_type == SOURCE_TORRENT
+    assert restored.gid is None
+
+    queue2._launch(restored)
+
+    assert len(rpc2.magnets) == 1
+    assert rpc2.magnets[0]["uri"] == MAGNET
+    assert len(_rows(db_path)) == 1
+
+
+def test_restart_after_the_gid_swap_does_not_duplicate_the_task(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    queue2._launch(queue2.tasks[tid])
+
+    assert len(_rows(db_path)) == 1
+    assert len(rpc2.magnets) == 1
+
+
+def test_restart_while_paused_restores_a_single_row(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+    queue.pause(tid)
+
+    queue2, _rpc2 = _restart(queue_env, db_path, monkeypatch)
+    assert list(queue2.tasks) == [tid]
+    assert len(_rows(db_path)) == 1
+
+
+def test_restart_of_a_local_torrent_file_re_adds_from_the_managed_copy(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    queue._launch(queue.tasks[tid])
+    assert len(rpc.torrents) == 1
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    restored = queue2.tasks[tid]
+    assert restored.torrent_path == queue.tasks[tid].torrent_path
+
+    queue2._launch(restored)
+    assert rpc2.torrents[0]["data"] == raw
+    assert len(_rows(db_path)) == 1
+
+
+def test_a_stale_gid_is_not_reused_after_a_restart(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    assert queue2.tasks[tid].gid is None
+    queue2._launch(queue2.tasks[tid])
+    assert queue2.tasks[tid].gid == "gid-meta"
+
+
+# --- duplicates ------------------------------------------------------------
+
+
+def test_duplicate_local_torrent_file_is_blocked(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.add_torrent_file(str(tmp_path / "picked.torrent"), str(tmp_path))
+
+    assert len(_rows(db_path)) == 1
+    assert errors
+
+
+def test_magnet_and_equivalent_torrent_file_are_one_torrent(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    same = torrent_mod.minimal_magnet(queue.tasks[tid].info_hash)
+    errors = []
+    queue.error.connect(errors.append)
+
+    assert queue.add_url(same) is None
+    assert len(_rows(db_path)) == 1
+    assert errors
+
+
+def test_duplicate_is_still_blocked_after_a_restart(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    queue2, _rpc2 = _restart(queue_env, db_path, monkeypatch)
+    assert queue2.add_url(MAGNET) is None
+    assert len(_rows(db_path)) == 1
+
+
+def test_cached_child_rows_do_not_look_like_a_live_local_torrent(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+
+    # The expansion rows share the info hash; a *new* add is still blocked
+    # (the torrent is live), but nothing about them is a local source task.
+    assert all(t.source_type == SOURCE_TORRENT_FILE for t in queue.tasks.values())
+    assert not any(t.phase for t in queue.tasks.values())
+
+
+# --- removal ---------------------------------------------------------------
+
+
+def _finished_local_torrent(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+    root = tmp_path / "Season 1"
+    (root / "extras").mkdir(parents=True)
+    (root / "ep1.mkv").write_bytes(b"a")
+    (root / "ep1.mkv.aria2").write_bytes(b"c")
+    (root / "extras" / "ep2.mkv").write_bytes(b"b")
+    rpc.files_result = [
+        {"path": str(root / "ep1.mkv")},
+        {"path": str(root / "extras" / "ep2.mkv")},
+    ]
+    return queue, rpc, db_path, tid, root
+
+
+def test_removing_a_torrent_keeps_the_downloaded_files(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+
+    queue.remove(tid, delete_file=False)
+
+    assert (root / "ep1.mkv").exists()
+    assert (root / "extras" / "ep2.mkv").exists()
+    assert rpc.removed == ["gid-child"]
+    assert _rows(db_path) == []
+
+
+def test_removing_a_torrent_with_files_deletes_only_aria2s_paths(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    bystander = root / "my notes.txt"
+    bystander.write_text("mine")
+
+    queue.remove(tid, delete_file=True)
+
+    assert not (root / "ep1.mkv").exists()
+    assert not (root / "ep1.mkv.aria2").exists()
+    assert not (root / "extras").exists()      # emptied, so cleaned up
+    assert bystander.exists()                  # unrelated file preserved
+    assert root.exists()                       # not blindly rmtree'd
+
+
+def test_torrent_file_deletion_refuses_paths_outside_the_destination(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    outside = tmp_path.parent / "outside.bin"
+    outside.write_bytes(b"keep")
+    rpc.files_result = [
+        {"path": str(outside)},
+        {"path": str(root / ".." / ".." / "escape.bin")},
+        {"path": "/etc/passwd"},
+    ]
+
+    queue.remove(tid, delete_file=True)
+
+    assert outside.exists()
+    outside.unlink()
+
+
+def test_torrent_file_deletion_refuses_a_symlink_escape(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    victim = tmp_path.parent / "victim.bin"
+    victim.write_bytes(b"keep")
+    link = root / "link.bin"
+    os.symlink(victim, link)
+    rpc.files_result = [{"path": str(link)}]
+
+    queue.remove(tid, delete_file=True)
+
+    assert victim.read_bytes() == b"keep"
+    victim.unlink()
+
+
+def test_removing_a_local_torrent_cleans_up_its_managed_copy(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    managed = queue.tasks[tid].torrent_path
+    queue._launch(queue.tasks[tid])
+
+    queue.remove(tid, delete_file=False)
+
+    assert not os.path.exists(managed)
+
+
+def test_a_second_task_keeps_the_managed_copy_alive(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    managed = queue.tasks[tid].torrent_path
+    twin = queue.add_url(
+        torrent_mod.minimal_magnet(queue.tasks[tid].info_hash),
+        source_type=SOURCE_TORRENT,
+        info_hash=queue.tasks[tid].info_hash,
+        torrent_path=managed,
+    )
+    assert twin is not None
+
+    queue.remove(tid, delete_file=False)
+
+    assert os.path.exists(managed)
+
+
+def test_removing_a_torrent_while_the_add_is_in_flight_stops_it(queue_env, monkeypatch):
+    """The gid lands after the user removed the row; it must not survive."""
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _uncached(queue, monkeypatch)
+    pending = []
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        # Bound methods compare by value, not identity, so match by name.
+        if getattr(fn, "__name__", "") == "_add_local_magnet":
+            pending.append((fn, args, on_done))
+            return
+        result = fn(*args, **kwargs)
+        if on_done is not None:
+            on_done(result)
+
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._spawn = spawn
+    queue._launch(queue.tasks[tid])
+    assert pending      # add_magnet is in flight
+
+    queue.remove(tid, delete_file=False)
+    fn, args, on_done = pending[0]
+    on_done(fn(*args))
+
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+    assert rpc.removed == ["gid-meta"]
+
+
+def test_removing_a_torrent_awaiting_consent_cancels_it(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+    assert tid in queue._awaiting_consent
+
+    queue.remove(tid, delete_file=False)
+    # A late answer must not resurrect a removed torrent.
+    queue.torrent_consent(tid, True)
+
+    assert tid not in queue.tasks
+    assert rpc.magnets == []
+    assert _rows(db_path) == []
+
+
+def _in_flight_magnet(queue_env, monkeypatch):
+    """A local magnet whose add_magnet RPC has not come back yet."""
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _uncached(queue, monkeypatch)
+    pending = []
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        if getattr(fn, "__name__", "") == "_add_local_magnet":
+            pending.append((fn, args, on_done))
+            return
+        result = fn(*args, **kwargs)
+        if on_done is not None:
+            on_done(result)
+
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._spawn = spawn
+    queue._launch(queue.tasks[tid])
+    assert pending
+    return queue, rpc, db_path, tid, pending
+
+
+def test_pausing_an_in_flight_torrent_pauses_the_late_gid(queue_env, monkeypatch):
+    queue, rpc, db_path, tid, pending = _in_flight_magnet(queue_env, monkeypatch)
+
+    queue.pause(tid)
+    fn, args, on_done = pending[0]
+    on_done(fn(*args))
+
+    task = queue.tasks[tid]
+    assert task.status == "paused"
+    assert task.gid == "gid-meta"
+    assert rpc.paused == ["gid-meta"]
+
+
+def test_resuming_an_in_flight_torrent_keeps_it_tracked(queue_env, monkeypatch):
+    """Pause then resume before the gid lands: the task must end up active
+    with the gid, not stranded in a state the poll loop ignores."""
+    queue, rpc, db_path, tid, pending = _in_flight_magnet(queue_env, monkeypatch)
+
+    queue.pause(tid)
+    queue.resume(tid)
+    # The add is still in flight, so no second torrent may be started.
+    assert len(pending) == 1
+
+    fn, args, on_done = pending[0]
+    on_done(fn(*args))
+
+    task = queue.tasks[tid]
+    assert task.gid == "gid-meta"
+    assert task.status == "active"
+    assert rpc.paused == []
+    assert _persisted_row(db_path, tid)["status"] == "active"
+    # Pollable: _poll_active only looks at active/paused tasks with a gid.
+    assert task.status in {"active", "paused"} and task.gid
+
+
+def test_stopping_the_queue_during_consent_prevents_any_peer_traffic(queue_env, monkeypatch):
+    """Stop Queue while the disclosure is open: answering Continue must not
+    open a single peer connection until the queue runs again."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+    assert tid in queue._awaiting_consent
+
+    queue._running = False
+    queue.torrent_consent(tid, True)
+
+    assert rpc.magnets == []
+    assert queue.tasks[tid].status == "paused"
+    assert queue.tasks[tid].gid is None
+
+    # Starting the queue again releases it.
+    queue.start_queue()
+    assert len(rpc.magnets) == 1
+    assert queue.tasks[tid].gid == "gid-meta"
+
+
+def test_scheduler_block_during_the_capability_check_defers_the_add(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _uncached(queue, monkeypatch)
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        result = fn(*args, **kwargs)
+        if getattr(fn, "__name__", "") == "_bittorrent_capable":
+            # The scheduler window closes while the check is in flight.
+            queue._scheduler_allows = False
+        if on_done is not None:
+            on_done(result)
+
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._spawn = spawn
+    queue._launch(queue.tasks[tid])
+
+    assert rpc.magnets == []
+    assert queue.tasks[tid].status == "paused"
+
+
+def test_pausing_during_consent_leaves_the_torrent_paused(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+
+    queue.pause(tid)
+    queue.torrent_consent(tid, True)
+
+    assert rpc.magnets == []
+    assert queue.tasks[tid].status == "paused"
+
+
+def test_aria2_torrent_add_failure_never_reaches_the_task_row(queue_env, monkeypatch):
+    """An aria2 error message for a magnet can quote the magnet itself."""
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+
+    def boom(*a, **k):
+        raise Aria2Error(
+            "RPC aria2.addUri failed: bad uri "
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"
+            "&tr=http://tracker.example/announce?passkey=SECRETPASS"
+        )
+
+    rpc.add_magnet = boom
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert task.error == TORRENT_ARIA2_FAILED
+    # The row's own URL is the user's magnet by design (Slice A); what must
+    # never appear is aria2's echo of it in the persisted error.
+    persisted_error = _persisted_row(db_path, tid)["error"]
+    for secret in ("SECRETPASS", "passkey", "tracker.example", "magnet:?"):
+        assert secret not in persisted_error
+
+
+def test_aria2_torrent_status_error_is_sanitized(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue._apply_status(tid, {
+        "status": "error", "errorCode": "24",
+        "errorMessage": "tracker http://tracker.example/announce?passkey=SECRETPASS "
+                        "refused peer 203.0.113.9",
+    })
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert TORRENT_ARIA2_FAILED in task.error
+    assert "24" in task.error          # the numeric code is still useful
+    persisted_error = _persisted_row(db_path, tid)["error"]
+    for secret in ("SECRETPASS", "passkey", "tracker.example", "203.0.113.9"):
+        assert secret not in persisted_error
+
+
+def test_managed_torrent_errors_are_not_flattened_into_the_generic_one(queue_env, monkeypatch, tmp_path):
+    """Sanitising aria2's messages must not hide Cove's own diagnoses."""
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    os.unlink(queue.tasks[tid].torrent_path)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].error != TORRENT_ARIA2_FAILED
+    assert "stored copy" in queue.tasks[tid].error
+
+
+def test_remove_and_delete_during_an_in_flight_add_still_deletes(queue_env, monkeypatch, tmp_path):
+    queue, rpc, db_path, tid, pending = _in_flight_magnet(queue_env, monkeypatch)
+    root = tmp_path / "Season 1"
+    root.mkdir(parents=True)
+    partial = root / "ep1.mkv"
+    partial.write_bytes(b"partial")
+    (root / "ep1.mkv.aria2").write_bytes(b"ctrl")
+    bystander = root / "notes.txt"
+    bystander.write_text("mine")
+    rpc.files_result = [{"path": str(partial)}]
+
+    queue.remove(tid, delete_file=True)
+    fn, args, on_done = pending[0]
+    on_done(fn(*args))
+
+    assert rpc.removed == ["gid-meta"]
+    assert not partial.exists()
+    assert not (root / "ep1.mkv.aria2").exists()
+    assert bystander.exists()
+    assert _rows(db_path) == []
+
+
+def test_pause_then_consent_then_resume_recovers_the_torrent(queue_env, monkeypatch):
+    """Pausing while the disclosure is open must not strand the task in an
+    'active' state with no aria2 work behind it."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+    assert tid in queue._awaiting_consent
+
+    queue.pause(tid)
+    queue.torrent_consent(tid, True)
+    assert queue.tasks[tid].status == "paused"
+    assert rpc.magnets == []
+
+    queue.resume(tid)
+
+    task = queue.tasks[tid]
+    assert task.status == "active"
+    assert task.gid == "gid-meta"
+    assert len(rpc.magnets) == 1
+
+
+def test_declining_consent_does_not_block_a_later_retry(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    tid = queue.add_url(MAGNET)
+    _running(queue)
+    queue._launch(queue.tasks[tid])
+    queue.pause(tid)
+    queue.torrent_consent(tid, False)
+    assert queue.tasks[tid].status == "error"
+
+    # Retry: consent is now recorded, so it should actually start.
+    queue.settings.torrent_ip_disclosure_shown = True
+    queue.resume(tid)
+
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert len(rpc.magnets) == 1
+
+
+def test_metadata_handoff_keeps_a_paused_torrent_paused(queue_env, monkeypatch):
+    """The child gid is the real transfer: a pause taken during metadata
+    must be re-applied to it, not silently lifted."""
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue.pause(tid)
+    assert queue.tasks[tid].status == "paused"
+
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    task = queue.tasks[tid]
+    assert task.gid == "gid-child"
+    assert task.status == "paused"
+    assert "gid-child" in rpc.paused
+    assert _persisted_row(db_path, tid)["status"] == "paused"
+
+
+def test_metadata_handoff_respects_a_stopped_queue(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._running = False
+
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    task = queue.tasks[tid]
+    assert task.gid == "gid-child"
+    assert task.status == "paused"
+    assert "gid-child" in rpc.paused
+
+
+def test_metadata_handoff_respects_a_closed_scheduler_window(queue_env, monkeypatch):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._scheduler_allows = False
+
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    assert queue.tasks[tid].status == "paused"
+    assert "gid-child" in rpc.paused

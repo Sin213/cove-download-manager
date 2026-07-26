@@ -61,6 +61,11 @@ _NO_BTIH = "This magnet link has no BitTorrent v1 info hash."
 _CONTRADICTORY = "This magnet link contains more than one info hash."
 _V2_ONLY = "BitTorrent v2-only torrents are not supported yet."
 _UNSAFE_PATH = "This torrent contains a file path Cove will not write to."
+_MANAGED_MISSING = "Cove's stored copy of this .torrent is missing."
+_MANAGED_CHANGED = (
+    "Cove's stored copy of this .torrent no longer matches this torrent."
+)
+_MANAGED_UNSAFE = "Cove will not write its .torrent copy to that path."
 
 
 # ---------------------------------------------------------------------------
@@ -489,6 +494,126 @@ def parse_torrent(data) -> TorrentMetadata:
         raw_bytes=data,
         info_bytes=data[info_span[0]:info_span[1]],
     )
+
+
+# ---------------------------------------------------------------------------
+# Cove's managed .torrent copies
+# ---------------------------------------------------------------------------
+#
+# A local torrent has to survive a restart, a pause and a retry, none of
+# which can depend on the file the user picked still being where it was.
+# Cove therefore keeps its own copy, named after the info hash, inside its
+# data directory: the name makes the identity checkable, and the identity is
+# re-checked on every read so a replaced or corrupted copy can never quietly
+# start a different torrent.
+
+
+def managed_torrent_dir():
+    """DATA_DIR/torrents, resolved at call time.
+
+    Imported lazily and read off the module so a test (or a portable
+    install) can redirect cove.config.DATA_DIR.
+    """
+    from . import config
+
+    return os.path.join(str(config.DATA_DIR), "torrents")
+
+
+def managed_torrent_path(info_hash: str) -> str:
+    return os.path.join(
+        managed_torrent_dir(), f"{normalize_info_hash(info_hash)}.torrent"
+    )
+
+
+def is_managed_torrent_path(path) -> bool:
+    """True when `path` is a file Cove itself placed in its torrent store."""
+    if not isinstance(path, str) or not path:
+        return False
+    base = os.path.realpath(managed_torrent_dir())
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    return parent == base
+
+
+def store_managed_torrent(meta: TorrentMetadata) -> str:
+    """Copy validated `.torrent` bytes into Cove's store; return the path.
+
+    An existing copy that still hashes to the same info hash is reused
+    untouched. Anything else under that name is not a different torrent —
+    the name *is* the hash — so it is replaced, but only after refusing to
+    follow a symlink: the replacement is written to a temp file in the same
+    directory and renamed over the target, so an attacker-planted link can
+    never turn this into a write somewhere else.
+    """
+    directory = managed_torrent_dir()
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    except OSError:
+        raise TorrentError(_MANAGED_UNSAFE) from None
+    target = managed_torrent_path(meta.info_hash)
+
+    if os.path.islink(target):
+        raise TorrentError(_MANAGED_UNSAFE)
+    if os.path.exists(target):
+        try:
+            if read_managed_torrent(target, meta.info_hash) == meta.raw_bytes:
+                return target
+        except TorrentError:
+            pass  # Junk under our own name; replaced below.
+
+    tmp = target + ".tmp"
+    try:
+        if os.path.islink(tmp):
+            raise TorrentError(_MANAGED_UNSAFE)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, meta.raw_bytes)
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, target)
+    except TorrentError:
+        raise
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise TorrentError(_MANAGED_UNSAFE) from None
+    return target
+
+
+def read_managed_torrent(path, info_hash: str) -> bytes:
+    """The stored bytes for `info_hash`, or raise.
+
+    Missing, replaced and corrupted copies are all distinguishable failures
+    for the caller, and none of them quote the file's contents.
+    """
+    if not isinstance(path, str) or not path:
+        raise TorrentError(_MANAGED_MISSING)
+    if os.path.islink(path):
+        raise TorrentError(_MANAGED_UNSAFE)
+    if not os.path.isfile(path):
+        raise TorrentError(_MANAGED_MISSING)
+    try:
+        meta = read_torrent_file(path)
+    except TorrentError:
+        raise TorrentError(_MANAGED_CHANGED) from None
+    if meta.info_hash != normalize_info_hash(info_hash):
+        raise TorrentError(_MANAGED_CHANGED)
+    return meta.raw_bytes
+
+
+def discard_managed_torrent(path) -> None:
+    """Delete a copy Cove owns. Anything else is left alone."""
+    if not is_managed_torrent_path(path):
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def read_torrent_file(path) -> TorrentMetadata:

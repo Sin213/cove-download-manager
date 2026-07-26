@@ -37,6 +37,8 @@ from .config import (
     CONNECTION_CHOICES,
     DEBRID_ALL_DEBRID,
     DEBRID_REAL_DEBRID,
+    TORRENT_FALLBACK_AUTOMATIC,
+    TORRENT_FALLBACK_NEVER,
     ScheduleWindow,
     Settings,
 )
@@ -625,6 +627,52 @@ class SettingsDialog(QDialog):
         scroll_layout.addWidget(debrid_group)
         self._on_debrid_toggled()
 
+        # BitTorrent — deliberately its own group, not part of Debrid
+        # services: a cached debrid torrent is an ordinary HTTPS download,
+        # while this section is about joining a swarm directly.
+        self.torrent_group = QGroupBox("BitTorrent")
+        torrent_lay = QFormLayout(self.torrent_group)
+        torrent_lay.setSpacing(8)
+        self.torrent_enabled = QCheckBox("Enable torrent support")
+        self.torrent_enabled.setChecked(
+            getattr(settings, "torrent_support_enabled", False) is True
+        )
+        self.torrent_enabled.toggled.connect(self._on_torrent_toggled)
+        torrent_lay.addRow(self.torrent_enabled)
+
+        self.torrent_fallback = QComboBox()
+        self.torrent_fallback.addItem(
+            "Download with Cove BitTorrent", TORRENT_FALLBACK_AUTOMATIC
+        )
+        self.torrent_fallback.addItem("Never download locally", TORRENT_FALLBACK_NEVER)
+        idx = self.torrent_fallback.findData(
+            getattr(settings, "torrent_fallback_mode", TORRENT_FALLBACK_AUTOMATIC)
+        )
+        self.torrent_fallback.setCurrentIndex(idx if idx >= 0 else 0)
+        torrent_lay.addRow("When not cached", self.torrent_fallback)
+
+        self.torrent_proxy_override = QCheckBox(
+            "Allow local BitTorrent while proxy settings are enabled"
+        )
+        self.torrent_proxy_override.setChecked(
+            getattr(settings, "torrent_allow_with_proxy", False) is True
+        )
+        torrent_lay.addRow(self.torrent_proxy_override)
+
+        torrent_note = QLabel(
+            "Torrents cached by an enabled debrid service download over HTTPS "
+            "and never join the torrent swarm.\n"
+            "Downloading locally exposes your IP address to peers and "
+            "trackers. Cove stops seeding as soon as a download completes.\n"
+            "Cove's ordinary HTTP proxy settings cannot guarantee that peer, "
+            "DHT or UDP tracker traffic is proxied."
+        )
+        torrent_note.setProperty("role", "muted")
+        torrent_note.setWordWrap(True)
+        torrent_lay.addRow(torrent_note)
+        scroll_layout.addWidget(self.torrent_group)
+        self._on_torrent_toggled()
+
         # Category folders
         cat_group = QGroupBox("Category folders")
         cat_lay = QFormLayout(cat_group)
@@ -708,6 +756,14 @@ class SettingsDialog(QDialog):
             edit.setEnabled(on)
             # Don't re-enable a Test button that is currently mid-request.
             test.setEnabled(on and test.property("testing") is not True)
+
+    # ---- torrents -----------------------------------------------------
+
+    def _on_torrent_toggled(self, _checked: bool = False) -> None:
+        """The torrent rows follow their switch, as the proxy rows do."""
+        on = self.torrent_enabled.isChecked()
+        self.torrent_fallback.setEnabled(on)
+        self.torrent_proxy_override.setEnabled(on)
 
     def _test_all_debrid(self) -> None:
         self._run_account_test(
@@ -794,6 +850,12 @@ class SettingsDialog(QDialog):
         self.settings.real_debrid_enabled = self.rd_enabled.isChecked()
         self.settings.real_debrid_api_token = self.rd_token.text().strip()
         self.settings.debrid_preferred_provider = self.debrid_preferred.currentData()
+        self.settings.torrent_support_enabled = self.torrent_enabled.isChecked()
+        self.settings.torrent_fallback_mode = self.torrent_fallback.currentData()
+        self.settings.torrent_allow_with_proxy = self.torrent_proxy_override.isChecked()
+        # torrent_ip_disclosure_shown is not written here on purpose: it
+        # records the user's answer to the one-time P2P notice, and Save
+        # must neither grant nor revoke that consent.
         for name, edit in self._cat_edits.items():
             setattr(self.settings.category_dirs, name, edit.text().strip())
         self.settings.save()
