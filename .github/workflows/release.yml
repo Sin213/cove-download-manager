@@ -340,41 +340,28 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 2.1.0
+          ## What's new in 3.0.0
 
-          Bug-audit release: 24 fixes across the queue, video backends, native messaging, local API, updater, and configuration, plus browser header support for video downloads.
+          Major release: debrid account integration and built-in BitTorrent support, including TorBox.
 
-          ### Added - browser headers for video downloads
+          ### Added - debrid accounts
 
-          - Video and HLS downloads handed off from the browser extension now carry the page's cookies, referrer, and user agent through to the ffmpeg/yt-dlp backend, so authenticated and anti-hotlink media downloads work the same way direct aria2 downloads always have. Headers are sanitized, persisted with the task, and reused on retry after a restart.
-          - The extension's requested download directory is now honored for video downloads instead of falling back to the default folder.
+          - Real-Debrid, AllDebrid, and TorBox accounts can be enabled in Settings, Debrid services. Hoster links on a supported host are resolved through your account automatically before downloading, giving you the provider's filename, file size, and a full speed multi connection download instead of a direct fetch.
+          - Test in Settings verifies a credential and shows the account name and plan without ever exposing the token itself.
+          - Try first controls which provider handles a link that more than one enabled account supports.
+          - Account bound debrid share or landing links are rejected with a clear message telling you to add the original hoster link instead, rather than silently saving the provider's error page as a file.
 
-          ### Fixed - queue and video backends
+          ### Added - built in torrents
 
-          - Removing an active HLS or yt-dlp download now terminates its process instead of leaving it running in the background.
-          - Stopping the queue or hitting the scheduler window now pauses video downloads reliably, even if the aria2 RPC call fails; previously tasks could stay "active" with no process behind them.
-          - Disabling downloads via the scheduler now stops active ffmpeg/yt-dlp processes, matching queue-stop behavior.
-          - HLS downloads into a directory that does not exist yet now create it instead of failing.
-          - HLS streams with non-AAC audio no longer fail: the AAC-specific bitstream filter is no longer forced on every stream.
-          - URLs with uppercase schemes (HTTP://, FTP://) are accepted by the queue.
+          - Cove now handles torrents itself. No external torrent client is ever launched, and every torrent appears in Cove's own list with the same progress, pause, resume, retry, and remove controls as any other download.
+          - Add a magnet link or a `.torrent` file, or drop a `.torrent` onto the window.
+          - If an enabled Real-Debrid, AllDebrid, or TorBox account already has the torrent cached, Cove downloads the files over HTTPS through your account. No swarm is joined and your IP address is not shared with peers.
+          - If no enabled provider has it cached, Cove falls back to its own built in aria2 BitTorrent engine and downloads it locally. A one time privacy notice explains what local peer to peer downloading means before it starts.
+          - Managed `.torrent` copies are stored keyed by info hash so local torrents survive a restart.
 
-          ### Fixed - native messaging and drop files
+          ### Fixed
 
-          - Drop files are written atomically, so the queue can no longer read a half-written request and discard it.
-          - Requests the queue rejects are kept for inspection instead of being silently deleted.
-          - Message framing uses explicit little-endian encoding per the WebExtension native messaging spec.
-          - URLs are normalized once, so a URL with surrounding whitespace can no longer pass validation and then be stored or forwarded untrimmed.
-
-          ### Fixed - local API, updater, and configuration
-
-          - The aria2 RPC secret is no longer visible in the process command line; it is passed via a permission-restricted config file.
-          - Bearer authentication accepts the scheme case-insensitively per RFC 7235, and slow clients can no longer raise unhandled socket timeouts in the API server.
-          - A malformed GitHub release response can no longer wedge future update checks, and cancelling an update download no longer shows an error dialog.
-          - The updater honors XDG_CACHE_HOME, and aria2 startup/shutdown errors are contained and reaped cleanly.
-          - Corrupted persisted settings (non-string RPC secret, out-of-range schedule values) are reset to safe defaults instead of crashing startup.
-          - Native messaging host registration uses proper macOS manifest locations and no longer runs on the GUI thread, so a slow flatpak cannot freeze the window at startup.
-          - Clipboard URL extraction no longer truncates URLs that legitimately end in a closing parenthesis.
-          - Project metadata and runtime version are aligned.
+          - aria2 startup now gives a clear error instead of failing silently when a leftover aria2 daemon is already holding the RPC port.
 
           ## Downloads
 
@@ -388,10 +375,6 @@ jobs:
           | Patched aria2 source | `aria2-1.37.0-cove.1-source.tar.gz` |
 
           Each artifact has a matching `.sha256` file for verification.
-
-          ### Credits
-
-          Thank you Kimi for finding the bugs.
           NOTESEOF
           sed -i "s/VERSION/${VERSION}/g" "$NOTES_FILE"
 
