@@ -45,15 +45,28 @@ from .config import (
     DEBRID_DEFAULT_PROVIDER,
     DEBRID_PROVIDERS,
     DEBRID_REAL_DEBRID,
+    DEBRID_TORBOX,
 )
 
 REAL_DEBRID = DEBRID_REAL_DEBRID
 ALL_DEBRID = DEBRID_ALL_DEBRID
+TORBOX = DEBRID_TORBOX
 PROVIDERS = DEBRID_PROVIDERS
-PROVIDER_LABELS = {REAL_DEBRID: "Real-Debrid", ALL_DEBRID: "AllDebrid"}
+PROVIDER_LABELS = {REAL_DEBRID: "Real-Debrid", ALL_DEBRID: "AllDebrid", TORBOX: "TorBox"}
+
+# TorBox is Cove's third debrid provider. Its complete feature (ordinary
+# hoster downloads plus cached-torrent routing) ships across two slices;
+# this flag stays False until both have landed, so a user on a T1 build
+# never sees a half-finished provider. Tests may monkeypatch this module
+# attribute to True to exercise the gated code paths; it is not a Settings
+# field because it describes what Cove ships, not what the user chose.
+TORBOX_FEATURE_AVAILABLE = False
 
 RD_BASE = "https://api.real-debrid.com/rest/1.0"
 AD_BASE = "https://api.alldebrid.com/v4"
+TORBOX_BASE = "https://api.torbox.app/v1/api"
+TORBOX_READY_POLL_INTERVAL = 1.0
+TORBOX_READY_MAX_WAIT = 10.0
 
 # (connect, read). Generous on read because unlock can be slow under load.
 HTTP_TIMEOUT = (10, 30)
@@ -74,6 +87,7 @@ PROVIDER_OWN_DOMAINS = (
     "real-debrid.com",
     "alldebrid.com",
     "debrid.it",
+    "torbox.app",
 )
 
 
@@ -85,6 +99,10 @@ class Unrestricted:
     filename: str
     filesize: int
     provider: str
+    # TorBox only: the web-download (T1) or torrent (T2) item ID the queue
+    # persists so a retry/restart can reuse it instead of creating another
+    # one. Empty for AllDebrid/Real-Debrid, which have no such identity.
+    item_id: str = ""
 
 
 class DebridError(Exception):
@@ -467,6 +485,332 @@ def all_debrid_supported_domains(*, session=None) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# TorBox
+# ---------------------------------------------------------------------------
+#
+# TorBox's official SDKs (torbox-sdk-py, torbox-sdk-dotnet) expose no
+# "cached-only" parameter on createwebdownload -- unlike AllDebrid/Real-Debrid
+# unrestrict, there is no server-side guarantee against creating an uncached
+# cloud job. Cove enforces cached-only behaviour itself: it calls the
+# separate GET /webdl/checkcached endpoint first and only creates a web
+# download when that reports the link cached. Any ambiguous or unparseable
+# checkcached response is treated as "not cached", never as "cached" -- a
+# false negative just skips TorBox for this link, while a false positive
+# would create an uncached job Cove promised never to leave running.
+#
+# Exact error-code casing for TorBox's `error` field is not part of any
+# published SDK/schema, so error classification here is done by HTTP status
+# only (401/403 auth, 429 rate limit, 5xx temporary), matching the responses
+# tables above in spirit without guessing string values TorBox may or may
+# not actually return.
+
+
+def _torbox_error_for_status(status: int) -> DebridError:
+    if status in (401, 403):
+        return DebridError(
+            TORBOX, "auth",
+            "the API token was rejected. Check the token in Settings.",
+            False, False,
+        )
+    if status == 429:
+        return DebridError(
+            TORBOX, "rate_limited",
+            "too many requests. Wait a moment and try again.", True, False,
+        )
+    if 500 <= status < 600:
+        return DebridError(TORBOX, "http", _TRANSPORT, True, False)
+    return _error(TORBOX, "unknown", {})
+
+
+def _torbox_payload(resp):
+    """Unwrap the {success, error, detail, data} envelope and return `data`.
+
+    Provider `detail`/`error` text is deliberately never read here: only
+    the HTTP status decides which fixed Cove message is raised.
+    """
+    body = _json_body(resp, TORBOX)
+    status = getattr(resp, "status_code", 0)
+    if not isinstance(body, dict) or body.get("success") is not True:
+        if not 200 <= status < 300:
+            raise _torbox_error_for_status(status)
+        raise _bad_response(TORBOX)
+    if not 200 <= status < 300:
+        raise _torbox_error_for_status(status)
+    return body.get("data")
+
+
+def torbox_account(token: str, *, session=None) -> dict:
+    """Sanitized account summary for the Settings "Test" button."""
+    resp = _request(session, "get", f"{TORBOX_BASE}/user/me", TORBOX, headers=_bearer(token))
+    data = _torbox_payload(resp)
+    if not isinstance(data, dict):
+        raise _bad_response(TORBOX)
+    account: dict = {}
+    email = data.get("email")
+    if isinstance(email, str) and email:
+        account["email"] = email
+    if isinstance(data.get("is_subscribed"), bool):
+        account["is_subscribed"] = data["is_subscribed"]
+    expires = data.get("premium_expires_at")
+    if isinstance(expires, str) and expires:
+        account["expiration"] = expires
+    return account
+
+
+def torbox_supported_domains(*, session=None) -> list[str]:
+    resp = _request(session, "get", f"{TORBOX_BASE}/webdl/hosters", TORBOX)
+    data = _torbox_payload(resp)
+    if not isinstance(data, list):
+        raise _bad_response(TORBOX)
+    domains: list[str] = []
+    for entry in data:
+        if not isinstance(entry, dict) or entry.get("status") is not True:
+            continue
+        entry_domains = entry.get("domains")
+        if isinstance(entry_domains, list):
+            domains.extend(entry_domains)
+    return _normalize_domains(domains)
+
+
+def _torbox_numeric_id(value, provider: str = TORBOX) -> str:
+    """Round-trip an item/file ID through int() before it reaches a URL.
+
+    Defence in depth: these values are either freshly returned by TorBox or
+    read back from our own DB column, but neither source should ever be
+    trusted enough to interpolate directly into a request.
+    """
+    try:
+        return str(int(str(value)))
+    except (TypeError, ValueError):
+        raise _bad_response(provider) from None
+
+
+def _torbox_check_cached(link: str, token: str, *, session=None) -> bool:
+    import hashlib
+
+    digest = hashlib.md5(link.encode("utf-8")).hexdigest()
+    resp = _request(
+        session, "get", f"{TORBOX_BASE}/webdl/checkcached?hash={digest}", TORBOX,
+        headers=_bearer(token),
+    )
+    data = _torbox_payload(resp)
+    if isinstance(data, dict):
+        return bool(data.get(digest))
+    if isinstance(data, list):
+        return len(data) > 0
+    return False
+
+
+def _torbox_create_web_download(link: str, token: str, *, session=None) -> str:
+    resp = _request(
+        session, "post", f"{TORBOX_BASE}/webdl/createwebdownload", TORBOX,
+        headers=_bearer(token), files={"link": (None, link)},
+    )
+    data = _torbox_payload(resp)
+    if not isinstance(data, dict):
+        raise _bad_response(TORBOX)
+    item_id = data.get("webdownload_id")
+    if isinstance(item_id, bool) or not isinstance(item_id, (str, int)) or not str(item_id):
+        raise _bad_response(TORBOX)
+    return _torbox_numeric_id(item_id)
+
+
+def _torbox_mylist_entry(item_id: str, token: str, *, session=None):
+    """The mylist row for one web download, or None when TorBox has no
+    record of it (a missing item, not an error)."""
+    safe_id = _torbox_numeric_id(item_id)
+    resp = _request(
+        session, "get", f"{TORBOX_BASE}/webdl/mylist?id={safe_id}", TORBOX,
+        headers=_bearer(token),
+    )
+    data = _torbox_payload(resp)
+    if data is None:
+        return None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    if data is not None and not isinstance(data, dict):
+        raise _bad_response(TORBOX)
+    return data
+
+
+def _torbox_delete_web_download(item_id: str, token: str, *, session=None) -> None:
+    """Best-effort cleanup for a job Cove's own polling decided to abandon.
+
+    Never allowed to raise: this only ever runs while another DebridError is
+    about to be raised, and a cleanup failure must not replace or hide it.
+    """
+    try:
+        safe_id = _torbox_numeric_id(item_id)
+        _request(
+            session, "post", f"{TORBOX_BASE}/webdl/controlwebdownload", TORBOX,
+            headers=_bearer(token), data={"id": safe_id, "operation": "delete"},
+        )
+    except DebridError:
+        pass
+
+
+def _torbox_pick_file(files, provider: str = TORBOX):
+    if not isinstance(files, list) or not files:
+        raise _bad_response(provider)
+    first = files[0]
+    if not isinstance(first, dict):
+        raise _bad_response(provider)
+    file_id = first.get("id")
+    if isinstance(file_id, bool) or not isinstance(file_id, (str, int)) or not str(file_id):
+        raise _bad_response(provider)
+    return (
+        _torbox_numeric_id(file_id, provider),
+        _safe_filename(first.get("name")),
+        _safe_filesize(first.get("size"), provider),
+    )
+
+
+def _torbox_request_dl(kind: str, item_id: str, file_id: str, token: str, *, session=None) -> str:
+    """Generate a temporary TorBox delivery URL without ever leaking the
+    tokenized request URL that produces it.
+
+    TorBox's requestdl takes the API token as a query parameter, so the
+    request URL itself is a secret. `allow_redirects=False` and the
+    explicit `redirect=false` query flag both keep this call from ever
+    silently following a redirect to that secret URL. Transport exceptions
+    are deliberately reduced to a fixed message with `from None`: a
+    requests.RequestException can quote the request URL (including the
+    token) in its own text, and that text must never reach a DebridError,
+    a log line, or a test failure snapshot.
+    """
+    from urllib.parse import urlencode
+
+    id_param = "web_id" if kind == "webdl" else "torrent_id"
+    query = urlencode({
+        "token": token,
+        id_param: _torbox_numeric_id(item_id),
+        "file_id": _torbox_numeric_id(file_id),
+        "redirect": "false",
+    })
+    url = f"{TORBOX_BASE}/{kind}/requestdl?{query}"
+    try:
+        resp = _session(session).get(url, timeout=HTTP_TIMEOUT, allow_redirects=False)
+    except Exception:
+        raise DebridError(TORBOX, "transport", _TRANSPORT, True, False) from None
+    data = _torbox_payload(resp)
+    return _safe_torbox_delivery_url(data)
+
+
+def _safe_torbox_delivery_url(value) -> str:
+    url = _safe_download_url(value, TORBOX)
+    if is_supported_domain(url, ("api.torbox.app",)):
+        # TorBox's own API/requestdl host echoed back as "data" would still
+        # carry the token in its query string; refuse it as a delivery URL
+        # rather than hand it to aria2. A CDN delivery host is expected to
+        # live elsewhere (e.g. a *.torbox.app storage/CDN subdomain other
+        # than api.), so only the API host itself is excluded here.
+        raise DebridError(
+            TORBOX, "unsafe_url",
+            "returned a link Cove will not download from.", False, False,
+        )
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        raise _bad_response(TORBOX) from None
+    if parsed.username or parsed.password:
+        raise DebridError(
+            TORBOX, "unsafe_url",
+            "returned a link Cove will not download from.", False, False,
+        )
+    return url
+
+
+def torbox_unrestrict(
+    link: str,
+    token: str,
+    *,
+    session=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> Unrestricted:
+    """First-time TorBox hoster route: cached-only create, then unlock.
+
+    Never leaves an uncached job running: a bounded ready-poll that times
+    out deletes the item it created before raising.
+    """
+    if not isinstance(token, str) or not token.strip():
+        raise DebridError(
+            TORBOX, "missing_credential",
+            "is enabled but has no API token saved. Add one in Settings.",
+            False, False,
+        )
+    token = token.strip()
+    if not _torbox_check_cached(link, token, session=session):
+        raise DebridError(
+            TORBOX, "not_cached",
+            "this file is not already available in your TorBox account.",
+            True, True,
+        )
+    item_id = _torbox_create_web_download(link, token, session=session)
+    deadline = clock() + TORBOX_READY_MAX_WAIT
+    while True:
+        entry = _torbox_mylist_entry(item_id, token, session=session)
+        if entry is None:
+            raise _bad_response(TORBOX)
+        if entry.get("download_present") is True or entry.get("download_finished") is True:
+            break
+        if clock() >= deadline:
+            _torbox_delete_web_download(item_id, token, session=session)
+            raise DebridError(
+                TORBOX, "not_ready",
+                "could not confirm this download was ready in time.", True, True,
+            )
+        sleep(TORBOX_READY_POLL_INTERVAL)
+    file_id, filename, filesize = _torbox_pick_file(entry.get("files"))
+    download = _torbox_request_dl("webdl", item_id, file_id, token, session=session)
+    return Unrestricted(
+        download=download, filename=filename, filesize=filesize,
+        provider=TORBOX, item_id=item_id,
+    )
+
+
+def torbox_refresh_web_download(
+    item_id: str,
+    hoster_url: str,
+    settings,
+    *,
+    session=None,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> Unrestricted:
+    """Retry/restart route for a task already pinned to a TorBox item.
+
+    A missing item soft-recreates once from the original hoster URL and the
+    queue is expected to persist the replacement `item_id` it gets back. An
+    item that exists but isn't ready, or any auth/malformed-response
+    failure, is raised as-is: only "missing" recreates.
+    """
+    token = getattr(settings, "torbox_api_token", "")
+    if not isinstance(token, str) or not token.strip():
+        raise DebridError(
+            TORBOX, "missing_credential",
+            "is needed for this download but has no API token saved. "
+            "Add one in Settings.",
+            False, False,
+        )
+    token = token.strip()
+    entry = _torbox_mylist_entry(item_id, token, session=session)
+    if entry is None:
+        return torbox_unrestrict(hoster_url, token, session=session, sleep=sleep, clock=clock)
+    if not (entry.get("download_present") is True or entry.get("download_finished") is True):
+        raise DebridError(
+            TORBOX, "not_ready",
+            "this TorBox item is not ready yet.", False, False,
+        )
+    file_id, filename, filesize = _torbox_pick_file(entry.get("files"))
+    download = _torbox_request_dl("webdl", item_id, file_id, token, session=session)
+    return Unrestricted(
+        download=download, filename=filename, filesize=filesize,
+        provider=TORBOX, item_id=item_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Host matching and the domain cache
 # ---------------------------------------------------------------------------
 
@@ -616,10 +960,12 @@ def supported_domains(provider: str, *, session=None, now=None) -> Optional[list
     cached, fetched_at = _cached_entry(_read_cache(), provider)
     if cached is not None and 0 <= now - fetched_at < HOST_CACHE_TTL:
         return cached
-    fetch = (
-        all_debrid_supported_domains if provider == ALL_DEBRID
-        else real_debrid_supported_domains
-    )
+    if provider == ALL_DEBRID:
+        fetch = all_debrid_supported_domains
+    elif provider == TORBOX:
+        fetch = torbox_supported_domains
+    else:
+        fetch = real_debrid_supported_domains
     try:
         domains = fetch(session=session)
     except Exception:
@@ -639,12 +985,23 @@ def _preferred(settings) -> str:
 
 
 def _enabled_providers(settings) -> list[tuple[str, str]]:
-    """(provider, credential) pairs, preferred provider first."""
+    """(provider, credential) pairs, preferred provider first.
+
+    Remaining providers keep DEBRID_PROVIDERS' registration order (a stable
+    sort on "is this the preferred one" preserves relative order for ties),
+    so appending a provider there is what puts it last in the fallback
+    chain. TorBox additionally requires the internal feature-availability
+    gate: while it is off, TorBox never enters this list regardless of the
+    user's torbox_enabled setting, so existing two-provider ordering is
+    unaffected.
+    """
     pairs = []
     if getattr(settings, "all_debrid_enabled", False) is True:
         pairs.append((ALL_DEBRID, getattr(settings, "all_debrid_api_key", "")))
     if getattr(settings, "real_debrid_enabled", False) is True:
         pairs.append((REAL_DEBRID, getattr(settings, "real_debrid_api_token", "")))
+    if TORBOX_FEATURE_AVAILABLE and getattr(settings, "torbox_enabled", False) is True:
+        pairs.append((TORBOX, getattr(settings, "torbox_api_token", "")))
     preferred = _preferred(settings)
     pairs.sort(key=lambda pair: 0 if pair[0] == preferred else 1)
     return pairs
@@ -667,6 +1024,8 @@ def _unrestrict(provider: str, url: str, credential: str, *, session, sleep, clo
         return all_debrid_unrestrict(
             url, credential, session=session, sleep=sleep, clock=clock
         )
+    if provider == TORBOX:
+        return torbox_unrestrict(url, credential, session=session, sleep=sleep, clock=clock)
     return real_debrid_unrestrict(url, credential, session=session)
 
 
@@ -1132,7 +1491,12 @@ def resolve_torrent(
     credential or account failure is not, and is raised so the user finds
     out their key is wrong instead of silently getting no torrent support.
     """
-    providers = _enabled_providers(settings)
+    # TorBox torrent (checkcached / cached-only creation) is TorBox T2 and
+    # is not implemented yet; excluding it here even if a future gate or
+    # test enables it keeps this generic AD/RD torrent probe from routing a
+    # TorBox credential into _probe_cached, which only knows AllDebrid and
+    # Real-Debrid.
+    providers = [p for p in _enabled_providers(settings) if p[0] != TORBOX]
     if not providers:
         return None
 

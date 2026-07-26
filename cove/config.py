@@ -30,10 +30,14 @@ MAX_CONNECTIONS_PER_SERVER = 16
 _LEGACY_RPC_SECRET = "cove"
 
 # Debrid providers Cove can resolve links through. cove.debrid imports these
-# so the accepted setting values and the resolver can't drift apart.
+# so the accepted setting values and the resolver can't drift apart. Order
+# here is also the deterministic fallback order after the preferred provider:
+# cove.debrid._enabled_providers walks this tuple to build the rest of the
+# chain, so appending a provider is what puts it last in that chain.
 DEBRID_ALL_DEBRID = "alldebrid"
 DEBRID_REAL_DEBRID = "real_debrid"
-DEBRID_PROVIDERS = (DEBRID_ALL_DEBRID, DEBRID_REAL_DEBRID)
+DEBRID_TORBOX = "torbox"
+DEBRID_PROVIDERS = (DEBRID_ALL_DEBRID, DEBRID_REAL_DEBRID, DEBRID_TORBOX)
 DEBRID_DEFAULT_PROVIDER = DEBRID_ALL_DEBRID
 
 # What Cove does with a torrent no enabled debrid provider has cached.
@@ -165,7 +169,13 @@ class Settings:
     all_debrid_api_key: str = ""
     real_debrid_enabled: bool = False
     real_debrid_api_token: str = ""
-    debrid_preferred_provider: str = "alldebrid"  # "alldebrid" | "real_debrid"
+    # TorBox: the account setting below only means "the user has enabled and
+    # configured their TorBox account". It is separate from the internal
+    # feature-availability gate in cove.debrid (TORBOX_FEATURE_AVAILABLE),
+    # which stays off until the full feature (hoster + cached torrent) ships.
+    torbox_enabled: bool = False
+    torbox_api_token: str = ""
+    debrid_preferred_provider: str = "alldebrid"  # "alldebrid" | "real_debrid" | "torbox"
     # Torrent support. Magnets and .torrent files are checked against the
     # enabled debrid providers first; anything they don't have cached falls
     # back to Cove's own aria2 BitTorrent engine (see torrent_fallback_mode).
@@ -250,11 +260,11 @@ class Settings:
         # Debrid: a hand-edited or partially-written file must never leave a
         # provider enabled with a non-string credential, or the resolver
         # would try to send it as a bearer header.
-        for flag in ("all_debrid_enabled", "real_debrid_enabled"):
+        for flag in ("all_debrid_enabled", "real_debrid_enabled", "torbox_enabled"):
             if not isinstance(getattr(s, flag), bool):
                 setattr(s, flag, False)
                 changed = True
-        for credential in ("all_debrid_api_key", "real_debrid_api_token"):
+        for credential in ("all_debrid_api_key", "real_debrid_api_token", "torbox_api_token"):
             if not isinstance(getattr(s, credential), str):
                 setattr(s, credential, "")
                 changed = True

@@ -2421,3 +2421,247 @@ def test_metadata_handoff_respects_a_closed_scheduler_window(queue_env, monkeypa
 
     assert queue.tasks[tid].status == "paused"
     assert "gid-child" in rpc.paused
+
+
+# ---------------------------------------------------------------------------
+# TorBox (T1: hoster route, create-once/reuse lifecycle, provider ordering)
+# ---------------------------------------------------------------------------
+
+TORBOX_NODE_URL = "https://cdn-01.torbox.app/dl/secret/movie.mkv"
+
+
+@pytest.fixture(autouse=False)
+def torbox_available(monkeypatch):
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", True)
+
+
+def _torbox_settings(**extra):
+    base = dict(torbox_enabled=True, torbox_api_token="torbox-token-value")
+    base.update(extra)
+    return base
+
+
+def test_first_torbox_success_persists_item_id_and_keeps_original_url(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path = queue_env(**_torbox_settings())
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: Unrestricted(
+            TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id="42"
+        ),
+    )
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+
+    queue._probe_and_add(task)
+
+    assert rpc.added[0]["uris"] == [TORBOX_NODE_URL]
+    assert task.url == ORIGINAL_URL
+    assert task.debrid_route == debrid.TORBOX
+    assert task.debrid_item_id == "42"
+    assert _persisted_url(db_path, tid) == ORIGINAL_URL
+
+    task.status = "active"
+    queue._persist(task)
+    row = _persisted_row(db_path, tid)
+    assert row["debrid_route"] == debrid.TORBOX
+    assert row["debrid_item_id"] == "42"
+    row_text = _persisted_row_text(db_path, tid)
+    assert TORBOX_NODE_URL not in row_text
+    assert "secret" not in row_text
+
+
+def test_torbox_cdn_url_is_not_persisted(queue_env, monkeypatch, torbox_available):
+    queue, _rpc, db_path = queue_env(**_torbox_settings())
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: Unrestricted(
+            TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id="42"
+        ),
+    )
+    tid = queue.add_url(ORIGINAL_URL)
+    queue._probe_and_add(queue.tasks[tid])
+    queue._persist(queue.tasks[tid])
+    assert TORBOX_NODE_URL not in _persisted_row_text(db_path, tid)
+
+
+def test_retry_reuses_the_existing_torbox_item(queue_env, monkeypatch, torbox_available):
+    queue, rpc, _db = queue_env(**_torbox_settings())
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+    task.debrid_route = debrid.TORBOX
+    task.debrid_item_id = "42"
+
+    calls = []
+
+    def fake_refresh(item_id, hoster_url, settings, **kw):
+        calls.append((item_id, hoster_url))
+        return Unrestricted(TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id=item_id)
+
+    monkeypatch.setattr(debrid, "torbox_refresh_web_download", fake_refresh)
+    queue._probe_and_add(task)
+
+    assert calls == [("42", ORIGINAL_URL)]
+    assert task.debrid_item_id == "42"
+    assert rpc.added[0]["uris"] == [TORBOX_NODE_URL]
+
+
+def test_restart_reuses_the_existing_torbox_item(queue_env, monkeypatch, torbox_available):
+    queue, _rpc, _db = queue_env(**_torbox_settings())
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+    task.debrid_route = debrid.TORBOX
+    task.debrid_item_id = "42"
+
+    monkeypatch.setattr(
+        debrid, "torbox_refresh_web_download",
+        lambda item_id, url, settings, **kw: Unrestricted(
+            TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id=item_id
+        ),
+    )
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: fn(*a) if fn is queue._probe_and_add else None)
+    # _launch clears transient fields before resolving; the pinned route
+    # must survive that (debrid_route/debrid_item_id are not transient).
+    queue._launch(task)
+    assert task.debrid_route == debrid.TORBOX
+    assert task.debrid_item_id == "42"
+
+
+def test_missing_remote_item_soft_recreates_and_persists_replacement_id(
+    queue_env, monkeypatch, torbox_available
+):
+    queue, rpc, db_path = queue_env(**_torbox_settings())
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+    task.debrid_route = debrid.TORBOX
+    task.debrid_item_id = "42"
+
+    monkeypatch.setattr(
+        debrid, "torbox_refresh_web_download",
+        lambda item_id, url, settings, **kw: Unrestricted(
+            TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id="99"
+        ),
+    )
+    queue._probe_and_add(task)
+    assert task.debrid_item_id == "99"
+
+    task.status = "active"
+    queue._persist(task)
+    assert _persisted_row(db_path, tid)["debrid_item_id"] == "99"
+
+
+def test_no_concurrent_duplicate_create_when_already_pinned(
+    queue_env, monkeypatch, torbox_available
+):
+    """Once a task is pinned to a TorBox item, a relaunch must go through
+    the reuse/refresh path, never back through resolve() (which would
+    create a second account item)."""
+    queue, _rpc, _db = queue_env(**_torbox_settings())
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+    task.debrid_route = debrid.TORBOX
+    task.debrid_item_id = "42"
+
+    def _resolve_must_not_be_called(*a, **kw):
+        raise AssertionError("resolve() must not run for a pinned TorBox task")
+
+    monkeypatch.setattr(debrid, "resolve", _resolve_must_not_be_called)
+    monkeypatch.setattr(
+        debrid, "torbox_refresh_web_download",
+        lambda item_id, url, settings, **kw: Unrestricted(
+            TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id=item_id
+        ),
+    )
+    queue._probe_and_add(task)  # must not raise
+
+
+def test_torbox_preferred_first_when_gate_is_on(queue_env, monkeypatch, torbox_available):
+    queue, rpc, _db = queue_env(
+        all_debrid_enabled=True, all_debrid_api_key="ad-key",
+        real_debrid_enabled=True, real_debrid_api_token="rd-token",
+        debrid_preferred_provider="torbox",
+        **_torbox_settings(),
+    )
+    order = []
+
+    def fake_resolve(url, settings, **kw):
+        order.append([p for p, _ in debrid._enabled_providers(settings)])
+        return Unrestricted(TORBOX_NODE_URL, "f", 1, debrid.TORBOX, item_id="1")
+
+    monkeypatch.setattr(debrid, "resolve", fake_resolve)
+    tid = queue.add_url(ORIGINAL_URL)
+    queue._probe_and_add(queue.tasks[tid])
+    assert order[0][0] == debrid.TORBOX
+
+
+def test_torbox_second_or_third_in_fallback_order(queue_env, torbox_available):
+    queue, _rpc, _db = queue_env(
+        all_debrid_enabled=True, all_debrid_api_key="ad-key",
+        debrid_preferred_provider="alldebrid",
+        **_torbox_settings(),
+    )
+    order = [p for p, _ in debrid._enabled_providers(queue.settings)]
+    assert order == [ALL_DEBRID, debrid.TORBOX]
+
+
+def test_ad_rd_ordering_regression_unaffected_by_torbox(queue_env):
+    """TorBox gate is off (default) here: existing two-provider ordering
+    must be identical to pre-TorBox behaviour."""
+    queue, _rpc, _db = queue_env(
+        all_debrid_enabled=True, all_debrid_api_key="ad-key",
+        real_debrid_enabled=True, real_debrid_api_token="rd-token",
+        debrid_preferred_provider="real_debrid",
+    )
+    order = [p for p, _ in debrid._enabled_providers(queue.settings)]
+    assert order == [debrid.REAL_DEBRID, debrid.ALL_DEBRID]
+
+
+def test_provider_auth_error_does_not_silently_fall_back(queue_env, monkeypatch, torbox_available):
+    queue, rpc, _db = queue_env(debrid_preferred_provider="torbox", **_torbox_settings())
+
+    def _boom(url, settings, **kw):
+        raise DebridError(debrid.TORBOX, "auth",
+                          "the API token was rejected. Check the token in Settings.")
+
+    monkeypatch.setattr(debrid, "resolve", _boom)
+    tid = queue.add_url(ORIGINAL_URL)
+    with pytest.raises(DebridError):
+        queue._probe_and_add(queue.tasks[tid])
+    assert rpc.added == []
+
+
+def test_torbox_disabled_by_default_gate_gives_current_behavior(queue_env, monkeypatch):
+    """With the availability gate off (the shipped T1 default), enabling
+    torbox_enabled in Settings must have zero routing effect."""
+    queue, rpc, _db = queue_env(**_torbox_settings())
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: None,
+    )
+    monkeypatch.setattr(
+        "requests.head",
+        lambda url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
+    )
+    tid = queue.add_url("https://example.com/plain.zip")
+    queue._probe_and_add(queue.tasks[tid])
+    assert rpc.added[0]["uris"] == ["https://example.com/plain.zip"]
+    assert debrid._enabled_providers(queue.settings) == []
+
+
+def test_pinned_torbox_task_falls_through_when_gate_is_off(queue_env, monkeypatch):
+    """A row pinned to a TorBox item during earlier development testing must
+    not route through torbox_refresh_web_download once the availability
+    gate is off again -- it should fall through to ordinary resolution."""
+    queue, rpc, _db = queue_env()
+    tid = queue.add_url(ORIGINAL_URL)
+    task = queue.tasks[tid]
+    task.debrid_route = debrid.TORBOX
+    task.debrid_item_id = "42"
+
+    def _refresh_must_not_be_called(*a, **kw):
+        raise AssertionError("torbox_refresh_web_download must not run while the gate is off")
+
+    monkeypatch.setattr(debrid, "torbox_refresh_web_download", _refresh_must_not_be_called)
+    queue._probe_and_add(task)  # must not raise
+    assert rpc.added[0]["uris"] == [ORIGINAL_URL]

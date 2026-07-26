@@ -75,6 +75,20 @@ _MIGRATIONS = [
         "ALTER TABLE downloads ADD COLUMN selected_files TEXT NOT NULL DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS idx_downloads_info_hash ON downloads(info_hash)",
     ],
+    # v6 -> v7: third-party debrid provider identifiers (TorBox T1). Purely
+    # additive; every existing row keeps both columns empty and behaves
+    # exactly as before.
+    #
+    #   debrid_item_id  TorBox web-download ID (T1) or torrent ID (T2)
+    #   debrid_file_id  generally empty for T1 hoster rows; TorBox torrent
+    #                   file ID in T2
+    #
+    # Note what is NOT here: no token, no generated CDN URL, no requestdl
+    # URL. Those stay transient, exactly as for existing debrid routes.
+    [
+        "ALTER TABLE downloads ADD COLUMN debrid_item_id TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN debrid_file_id TEXT NOT NULL DEFAULT ''",
+    ],
 ]
 
 

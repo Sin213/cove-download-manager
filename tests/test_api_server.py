@@ -15,6 +15,7 @@ from cove.api_server import (
     ApiProblem,
     LocalApiServer,
     QueueApiBridge,
+    task_snapshot,
     validate_add_payload,
 )
 from cove import config
@@ -473,3 +474,77 @@ def test_windows_packaging_explicitly_includes_api_server():
     assert "--hidden-import cove.api_server" in wine_script.read_text(encoding="utf-8")
     workflow_text = workflow.read_text(encoding="utf-8")
     assert workflow_text.count("--hidden-import cove.api_server") == 2
+
+
+# ---------------------------------------------------------------------------
+# TorBox regression: settings/task serialization boundaries are unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_settings_endpoint_omits_every_debrid_credential_including_torbox(tmp_path):
+    app = QCoreApplication.instance() or QCoreApplication([])
+    settings = Settings(
+        download_dir=str(tmp_path),
+        api_token=TOKEN,
+        api_port=0,
+        all_debrid_enabled=True,
+        all_debrid_api_key="ad-key-value",
+        real_debrid_enabled=True,
+        real_debrid_api_token="rd-token-value",
+        torbox_enabled=True,
+        torbox_api_token="torbox-token-value",
+        debrid_preferred_provider="torbox",
+    )
+    queue = QueueManager(settings, SimpleNamespace())
+    try:
+        bridge = QueueApiBridge(queue)
+        result = bridge._handle("settings", {})
+        for forbidden in (
+            "torbox_enabled", "torbox_api_token", "debrid_preferred_provider",
+            "real_debrid_api_token", "all_debrid_api_key",
+        ):
+            assert forbidden not in result
+    finally:
+        queue._poll.stop()
+        queue._ext_poll.stop()
+        queue._drop_poll.stop()
+
+
+def test_task_snapshot_omits_internal_torbox_identifiers():
+    task = DownloadTask(
+        id=1,
+        url="https://rapidgator.net/f",
+        out_dir="/dl",
+        debrid_route="torbox",
+        debrid_item_id="42",
+        debrid_file_id="",
+        resolved_url="https://cdn-01.torbox.app/dl/secret/f.zip",
+        debrid_provider="torbox",
+    )
+    snapshot = task_snapshot(task)
+    for forbidden in (
+        "debrid_route", "debrid_item_id", "debrid_file_id",
+        "resolved_url", "debrid_provider",
+    ):
+        assert forbidden not in snapshot
+    snapshot_text = json.dumps(snapshot)
+    assert "torbox" not in snapshot_text
+    assert "secret" not in snapshot_text
+
+
+def test_torbox_settings_do_not_broaden_the_add_payload_schema(api_server):
+    """TorBox must not add any new accepted field to POST /downloads: an
+    internal identifier submitted by a client is still an unknown field."""
+    server, _bridge = api_server
+    status, payload = call(
+        server, "POST", "/api/v1/downloads",
+        body={
+            "url": "https://example.com/f.bin",
+            "debrid_route": "torbox",
+            "debrid_item_id": "42",
+            "torbox_api_token": "torbox-token-value",
+        },
+        headers=auth(),
+    )
+    assert status == 400
+    assert payload["error"]["code"] == "unknown_fields"

@@ -60,8 +60,9 @@ class FakeSession:
 
     def _handle(self, method, url, kwargs):
         self.calls.append((method, url, kwargs))
+        bare_url = url.split("?", 1)[0]
         for suffix, value in self.routes.items():
-            if url.endswith(suffix):
+            if url.endswith(suffix) or bare_url.endswith(suffix):
                 if isinstance(value, list):
                     if not value:
                         raise AssertionError(f"no queued response left for {suffix}")
@@ -1808,3 +1809,490 @@ def test_real_debrid_torrent_errors_never_carry_secrets():
     text = f"{excinfo.value} {excinfo.value.user_message}"
     for leaked in ("SECRET", TOKEN, INFO_HASH, RD_LOCKED_1, "rd-1"):
         assert leaked not in text
+
+
+# --------------------------------------------------------------------------
+# TorBox (T1: hoster/web-download route and provider foundation only)
+# --------------------------------------------------------------------------
+
+TORBOX_TOKEN = "torbox-token-SECRET-0123456789"  # gitleaks:allow
+TORBOX_LINK = "https://rapidgator.net/file/1"
+
+
+def _tb_hash(link=TORBOX_LINK):
+    import hashlib
+    return hashlib.md5(link.encode("utf-8")).hexdigest()
+
+
+def _tb_env(data):
+    return _Resp({"success": True, "error": None, "detail": "", "data": data})
+
+
+def _tb_entry(files=None, ready=True):
+    return {
+        "download_present": ready,
+        "download_finished": ready,
+        "files": [{"id": 555, "name": "file.zip", "size": 100}] if files is None else files,
+    }
+
+
+def _tb_settings(**kwargs):
+    base = dict(torbox_enabled=False, torbox_api_token="", debrid_preferred_provider="alldebrid")
+    base.update(kwargs)
+    return Settings(**base)
+
+
+@pytest.fixture
+def torbox_available(monkeypatch):
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", True)
+
+
+# ---- config: settings, ordering, availability gate ------------------------
+
+
+def test_torbox_settings_defaults_are_disabled():
+    s = Settings()
+    assert s.torbox_enabled is False
+    assert s.torbox_api_token == ""
+
+
+def test_torbox_settings_round_trip(settings_env):
+    s = Settings()
+    s.torbox_enabled = True
+    s.torbox_api_token = TORBOX_TOKEN
+    s.debrid_preferred_provider = "torbox"
+    s.save()
+    loaded = Settings.load()
+    assert loaded.torbox_enabled is True
+    assert loaded.torbox_api_token == TORBOX_TOKEN
+    assert loaded.debrid_preferred_provider == "torbox"
+
+
+def test_torbox_settings_type_guards_reset_bad_values(settings_env):
+    Settings().save()
+    raw = json.loads(settings_env.read_text())
+    raw.update({"torbox_enabled": "yes", "torbox_api_token": 12345})
+    settings_env.write_text(json.dumps(raw))
+    loaded = Settings.load()
+    assert loaded.torbox_enabled is False
+    assert loaded.torbox_api_token == ""
+
+
+def test_torbox_preferred_provider_is_accepted_and_round_trips(settings_env):
+    s = Settings()
+    s.debrid_preferred_provider = "torbox"
+    s.save()
+    assert Settings.load().debrid_preferred_provider == "torbox"
+
+
+def test_invalid_preferred_provider_still_resets_to_alldebrid(settings_env):
+    Settings().save()
+    raw = json.loads(settings_env.read_text())
+    raw["debrid_preferred_provider"] = "premiumize"
+    settings_env.write_text(json.dumps(raw))
+    assert Settings.load().debrid_preferred_provider == "alldebrid"
+
+
+def test_torbox_excluded_from_enabled_providers_when_gate_is_off():
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    assert debrid._enabled_providers(settings) == []
+    assert debrid.is_enabled(settings) is False
+
+
+def test_torbox_included_when_gate_and_setting_are_both_on(torbox_available):
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    assert debrid._enabled_providers(settings) == [(debrid.TORBOX, TORBOX_TOKEN)]
+
+
+def test_torbox_disabled_setting_excludes_it_even_with_gate_on(torbox_available):
+    settings = _tb_settings(torbox_enabled=False, torbox_api_token=TORBOX_TOKEN)
+    assert debrid._enabled_providers(settings) == []
+
+
+@pytest.mark.usefixtures("torbox_available")
+@pytest.mark.parametrize("preferred,expected", [
+    ("alldebrid", [ALL_DEBRID, REAL_DEBRID, debrid.TORBOX]),
+    ("real_debrid", [REAL_DEBRID, ALL_DEBRID, debrid.TORBOX]),
+    ("torbox", [debrid.TORBOX, ALL_DEBRID, REAL_DEBRID]),
+])
+def test_three_provider_ordering_is_deterministic(preferred, expected):
+    settings = _settings(
+        all_debrid_enabled=True, all_debrid_api_key=APIKEY,
+        real_debrid_enabled=True, real_debrid_api_token=TOKEN,
+        debrid_preferred_provider=preferred,
+    )
+    settings.torbox_enabled = True
+    settings.torbox_api_token = TORBOX_TOKEN
+    pairs = [p[0] for p in debrid._enabled_providers(settings)]
+    assert pairs == expected
+
+
+def test_two_provider_ordering_is_unchanged_when_torbox_gate_is_off():
+    settings = _settings(
+        all_debrid_enabled=True, all_debrid_api_key=APIKEY,
+        real_debrid_enabled=True, real_debrid_api_token=TOKEN,
+        debrid_preferred_provider="real_debrid",
+    )
+    settings.torbox_enabled = True
+    settings.torbox_api_token = TORBOX_TOKEN
+    pairs = [p[0] for p in debrid._enabled_providers(settings)]
+    assert pairs == [REAL_DEBRID, ALL_DEBRID]
+
+
+# ---- hoster domains ---------------------------------------------------
+
+
+def test_torbox_supported_domains_filters_disabled_hosts():
+    session = FakeSession({
+        "/webdl/hosters": _tb_env([
+            {"name": "RapidGator", "domains": ["rapidgator.net"], "status": True},
+            {"name": "Dead Host", "domains": ["deadhost.example"], "status": False},
+        ]),
+    })
+    assert debrid.torbox_supported_domains(session=session) == ["rapidgator.net"]
+
+
+def test_torbox_domain_matching_is_exact_or_subdomain_not_substring():
+    domains = ["rapidgator.net"]
+    assert debrid.is_supported_domain("https://rapidgator.net/f", domains) is True
+    assert debrid.is_supported_domain("https://cdn.rapidgator.net/f", domains) is True
+    assert debrid.is_supported_domain("https://notrapidgator.net.evil.com/f", domains) is False
+
+
+def test_torbox_is_excluded_as_a_provider_owned_domain():
+    assert debrid.is_provider_domain("https://torbox.app/f/abc") is True
+    assert debrid.is_provider_domain("https://api.torbox.app/v1/api/webdl/requestdl") is True
+
+
+# ---- account test -------------------------------------------------------
+
+
+def test_torbox_account_maps_only_safe_fields():
+    session = FakeSession({
+        "/user/me": _tb_env({
+            "email": "user@example.com",
+            "is_subscribed": True,
+            "premium_expires_at": "2027-01-01T00:00:00Z",
+            "customer": "cus_SECRET123",
+            "auth_id": "auth_SECRET456",
+            "id": 999,
+            "total_downloaded": 123456,
+        }),
+    })
+    account = debrid.torbox_account(TORBOX_TOKEN, session=session)
+    assert account == {
+        "email": "user@example.com",
+        "is_subscribed": True,
+        "expiration": "2027-01-01T00:00:00Z",
+    }
+
+
+def test_torbox_account_invalid_token_is_non_fallback():
+    session = FakeSession({"/user/me": _Resp({"success": False}, 401)})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_account(TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is False
+
+
+def test_torbox_account_malformed_response_is_rejected():
+    session = FakeSession({"/user/me": _Resp("not-json-object")})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_account(TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is False
+
+
+def test_torbox_account_error_never_carries_the_token():
+    session = FakeSession({"/user/me": _Resp({"success": False, "detail": TORBOX_TOKEN}, 401)})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_account(TORBOX_TOKEN, session=session)
+    text = _all_error_text(excinfo.value)
+    assert TORBOX_TOKEN not in text
+    assert "SECRET" not in text
+
+
+# ---- checkcached / create / requestdl -------------------------------------
+
+
+def test_torbox_check_cached_true_when_hash_present():
+    h = _tb_hash()
+    session = FakeSession({"/webdl/checkcached": _tb_env({h: True})})
+    assert debrid._torbox_check_cached(TORBOX_LINK, TORBOX_TOKEN, session=session) is True
+
+
+def test_torbox_check_cached_false_when_hash_absent():
+    session = FakeSession({"/webdl/checkcached": _tb_env({})})
+    assert debrid._torbox_check_cached(TORBOX_LINK, TORBOX_TOKEN, session=session) is False
+
+
+def test_torbox_check_cached_false_on_ambiguous_response():
+    session = FakeSession({"/webdl/checkcached": _tb_env("unexpected-shape")})
+    assert debrid._torbox_check_cached(TORBOX_LINK, TORBOX_TOKEN, session=session) is False
+
+
+def test_torbox_unrestrict_refuses_and_allows_fallback_when_not_cached():
+    h = _tb_hash()
+    session = FakeSession({"/webdl/checkcached": _tb_env({h: False})})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is True
+    assert excinfo.value.host_unsupported is True
+
+
+def test_torbox_unrestrict_does_not_call_create_when_not_cached():
+    h = _tb_hash()
+    session = FakeSession({"/webdl/checkcached": _tb_env({h: False})})
+    with pytest.raises(DebridError):
+        debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+    assert not any("createwebdownload" in url for _, url, _ in session.calls)
+
+
+def test_torbox_unrestrict_creates_then_unlocks_when_cached():
+    h = _tb_hash()
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 42}),
+        "/webdl/mylist": _tb_env(_tb_entry()),
+        "/webdl/requestdl": _tb_env("https://cdn-01.torbox.app/dl/secret/file.zip"),
+    })
+    result = debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+    assert result.provider == debrid.TORBOX
+    assert result.item_id == "42"
+    assert result.filename == "file.zip"
+    assert result.filesize == 100
+    assert result.download == "https://cdn-01.torbox.app/dl/secret/file.zip"
+
+
+def test_torbox_unrestrict_zero_filesize_is_accepted():
+    h = _tb_hash()
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 1}),
+        "/webdl/mylist": _tb_env(_tb_entry(files=[{"id": 1, "name": "f", "size": 0}])),
+        "/webdl/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    result = debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+    assert result.filesize == 0
+
+
+def test_torbox_unrestrict_never_polls_past_the_deadline_and_cleans_up():
+    h = _tb_hash()
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 7}),
+        "/webdl/mylist": [_tb_env(_tb_entry(ready=False)) for _ in range(2)],
+        "/webdl/controlwebdownload": _tb_env(None),
+    })
+    clock = FakeClock()
+    # A sleep that jumps straight past the deadline turns this into a
+    # two-iteration test instead of one iteration per second of real wait.
+    fast_sleep = lambda _s: clock.sleep(debrid.TORBOX_READY_MAX_WAIT)
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_unrestrict(
+            TORBOX_LINK, TORBOX_TOKEN, session=session,
+            sleep=fast_sleep, clock=clock.monotonic,
+        )
+    assert excinfo.value.fallback_allowed is True
+    assert any("controlwebdownload" in url for _, url, _ in session.calls)
+
+
+def test_torbox_create_uses_multipart_form_data():
+    h = _tb_hash()
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 1}),
+        "/webdl/mylist": _tb_env(_tb_entry()),
+        "/webdl/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+    method, url, kwargs = next(c for c in session.calls if "createwebdownload" in c[1])
+    assert method == "POST"
+    assert "files" in kwargs
+    assert kwargs["files"]["link"] == (None, TORBOX_LINK)
+
+
+# ---- requestdl security boundary -------------------------------------------
+
+
+def test_torbox_requestdl_sends_redirect_false_and_disables_auto_redirect():
+    session = FakeSession({"/webdl/requestdl": _tb_env("https://cdn.torbox.app/f")})
+    debrid._torbox_request_dl("webdl", "1", "2", TORBOX_TOKEN, session=session)
+    method, url, kwargs = session.calls[0]
+    assert "redirect=false" in url
+    assert kwargs.get("allow_redirects") is False
+
+
+def test_torbox_requestdl_rejects_its_own_api_host_as_a_delivery_url():
+    session = FakeSession({
+        "/webdl/requestdl": _tb_env("https://api.torbox.app/v1/api/webdl/requestdl?token=x"),
+    })
+    with pytest.raises(DebridError) as excinfo:
+        debrid._torbox_request_dl("webdl", "1", "2", TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is False
+
+
+def test_torbox_requestdl_rejects_credentials_in_the_delivery_url():
+    session = FakeSession({
+        "/webdl/requestdl": _tb_env("https://user:pass@cdn.torbox.app/f"),
+    })
+    with pytest.raises(DebridError):
+        debrid._torbox_request_dl("webdl", "1", "2", TORBOX_TOKEN, session=session)
+
+
+def test_torbox_requestdl_rejects_a_non_http_delivery_url():
+    session = FakeSession({"/webdl/requestdl": _tb_env("ftp://cdn.torbox.app/f")})
+    with pytest.raises(DebridError):
+        debrid._torbox_request_dl("webdl", "1", "2", TORBOX_TOKEN, session=session)
+
+
+def test_torbox_requestdl_transport_failure_discards_the_original_exception_text():
+    class ExplodingSession:
+        def get(self, url, **kwargs):
+            raise Exception(f"connection failed for {url}?token={TORBOX_TOKEN}")
+
+    with pytest.raises(DebridError) as excinfo:
+        debrid._torbox_request_dl("webdl", "1", "2", TORBOX_TOKEN, session=ExplodingSession())
+    text = _all_error_text(excinfo.value)
+    assert TORBOX_TOKEN not in text
+    assert "SECRET" not in text
+    assert excinfo.value.__cause__ is None
+
+
+def test_torbox_requestdl_url_never_reaches_a_raised_error():
+    """The tokenized request URL itself must never appear in any raised
+    DebridError, even on a clean non-transport failure path."""
+    session = FakeSession({"/webdl/requestdl": _Resp({"success": False}, 401)})
+    with pytest.raises(DebridError) as excinfo:
+        debrid._torbox_request_dl("webdl", "1", "2", TORBOX_TOKEN, session=session)
+    text = _all_error_text(excinfo.value)
+    assert TORBOX_TOKEN not in text
+    assert "requestdl" not in text
+
+
+# ---- retry / restart: reuse, missing-item recreate -------------------------
+
+
+def test_torbox_refresh_reuses_the_existing_item_when_ready():
+    session = FakeSession({
+        "/webdl/mylist": _tb_env(_tb_entry()),
+        "/webdl/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    result = debrid.torbox_refresh_web_download("42", TORBOX_LINK, settings, session=session)
+    assert result.item_id == "42"
+    assert not any("createwebdownload" in url for _, url, _ in session.calls)
+
+
+def test_torbox_refresh_soft_recreates_once_when_item_is_missing():
+    h = _tb_hash()
+    session = FakeSession({
+        # First call (by the stale id "42") reports missing; the second
+        # call, made by torbox_unrestrict's own ready-poll against the
+        # freshly created id, reports a ready entry.
+        "/webdl/mylist": [_tb_env(None), _tb_env(_tb_entry())],
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 99}),
+        "/webdl/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    result = debrid.torbox_refresh_web_download("42", TORBOX_LINK, settings, session=session)
+    assert result.item_id == "99"
+
+
+def test_torbox_refresh_does_not_recreate_on_auth_failure():
+    session = FakeSession({"/webdl/mylist": _Resp({"success": False}, 401)})
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_refresh_web_download("42", TORBOX_LINK, settings, session=session)
+    assert excinfo.value.fallback_allowed is False
+    assert not any("createwebdownload" in url for _, url, _ in session.calls)
+
+
+def test_torbox_refresh_does_not_recreate_on_malformed_response():
+    session = FakeSession({"/webdl/mylist": _Resp("not-a-dict")})
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    with pytest.raises(DebridError):
+        debrid.torbox_refresh_web_download("42", TORBOX_LINK, settings, session=session)
+    assert not any("createwebdownload" in url for _, url, _ in session.calls)
+
+
+def test_torbox_refresh_unfinished_item_fails_without_fallback():
+    session = FakeSession({"/webdl/mylist": _tb_env(_tb_entry(ready=False))})
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_refresh_web_download("42", TORBOX_LINK, settings, session=session)
+    assert excinfo.value.fallback_allowed is False
+
+
+def test_torbox_refresh_missing_credential_is_reported():
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token="")
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_refresh_web_download("42", TORBOX_LINK, settings, session=FakeSession({}))
+    assert excinfo.value.provider == debrid.TORBOX
+
+
+# ---- error mapping (HTTP status only; no guessed error-string casing) -----
+
+
+def test_torbox_rate_limit_status_allows_fallback():
+    session = FakeSession({"/user/me": _Resp({"success": False}, 429)})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_account(TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is True
+
+
+def test_torbox_server_error_status_allows_fallback():
+    session = FakeSession({"/user/me": _Resp({"success": False}, 503)})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_account(TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is True
+
+
+def test_torbox_unknown_failure_does_not_allow_fallback():
+    session = FakeSession({"/user/me": _Resp({"success": False}, 418)})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.torbox_account(TORBOX_TOKEN, session=session)
+    assert excinfo.value.fallback_allowed is False
+
+
+# ---- resolve() integration --------------------------------------------
+
+
+def test_resolve_routes_through_torbox_when_preferred(torbox_available):
+    h = _tb_hash()
+    settings = _tb_settings(
+        torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
+        debrid_preferred_provider="torbox",
+    )
+    session = FakeSession({
+        "/webdl/hosters": _tb_env([{"name": "x", "domains": ["rapidgator.net"], "status": True}]),
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 5}),
+        "/webdl/mylist": _tb_env(_tb_entry()),
+        "/webdl/requestdl": _tb_env("https://cdn.torbox.app/f"),
+    })
+    result = debrid.resolve(TORBOX_LINK, settings, session=session)
+    assert result.provider == debrid.TORBOX
+    assert result.item_id == "5"
+
+
+def test_resolve_falls_back_past_torbox_when_host_unsupported(torbox_available):
+    settings = _tb_settings(
+        torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
+        debrid_preferred_provider="torbox",
+        all_debrid_enabled=True, all_debrid_api_key=APIKEY,
+    )
+    session = FakeSession({
+        "/webdl/hosters": _tb_env([{"name": "x", "domains": ["otherhost.example"], "status": True}]),
+        "/hosts/domains": _Resp(["rapidgator.net"]),
+        "/link/unlock": _ok_ad(),
+    })
+    result = debrid.resolve("https://rapidgator.net/f", settings, session=session)
+    assert result.provider == ALL_DEBRID
+
+
+def test_resolve_torrent_excludes_torbox_even_when_gate_is_on(torbox_available):
+    settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
+                             debrid_preferred_provider="torbox")
+    # No AD/RD enabled and TorBox excluded -> nothing to ask, returns None
+    # rather than misrouting a TorBox credential into the AD/RD-only probe.
+    assert debrid.resolve_torrent(INFO_HASH, settings, session=FakeSession({})) is None

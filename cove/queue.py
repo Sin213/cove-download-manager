@@ -138,6 +138,8 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         torrent_name=_row_get(row, "torrent_name", "") or "",
         torrent_path=_row_get(row, "torrent_path", "") or "",
         debrid_route=_row_get(row, "debrid_route", "") or "",
+        debrid_item_id=_row_get(row, "debrid_item_id", "") or "",
+        debrid_file_id=_row_get(row, "debrid_file_id", "") or "",
     )
 
 
@@ -180,6 +182,15 @@ class DownloadTask:
     torrent_name: str = ""
     torrent_path: str = ""
     debrid_route: str = ""
+    # Third-party provider identifiers, persisted by the v7 schema. Empty
+    # for AllDebrid/Real-Debrid, which have no such identity to reuse.
+    #   debrid_item_id  TorBox web-download ID (T1) this task is pinned to,
+    #                   so a retry/restart reuses it instead of creating
+    #                   another one.
+    #   debrid_file_id  reserved for TorBox torrent files (T2); always ''
+    #                   for an ordinary hoster row.
+    debrid_item_id: str = ""
+    debrid_file_id: str = ""
     # Transient debrid state, deliberately absent from the 'downloads'
     # table and from _task_from_persisted_row. `resolved_url` is a
     # short-lived secret on the provider's delivery node: it is handed to
@@ -473,7 +484,8 @@ class QueueManager(QObject):
                 """
                 UPDATE downloads
                 SET filename=?, status=?, gid=?, total_bytes=?, completed_bytes=?,
-                    error=?, finished_at=?, segments=?, out_dir=?
+                    error=?, finished_at=?, segments=?, out_dir=?,
+                    debrid_route=?, debrid_item_id=?, debrid_file_id=?
                 WHERE id=?
                 """,
                 (
@@ -486,6 +498,9 @@ class QueueManager(QObject):
                     t.finished_at,
                     t.segments,
                     t.out_dir,
+                    t.debrid_route,
+                    t.debrid_item_id,
+                    t.debrid_file_id,
                     t.id,
                 ),
             )
@@ -1982,6 +1997,34 @@ class QueueManager(QObject):
             if result.filesize > 0:
                 t.total_bytes = result.filesize
             return result.download
+        if (
+            t.source_type == SOURCE_PLAIN
+            and t.debrid_route == debrid.TORBOX
+            and t.debrid_item_id
+            and debrid.TORBOX_FEATURE_AVAILABLE
+        ):
+            # Pinned to a TorBox web-download item from an earlier launch:
+            # reuse/refresh it instead of asking resolve() to create
+            # another one. A missing remote item soft-recreates once inside
+            # torbox_refresh_web_download and comes back with a replacement
+            # item_id, which is persisted here exactly like the original.
+            #
+            # The availability-gate check keeps this authoritative: with the
+            # gate off (the shipped T1 default), a row pinned during earlier
+            # development testing falls through to the branches below
+            # instead of calling into a hidden, unsupported provider.
+            result = debrid.torbox_refresh_web_download(
+                t.debrid_item_id, t.url, self.settings
+            )
+            t.resolved_url = result.download
+            t.debrid_provider = result.provider
+            if result.item_id:
+                t.debrid_item_id = result.item_id
+            if not t.filename and result.filename:
+                t.filename = result.filename
+            if result.filesize > 0:
+                t.total_bytes = result.filesize
+            return result.download
         if not self._debrid_enabled():
             return t.url
         result = debrid.resolve(t.url, self.settings)
@@ -1992,6 +2035,13 @@ class QueueManager(QObject):
         # re-resolves. Only the transient fields learn about the node URL.
         t.resolved_url = result.download
         t.debrid_provider = result.provider
+        if result.provider == debrid.TORBOX and result.item_id:
+            # First-time TorBox hoster success: pin this task to the
+            # created item so a retry/restart reuses it instead of creating
+            # another one. t.url (the original hoster link) is untouched.
+            t.debrid_route = debrid.TORBOX
+            t.debrid_item_id = result.item_id
+            t.debrid_file_id = ""
         if not t.filename and result.filename:
             # Empty means nobody chose a name: add_url stores None unless the
             # user (or the extension) explicitly supplied one, so a non-empty

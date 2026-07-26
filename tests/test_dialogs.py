@@ -303,6 +303,191 @@ def test_debrid_account_labels_never_render_provider_markup(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# TorBox (T1: gated behind cove.debrid.TORBOX_FEATURE_AVAILABLE)
+# ---------------------------------------------------------------------------
+
+TORBOX_SCRIPT = r'''
+import json, sys
+from PySide6.QtCore import Qt, QThreadPool
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = sys.argv[1]
+config.CONFIG_DIR = __import__("pathlib").Path(tmp)
+config.DATA_DIR = __import__("pathlib").Path(tmp)
+config.CONFIG_FILE = __import__("pathlib").Path(tmp) / "settings.json"
+
+from cove import debrid
+from cove.config import Settings
+from cove.debrid import DEBRID_TORBOX, DebridError
+from cove.dialogs import SettingsDialog
+
+def _no_network(*a, **k):
+    raise AssertionError("live provider request attempted")
+for name in ("get", "post", "head", "put", "request"):
+    setattr(debrid.requests, name, _no_network)
+
+TB_TOKEN = "torbox-token-SECRETVALUE"
+
+app = QApplication([])
+out = {}
+
+def _drain():
+    for _ in range(100):
+        app.processEvents()
+        if QThreadPool.globalInstance().waitForDone(200):
+            break
+    app.processEvents()
+    app.processEvents()
+
+# ---- gate off (default): controls hidden, no combo entry -----------------
+gated_off = SettingsDialog(Settings())
+out["hidden_when_gate_off"] = gated_off.torbox_container.isHidden()
+out["combo_options_gate_off"] = [
+    gated_off.debrid_preferred.itemData(i)
+    for i in range(gated_off.debrid_preferred.count())
+]
+gated_off.close()
+
+# A stored "torbox" preference survives an unrelated Save while the gate
+# is off, instead of being silently reset to AllDebrid.
+preexisting = Settings(debrid_preferred_provider="torbox")
+gated_off_save = SettingsDialog(preexisting)
+gated_off_save.ad_enabled.setChecked(True)
+gated_off_save.ad_key.setText("somekey")
+gated_off_save._on_accept()
+out["preserved_torbox_preference_when_gate_off"] = preexisting.debrid_preferred_provider
+gated_off_save.close()
+
+# ---- gate on: everything below runs with TorBox available ----------------
+debrid.TORBOX_FEATURE_AVAILABLE = True
+
+loaded = SettingsDialog(Settings(
+    torbox_enabled=True, torbox_api_token=TB_TOKEN,
+    debrid_preferred_provider="torbox",
+))
+out["visible_when_gate_on"] = not loaded.torbox_container.isHidden()
+out["tb_enabled"] = loaded.torbox_enabled_cb.isChecked()
+out["tb_token"] = loaded.torbox_token.text()
+out["tb_masked"] = loaded.torbox_token.echoMode() == loaded.torbox_token.EchoMode.Password
+out["preferred"] = loaded.debrid_preferred.currentData()
+out["combo_options_gate_on"] = [
+    loaded.debrid_preferred.itemData(i) for i in range(loaded.debrid_preferred.count())
+]
+# Existing AD/RD controls are unaffected by TorBox being present.
+out["ad_enabled_untouched"] = loaded.ad_enabled.isChecked()
+loaded.close()
+
+settings = Settings()
+dialog = SettingsDialog(settings)
+dialog.torbox_enabled_cb.setChecked(True)
+dialog.torbox_token.setText("  " + TB_TOKEN + "  ")
+dialog.debrid_preferred.setCurrentIndex(dialog.debrid_preferred.findData(DEBRID_TORBOX))
+dialog._on_accept()
+out["saved"] = {
+    "torbox_enabled": settings.torbox_enabled,
+    "torbox_api_token": settings.torbox_api_token,
+    "preferred": settings.debrid_preferred_provider,
+}
+
+# ---- account test: success ------------------------------------------------
+debrid.torbox_account = lambda token, **kw: {
+    "email": "user@example.com", "is_subscribed": True,
+    "expiration": "2027-01-01T00:00:00.000Z",
+}
+tester = SettingsDialog(Settings(torbox_enabled=True, torbox_api_token=TB_TOKEN))
+tester.torbox_test.click()
+out["tb_button_disabled_during_test"] = not tester.torbox_test.isEnabled()
+_drain()
+out["tb_success_text"] = tester.torbox_result.text()
+out["tb_button_restored"] = tester.torbox_test.isEnabled()
+out["tb_result_plain"] = tester.torbox_result.textFormat() == Qt.PlainText
+
+# ---- account test: failure -------------------------------------------------
+def _bad_token(token, **kw):
+    raise DebridError(DEBRID_TORBOX, "auth",
+                      "the API token was rejected. Check the token in Settings.")
+debrid.torbox_account = _bad_token
+tester.torbox_test.click()
+_drain()
+out["tb_failure_text"] = tester.torbox_result.text()
+
+# ---- an unexpected provider crash is still sanitized -----------------------
+def _explode(token, **kw):
+    raise RuntimeError("boom with token " + TB_TOKEN)
+debrid.torbox_account = _explode
+tester.torbox_test.click()
+_drain()
+out["tb_crash_text"] = tester.torbox_result.text()
+
+tester.close()
+print(json.dumps(out))
+'''
+
+
+def _run_torbox_dialog_script(tmp_path):
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", TORBOX_SCRIPT, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr[-4000:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_torbox_controls_hidden_and_excluded_from_combo_while_gate_is_off(tmp_path):
+    m = _run_torbox_dialog_script(tmp_path)
+    assert m["hidden_when_gate_off"] is True
+    assert m["combo_options_gate_off"] == ["alldebrid", "real_debrid"]
+    assert m["preserved_torbox_preference_when_gate_off"] == "torbox"
+
+
+def test_torbox_controls_available_when_gate_is_on(tmp_path):
+    m = _run_torbox_dialog_script(tmp_path)
+    assert m["visible_when_gate_on"] is True
+    assert m["tb_enabled"] is True
+    assert m["tb_token"] == "torbox-token-SECRETVALUE"
+    assert m["tb_masked"] is True
+    assert m["preferred"] == "torbox"
+    assert m["combo_options_gate_on"] == ["alldebrid", "real_debrid", "torbox"]
+    assert m["ad_enabled_untouched"] is False
+
+
+def test_torbox_checkbox_and_masked_token_load_and_save(tmp_path):
+    m = _run_torbox_dialog_script(tmp_path)
+    assert m["saved"] == {
+        "torbox_enabled": True,
+        "torbox_api_token": "torbox-token-SECRETVALUE",
+        "preferred": "torbox",
+    }
+
+
+def test_torbox_account_test_reports_sanitized_results(tmp_path):
+    m = _run_torbox_dialog_script(tmp_path)
+    assert m["tb_button_disabled_during_test"] is True
+    assert m["tb_button_restored"] is True
+    assert m["tb_result_plain"] is True
+    assert "user@example.com" in m["tb_success_text"]
+    assert "Subscribed" in m["tb_success_text"]
+
+    assert "TorBox" in m["tb_failure_text"]
+    assert "API token was rejected" in m["tb_failure_text"]
+
+    assert "SECRETVALUE" not in m["tb_crash_text"]
+    assert "RuntimeError" not in m["tb_crash_text"]
+    assert m["tb_crash_text"]
+
+    for key in ("tb_success_text", "tb_failure_text", "tb_crash_text"):
+        assert "SECRETVALUE" not in m[key], key
+
+
+# ---------------------------------------------------------------------------
 # Torrent input (hidden unless torrent_support_enabled)
 # ---------------------------------------------------------------------------
 

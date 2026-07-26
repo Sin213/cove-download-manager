@@ -37,6 +37,7 @@ from .config import (
     CONNECTION_CHOICES,
     DEBRID_ALL_DEBRID,
     DEBRID_REAL_DEBRID,
+    DEBRID_TORBOX,
     TORRENT_FALLBACK_AUTOMATIC,
     TORRENT_FALLBACK_NEVER,
     ScheduleWindow,
@@ -51,6 +52,7 @@ from .speed_limit import (
 
 ALL_DEBRID_KEY_URL = "https://alldebrid.com/apikeys/"
 REAL_DEBRID_TOKEN_URL = "https://real-debrid.com/apitoken"
+TORBOX_TOKEN_URL = "https://torbox.app/settings"
 
 # Account tests are pinned here rather than on the dialog so a runnable
 # still in flight survives the dialog closing. The queue module documents
@@ -136,6 +138,14 @@ def _account_summary(provider: str, account: object) -> str:
         else:
             parts.append("Free")
         expires = _format_epoch(account.get("premium_until"))
+        if expires:
+            parts.append(f"until {expires}")
+    elif provider == DEBRID_TORBOX:
+        email = account.get("email")
+        if isinstance(email, str) and email:
+            parts.append(email)
+        parts.append("Subscribed" if account.get("is_subscribed") is True else "Free")
+        expires = _format_iso_date(account.get("expiration"))
         if expires:
             parts.append(f"until {expires}")
     else:
@@ -611,9 +621,41 @@ class SettingsDialog(QDialog):
         debrid_lay.addRow("", self.rd_result)
         debrid_lay.addRow("", _link_label("Get a Real-Debrid API token", REAL_DEBRID_TOKEN_URL))
 
+        # TorBox: hidden/disabled for ordinary users until the T2 slice
+        # ships (cove.debrid.TORBOX_FEATURE_AVAILABLE). Kept as one
+        # container so the whole block toggles together while still living
+        # inside this same Debrid services group, matching AD/RD.
+        self.torbox_container = QWidget()
+        torbox_form = QFormLayout(self.torbox_container)
+        torbox_form.setContentsMargins(0, 0, 0, 0)
+        torbox_form.setSpacing(8)
+        self.torbox_enabled_cb = QCheckBox("Enable TorBox")
+        self.torbox_enabled_cb.setChecked(getattr(settings, "torbox_enabled", False) is True)
+        self.torbox_enabled_cb.toggled.connect(self._on_debrid_toggled)
+        torbox_form.addRow(self.torbox_enabled_cb)
+        self.torbox_token = QLineEdit(getattr(settings, "torbox_api_token", ""))
+        self.torbox_token.setEchoMode(QLineEdit.Password)
+        self.torbox_token.setPlaceholderText("API token")
+        self.torbox_test = QPushButton("Test")
+        self.torbox_test.clicked.connect(self._test_torbox)
+        torbox_row = QHBoxLayout()
+        torbox_row.addWidget(self.torbox_token, 1)
+        torbox_row.addWidget(self.torbox_test)
+        torbox_form.addRow("TorBox API token", torbox_row)
+        self.torbox_result = QLabel("")
+        self.torbox_result.setProperty("role", "muted")
+        self.torbox_result.setWordWrap(True)
+        self.torbox_result.setTextFormat(Qt.PlainText)
+        torbox_form.addRow("", self.torbox_result)
+        torbox_form.addRow("", _link_label("Get a TorBox API token", TORBOX_TOKEN_URL))
+        debrid_lay.addRow(self.torbox_container)
+        self.torbox_container.setVisible(debrid.TORBOX_FEATURE_AVAILABLE)
+
         self.debrid_preferred = QComboBox()
         self.debrid_preferred.addItem("AllDebrid first", DEBRID_ALL_DEBRID)
         self.debrid_preferred.addItem("Real-Debrid first", DEBRID_REAL_DEBRID)
+        if debrid.TORBOX_FEATURE_AVAILABLE:
+            self.debrid_preferred.addItem("TorBox first", DEBRID_TORBOX)
         idx = self.debrid_preferred.findData(settings.debrid_preferred_provider)
         self.debrid_preferred.setCurrentIndex(idx if idx >= 0 else 0)
         debrid_lay.addRow("Try first", self.debrid_preferred)
@@ -751,6 +793,7 @@ class SettingsDialog(QDialog):
         for enabled_box, edit, test in (
             (self.ad_enabled, self.ad_key, self.ad_test),
             (self.rd_enabled, self.rd_token, self.rd_test),
+            (self.torbox_enabled_cb, self.torbox_token, self.torbox_test),
         ):
             on = enabled_box.isChecked()
             edit.setEnabled(on)
@@ -777,6 +820,12 @@ class SettingsDialog(QDialog):
             self.rd_token.text().strip(), debrid.real_debrid_account,
         )
 
+    def _test_torbox(self) -> None:
+        self._run_account_test(
+            DEBRID_TORBOX, self.torbox_test, self.torbox_result,
+            self.torbox_token.text().strip(), debrid.torbox_account,
+        )
+
     def _run_account_test(self, provider, button, result, credential, fn) -> None:
         label = debrid.provider_label(provider)
         if not credential:
@@ -800,6 +849,8 @@ class SettingsDialog(QDialog):
     def _debrid_widgets(self, provider):
         if provider == DEBRID_ALL_DEBRID:
             return self.ad_test, self.ad_result
+        if provider == DEBRID_TORBOX:
+            return self.torbox_test, self.torbox_result
         return self.rd_test, self.rd_result
 
     def _finish_account_test(self, provider, message: str) -> None:
@@ -849,7 +900,15 @@ class SettingsDialog(QDialog):
         self.settings.all_debrid_api_key = self.ad_key.text().strip()
         self.settings.real_debrid_enabled = self.rd_enabled.isChecked()
         self.settings.real_debrid_api_token = self.rd_token.text().strip()
-        self.settings.debrid_preferred_provider = self.debrid_preferred.currentData()
+        self.settings.torbox_enabled = self.torbox_enabled_cb.isChecked()
+        self.settings.torbox_api_token = self.torbox_token.text().strip()
+        # The combo has no "TorBox first" entry while the feature gate is
+        # off, so its currentData() can never be "torbox" in that state.
+        # Saving it unconditionally would then silently reset a previously
+        # stored TorBox preference (e.g. set during T1 development testing)
+        # back to AllDebrid every time Settings is saved.
+        if debrid.TORBOX_FEATURE_AVAILABLE or self.settings.debrid_preferred_provider != DEBRID_TORBOX:
+            self.settings.debrid_preferred_provider = self.debrid_preferred.currentData()
         self.settings.torrent_support_enabled = self.torrent_enabled.isChecked()
         self.settings.torrent_fallback_mode = self.torrent_fallback.currentData()
         self.settings.torrent_allow_with_proxy = self.torrent_proxy_override.isChecked()

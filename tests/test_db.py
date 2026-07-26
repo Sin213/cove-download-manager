@@ -205,3 +205,136 @@ def test_torrent_file_row_persists_the_locked_link_only(tmp_path):
         assert forbidden not in cols
     joined = " ".join(str(row[k]) for k in row.keys())
     assert "debrid.it" not in joined
+
+
+# ---------------------------------------------------------------------------
+# v6 -> v7: third-party debrid provider identifiers (TorBox T1)
+# ---------------------------------------------------------------------------
+
+_PROVIDER_ID_COLUMNS = ("debrid_item_id", "debrid_file_id")
+
+TORBOX_ITEM_ID = "42"
+
+
+def _v6_db(path):
+    """A database at the previous schema version, with one existing row."""
+    _v5_db(path)
+    conn = sqlite3.connect(path)
+    for sql in (
+        "ALTER TABLE downloads ADD COLUMN source_type TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN info_hash TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN torrent_name TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN torrent_path TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN debrid_route TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN selected_files TEXT NOT NULL DEFAULT ''",
+    ):
+        conn.execute(sql)
+    conn.execute("PRAGMA user_version = 6")
+    conn.commit()
+    conn.close()
+
+
+def test_fresh_database_has_the_provider_id_columns(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    cols = _columns(path)
+    for name in _PROVIDER_ID_COLUMNS:
+        assert name in cols
+
+
+def test_v6_database_gains_the_provider_id_columns(tmp_path):
+    path = tmp_path / "cove.db"
+    _v6_db(path)
+    db.init(path)
+    cols = _columns(path)
+    for name in _PROVIDER_ID_COLUMNS:
+        assert name in cols
+    with db.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == len(db._MIGRATIONS)
+
+
+def test_v7_migration_is_idempotent(tmp_path):
+    path = tmp_path / "cove.db"
+    _v6_db(path)
+    db.init(path)
+    db.init(path)
+    db.init(path)
+    cols = _columns(path)
+    for name in _PROVIDER_ID_COLUMNS:
+        assert cols.count(name) == 1
+
+
+def test_existing_rows_gain_empty_provider_id_defaults(tmp_path):
+    path = tmp_path / "cove.db"
+    _v6_db(path)
+    db.init(path)
+    with db.connect(path) as conn:
+        row = conn.execute("SELECT * FROM downloads").fetchone()
+    for name in _PROVIDER_ID_COLUMNS:
+        assert row[name] == ""
+
+
+def test_torbox_hoster_item_id_round_trips(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    with db.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO downloads (url, out_dir, created_at, debrid_route, "
+            "debrid_item_id) VALUES (?,?,?,?,?)",
+            ("https://rapidgator.net/f", "/dl", time.time(), "torbox", TORBOX_ITEM_ID),
+        )
+    with db.connect(path) as conn:
+        row = conn.execute("SELECT * FROM downloads").fetchone()
+    assert row["debrid_route"] == "torbox"
+    assert row["debrid_item_id"] == TORBOX_ITEM_ID
+    assert row["debrid_file_id"] == ""
+
+
+def test_alldebrid_and_real_debrid_rows_keep_empty_provider_ids(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    with db.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO downloads (url, out_dir, created_at, source_type, "
+            "info_hash, torrent_name, debrid_route) VALUES (?,?,?,?,?,?,?)",
+            (LOCKED_LINK, "/dl", time.time(), "torrent_file", INFO_HASH,
+             "Season 1", "alldebrid"),
+        )
+        conn.execute(
+            "INSERT INTO downloads (url, out_dir, created_at, debrid_route) "
+            "VALUES (?,?,?,?)",
+            ("https://real-debrid.com/d/x", "/dl", time.time(), "real_debrid"),
+        )
+    with db.connect(path) as conn:
+        rows = conn.execute(
+            "SELECT debrid_route, debrid_item_id, debrid_file_id "
+            "FROM downloads ORDER BY id"
+        ).fetchall()
+    for row in rows:
+        assert row["debrid_item_id"] == ""
+        assert row["debrid_file_id"] == ""
+
+
+def test_no_transient_delivery_url_column_exists(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    cols = _columns(path)
+    for forbidden in ("resolved_url", "download_url", "cdn_url", "requestdl_url"):
+        assert forbidden not in cols
+
+
+def test_no_torbox_token_column_or_content_exists(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    cols = _columns(path)
+    for forbidden in ("torbox_api_token", "api_token", "token"):
+        assert forbidden not in cols
+    with db.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO downloads (url, out_dir, created_at, debrid_route, "
+            "debrid_item_id) VALUES (?,?,?,?,?)",
+            ("https://rapidgator.net/f", "/dl", time.time(), "torbox", TORBOX_ITEM_ID),
+        )
+        row = conn.execute("SELECT * FROM downloads").fetchone()
+    joined = " ".join(str(row[k]) for k in row.keys())
+    assert "torbox-token" not in joined
