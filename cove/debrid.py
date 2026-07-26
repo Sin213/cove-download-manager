@@ -60,7 +60,7 @@ PROVIDER_LABELS = {REAL_DEBRID: "Real-Debrid", ALL_DEBRID: "AllDebrid", TORBOX: 
 # never sees a half-finished provider. Tests may monkeypatch this module
 # attribute to True to exercise the gated code paths; it is not a Settings
 # field because it describes what Cove ships, not what the user chose.
-TORBOX_FEATURE_AVAILABLE = False
+TORBOX_FEATURE_AVAILABLE = True
 
 RD_BASE = "https://api.real-debrid.com/rest/1.0"
 AD_BASE = "https://api.alldebrid.com/v4"

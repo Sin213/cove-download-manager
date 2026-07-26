@@ -48,9 +48,9 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 - **Browser extension** - intercept downloads from Firefox, Chrome, and
   their derivatives (Zen, LibreWolf, Edge, Brave, and more). See
   [Browser Extension](#browser-extension).
-- **Debrid accounts** - optional Real-Debrid and AllDebrid integration.
-  Links on hosts your account supports are resolved automatically before
-  downloading. See [Debrid services](#debrid-services).
+- **Debrid accounts** - optional Real-Debrid, AllDebrid, and TorBox
+  integration. Links on hosts your account supports are resolved
+  automatically before downloading. See [Debrid services](#debrid-services).
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
 - **In-page video pill** - a floating "Download with Cove" pill appears on
@@ -173,19 +173,22 @@ explicit click, and DRM-protected media remains unsupported.
 
 ## Debrid services
 
-Cove can download through a **Real-Debrid** or **AllDebrid** account. Both
-are optional and off by default; with neither enabled, nothing about
-downloading changes.
+Cove can download through a **Real-Debrid**, **AllDebrid**, or **TorBox**
+account. All three are optional and off by default; with none enabled,
+nothing about downloading changes.
 
 Configure them in **Settings -> Debrid services**:
 
 - Tick **Enable AllDebrid** and paste an API key from
-  <https://alldebrid.com/apikeys/>, and/or tick **Enable Real-Debrid** and
-  paste an API token from <https://real-debrid.com/apitoken>. Each
-  provider works on its own; you do not need both.
+  <https://alldebrid.com/apikeys/>, tick **Enable Real-Debrid** and paste an
+  API token from <https://real-debrid.com/apitoken>, and/or tick **Enable
+  TorBox** and paste an API token generated from your TorBox account
+  settings. Each provider works on its own; you do not need all three.
 - **Test** verifies the credential and shows the account name and plan.
-- **Try first** picks which provider handles a link both accounts support.
-  The default is AllDebrid first.
+- **Try first** picks which provider handles a link multiple enabled
+  accounts support. The default is AllDebrid first.
+- TorBox hoster downloads and cached torrents are supported. TorBox Usenet
+  is not.
 
 When a download starts, Cove checks the URL's host against the provider's
 published host list. If the host is supported, the original link is
@@ -233,12 +236,13 @@ a torrent by pasting a magnet link or by choosing **Add torrent file...**
 
 What happens to a torrent you add:
 
-1. If an enabled AllDebrid or Real-Debrid account already has the torrent
-   cached, Cove downloads the files over **HTTPS** through your account. No
-   swarm is joined and your IP address is not shared with peers.
+1. If an enabled AllDebrid, Real-Debrid, or TorBox account already has the
+   torrent cached, Cove downloads the files over **HTTPS** through your
+   account. No swarm is joined and your IP address is not shared with peers.
 2. If no enabled provider has it cached - or you have no provider
-   configured - Cove downloads it locally through its own **built-in aria2
-   BitTorrent engine**.
+   configured - Cove falls back to its own **built-in aria2 BitTorrent
+   engine** and downloads it locally. Cove does not wait for TorBox (or any
+   other provider) to cloud-download an uncached torrent first.
 
 ### What local BitTorrent means for your privacy
 

@@ -1905,7 +1905,8 @@ def test_invalid_preferred_provider_still_resets_to_alldebrid(settings_env):
     assert Settings.load().debrid_preferred_provider == "alldebrid"
 
 
-def test_torbox_excluded_from_enabled_providers_when_gate_is_off():
+def test_torbox_excluded_from_enabled_providers_when_gate_is_off(monkeypatch):
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", False)
     settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN)
     assert debrid._enabled_providers(settings) == []
     assert debrid.is_enabled(settings) is False
@@ -1939,7 +1940,8 @@ def test_three_provider_ordering_is_deterministic(preferred, expected):
     assert pairs == expected
 
 
-def test_two_provider_ordering_is_unchanged_when_torbox_gate_is_off():
+def test_two_provider_ordering_is_unchanged_when_torbox_gate_is_off(monkeypatch):
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", False)
     settings = _settings(
         all_debrid_enabled=True, all_debrid_api_key=APIKEY,
         real_debrid_enabled=True, real_debrid_api_token=TOKEN,
@@ -2302,7 +2304,8 @@ def test_resolve_falls_back_past_torbox_when_host_unsupported(torbox_available):
     assert result.provider == ALL_DEBRID
 
 
-def test_resolve_torrent_excludes_torbox_when_gate_is_off():
+def test_resolve_torrent_excludes_torbox_when_gate_is_off(monkeypatch):
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", False)
     settings = _tb_settings(torbox_enabled=True, torbox_api_token=TORBOX_TOKEN,
                              debrid_preferred_provider="torbox")
     # Gate is off (the default): TorBox never enters _enabled_providers, so

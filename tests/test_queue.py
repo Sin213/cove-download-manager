@@ -2634,6 +2634,7 @@ def test_provider_auth_error_does_not_silently_fall_back(queue_env, monkeypatch,
 def test_torbox_disabled_by_default_gate_gives_current_behavior(queue_env, monkeypatch):
     """With the availability gate off (the shipped T1 default), enabling
     torbox_enabled in Settings must have zero routing effect."""
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", False)
     queue, rpc, _db = queue_env(**_torbox_settings())
     monkeypatch.setattr(
         debrid, "resolve",
@@ -2653,6 +2654,7 @@ def test_pinned_torbox_task_falls_through_when_gate_is_off(queue_env, monkeypatc
     """A row pinned to a TorBox item during earlier development testing must
     not route through torbox_refresh_web_download once the availability
     gate is off again -- it should fall through to ordinary resolution."""
+    monkeypatch.setattr(debrid, "TORBOX_FEATURE_AVAILABLE", False)
     queue, rpc, _db = queue_env()
     tid = queue.add_url(ORIGINAL_URL)
     task = queue.tasks[tid]

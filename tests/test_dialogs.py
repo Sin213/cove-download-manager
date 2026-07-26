@@ -90,6 +90,10 @@ from cove.config import Settings
 from cove.debrid import ALL_DEBRID, REAL_DEBRID, DebridError
 from cove.dialogs import SettingsDialog
 
+# This script only exercises AD/RD controls, so force TorBox off regardless
+# of the shipped module default.
+debrid.TORBOX_FEATURE_AVAILABLE = False
+
 # Any real network call is a test failure, not a slow test.
 def _no_network(*a, **k):
     raise AssertionError("live provider request attempted")
@@ -340,7 +344,8 @@ def _drain():
     app.processEvents()
     app.processEvents()
 
-# ---- gate off (default): controls hidden, no combo entry -----------------
+# ---- gate off: controls hidden, no combo entry ----------------------------
+debrid.TORBOX_FEATURE_AVAILABLE = False
 gated_off = SettingsDialog(Settings())
 out["hidden_when_gate_off"] = gated_off.torbox_container.isHidden()
 out["combo_options_gate_off"] = [
