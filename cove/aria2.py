@@ -184,7 +184,15 @@ class Aria2Daemon:
                     time.sleep(0.1)
         finally:
             client.close()
+        our_proc_died = self._proc.poll() is not None
         self.stop()
+        if our_proc_died and "unauthorized" in str(last_err).lower():
+            raise Aria2Error(
+                "Another aria2 process is already using port "
+                f"{self.settings.rpc_port}. Quit it (check your process list "
+                "for a leftover aria2c) or change the RPC port in Cove's "
+                "settings, then restart Cove."
+            )
         raise Aria2Error(f"aria2 RPC did not come up: {last_err}")
 
     def _build_proxy_url(self) -> str:
