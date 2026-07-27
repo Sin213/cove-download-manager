@@ -340,28 +340,14 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.0.0
+          ## What's new in 3.0.1
 
-          Major release: debrid account integration and built-in BitTorrent support, including TorBox.
-
-          ### Added - debrid accounts
-
-          - Real-Debrid, AllDebrid, and TorBox accounts can be enabled in Settings, Debrid services. Hoster links on a supported host are resolved through your account automatically before downloading, giving you the provider's filename, file size, and a full speed multi connection download instead of a direct fetch.
-          - Test in Settings verifies a credential and shows the account name and plan without ever exposing the token itself.
-          - Try first controls which provider handles a link that more than one enabled account supports.
-          - Account bound debrid share or landing links are rejected with a clear message telling you to add the original hoster link instead, rather than silently saving the provider's error page as a file.
-
-          ### Added - built in torrents
-
-          - Cove now handles torrents itself. No external torrent client is ever launched, and every torrent appears in Cove's own list with the same progress, pause, resume, retry, and remove controls as any other download.
-          - Add a magnet link or a `.torrent` file, or drop a `.torrent` onto the window.
-          - If an enabled Real-Debrid, AllDebrid, or TorBox account already has the torrent cached, Cove downloads the files over HTTPS through your account. No swarm is joined and your IP address is not shared with peers.
-          - If no enabled provider has it cached, Cove falls back to its own built in aria2 BitTorrent engine and downloads it locally. A one time privacy notice explains what local peer to peer downloading means before it starts.
-          - Managed `.torrent` copies are stored keyed by info hash so local torrents survive a restart.
+          Emergency patch for a debrid bypass introduced in 3.0.0. If you have Real-Debrid, AllDebrid, or TorBox enabled, update as soon as possible.
 
           ### Fixed
 
-          - aria2 startup now gives a clear error instead of failing silently when a leftover aria2 daemon is already holding the RPC port.
+          - Downloads sent to Cove from the browser extension (auto intercepted downloads, right click Download with Cove, the in page media pill, and the keyboard shortcut) now resolve through an enabled Real-Debrid, AllDebrid, or TorBox account, the same way a link pasted directly into Cove already did. In 3.0.0 these were added straight to aria2 with no debrid resolution, so a debrid supported hoster link silently downloaded the host's small unauthenticated response page instead of the real file.
+          - The Firefox extension's right click Download with Cove menu item no longer disappears after restarting the browser. It was only registered when the extension was installed or updated, and Firefox does not keep a persistent background page's menu items across a normal restart.
 
           ## Downloads
 
