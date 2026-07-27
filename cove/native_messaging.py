@@ -94,8 +94,8 @@ def handle_message(
     if action == "download":
         url = msg.get("url", "")
         # Normalize once so the same URL that passed validation is the one
-        # forwarded to aria2 / the drop file (validation checks a stripped
-        # copy, so an untrimmed original could slip through otherwise).
+        # forwarded to the drop file (validation checks a stripped copy, so
+        # an untrimmed original could slip through otherwise).
         if isinstance(url, str):
             url = url.strip()
         if not validate_url(url):
@@ -103,72 +103,56 @@ def handle_message(
         if rpc is None or settings is None:
             return {"status": "error", "message": "Cove is not configured"}
 
-        headers: list[str] = []
         cookies = _sanitize_header(msg.get("cookies", ""))
-        if cookies:
-            headers.append(f"Cookie: {cookies}")
         referrer = _sanitize_header(msg.get("referrer", ""))
-        if referrer:
-            headers.append(f"Referer: {referrer}")
         user_agent = _sanitize_header(msg.get("userAgent", ""))
-        if user_agent:
-            headers.append(f"User-Agent: {user_agent}")
-
-        out_dir = msg.get("directory") or settings.download_dir
         filename = msg.get("filename") or None
 
-        from .extractor import is_extractor_url
-        from .hls import is_hls_url
-        drop_backend = "extractor" if is_extractor_url(url) else "hls"
-        if drop_backend == "extractor" or is_hls_url(url):
-            import json as _json
-            import time as _time
-            import uuid as _uuid
-            from .config import DATA_DIR
-            try:
-                drop_dir = DATA_DIR / "drop"
-                drop_dir.mkdir(parents=True, exist_ok=True)
-                # Random suffix: two drops in the same millisecond must not
-                # overwrite each other.
-                drop_file = drop_dir / (
-                    f"{drop_backend}-{int(_time.time() * 1000)}"
-                    f"-{_uuid.uuid4().hex[:8]}.json"
-                )
-                payload = {"url": url, "filename": filename}
-                # Only pass a directory the caller explicitly requested, so
-                # the queue's category routing still applies otherwise.
-                requested_dir = msg.get("directory")
-                if requested_dir:
-                    payload["dir"] = requested_dir
-                # Browser headers, already CR/LF-sanitized above; the queue
-                # forwards them to the ffmpeg/yt-dlp backend so authenticated
-                # or anti-hotlink media keeps working.
-                if cookies:
-                    payload["cookies"] = cookies
-                if referrer:
-                    payload["referrer"] = referrer
-                if user_agent:
-                    payload["userAgent"] = user_agent
-                # Write via tmp + rename: the queue polls this directory and
-                # must never see a half-written .json file.
-                tmp_file = drop_file.with_suffix(".tmp")
-                tmp_file.write_text(_json.dumps(payload))
-                os.replace(tmp_file, drop_file)
-            except OSError as e:
-                return {"status": "error", "message": f"Could not queue video download: {e}"}
-            return {"status": "ok", "message": "Video download queued in Cove"}
-
+        # Every download (plain, HLS, or extractor) is handed to the running
+        # GUI process via this drop file rather than added to aria2 directly
+        # here. The native messaging host is a separate process with no
+        # access to the live QueueManager, so an rpc.add_uri() shortcut here
+        # would add the raw URL straight to aria2, bypassing debrid
+        # resolution (Real-Debrid/AllDebrid/TorBox), category routing, and
+        # Cove's own DB row -- exactly the resolution QueueManager.add_url()
+        # performs for a manually pasted URL. The queue's _check_drop_dir()
+        # picks this up and calls add_url() itself, which detects the
+        # correct backend (aria2/ffmpeg/yt-dlp) from the URL.
+        import json as _json
+        import time as _time
+        import uuid as _uuid
+        from .config import DATA_DIR
         try:
-            gid = rpc.add_uri(
-                [url],
-                out_dir,
-                settings.connections_per_server,
-                headers=headers if headers else None,
-                filename=filename,
+            drop_dir = DATA_DIR / "drop"
+            drop_dir.mkdir(parents=True, exist_ok=True)
+            # Random suffix: two drops in the same millisecond must not
+            # overwrite each other.
+            drop_file = drop_dir / (
+                f"download-{int(_time.time() * 1000)}-{_uuid.uuid4().hex[:8]}.json"
             )
-            return {"status": "ok", "gid": gid, "message": "Download added to Cove"}
-        except Aria2Error as e:
-            return {"status": "error", "message": str(e)}
+            payload = {"url": url, "filename": filename}
+            # Only pass a directory the caller explicitly requested, so the
+            # queue's category routing still applies otherwise.
+            requested_dir = msg.get("directory")
+            if requested_dir:
+                payload["dir"] = requested_dir
+            # Browser headers, already CR/LF-sanitized above; the queue
+            # forwards them to the relevant backend so authenticated or
+            # anti-hotlink downloads keep working.
+            if cookies:
+                payload["cookies"] = cookies
+            if referrer:
+                payload["referrer"] = referrer
+            if user_agent:
+                payload["userAgent"] = user_agent
+            # Write via tmp + rename: the queue polls this directory and
+            # must never see a half-written .json file.
+            tmp_file = drop_file.with_suffix(".tmp")
+            tmp_file.write_text(_json.dumps(payload))
+            os.replace(tmp_file, drop_file)
+        except OSError as e:
+            return {"status": "error", "message": f"Could not queue download: {e}"}
+        return {"status": "ok", "message": "Download queued in Cove"}
 
     if action == "status":
         if rpc is None:

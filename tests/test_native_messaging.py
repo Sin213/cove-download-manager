@@ -61,21 +61,20 @@ def test_sanitize_header_strips_crlf():
     assert nm._sanitize_header(None) == ""
 
 
-def test_download_does_not_inject_headers_via_crlf():
-    rpc = MagicMock()
-    rpc.add_uri.return_value = "gid-1"
-    settings = MagicMock()
-    settings.download_dir = "/tmp"
-    settings.connections_per_server = 8
+def test_download_does_not_inject_headers_via_crlf(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
     msg = {
         "action": "download",
         "url": "https://example.com/f.zip",
         "cookies": "s=1\r\nX-Evil: 1",
         "referrer": "https://example.com/\r\nHost: evil",
     }
-    handle_message(msg, rpc=rpc, settings=settings)
-    headers = rpc.add_uri.call_args[1]["headers"]
-    assert all("\r" not in h and "\n" not in h for h in headers)
+    handle_message(msg, rpc=MagicMock(), settings=MagicMock())
+    drop_files = list((tmp_path / "drop").glob("download-*.json"))
+    assert len(drop_files) == 1
+    data = json.loads(drop_files[0].read_text())
+    assert "\r" not in data["cookies"] and "\n" not in data["cookies"]
+    assert "\r" not in data["referrer"] and "\n" not in data["referrer"]
 
 
 def test_binary_stdio_uses_existing_buffers():
@@ -152,12 +151,14 @@ def test_handle_ping():
     assert "version" in result
 
 
-def test_handle_download():
+def test_handle_download(tmp_path, monkeypatch):
+    """A plain (non-HLS/extractor) download must be handed to the running
+    GUI process via the drop file, not added to aria2 directly here -- a
+    direct rpc.add_uri() would bypass debrid resolution (Real-Debrid/
+    AllDebrid/TorBox) entirely, since this process has no access to the
+    live QueueManager that performs it."""
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
     mock_rpc = MagicMock()
-    mock_rpc.add_uri.return_value = "gid-123"
-    mock_settings = MagicMock()
-    mock_settings.download_dir = "/tmp/downloads"
-    mock_settings.connections_per_server = 16
 
     msg = {
         "action": "download",
@@ -166,15 +167,17 @@ def test_handle_download():
         "referrer": "https://example.com/page",
         "cookies": "session=abc",
     }
-    result = handle_message(msg, rpc=mock_rpc, settings=mock_settings)
-    assert result["status"] == "ok"
-    assert result["gid"] == "gid-123"
+    result = handle_message(msg, rpc=mock_rpc, settings=MagicMock())
+    assert result == {"status": "ok", "message": "Download queued in Cove"}
+    mock_rpc.add_uri.assert_not_called()
 
-    call_args = mock_rpc.add_uri.call_args
-    assert call_args[0][0] == ["https://example.com/file.zip"]
-    headers = call_args[1]["headers"]
-    assert "Cookie: session=abc" in headers
-    assert "Referer: https://example.com/page" in headers
+    drop_files = list((tmp_path / "drop").glob("download-*.json"))
+    assert len(drop_files) == 1
+    data = json.loads(drop_files[0].read_text())
+    assert data["url"] == "https://example.com/file.zip"
+    assert data["filename"] == "file.zip"
+    assert data["referrer"] == "https://example.com/page"
+    assert data["cookies"] == "session=abc"
 
 
 def test_handle_youtube_download_queues_extractor(tmp_path, monkeypatch):
@@ -193,8 +196,8 @@ def test_handle_youtube_download_queues_extractor(tmp_path, monkeypatch):
         settings=settings,
     )
 
-    assert result == {"status": "ok", "message": "Video download queued in Cove"}
-    drop_files = list((tmp_path / "drop").glob("extractor-*.json"))
+    assert result == {"status": "ok", "message": "Download queued in Cove"}
+    drop_files = list((tmp_path / "drop").glob("download-*.json"))
     assert len(drop_files) == 1
     assert '"url": "https://www.youtube.com/watch?v=BMcJirSZACw"' in drop_files[0].read_text()
     rpc.add_uri.assert_not_called()
@@ -216,7 +219,7 @@ def test_video_drop_payload_preserves_headers_and_dir(tmp_path, monkeypatch):
         settings=MagicMock(),
     )
     assert result["status"] == "ok"
-    drop_files = list((tmp_path / "drop").glob("extractor-*.json"))
+    drop_files = list((tmp_path / "drop").glob("download-*.json"))
     assert len(drop_files) == 1
     data = json.loads(drop_files[0].read_text())
     assert data["dir"] == "/tmp/videos"

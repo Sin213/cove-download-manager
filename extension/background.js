@@ -255,10 +255,16 @@ async function interceptDownload(downloadItem) {
 
 // ---- Context menu ----
 
-// Register the context menu on install/update. Doing this at top level
-// would throw "duplicate id" every time an MV3 service worker wakes, since
-// the script re-runs on each wake.
-browser.runtime.onInstalled.addListener(() => {
+// Registered unconditionally at top level rather than inside onInstalled:
+// onInstalled only fires on an actual install/update, not on a normal
+// browser restart, and Firefox's persistent background page does not
+// persist previously-created menu items across a restart -- so an
+// onInstalled-only registration disappears the first time Firefox restarts
+// after install. Running this at top level re-registers the menu every
+// time the background page loads (every Firefox startup; every Chrome MV3
+// service-worker wake), which is exactly what's needed on Firefox and a
+// harmless duplicate-id no-op on Chrome.
+function registerContextMenu() {
   browser.contextMenus.create(
     {
       id: "download-with-cove",
@@ -267,13 +273,18 @@ browser.runtime.onInstalled.addListener(() => {
     },
     () => {
       if (browser.runtime.lastError) {
-        console.error("Cove: context menu create error:", browser.runtime.lastError);
+        const message = browser.runtime.lastError.message || "";
+        if (!/duplicate id/i.test(message)) {
+          console.error("Cove: context menu create error:", browser.runtime.lastError);
+        }
       } else {
         console.log("Cove: context menu registered");
       }
     }
   );
-});
+}
+
+registerContextMenu();
 
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
   console.log("Cove: context menu clicked", info.menuItemId, info.linkUrl || info.srcUrl);

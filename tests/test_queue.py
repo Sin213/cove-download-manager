@@ -285,6 +285,47 @@ def _persisted_row(db_path, tid):
         conn.close()
 
 
+def test_check_drop_dir_routes_a_plain_url_through_add_url(queue_env, monkeypatch, tmp_path):
+    """A plain (non-video) URL dropped by the native messaging host must go
+    through the same add_url() path a manually pasted URL would -- that is
+    what lets a debrid-supported hoster link actually resolve through
+    Real-Debrid/AllDebrid/TorBox instead of aria2 fetching the raw hoster
+    page directly."""
+    import json as _json
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    queue, _rpc, _db = queue_env()
+
+    calls = []
+    real_add_url = queue.add_url
+
+    def spy_add_url(url, **kwargs):
+        calls.append((url, kwargs))
+        return real_add_url(url, **kwargs)
+
+    monkeypatch.setattr(queue, "add_url", spy_add_url)
+
+    drop_dir = tmp_path / "drop"
+    drop_dir.mkdir(parents=True)
+    (drop_dir / "download-1-abcd1234.json").write_text(_json.dumps({
+        "url": "https://rapidgator.net/file/abc/f.rar",
+        "filename": "f.rar",
+        "cookies": "s=1",
+        "referrer": "https://rapidgator.net/",
+        "userAgent": "TestUA/1.0",
+    }))
+
+    queue._check_drop_dir()
+
+    assert len(calls) == 1
+    url, kwargs = calls[0]
+    assert url == "https://rapidgator.net/file/abc/f.rar"
+    assert kwargs["cookies"] == "s=1"
+    assert kwargs["referrer"] == "https://rapidgator.net/"
+    assert kwargs["user_agent"] == "TestUA/1.0"
+    assert len(queue.tasks) == 1
+    assert list(drop_dir.glob("*.json")) == []
+
+
 def _persisted_url(db_path, tid):
     return _persisted_row(db_path, tid)["url"]
 
