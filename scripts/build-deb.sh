@@ -98,14 +98,21 @@ Type=Application
 Name=$DISPLAY_NAME
 GenericName=Download Manager
 Comment=Multi-connection downloads with a queue, schedule, and global speed cap
-Exec=$APP_NAME
+Exec=$APP_NAME %u
 Icon=$APP_NAME
 Terminal=false
 Categories=Network;FileTransfer;Qt;
 Keywords=download;manager;aria2;http;ftp;
+MimeType=x-scheme-handler/magnet;
 StartupNotify=true
 StartupWMClass=Cove
 EOF
+
+# Maintainer scripts refresh the desktop/MIME caches so the magnet handler
+# shows up as a choice. They never set a default -- picking a handler stays
+# the user's decision.
+install -m 0755 "$ROOT/packaging/debian/postinst" "$PKG_ROOT/DEBIAN/postinst"
+install -m 0755 "$ROOT/packaging/debian/postrm" "$PKG_ROOT/DEBIAN/postrm"
 
 if [ -f "$ROOT/LICENSE" ]; then
     cp "$ROOT/LICENSE" "$PKG_ROOT/usr/share/doc/$APP_NAME/copyright"
