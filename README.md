@@ -7,7 +7,7 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v1.9.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v3.1.0-5eead4?style=flat-square)
 
 ![Cove Download Manager](docs/screenshot.png)
 
@@ -51,6 +51,11 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 - **Debrid accounts** - optional Real-Debrid, AllDebrid, and TorBox
   integration. Links on hosts your account supports are resolved
   automatically before downloading. See [Debrid services](#debrid-services).
+- **Magnet links from your browser** - once Cove is registered as a magnet
+  handler on Linux or Windows, clicking a magnet link opens Cove and adds it
+  to the existing torrent / debrid pipeline. An already-running Cove picks
+  the link up in place, so there is no second window and no second aria2
+  daemon. See [Opening magnet links from your browser](#opening-magnet-links-from-your-browser).
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
 - **In-page video pill** - a floating "Download with Cove" pill appears on
@@ -93,7 +98,10 @@ Two builds on the [Releases](https://github.com/Sin213/cove-download-manager/rel
 - **`Cove-Download-Manager-<version>-Setup.exe`** - Inno Setup installer,
   per-user (no admin prompt), Start Menu + optional desktop shortcut.
 - **`Cove-Download-Manager-<version>-Portable.exe`** - single-file build.
-  No install, nothing in the registry, runs from anywhere.
+  No install, runs from anywhere. A normal portable launch writes nothing to
+  the registry; the only thing that does is the opt-in magnet registration
+  described in
+  [Opening magnet links from your browser](#opening-magnet-links-from-your-browser).
 
 Both Windows builds bundle `aria2c.exe` and `yt-dlp.exe`, so direct downloads
 and YouTube extraction work without system installs of either tool.
@@ -111,6 +119,62 @@ sha256sum -c Cove-Download-Manager-<version>-x86_64.AppImage.sha256
 
 (or `Get-FileHash -Algorithm SHA256` on Windows). Cove's auto-update
 verifies this digest before swapping any binary.
+
+### Opening magnet links from your browser
+
+Cove can be registered with the operating system as a magnet link handler.
+Once it is, clicking a magnet link in your browser opens Cove and the link
+goes into the normal torrent / debrid pipeline. If Cove is already running,
+that same window takes the link, so you never get a second Cove window or a
+second aria2 daemon.
+
+Cove only ever advertises itself as *capable* of opening magnet links.
+Choosing the default handler stays your decision on every platform, and
+installing Cove never silently replaces a handler you already use.
+
+**Linux (AppImage)**
+
+The AppImage ships a desktop entry that declares
+`x-scheme-handler/magnet`. Downloading the AppImage on its own is not
+enough: the desktop entry has to be installed first, either by integrating
+the AppImage (AppImageLauncher, your file manager's "integrate" prompt, or
+Gearlever) or by installing the entry by hand. After that, pick Cove as the
+magnet handler in your desktop environment's default-applications settings,
+or with your distribution's MIME tooling.
+
+**Linux (Debian / Ubuntu)**
+
+The `.deb` installs Cove's desktop entry with the same magnet declaration,
+and its post-install script refreshes the desktop and MIME caches so Cove
+shows up as a choice. It does not make Cove the default, so you may still
+need to select Cove for magnet links once in your desktop settings.
+
+**Windows (Setup)**
+
+The installer offers an optional task, **Register Cove as a magnet link
+handler**, on the file-associations page. It is per-user, needs no
+administrator rights, and only advertises Cove. Windows may still ask you to
+pick Cove under **Settings -> Apps -> Default apps**, and the task never
+takes an existing default away from another application.
+
+**Windows (portable)**
+
+A normal portable launch registers nothing. Registration is opt-in, from a
+terminal in the folder holding the executable:
+
+```powershell
+.\Cove-Download-Manager-<version>-Portable.exe --register-magnet-handler
+.\Cove-Download-Manager-<version>-Portable.exe --unregister-magnet-handler
+```
+
+Both are per-user. Registration records the executable's current location,
+so if you move the portable `.exe` afterwards, run
+`--register-magnet-handler` again from the new location.
+
+Installed Cove and portable Cove register under separate identities of their
+own, so they never unregister each other: uninstalling the installed build
+leaves a portable registration alone, and `--unregister-magnet-handler` only
+removes a registration the portable executable owns.
 
 ---
 

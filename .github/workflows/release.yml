@@ -340,14 +340,31 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.0.1
+          ## What's new in 3.1.0
 
-          Emergency patch for a debrid bypass introduced in 3.0.0. If you have Real-Debrid, AllDebrid, or TorBox enabled, update as soon as possible.
+          Cove can now open magnet links straight from your browser, on both Linux and Windows.
 
-          ### Fixed
+          ### Highlights
 
-          - Downloads sent to Cove from the browser extension (auto intercepted downloads, right click Download with Cove, the in page media pill, and the keyboard shortcut) now resolve through an enabled Real-Debrid, AllDebrid, or TorBox account, the same way a link pasted directly into Cove already did. In 3.0.0 these were added straight to aria2 with no debrid resolution, so a debrid supported hoster link silently downloaded the host's small unauthenticated response page instead of the real file.
-          - The Firefox extension's right click Download with Cove menu item no longer disappears after restarting the browser. It was only registered when the extension was installed or updated, and Firefox does not keep a persistent background page's menu items across a normal restart.
+          - Click a magnet link in Firefox, Chrome, or any other browser and Cove opens with it. The link goes into Cove's existing torrent and debrid pipeline, exactly as if you had pasted it in by hand.
+          - If Cove is already running, the running window takes the link. You get one Cove process, one Cove window, and one aria2 daemon, with no second daemon fighting over the RPC port.
+
+          ### Added
+
+          - Linux AppImage: the bundled desktop entry now declares `x-scheme-handler/magnet`, so Cove can be picked as your magnet handler once the AppImage's desktop entry has been integrated or installed.
+          - Linux Debian/Ubuntu package: installing the `.deb` adds Cove's magnet handler declaration and refreshes the desktop and MIME caches so Cove appears as a choice.
+          - Windows installer: an optional per-user task, "Register Cove as a magnet link handler", on the file associations page. It needs no administrator rights.
+          - Windows portable: opt-in registration from the command line with `--register-magnet-handler` and `--unregister-magnet-handler`. A normal portable launch still registers nothing at all.
+
+          ### Security and privacy
+
+          - Every form of magnet registration is per-user. On Windows that means `HKCU` only, with no administrator rights and nothing written to `HKLM`.
+          - Cove is only ever advertised as capable of opening magnet links. Picking the default handler stays your decision on every platform, and neither installing nor registering Cove takes an existing default away from another application.
+          - The installed build and the portable build own separate registrations and never remove each other's. Uninstalling the installer only clears a registration that still points at that installation, and portable unregistration only clears a registration that the portable executable owns.
+
+          ### Improved
+
+          - The README now documents magnet handler setup for each packaged build, and spells out the automatic debrid workflow: paste the original magnet or hoster link into Cove instead of generating a link on the provider's own website first.
 
           ## Downloads
 
