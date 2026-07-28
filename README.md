@@ -234,6 +234,27 @@ Turn it on in **Settings -> BitTorrent -> Enable torrent support**, then add
 a torrent by pasting a magnet link or by choosing **Add torrent file...**
 (you can also drop a `.torrent` onto the window).
 
+### If you're used to the manual debrid workflow
+
+If you already have a Real-Debrid, AllDebrid, or TorBox account, you do not
+need the usual routine of pasting a magnet into the provider's own website,
+checking whether it is cached, copying the generated link, and pasting that
+link into a download manager. Once the account is enabled in **Settings ->
+Debrid services**, Cove does that whole sequence itself:
+
+1. Paste the magnet link, or add the `.torrent` file, into Cove exactly like
+   any other torrent. There is nothing to check or copy by hand first.
+2. Cove checks your enabled account for a cached copy and, if it finds one,
+   requests the direct link and downloads it over HTTPS automatically.
+3. If nothing is cached, Cove falls back to its own local BitTorrent engine
+   (or the next enabled provider, if you have more than one configured)
+   instead of creating a cloud download and waiting for it.
+
+The same applies to a hoster link, for example a rapidgator.net URL: paste
+the original hoster link into Cove, not a link generated on the provider's
+own website. Cove resolves it through your account itself. See
+[Debrid services](#debrid-services) for how to enable an account.
+
 What happens to a torrent you add:
 
 1. If an enabled AllDebrid, Real-Debrid, or TorBox account already has the
