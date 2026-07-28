@@ -342,39 +342,31 @@ jobs:
           cat > "$NOTES_FILE" <<'NOTESEOF'
           ## What's new in 3.1.0
 
-          Cove can now open magnet links straight from your browser on both Linux and Windows, and gives you real control over what happens when a torrent is not cached.
-
-          ### Highlights
-
-          - Click a magnet link in Firefox, Chrome, or any other browser and Cove opens with it. The link goes into Cove's existing torrent and debrid pipeline, exactly as if you had pasted it in by hand.
-          - If Cove is already running, the running window takes the link. You get one Cove process, one Cove window, and one aria2 daemon, with no second daemon fighting over the RPC port.
-          - Bind Cove's downloads to a specific network interface, such as a VPN adapter, under Settings -> BitTorrent.
-          - Choose what an uncached torrent does: download it locally over BitTorrent, or cancel it.
+          Magnet links open straight from your browser, and you can bind Cove's downloads to a specific network interface such as a VPN adapter.
 
           ### Added
 
-          - **Network interface binding.** Settings -> BitTorrent has a "Network interface" dropdown listing the interfaces on your machine. Pick one and Cove passes it to aria2 as `--interface`, so downloads leave through that adapter. Restart Cove to apply a change.
-          - **"Cancel the download" for uncached torrents.** The "When a torrent is not cached" setting now offers "Download locally with BitTorrent" or "Cancel the download". Cancelled torrents stay in the list as a failed task with the reason shown, rather than disappearing.
-          - **A clearer uncached-torrent notice.** When a torrent is not cached and local BitTorrent is about to start, Cove explains what that means and offers three choices: open Settings, cancel the download, or download locally. "Don't show this notice again" is only remembered if you actually choose to download.
+          - **Magnet links from your browser.** Register Cove as a magnet handler on Linux or Windows, then click a magnet link and it goes into Cove's normal torrent and debrid pipeline. If Cove is already running, the running window takes the link, so there is no second window and no second aria2 daemon.
+          - **Network interface binding.** Settings -> BitTorrent has a "Network interface" dropdown. Pick an interface and all of Cove's traffic leaves through it. Restart Cove to apply a change.
+          - **Choose what happens to uncached torrents.** "When a torrent is not cached" now offers "Download locally with BitTorrent" or "Cancel the download". Cancelled torrents stay in the list as a failed task with the reason shown.
+          - **A clearer uncached-torrent notice.** Cove explains what local BitTorrent means and offers three choices: open Settings, cancel the download, or download locally. "Don't show this notice again" is only remembered if you choose to download.
+          - **Windows portable magnet registration.** Opt-in from the command line with `--register-magnet-handler` and `--unregister-magnet-handler`. A normal portable launch registers nothing.
 
-          - Linux AppImage: the bundled desktop entry now declares `x-scheme-handler/magnet`, so Cove can be picked as your magnet handler once the AppImage's desktop entry has been integrated or installed.
-          - Linux Debian/Ubuntu package: installing the `.deb` adds Cove's magnet handler declaration and refreshes the desktop and MIME caches so Cove appears as a choice.
-          - Windows installer: an optional per-user task, "Register Cove as a magnet link handler", on the file associations page. It needs no administrator rights.
-          - Windows portable: opt-in registration from the command line with `--register-magnet-handler` and `--unregister-magnet-handler`. A normal portable launch still registers nothing at all.
+          ### Fixed
 
-          ### Security and privacy
+          - Debrid API calls, the queue's link probe, and update checks used to go out over the default route. They now follow the selected network interface like everything else, so a VPN binding covers all of Cove's traffic and not only aria2 downloads.
+          - A network interface that disappears no longer sends downloads out over another adapter. Cove refuses to start aria2 and says which interface is missing, and the window stays usable so you can change the setting.
+          - Cancelling or dismissing the uncached-torrent notice no longer counts as consent.
 
-          - Every form of magnet registration is per-user. On Windows that means `HKCU` only, with no administrator rights and nothing written to `HKLM`.
-          - Cove is only ever advertised as capable of opening magnet links. Picking the default handler stays your decision on every platform, and neither installing nor registering Cove takes an existing default away from another application.
-          - Interface binding never silently falls back. If the interface you selected is gone when Cove starts, Cove refuses to launch aria2 and tells you why, instead of sending your downloads out over whatever adapter happens to be up.
-          - Because Cove runs one shared aria2 daemon, the selected interface binds every download Cove handles, not only torrents. The setting says so directly.
-          - Cove cannot verify that a VPN is active, and the notice says that rather than implying protection Cove cannot confirm.
-          - Cancelling or dismissing the uncached-torrent notice never records consent, and no peer connection is opened until you choose to download.
-          - The installed build and the portable build own separate registrations and never remove each other's. Uninstalling the installer only clears a registration that still points at that installation, and portable unregistration only clears a registration that the portable executable owns.
+          ### Notes
 
-          ### Improved
+          - Magnet registration is per-user everywhere. On Windows that means `HKCU` only, with no administrator rights. Cove only advertises itself as capable of opening magnet links; choosing the default stays your decision.
+          - Cove cannot verify that a VPN is actually active. Binding to its interface is a routing choice, not a guarantee.
 
-          - The README now documents magnet handler setup for each packaged build, and spells out the automatic debrid workflow: paste the original magnet or hoster link into Cove instead of generating a link on the provider's own website first.
+          ### Thanks
+
+          - Qb for the suggestions behind this release.
+          - Whooshy for testing.
 
           ## Downloads
 
@@ -396,6 +388,7 @@ jobs:
           else
             gh release create "v$VERSION" \
               --title "v$VERSION" \
+              --draft \
               -F "$NOTES_FILE" \
               release/*
           fi

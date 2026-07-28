@@ -56,6 +56,21 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
   to the existing torrent / debrid pipeline. An already-running Cove picks
   the link up in place, so there is no second window and no second aria2
   daemon. See [Opening magnet links from your browser](#opening-magnet-links-from-your-browser).
+- **Torrents and magnets** - Cove downloads torrents itself, no external
+  client. Enabled debrid accounts are checked for a cached copy first and
+  the files come down over HTTPS; anything uncached falls back to Cove's
+  own aria2 BitTorrent engine, or is cancelled if you prefer. See
+  [Torrents](#torrents).
+- **Network interface binding** - bind all of Cove's traffic to a chosen
+  interface, such as a VPN adapter, in Settings -> BitTorrent. If that
+  interface disappears, Cove stops rather than falling back to another one.
+  See [Binding downloads to a network interface](#binding-downloads-to-a-network-interface).
+- **Proxy support** - HTTP, HTTPS, or SOCKS5, with optional credentials.
+  Local BitTorrent stays blocked while a proxy is set unless you enable the
+  override, because a proxy cannot be trusted to cover peer traffic.
+- **YouTube and video sites** - links yt-dlp supports are extracted and
+  downloaded through it automatically, with the browser's cookies, referrer,
+  and user agent passed along so gated media still works.
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
 - **In-page video pill** - a floating "Download with Cove" pill appears on
@@ -257,7 +272,7 @@ Configure them in **Settings -> Debrid services**:
 When a download starts, Cove checks the URL's host against the provider's
 published host list. If the host is supported, the original link is
 resolved through your account and the resulting direct link is handed to
-aria2 — you get the provider's filename, file size, and full-speed
+aria2 - you get the provider's filename, file size, and full-speed
 multi-connection download. If no enabled provider supports the host, the
 URL downloads directly exactly as before.
 
