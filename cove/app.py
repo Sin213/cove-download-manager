@@ -25,11 +25,55 @@ from .config import Settings
 from .main_window import MainWindow
 from .queue import QueueManager
 from .scheduler import Scheduler
+from .single_instance import (
+    MAX_URLS_PER_MESSAGE,
+    SingleInstanceServer,
+    is_valid_launch_url,
+    send_to_primary,
+    server_name,
+)
 from .updater import UpdateController
 from .native_host_install import install_native_hosts
 from .widgets import find_icon
 
 UPDATE_REPO = "Sin213/cove-download-manager"
+
+
+def parse_launch_urls(argv: list[str]) -> list[str]:
+    """Extract magnet URIs from GUI launch arguments.
+
+    Uses the exact same per-URL validation policy as the IPC `open` message
+    path (`single_instance.is_valid_launch_url` - length bound, control-
+    character rejection, magnet-prefix gate), so the same magnet is
+    accepted or rejected identically whether it arrives on the command line
+    of a fresh launch or over IPC to an already-running primary - a
+    malformed/oversized/control-character magnet is silently dropped
+    before it can enter the startup inbox, not just later when drained into
+    the queue. Anything else that isn't launch-URL-shaped (flags, file
+    paths, other schemes) is likewise silently ignored rather than
+    rejected with an error, matching how a double-clicked association
+    normally behaves.
+    """
+    urls: list[str] = []
+    for arg in argv[1:]:
+        if is_valid_launch_url(arg):
+            if len(urls) >= MAX_URLS_PER_MESSAGE:
+                break
+            urls.append(arg)
+    return urls
+
+
+def activate_window(window) -> None:
+    """Best-effort bring-to-front. Never raises - a compositor that refuses
+    focus must not block the magnet that triggered the activation."""
+    try:
+        if window.isMinimized():
+            window.showNormal()
+        window.show()
+        window.raise_()
+        window.activateWindow()
+    except Exception:
+        pass
 
 
 def _apply_palette(app: QApplication) -> None:
@@ -76,11 +120,86 @@ def run() -> int:
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("cove")
 
+    launch_urls = parse_launch_urls(sys.argv)
+
+    from .config import DATA_DIR
+
+    instance_name = server_name(DATA_DIR)
+    instance_server = SingleInstanceServer()
+    if not instance_server.try_become_primary(instance_name):
+        # Not primary. Forward and exit before touching Settings, aria2, the
+        # queue, or the window - a second aria2 daemon fights the first one
+        # for the same RPC port.
+        sent = send_to_primary(instance_name, launch_urls)
+        if not sent:
+            sent = send_to_primary(instance_name, launch_urls)  # one bounded retry
+        if not sent:
+            logging.getLogger("cove").error(
+                "single_instance_forward_failed: could not reach the running Cove instance"
+            )
+            return 1
+        return 0
+
+    # We are primary and already listening, but nothing pumps the Qt event
+    # loop until app.exec() at the very end of this function - a secondary
+    # that connects during the synchronous construction below would sit
+    # unacknowledged and could time out even though we are alive. Wire up
+    # the IPC handlers and a few processEvents() calls through construction
+    # so a racing secondary still gets a prompt ack, without deferring
+    # construction itself into the event loop.
+    #
+    # `window` and `queue` are assigned further down in this same function
+    # scope; `_handle_open`/`_handle_activate`/`_drain_startup_inbox` close
+    # over them and read whatever value each name holds *at call time* (not
+    # at definition time), so declaring them `None` here and guarding each
+    # use is enough to make an early-arriving IPC request safe: it still
+    # buffers into `startup_inbox` and gets acked, it just can't raise the
+    # window or touch the queue until those objects actually exist.
+    queue = None
+    window = None
+
+    # Magnets that arrive before aria2 is up (command line or IPC) are
+    # buffered here and drained exactly once, in arrival order, after
+    # daemon.start() succeeds and the persisted queue has resumed.
+    startup_inbox: list[str] = list(launch_urls)
+    queue_ready = False
+
+    def _drain_startup_inbox() -> None:
+        nonlocal queue_ready
+        queue_ready = True
+        pending, startup_inbox[:] = list(startup_inbox), []
+        for url in pending:
+            try:
+                queue.add_url(url)
+            except Exception:
+                logging.getLogger("cove").warning("startup_inbox_add_failed")
+
+    def _handle_open(urls: list[str]) -> None:
+        if queue_ready and queue is not None:
+            for url in urls:
+                try:
+                    queue.add_url(url)
+                except Exception:
+                    logging.getLogger("cove").warning("ipc_add_failed")
+        else:
+            startup_inbox.extend(urls)
+        if window is not None:
+            activate_window(window)
+
+    def _handle_activate() -> None:
+        if window is not None:
+            activate_window(window)
+
+    instance_server.open_requested.connect(_handle_open)
+    instance_server.activate_requested.connect(_handle_activate)
+    app.processEvents()
+
     icon_path = find_icon()
     if icon_path:
         app.setWindowIcon(QIcon(str(icon_path)))
 
     settings = Settings.load()
+    app.processEvents()
 
     def _register_native_hosts() -> None:
         try:
@@ -101,9 +220,12 @@ def run() -> int:
     rpc = Aria2RPC(settings)
     queue = QueueManager(settings, rpc)
     scheduler = Scheduler(settings.schedule)
+    app.processEvents()
 
     window = MainWindow(settings, queue, scheduler)
     api_server = LocalApiServer(settings, queue)
+    window._single_instance_server = instance_server  # keep a strong reference
+    app.processEvents()
 
     def _start_api_server() -> None:
         try:
@@ -145,6 +267,10 @@ def run() -> int:
             pass
         # Now that aria2 is reachable, drive any persisted-queued tasks.
         queue.resume_persisted()
+        # Only now drain command-line/IPC magnets buffered before aria2 was
+        # ready. If daemon.start() raised above, we return before this and
+        # the startup inbox is never drained into a broken daemon.
+        _drain_startup_inbox()
         # Accept API downloads only once aria2 is up, so a request that
         # races app startup cannot be persisted straight into "error".
         if settings.api_enabled:
@@ -182,6 +308,7 @@ def run() -> int:
         except Exception:
             pass
         daemon.stop()
+        instance_server.shutdown()
 
     app.aboutToQuit.connect(_cleanup)
     return app.exec()
