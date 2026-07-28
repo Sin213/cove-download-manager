@@ -185,6 +185,11 @@ class Settings:
     # traffic, so a configured proxy blocks local BitTorrent unless the user
     # explicitly overrides it.
     torrent_allow_with_proxy: bool = False
+    # Interface aria2 binds its sockets to, "" meaning "any interface".
+    # Cove runs one shared aria2 daemon, so this binds every aria2-managed
+    # transfer, not only torrents. If the name is gone at launch time Cove
+    # refuses to start aria2 rather than picking another adapter.
+    torrent_network_interface: str = ""
     # Set once the user has accepted the one-time P2P privacy disclosure.
     # Not a user-facing checkbox: it records a decision, it isn't an option.
     torrent_ip_disclosure_shown: bool = False
@@ -279,6 +284,11 @@ class Settings:
             if not isinstance(getattr(s, flag), bool):
                 setattr(s, flag, False)
                 changed = True
+        # A hand-edited non-string interface is meaningless; "" (any) is the
+        # only safe repair, and it is visible in Settings.
+        if not isinstance(s.torrent_network_interface, str):
+            s.torrent_network_interface = ""
+            changed = True
         if s.torrent_fallback_mode not in TORRENT_FALLBACK_MODES:
             s.torrent_fallback_mode = TORRENT_FALLBACK_AUTOMATIC
             changed = True

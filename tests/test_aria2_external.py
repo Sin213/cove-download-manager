@@ -8,6 +8,7 @@ import pytest
 from cove.aria2 import (
     Aria2Daemon,
     Aria2Error,
+    Aria2InterfaceError,
     Aria2RPC,
     MAX_CONCURRENT_DOWNLOADS,
     bittorrent_enabled,
@@ -57,6 +58,53 @@ def test_daemon_stops_seeding_when_the_download_completes():
 
     args = popen.call_args[0][0]
     assert "--seed-time=0" in args
+
+
+def test_daemon_binds_to_the_selected_network_interface():
+    settings = Settings(torrent_network_interface="wg0-mullvad")
+    daemon = Aria2Daemon(settings)
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.interface_exists", return_value=True), \
+         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
+        daemon.start()
+
+    assert "--interface=wg0-mullvad" in popen.call_args[0][0]
+
+
+def test_daemon_passes_no_interface_flag_for_any_interface():
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
+        daemon.start()
+
+    assert not [a for a in popen.call_args[0][0] if a.startswith("--interface=")]
+
+
+def test_daemon_refuses_to_launch_when_the_interface_is_gone():
+    """A VPN adapter that vanished must block traffic, not reroute it."""
+    settings = Settings(torrent_network_interface="wg0-mullvad")
+    daemon = Aria2Daemon(settings)
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.interface_exists", return_value=False), \
+         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
+        with pytest.raises(Aria2InterfaceError) as excinfo:
+            daemon.start()
+
+    assert "wg0-mullvad" in str(excinfo.value)
+    assert popen.call_count == 0
+    # Still an Aria2Error for every existing handler, but distinguishable:
+    # startup must keep the window usable so Settings can be reached, rather
+    # than treating this like a missing aria2 binary.
+    assert isinstance(excinfo.value, Aria2Error)
 
 
 def test_daemon_adds_no_speculative_bittorrent_flags():

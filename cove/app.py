@@ -19,7 +19,7 @@ from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import APP_NAME, __version__, theme
-from .aria2 import Aria2Daemon, Aria2Error, Aria2RPC
+from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC
 from .api_server import LocalApiServer
 from .config import Settings
 from .main_window import MainWindow
@@ -253,12 +253,33 @@ def run() -> int:
     ).start()
 
     def _boot_daemon() -> None:
-        try:
-            daemon.start()
-        except Aria2Error as e:
-            QMessageBox.critical(window, f"{APP_NAME} - aria2 missing", str(e))
-            window.setEnabled(False)
-            return
+        while True:
+            try:
+                daemon.start()
+                break
+            except Aria2InterfaceError as e:
+                # A bound interface that is gone blocks every download, but
+                # the window stays usable: disabling it would trap the user
+                # with no way to reach the very setting at fault.
+                box = QMessageBox(window)
+                box.setIcon(QMessageBox.Warning)
+                box.setWindowTitle(f"{APP_NAME} - network interface unavailable")
+                box.setText(str(e))
+                settings_button = box.addButton("Open Settings", QMessageBox.ActionRole)
+                close_button = box.addButton("Close", QMessageBox.RejectRole)
+                box.setDefaultButton(settings_button)
+                box.setEscapeButton(close_button)
+                box.exec()
+                if box.clickedButton() is settings_button:
+                    window._open_settings()
+                    continue
+                # Nothing was started, so no traffic leaves over another
+                # interface. Downloads simply stay blocked until aria2 runs.
+                return
+            except Aria2Error as e:
+                QMessageBox.critical(window, f"{APP_NAME} - aria2 missing", str(e))
+                window.setEnabled(False)
+                return
         # Apply the effective speed limit (kbps if the limiter is on, else 0).
         effective = settings.overall_speed_limit_kbps if settings.speed_limiter_enabled else 0
         try:
@@ -286,6 +307,7 @@ def run() -> int:
             repo=UPDATE_REPO,
             app_display_name=f"{APP_NAME} Download Manager",
             cache_subdir="cove-download-manager",
+            iface=str(getattr(settings, "torrent_network_interface", "") or ""),
         )
         # Defer a few seconds so the window has fully painted before any
         # network or dialog work happens.

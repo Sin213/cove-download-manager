@@ -422,8 +422,8 @@ def test_provider_filesize_skips_the_head_probe(queue_env, monkeypatch):
     )
     calls = []
     monkeypatch.setattr(
-        "requests.head",
-        lambda url, **kw: calls.append(url) or (_ for _ in ()).throw(AssertionError("HEAD")),
+        "requests.Session.head",
+        lambda self, url, **kw: calls.append(url) or (_ for _ in ()).throw(AssertionError("HEAD")),
     )
     tid = queue.add_url(ORIGINAL_URL)
     queue._probe_and_add(queue.tasks[tid])
@@ -471,8 +471,8 @@ def test_ordinary_head_content_length_seeds_size(queue_env, monkeypatch):
     task = queue.tasks[tid]
 
     monkeypatch.setattr(
-        "requests.head",
-        lambda url, **kw: SimpleNamespace(
+        "requests.Session.head",
+        lambda self, url, **kw: SimpleNamespace(
             ok=True, headers={"Accept-Ranges": "bytes", "Content-Length": "20971520"}
         ),
     )
@@ -487,8 +487,8 @@ def test_ordinary_head_does_not_overwrite_an_existing_size(queue_env, monkeypatc
     task.total_bytes = 111
 
     monkeypatch.setattr(
-        "requests.head",
-        lambda url, **kw: SimpleNamespace(
+        "requests.Session.head",
+        lambda self, url, **kw: SimpleNamespace(
             ok=True, headers={"Accept-Ranges": "bytes", "Content-Length": "20971520"}
         ),
     )
@@ -569,8 +569,8 @@ def test_unsupported_host_falls_through_to_the_direct_download(queue_env, monkey
     queue, rpc, _db = queue_env(**_debrid_settings())
     monkeypatch.setattr(debrid, "resolve", lambda url, settings, **kw: None)
     monkeypatch.setattr(
-        "requests.head",
-        lambda url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
+        "requests.Session.head",
+        lambda self, url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
     )
     tid = queue.add_url("https://example.com/plain.zip")
     task = queue.tasks[tid]
@@ -706,7 +706,7 @@ from cove.queue import (                          # noqa: E402
     SOURCE_TORRENT_FILE,
     TORRENT_ARIA2_FAILED,
     TORRENT_CONSENT_DECLINED,
-    TORRENT_LOCAL_DISABLED,
+    TORRENT_CANCELLED_UNCACHED,
     TORRENT_NO_BITTORRENT,
     TORRENT_METADATA_FAILED,
     TORRENT_PROXY_BLOCKED,
@@ -1442,7 +1442,7 @@ def test_fallback_mode_never_refuses_without_touching_the_swarm(queue_env, monke
 
     task = queue.tasks[tid]
     assert task.status == "error"
-    assert task.error == TORRENT_LOCAL_DISABLED
+    assert task.error == TORRENT_CANCELLED_UNCACHED
     assert rpc.magnets == [] and rpc.torrents == [] and rpc.added == []
 
 
@@ -1545,11 +1545,64 @@ def test_accepting_consent_saves_it_before_the_torrent_starts(queue_env, monkeyp
     original_add = rpc.add_magnet
     rpc.add_magnet = lambda *a, **k: (order.append("add"), original_add(*a, **k))[1]
 
-    queue.torrent_consent(tid, True)
+    queue.torrent_consent(tid, True, remember=True)
 
     assert queue.settings.torrent_ip_disclosure_shown is True
     assert order == ["save", "add"]
     assert queue.tasks[tid].gid == "gid-meta"
+
+
+def test_accepting_without_remember_does_not_persist_consent(queue_env, monkeypatch):
+    """The notice's checkbox is the only thing that silences it later."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+
+    queue.torrent_consent(tid, True)
+
+    assert queue.settings.torrent_ip_disclosure_shown is False
+    assert len(rpc.magnets) == 1
+
+
+def test_reevaluating_after_settings_re_asks_without_starting_anything(
+    queue_env, monkeypatch
+):
+    """Open Settings parks the task; nothing reaches aria2 in the meantime."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    asked = []
+    queue.torrent_consent_needed.connect(asked.append)
+    tid = queue.add_url(MAGNET)
+    assert asked == [tid]
+
+    queue.torrent_consent_reevaluate(tid)
+
+    assert rpc.magnets == []
+    assert asked == [tid, tid]
+
+
+def test_reevaluating_honours_cancel_chosen_in_settings(queue_env, monkeypatch):
+    """Switching to "Cancel the download" while parked fails the task."""
+    queue, rpc, db_path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    assert tid in queue._awaiting_consent
+
+    queue.settings.torrent_fallback_mode = "never"
+    queue.torrent_consent_reevaluate(tid)
+
+    assert queue.tasks[tid].status == "error"
+    assert queue.tasks[tid].error == TORRENT_CANCELLED_UNCACHED
+    assert rpc.magnets == []
+    assert queue.settings.torrent_ip_disclosure_shown is False
 
 
 def test_consent_is_asked_once(queue_env, monkeypatch):
@@ -2682,8 +2735,8 @@ def test_torbox_disabled_by_default_gate_gives_current_behavior(queue_env, monke
         lambda url, settings, **kw: None,
     )
     monkeypatch.setattr(
-        "requests.head",
-        lambda url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
+        "requests.Session.head",
+        lambda self, url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
     )
     tid = queue.add_url("https://example.com/plain.zip")
     queue._probe_and_add(queue.tasks[tid])

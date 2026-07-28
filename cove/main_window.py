@@ -109,34 +109,39 @@ def torrent_drop_paths(local_paths, enabled: bool) -> list[str]:
 # Shown once, immediately before Cove's first local BitTorrent transfer.
 # Every sentence here is something Cove can actually stand behind: it does
 # not claim anonymity, VPN protection or proxy coverage it cannot deliver.
-P2P_DISCLOSURE_TITLE = "Local BitTorrent privacy notice"
+P2P_DISCLOSURE_TITLE = "Torrent is not cached"
 P2P_DISCLOSURE_TEXT = (
-    "This torrent was not available through an enabled debrid service, so "
-    "Cove is ready to download it directly through BitTorrent.\n\n"
-    "Direct BitTorrent connections expose your IP address to peers and "
-    "trackers. Cove may upload pieces to peers while the download is "
-    "active, but it stops seeding when the download completes.\n\n"
-    "Cove cannot verify that a VPN is active. Standard HTTP proxy settings "
-    "may not cover peer, DHT or UDP tracker traffic.\n\n"
-    "Continue with local BitTorrent?"
+    "This torrent is not available through any enabled debrid service. Cove "
+    "is configured to download uncached torrents directly through "
+    "BitTorrent.\n\n"
+    "Local BitTorrent exposes your IP address to peers and trackers. You "
+    "can bind Cove to a VPN network interface or cancel uncached torrents "
+    "under Settings → BitTorrent.\n\n"
+    "Cove cannot verify that your VPN is active."
 )
 
 
 def build_p2p_consent_box(parent):
-    """The one-time local-BitTorrent modal, and its Continue button.
+    """The uncached-torrent notice, its three buttons and its checkbox.
 
     Cancel is the default: a user who dismisses this dialog has not agreed
-    to join a swarm.
+    to join a swarm. The checkbox is only ever honoured alongside the
+    download button, so dismissing can never record consent either.
+
+    Returns (box, download_button, settings_button, remember_checkbox).
     """
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Warning)
     box.setWindowTitle(P2P_DISCLOSURE_TITLE)
     box.setText(P2P_DISCLOSURE_TEXT)
-    continue_button = box.addButton("Continue", QMessageBox.AcceptRole)
-    cancel_button = box.addButton("Cancel", QMessageBox.RejectRole)
+    remember = QCheckBox("Don't show this notice again", box)
+    box.setCheckBox(remember)
+    settings_button = box.addButton("Open Settings", QMessageBox.ActionRole)
+    cancel_button = box.addButton("Cancel download", QMessageBox.RejectRole)
+    download_button = box.addButton("Download locally", QMessageBox.AcceptRole)
     box.setDefaultButton(cancel_button)
     box.setEscapeButton(cancel_button)
-    return box, continue_button
+    return box, download_button, settings_button, remember
 
 
 def _human_bytes(n: int) -> str:
@@ -680,9 +685,21 @@ class MainWindow(QMainWindow):
         until the answer comes back, so no worker ever waits on a modal and
         no peer connection is opened before the user has said yes.
         """
-        box, continue_button = build_p2p_consent_box(self)
+        box, download_button, settings_button, remember = build_p2p_consent_box(self)
         box.exec()
-        self.queue.torrent_consent(tid, box.clickedButton() is continue_button)
+        clicked = box.clickedButton()
+        if clicked is settings_button:
+            # The task stays parked in the queue while Settings is open, so
+            # the notice's checkbox is discarded here on purpose: the user
+            # has not chosen to download yet.
+            self._open_settings()
+            self.queue.torrent_consent_reevaluate(tid)
+            return
+        self.queue.torrent_consent(
+            tid,
+            clicked is download_button,
+            remember=remember.isChecked(),
+        )
 
     def _add_from_clipboard(self) -> None:
         text = QGuiApplication.clipboard().text() or ""

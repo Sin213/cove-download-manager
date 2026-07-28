@@ -44,6 +44,7 @@ from .config import (
     Settings,
 )
 from .debrid import DebridError
+from .netiface import ANY_INTERFACE, ANY_INTERFACE_LABEL, list_interfaces
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
     configure_speed_spin,
@@ -684,14 +685,33 @@ class SettingsDialog(QDialog):
 
         self.torrent_fallback = QComboBox()
         self.torrent_fallback.addItem(
-            "Download with Cove BitTorrent", TORRENT_FALLBACK_AUTOMATIC
+            "Download locally with BitTorrent", TORRENT_FALLBACK_AUTOMATIC
         )
-        self.torrent_fallback.addItem("Never download locally", TORRENT_FALLBACK_NEVER)
+        # Still the stored value "never": relabelling the option must not
+        # invalidate settings files written by earlier versions.
+        self.torrent_fallback.addItem("Cancel the download", TORRENT_FALLBACK_NEVER)
         idx = self.torrent_fallback.findData(
             getattr(settings, "torrent_fallback_mode", TORRENT_FALLBACK_AUTOMATIC)
         )
         self.torrent_fallback.setCurrentIndex(idx if idx >= 0 else 0)
-        torrent_lay.addRow("When not cached", self.torrent_fallback)
+        torrent_lay.addRow("When a torrent is not cached", self.torrent_fallback)
+
+        # Interface binding. This lives under BitTorrent because that is the
+        # traffic users come here to control, but it is honest about the
+        # fact that one shared aria2 daemon means it binds everything.
+        self.torrent_interface = QComboBox()
+        self._reload_interfaces(
+            str(getattr(settings, "torrent_network_interface", "") or "")
+        )
+        torrent_lay.addRow("Network interface", self.torrent_interface)
+        interface_note = QLabel(
+            "Binds all downloads handled by aria2, plus debrid resolution, "
+            "queue probes, and update checks, to the selected network "
+            "interface. Restart Cove to apply changes."
+        )
+        interface_note.setProperty("role", "muted")
+        interface_note.setWordWrap(True)
+        torrent_lay.addRow(interface_note)
 
         self.torrent_proxy_override = QCheckBox(
             "Allow local BitTorrent while proxy settings are enabled"
@@ -801,6 +821,23 @@ class SettingsDialog(QDialog):
             test.setEnabled(on and test.property("testing") is not True)
 
     # ---- torrents -----------------------------------------------------
+
+    def _reload_interfaces(self, current: str) -> None:
+        """Fill the interface combo, preserving an unavailable saved name.
+
+        A saved interface that has gone away stays selected and is marked
+        as missing rather than being dropped: silently reverting it to
+        "Any interface" is exactly the fall back Cove promises not to do.
+        """
+        self.torrent_interface.clear()
+        self.torrent_interface.addItem(ANY_INTERFACE_LABEL, ANY_INTERFACE)
+        names = list_interfaces()
+        for name in names:
+            self.torrent_interface.addItem(name, name)
+        if current and current not in names:
+            self.torrent_interface.addItem(f"{current} (not available)", current)
+        idx = self.torrent_interface.findData(current)
+        self.torrent_interface.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _on_torrent_toggled(self, _checked: bool = False) -> None:
         """The torrent rows follow their switch, as the proxy rows do."""
@@ -912,6 +949,9 @@ class SettingsDialog(QDialog):
         self.settings.torrent_support_enabled = self.torrent_enabled.isChecked()
         self.settings.torrent_fallback_mode = self.torrent_fallback.currentData()
         self.settings.torrent_allow_with_proxy = self.torrent_proxy_override.isChecked()
+        self.settings.torrent_network_interface = (
+            self.torrent_interface.currentData() or ""
+        )
         # torrent_ip_disclosure_shown is not written here on purpose: it
         # records the user's answer to the one-time P2P notice, and Save
         # must neither grant nor revoke that consent.

@@ -34,6 +34,7 @@ from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
+from . import netiface
 from .system_open import child_env
 
 
@@ -191,19 +192,19 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def fetch_text(url: str, repo: str, timeout: float = 8.0) -> str | None:
+def fetch_text(url: str, repo: str, timeout: float = 8.0, iface: str = "") -> str | None:
     req = urllib.request.Request(
         url,
         headers={"User-Agent": f"{repo.split('/')[-1]}-updater"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with netiface.bound_urlopen(req, name=iface, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except Exception:
         return None
 
 
-def fetch_latest_release(repo: str, timeout: float = 8.0) -> dict | None:
+def fetch_latest_release(repo: str, timeout: float = 8.0, iface: str = "") -> dict | None:
     req = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/releases/latest",
         headers={
@@ -212,7 +213,7 @@ def fetch_latest_release(repo: str, timeout: float = 8.0) -> dict | None:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with netiface.bound_urlopen(req, name=iface, timeout=timeout) as resp:
             return json.load(resp)
     except Exception:
         return None
@@ -223,10 +224,11 @@ class UpdateCheckWorker(QObject):
     noUpdate = Signal()
     failed = Signal(str)
 
-    def __init__(self, current_version: str, repo: str):
+    def __init__(self, current_version: str, repo: str, iface: str = ""):
         super().__init__()
         self._current = current_version
         self._repo = repo
+        self._iface = iface
 
     def run(self) -> None:
         # Every exit path must emit a signal: run() is driven by
@@ -239,7 +241,7 @@ class UpdateCheckWorker(QObject):
             self.failed.emit(f"malformed release data: {exc}")
 
     def _run(self) -> None:
-        data = fetch_latest_release(self._repo)
+        data = fetch_latest_release(self._repo, iface=self._iface)
         if data is None:
             self.failed.emit("could not reach the releases API")
             return
@@ -274,11 +276,12 @@ class DownloadWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, url: str, dest: Path, repo: str):
+    def __init__(self, url: str, dest: Path, repo: str, iface: str = ""):
         super().__init__()
         self._url = url
         self._dest = dest
         self._repo = repo
+        self._iface = iface
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -290,7 +293,7 @@ class DownloadWorker(QObject):
                 self._url,
                 headers={"User-Agent": f"{self._repo.split('/')[-1]}-updater"},
             )
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with netiface.bound_urlopen(req, name=self._iface, timeout=20) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 written = 0
                 self._dest.parent.mkdir(parents=True, exist_ok=True)
@@ -371,6 +374,7 @@ class UpdateController(QObject):
         repo: str,
         app_display_name: str,
         cache_subdir: str,
+        iface: str = "",
     ):
         super().__init__(parent)
         self._parent = parent
@@ -378,6 +382,7 @@ class UpdateController(QObject):
         self._repo = repo
         self._display_name = app_display_name
         self._cache_subdir = cache_subdir
+        self._iface = iface
         self._thread: QThread | None = None
         self._worker: UpdateCheckWorker | None = None
         self._download_thread: QThread | None = None
@@ -391,7 +396,7 @@ class UpdateController(QObject):
         if self._thread is not None:
             return
         thread = QThread(self)
-        worker = UpdateCheckWorker(self._current, self._repo)
+        worker = UpdateCheckWorker(self._current, self._repo, iface=self._iface)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.updateAvailable.connect(thread.quit)
@@ -504,7 +509,7 @@ class UpdateController(QObject):
         self._progress.setValue(0)
 
         thread = QThread(self)
-        worker = DownloadWorker(info.asset_url, dest, self._repo)
+        worker = DownloadWorker(info.asset_url, dest, self._repo, iface=self._iface)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)

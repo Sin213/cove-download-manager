@@ -17,7 +17,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
-from . import db, debrid, torrent
+from . import db, debrid, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
@@ -50,6 +50,10 @@ TORRENT_NO_BITTORRENT = (
 )
 TORRENT_CONSENT_DECLINED = (
     "Local BitTorrent was declined, so this torrent was not downloaded."
+)
+TORRENT_CANCELLED_UNCACHED = (
+    "This torrent is not cached by an enabled debrid service, and the "
+    "download was cancelled."
 )
 TORRENT_METADATA_FAILED = "Cove could not read this torrent's metadata."
 # aria2's own message for a failed torrent may quote the magnet it was
@@ -305,6 +309,10 @@ class QueueManager(QObject):
         self._bt_capable: bool | None = None
         # Tasks parked on the one-time P2P disclosure.
         self._awaiting_consent: set[int] = set()
+        # Tasks whose owner already accepted the notice this session. The
+        # persisted "don't show again" flag is a global preference; this is
+        # per task, so a paused-then-resumed torrent is not asked twice.
+        self._consent_granted: set[int] = set()
         self._hls_procs: dict[int, QProcess] = {}
         self._hls_duration: dict[int, float] = {}
         self._hls_stderr: dict[int, str] = {}
@@ -785,7 +793,8 @@ class QueueManager(QObject):
                 # passkey. The info-only document hashes identically.
                 torrent_bytes = meta.info_only_document()
         return debrid.resolve_torrent(
-            info_hash, self.settings, torrent_bytes=torrent_bytes
+            info_hash, self.settings, torrent_bytes=torrent_bytes,
+            session=self._bound_session(),
         )
 
     def _on_torrent_probed(self, tid: int, cached) -> None:
@@ -972,7 +981,10 @@ class QueueManager(QObject):
         if t is None or t.source_type != SOURCE_TORRENT:
             return
         if not self._local_fallback_allowed():
-            self._fail_task(tid, TORRENT_LOCAL_DISABLED)
+            # "Cancel the download" in Settings. The task stays visible as a
+            # failure with a reason rather than vanishing, and the notice
+            # below is skipped entirely: the user already answered it.
+            self._fail_task(tid, TORRENT_CANCELLED_UNCACHED)
             return
         if self._proxy_configured() and not getattr(
             self.settings, "torrent_allow_with_proxy", False
@@ -982,7 +994,10 @@ class QueueManager(QObject):
             # user who set a proxy did not agree to leak around it.
             self._fail_task(tid, TORRENT_PROXY_BLOCKED)
             return
-        if not getattr(self.settings, "torrent_ip_disclosure_shown", False):
+        if (
+            not getattr(self.settings, "torrent_ip_disclosure_shown", False)
+            and tid not in self._consent_granted
+        ):
             # Park the task and ask the window. Nothing has been sent to
             # aria2 yet, so declining costs the swarm nothing.
             self._awaiting_consent.add(tid)
@@ -990,11 +1005,13 @@ class QueueManager(QObject):
             return
         self._verify_bittorrent_then_add(tid)
 
-    def torrent_consent(self, tid: int, accepted: bool) -> None:
-        """The user's answer to the one-time P2P disclosure.
+    def torrent_consent(self, tid: int, accepted: bool, remember: bool = False) -> None:
+        """The user's answer to the uncached-torrent notice.
 
         Called from the GUI thread by the window that showed the modal.
-        Consent is persisted *before* anything reaches aria2.
+        Consent is persisted *before* anything reaches aria2, and only when
+        the user both proceeded and asked not to be shown the notice again:
+        cancelling or dismissing the dialog must never record consent.
         """
         if tid not in self._awaiting_consent:
             return
@@ -1002,9 +1019,23 @@ class QueueManager(QObject):
         if not accepted:
             self._fail_task(tid, TORRENT_CONSENT_DECLINED)
             return
-        self.settings.torrent_ip_disclosure_shown = True
-        self.settings.save()
+        self._consent_granted.add(tid)
+        if remember:
+            self.settings.torrent_ip_disclosure_shown = True
+            self.settings.save()
         self._verify_bittorrent_then_add(tid)
+
+    def torrent_consent_reevaluate(self, tid: int) -> None:
+        """Re-run the local-torrent checks after the user visited Settings.
+
+        The task stayed parked while Settings was open — nothing reached
+        aria2 — so the freshly saved settings decide its fate: the notice
+        may reappear, or "Cancel the download" may now fail it outright.
+        """
+        if tid not in self._awaiting_consent:
+            return
+        self._awaiting_consent.discard(tid)
+        self._start_local_torrent(tid)
 
     def _verify_bittorrent_then_add(self, tid: int) -> None:
         if self._bt_capable is True:
@@ -1387,6 +1418,7 @@ class QueueManager(QObject):
         base = t.out_dir
         self.tasks.pop(tid, None)
         self._awaiting_consent.discard(tid)
+        self._consent_granted.discard(tid)
         with db.connect() as conn:
             conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
         self.task_removed.emit(tid)
@@ -1991,6 +2023,20 @@ class QueueManager(QObject):
     def _debrid_enabled(self) -> bool:
         return debrid.is_enabled(self.settings)
 
+    def _bound_session(self):
+        """requests.Session for the debrid/probe calls aria2 never sees.
+
+        Lazily built and cached: the interface setting only takes effect on
+        restart (see Settings), so there is no need to rebuild this per
+        call. Bound to the same interface aria2 is launched with, so a VPN
+        binding covers this traffic too, not only aria2-managed downloads.
+        """
+        if getattr(self, "_debrid_session", None) is None:
+            self._debrid_session = netiface.bound_requests_session(
+                str(getattr(self.settings, "torrent_network_interface", "") or "")
+            )
+        return self._debrid_session
+
     def _resolve_debrid(self, t: DownloadTask) -> str:
         """Swap the original hoster URL for a provider node URL, if any.
 
@@ -2021,6 +2067,7 @@ class QueueManager(QObject):
                 token = getattr(self.settings, "torbox_api_token", "")
                 download = debrid.torbox_refresh_torrent_file(
                     t.debrid_item_id, t.debrid_file_id, token,
+                    session=self._bound_session(),
                 )
                 t.resolved_url = download
                 t.debrid_provider = debrid.TORBOX
@@ -2032,7 +2079,8 @@ class QueueManager(QObject):
             # that issued it. t.url is left untouched: the generated node
             # URL expires, this link doesn't.
             result = debrid.unlock_torrent_file(
-                t.url, t.debrid_route, self.settings
+                t.url, t.debrid_route, self.settings,
+                session=self._bound_session(),
             )
             t.resolved_url = result.download
             t.debrid_provider = result.provider
@@ -2056,7 +2104,8 @@ class QueueManager(QObject):
             # development testing falls through to the branches below
             # instead of calling into a hidden, unsupported provider.
             result = debrid.torbox_refresh_web_download(
-                t.debrid_item_id, t.url, self.settings
+                t.debrid_item_id, t.url, self.settings,
+                session=self._bound_session(),
             )
             t.resolved_url = result.download
             t.debrid_provider = result.provider
@@ -2069,7 +2118,7 @@ class QueueManager(QObject):
             return result.download
         if not self._debrid_enabled():
             return t.url
-        result = debrid.resolve(t.url, self.settings)
+        result = debrid.resolve(t.url, self.settings, session=self._bound_session())
         if result is None:
             return t.url
         # t.url stays the original hoster link: it is the task's identity,
@@ -2094,7 +2143,6 @@ class QueueManager(QObject):
         return result.download
 
     def _probe_and_add(self, t: DownloadTask) -> str:
-        import requests as _requests
         target = self._resolve_debrid(t)
         probed = False
         supports_range = False
@@ -2103,7 +2151,7 @@ class QueueManager(QObject):
         # probe would; skip it rather than send the node URL a second time.
         if not (t.resolved_url and t.total_bytes > 0):
             try:
-                resp = _requests.head(target, timeout=5, allow_redirects=True)
+                resp = self._bound_session().head(target, timeout=5, allow_redirects=True)
                 if resp.ok:
                     probed = True
                     supports_range = resp.headers.get("Accept-Ranges", "").lower() == "bytes"

@@ -28,10 +28,20 @@ from .config import (
     MAX_CONNECTIONS_PER_SERVER,
     Settings,
 )
+from .netiface import interface_exists
 
 
 class Aria2Error(RuntimeError):
     pass
+
+
+class Aria2InterfaceError(Aria2Error):
+    """The configured network interface is not present on this machine.
+
+    Distinct from a fatal aria2 failure on purpose: downloads must stay
+    blocked, but the user has to keep access to Settings to clear or change
+    the binding, otherwise the only fix is hand-editing the config file.
+    """
 
 
 # aria2 defaults max-concurrent-downloads to 5. Downloads added via the
@@ -182,6 +192,19 @@ class Aria2Daemon:
             "--summary-interval=0",
             "--quiet=true",
         ]
+        # Interface binding. Cove refuses to launch rather than let traffic
+        # out over an adapter the user did not choose, so a missing
+        # interface is a hard error and never a silent fall back to "any".
+        iface = str(getattr(self.settings, "torrent_network_interface", "") or "")
+        if iface:
+            if not interface_exists(iface):
+                raise Aria2InterfaceError(
+                    f"Network interface '{iface}' was not found. Cove is configured "
+                    "to bind all downloads to it and will not fall back to another "
+                    "interface. Reconnect it, or pick a different interface under "
+                    "Settings → BitTorrent."
+                )
+            args.append(f"--interface={iface}")
         if self.settings.speed_limiter_enabled and self.settings.overall_speed_limit_kbps > 0:
             args.append(
                 f"--max-overall-download-limit={self.settings.overall_speed_limit_kbps}K"

@@ -333,9 +333,14 @@ What happens to a torrent you add:
 
 Downloading a torrent locally is a direct peer-to-peer connection:
 
-- **Your IP address is visible to peers and trackers.** Cove shows a
-  one-time notice explaining this before its first local torrent, and does
-  not start until you choose Continue.
+- **Your IP address is visible to peers and trackers.** Before a local
+  torrent starts, Cove shows a **Torrent is not cached** notice explaining
+  this and waits: nothing is sent to any peer until you choose **Download
+  locally**. The notice also offers **Open Settings** (change how uncached
+  torrents are handled, then Cove re-checks the task) and **Cancel
+  download**. Ticking *Don't show this notice again* only takes effect if
+  you go on to download locally - cancelling or closing the dialog never
+  records consent.
 - **Cove does not seed after a download completes.** It may upload pieces
   to peers while the download is still running, and stops when it finishes.
 - **Cove's proxy settings may not cover BitTorrent.** An HTTP proxy cannot
@@ -345,8 +350,32 @@ Downloading a torrent locally is a direct peer-to-peer connection:
 - Cove cannot detect whether a VPN is active and makes no claim about
   anonymity.
 
-Set **When not cached** to *Never download locally* if you want Cove to use
-only the cached debrid route and fail anything else.
+Set **When a torrent is not cached** to *Cancel the download* if you want
+Cove to use only the cached debrid route. Cancelled torrents stay in the
+list as a failed task with the reason shown, and the notice above is skipped
+entirely - you have already answered it.
+
+### Binding downloads to a network interface
+
+**Settings -> BitTorrent -> Network interface** lists the network interfaces
+on your machine. Leave it on *Any interface* for normal behaviour, or pick
+one - a VPN adapter such as `wg0-mullvad`, for example - and Cove passes it
+to aria2 as `--interface`, so traffic leaves through that adapter.
+
+Two things to know:
+
+- **It binds every download Cove handles, not just torrents.** Cove runs a
+  single shared aria2 daemon, so the selected interface applies to ordinary
+  HTTP downloads and cached debrid downloads as well. Restart Cove to apply
+  a change.
+- **There is no silent fallback.** If the interface you selected is missing
+  when Cove starts - a VPN that is down, an adapter that was renamed - Cove
+  refuses to launch aria2 and shows an error naming the interface. It will
+  not quietly send your downloads out over a different adapter. Reconnect
+  the interface, or choose another one in Settings.
+
+Cove still cannot verify that a VPN is actually up and working; binding to
+its interface is a routing decision, not a guarantee.
 
 ### Current limits
 

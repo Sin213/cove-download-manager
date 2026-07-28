@@ -855,16 +855,146 @@ def test_disclosure_wording_is_honest_about_what_cove_can_promise():
     from cove.main_window import P2P_DISCLOSURE_TEXT, P2P_DISCLOSURE_TITLE
 
     text = P2P_DISCLOSURE_TEXT.lower()
-    assert "privacy notice" in P2P_DISCLOSURE_TITLE.lower()
+    assert "not cached" in P2P_DISCLOSURE_TITLE.lower()
     assert "ip address" in text
     assert "peers and trackers" in text
-    assert "stops seeding" in text
     assert "vpn" in text and "cannot verify" in text
-    assert "proxy" in text
+    # Both escape routes are named, so the notice is not a dead end.
+    assert "network interface" in text and "cancel" in text
+    assert "settings" in text
     # No promise Cove cannot keep.
     for claim in ("anonymous", "anonymity", "kill switch", "fully protected",
                   "you are protected", "encrypted end-to-end"):
         assert claim not in text
+
+
+def test_bittorrent_tab_exposes_interface_binding_and_cancel_wording(tmp_path):
+    script = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+import cove.dialogs as dialogs
+from cove.dialogs import SettingsDialog
+
+dialogs.list_interfaces = lambda: ["eno1", "wg0-mullvad"]
+
+app = QApplication([])
+out = {}
+
+dialog = SettingsDialog(Settings())
+out["fallback_labels"] = [
+    dialog.torrent_fallback.itemText(i)
+    for i in range(dialog.torrent_fallback.count())
+]
+out["fallback_values"] = [
+    dialog.torrent_fallback.itemData(i)
+    for i in range(dialog.torrent_fallback.count())
+]
+out["interface_labels"] = [
+    dialog.torrent_interface.itemText(i)
+    for i in range(dialog.torrent_interface.count())
+]
+out["interface_default"] = dialog.torrent_interface.currentData()
+# Interface binding covers every aria2 transfer, so it must not be gated
+# behind the torrent-support switch.
+out["interface_enabled_with_torrents_off"] = dialog.torrent_interface.isEnabled()
+dialog.close()
+
+# A saved interface that no longer exists stays selected and is flagged.
+stale = SettingsDialog(Settings(torrent_network_interface="tun9"))
+out["stale_current"] = stale.torrent_interface.currentData()
+out["stale_label"] = stale.torrent_interface.currentText()
+stale.close()
+
+settings = Settings()
+saver = SettingsDialog(settings)
+saver.torrent_interface.setCurrentIndex(
+    saver.torrent_interface.findData("wg0-mullvad")
+)
+saver.torrent_fallback.setCurrentIndex(saver.torrent_fallback.findData("never"))
+saver._on_accept()
+out["saved_interface"] = settings.torrent_network_interface
+out["saved_fallback"] = settings.torrent_fallback_mode
+
+print(json.dumps(out))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    out = json.loads(result.stdout)
+
+    assert out["fallback_labels"] == [
+        "Download locally with BitTorrent", "Cancel the download",
+    ]
+    # Relabelling must not change what is stored.
+    assert out["fallback_values"] == ["automatic", "never"]
+    assert out["saved_fallback"] == "never"
+
+    assert out["interface_labels"] == ["Any interface", "eno1", "wg0-mullvad"]
+    assert out["interface_default"] == ""
+    assert out["interface_enabled_with_torrents_off"] is True
+    assert out["saved_interface"] == "wg0-mullvad"
+    # A vanished interface is never silently downgraded to "Any interface".
+    assert out["stale_current"] == "tun9"
+    assert "not available" in out["stale_label"]
+
+
+def test_interface_note_states_that_binding_covers_every_download(tmp_path):
+    """One shared aria2 daemon means this is not a torrent-only setting."""
+    script = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication, QLabel
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import SettingsDialog
+
+app = QApplication([])
+dialog = SettingsDialog(Settings())
+notes = " ".join(
+    lbl.text() for lbl in dialog.torrent_group.findChildren(QLabel)
+)
+print(json.dumps({"notes": notes.lower()}))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    notes = json.loads(result.stdout)["notes"]
+
+    assert "all downloads" in notes
+    assert "restart cove" in notes
+    # It must not imply the binding is limited to torrent traffic.
+    assert "only torrent" not in notes
 
 
 def test_metadata_phase_has_its_own_status_label():
@@ -904,39 +1034,57 @@ out = {"on_gui_thread": [], "texts": [], "titles": [], "buttons": []}
 class FakeQueue:
     def __init__(self):
         self.answers = []
-    def torrent_consent(self, tid, accepted):
-        self.answers.append((tid, accepted))
+        self.reevaluated = []
+    def torrent_consent(self, tid, accepted, remember=False):
+        self.answers.append((tid, accepted, remember))
+    def torrent_consent_reevaluate(self, tid):
+        self.reevaluated.append(tid)
 
 class Host(QWidget):
-    pass
+    def _open_settings(self):
+        out["settings_opened"].append(True)
 
+out["settings_opened"] = []
 host = Host()
 host.queue = FakeQueue()
 
 real_build = mw.build_p2p_consent_box
-choice = {"continue": True}
+# "download" | "cancel" | "settings", plus the checkbox state.
+choice = {"button": "download", "remember": True}
 
 def build(parent):
-    box, cont = real_build(parent)
+    box, download, settings, remember = real_build(parent)
     out["on_gui_thread"].append(QThread.currentThread() is app.thread())
     out["texts"].append(box.text())
     out["titles"].append(box.windowTitle())
     out["buttons"].append([
         (b.text(), int(box.buttonRole(b).value)) for b in box.buttons()
     ])
-    out["default_is_cancel"] = box.defaultButton().text() == "Cancel"
-    clicked = cont if choice["continue"] else box.buttons()[1]
+    out["default_is_cancel"] = box.defaultButton().text() == "Cancel download"
+    out["checkbox_text"] = box.checkBox().text()
+    remember.setChecked(choice["remember"])
+    clicked = {
+        "download": download,
+        "settings": settings,
+    }.get(choice["button"])
+    if clicked is None:
+        clicked = [b for b in box.buttons() if b.text() == "Cancel download"][0]
     box.exec = lambda: 0
     box.clickedButton = lambda: clicked
-    return box, cont
+    return box, download, settings, remember
 
 mw.build_p2p_consent_box = build
 
 mw.MainWindow._on_torrent_consent_needed(host, 7)
-choice["continue"] = False
+choice["button"] = "cancel"
 mw.MainWindow._on_torrent_consent_needed(host, 9)
+# Open Settings must park the task and never record consent, even with the
+# checkbox ticked.
+choice["button"] = "settings"
+mw.MainWindow._on_torrent_consent_needed(host, 11)
 
 out["answers"] = host.queue.answers
+out["reevaluated"] = host.queue.reevaluated
 out["text_matches"] = [t == mw.P2P_DISCLOSURE_TEXT for t in out["texts"]]
 out["title_matches"] = [t == mw.P2P_DISCLOSURE_TITLE for t in out["titles"]]
 print(json.dumps(out))
@@ -957,6 +1105,14 @@ print(json.dumps(out))
     assert all(out["on_gui_thread"])
     assert all(out["text_matches"])
     assert all(out["title_matches"])
-    assert [b[0] for b in out["buttons"][0]] == ["Continue", "Cancel"]
+    assert sorted(b[0] for b in out["buttons"][0]) == [
+        "Cancel download", "Download locally", "Open Settings",
+    ]
     assert out["default_is_cancel"] is True
-    assert out["answers"] == [[7, True], [9, False]]
+    assert out["checkbox_text"] == "Don't show this notice again"
+    # Cancel carries the ticked checkbox through as remember=True, but the
+    # queue only honours it on an accepted download.
+    assert out["answers"] == [[7, True, True], [9, False, True]]
+    # Open Settings answers nothing and re-evaluates instead.
+    assert out["settings_opened"] == [True]
+    assert out["reevaluated"] == [11]
