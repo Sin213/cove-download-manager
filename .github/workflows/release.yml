@@ -357,6 +357,7 @@ jobs:
           - Debrid API calls, the queue's link probe, and update checks used to go out over the default route. They now follow the selected network interface like everything else, so a VPN binding covers all of Cove's traffic and not only aria2 downloads.
           - A network interface that disappears no longer sends downloads out over another adapter. Cove refuses to start aria2 and says which interface is missing, and the window stays usable so you can change the setting.
           - Cancelling or dismissing the uncached-torrent notice no longer counts as consent.
+          - A leftover aria2 process from an earlier Cove session no longer breaks downloads. If Cove exited abnormally its aria2 could keep holding port 6800, and the next Cove would attach to it instead of starting its own, so every download failed with "connection refused" once that leftover exited. Cove now shuts down a leftover it recognises and starts a daemon it owns. An aria2 belonging to something else is reported rather than shut down.
 
           ### Notes
 
