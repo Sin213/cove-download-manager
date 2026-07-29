@@ -11,6 +11,7 @@ import base64
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -212,29 +213,37 @@ class Aria2Daemon:
         if self.settings.proxy_type != "none" and self.settings.proxy_host:
             proxy_url = self._build_proxy_url()
             args.append(f"--all-proxy={proxy_url}")
-        try:
-            self._proc = subprocess.Popen(
-                args,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                **_hidden_console_kwargs(),
-            )
-        except OSError as e:
-            raise Aria2Error(f"Failed to launch aria2c: {e}")
-        # Wait briefly for RPC to come up.
-        deadline = time.time() + 5.0
-        client = Aria2RPC(self.settings)
-        last_err: Exception | None = None
-        try:
-            while time.time() < deadline:
-                try:
-                    client.get_version()
-                    return
-                except Exception as e:
-                    last_err = e
-                    time.sleep(0.1)
-        finally:
-            client.close()
+        # Reclaim the port *before* spawning. Checking afterwards races the
+        # doomed child: it needs a moment to fail its bind and exit, so
+        # poll() can still read "alive" while the RPC reply is really coming
+        # from the leftover daemon.
+        if self._port_in_use():
+            self._reclaim_stale_daemon()
+        self._spawn(args)
+        last_err = self._await_rpc()
+        if last_err is None:
+            if self._proc.poll() is None:
+                return
+            # RPC answered, but our own child is already dead: an aria2c
+            # from a previous Cove outlived it and still holds the port. It
+            # accepts our secret, so it is ours - but we cannot stop or
+            # restart a process we have no handle on, and when it finally
+            # exits every RPC call fails with "connection refused" mid
+            # session. Shut it down and take ownership instead of driving it.
+            client = Aria2RPC(self.settings)
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+            finally:
+                client.close()
+            self._wait_for_port_release()
+            self._spawn(args)
+            last_err = self._await_rpc()
+            if last_err is None and self._proc.poll() is None:
+                return
+            self.stop()
+            raise self._stale_daemon_error()
         our_proc_died = self._proc.poll() is not None
         self.stop()
         if our_proc_died and "unauthorized" in str(last_err).lower():
@@ -245,6 +254,95 @@ class Aria2Daemon:
                 "settings, then restart Cove."
             )
         raise Aria2Error(f"aria2 RPC did not come up: {last_err}")
+
+    def _spawn(self, args: list[str]) -> None:
+        try:
+            self._proc = subprocess.Popen(
+                args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                **_hidden_console_kwargs(),
+            )
+        except OSError as e:
+            raise Aria2Error(f"Failed to launch aria2c: {e}")
+
+    def _await_rpc(self, timeout: float = 5.0) -> Exception | None:
+        """Poll the RPC endpoint. None once it answers, else the last error."""
+        deadline = time.time() + timeout
+        client = Aria2RPC(self.settings)
+        last_err: Exception | None = None
+        try:
+            while time.time() < deadline:
+                try:
+                    client.get_version()
+                    return None
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.1)
+        finally:
+            client.close()
+        return last_err
+
+    def _port_in_use(self) -> bool:
+        with socket.socket() as probe:
+            probe.settimeout(0.2)
+            try:
+                probe.connect(("127.0.0.1", int(self.settings.rpc_port)))
+            except OSError:
+                return False
+        return True
+
+    def _stale_daemon_error(self) -> "Aria2Error":
+        return Aria2Error(
+            "Another aria2 process is already using port "
+            f"{self.settings.rpc_port}. Quit it (check your process list "
+            "for a leftover aria2c) or change the RPC port in Cove's "
+            "settings, then restart Cove."
+        )
+
+    def _reclaim_stale_daemon(self) -> None:
+        """Clear an aria2 that already holds our RPC port.
+
+        A previous Cove's aria2c can outlive it (a crash, a killed session)
+        and keep listening. It accepts our secret, so a naive health check
+        passes and Cove ends up driving a process it cannot stop or restart
+        - then every call fails with "connection refused" once that process
+        finally exits. Shut it down and take ownership instead.
+        """
+        client = Aria2RPC(self.settings)
+        try:
+            client.get_version()
+        except Exception as e:
+            if "unauthorized" in str(e).lower():
+                # Someone else's aria2, not ours to shut down.
+                raise self._stale_daemon_error()
+            # Not an aria2 RPC we can talk to. Leave it alone and let the
+            # normal startup path report why our own daemon never came up.
+            return
+        finally:
+            client.close()
+        client = Aria2RPC(self.settings)
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+        finally:
+            client.close()
+        self._wait_for_port_release()
+        if self._port_in_use():
+            raise self._stale_daemon_error()
+
+    def _wait_for_port_release(self, timeout: float = 5.0) -> None:
+        """Give a shut-down daemon time to let go of the RPC port."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(0.2)
+                try:
+                    probe.connect(("127.0.0.1", int(self.settings.rpc_port)))
+                except OSError:
+                    return
+            time.sleep(0.1)
 
     def _build_proxy_url(self) -> str:
         from urllib.parse import quote

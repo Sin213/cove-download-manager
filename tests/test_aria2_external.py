@@ -16,13 +16,35 @@ from cove.aria2 import (
 from cove.config import MAX_CONNECTIONS_PER_SERVER, Settings
 
 
+@pytest.fixture(autouse=True)
+def _no_stale_daemon():
+    """Daemon startup tests must not depend on what holds 6800 locally.
+
+    Tests that exercise the reclaim path re-patch this inside the test, and
+    the inner patch wins.
+    """
+    with patch.object(Aria2Daemon, "_port_in_use", return_value=False):
+        yield
+
+
+def _live_proc():
+    """A Popen stand-in that reports a running child (poll() is None).
+
+    A bare MagicMock returns a truthy MagicMock from poll(), which the
+    daemon correctly reads as "our child already exited".
+    """
+    proc = MagicMock()
+    proc.poll.return_value = None
+    return proc
+
+
 def test_daemon_lifts_max_concurrent_downloads():
     """aria2 defaults to 5; the daemon must pass an explicit higher cap."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
 
@@ -37,7 +59,7 @@ def test_daemon_caps_per_server_connections_for_stock_aria2():
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
 
@@ -52,7 +74,7 @@ def test_daemon_stops_seeding_when_the_download_completes():
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
 
@@ -67,7 +89,7 @@ def test_daemon_binds_to_the_selected_network_interface():
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.interface_exists", return_value=True), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
 
@@ -79,7 +101,7 @@ def test_daemon_passes_no_interface_flag_for_any_interface():
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
 
@@ -94,7 +116,7 @@ def test_daemon_refuses_to_launch_when_the_interface_is_gone():
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.interface_exists", return_value=False), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         with pytest.raises(Aria2InterfaceError) as excinfo:
             daemon.start()
@@ -107,13 +129,90 @@ def test_daemon_refuses_to_launch_when_the_interface_is_gone():
     assert isinstance(excinfo.value, Aria2Error)
 
 
+def test_daemon_reclaims_the_port_from_a_leftover_aria2():
+    """A previous Cove's aria2c can outlive it and keep port 6800.
+
+    It answers RPC with the same secret, so a naive health check passes
+    while our own child is dying of a failed bind. Cove must not drive a
+    process it cannot stop or restart: shut the leftover down first, then
+    launch a daemon it owns.
+    """
+    daemon = Aria2Daemon(Settings())
+    # In use before the shutdown call, free afterwards.
+    in_use = iter([True, False, False])
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
+         patch.object(Aria2Daemon, "_port_in_use", side_effect=lambda: next(in_use)), \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}), \
+         patch.object(Aria2RPC, "shutdown") as shutdown:
+        daemon.start()
+
+    assert shutdown.call_count == 1
+    # Exactly one spawn: the leftover is cleared before we launch, so no
+    # child is ever burned on a doomed bind.
+    assert popen.call_count == 1
+
+
+def test_daemon_reports_a_port_it_cannot_reclaim():
+    """If the leftover will not go away, say so instead of pretending."""
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
+         patch.object(Aria2Daemon, "_port_in_use", return_value=True), \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}), \
+         patch.object(Aria2RPC, "shutdown"):
+        with pytest.raises(Aria2Error) as excinfo:
+            daemon.start()
+
+    message = str(excinfo.value)
+    assert "6800" in message and "aria2c" in message
+    assert popen.call_count == 0
+
+
+def test_daemon_refuses_a_foreign_aria2_on_our_port():
+    """A stranger's aria2 rejects our secret and must not be shut down."""
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()), \
+         patch.object(Aria2Daemon, "_port_in_use", return_value=True), \
+         patch.object(Aria2RPC, "get_version", side_effect=Aria2Error("Unauthorized")), \
+         patch.object(Aria2RPC, "shutdown") as shutdown:
+        with pytest.raises(Aria2Error) as excinfo:
+            daemon.start()
+
+    assert "6800" in str(excinfo.value)
+    assert shutdown.call_count == 0
+
+
+def test_daemon_keeps_a_healthy_child_without_shutting_anything_down():
+    """The normal path must not gain a stray shutdown call."""
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2.DATA_DIR", MagicMock()), \
+         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
+         patch.object(Aria2Daemon, "_port_in_use", return_value=False), \
+         patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}), \
+         patch.object(Aria2RPC, "shutdown") as shutdown:
+        daemon.start()
+
+    assert popen.call_count == 1
+    assert shutdown.call_count == 0
+
+
 def test_daemon_adds_no_speculative_bittorrent_flags():
     """Only --seed-time=0 is new; DHT/PEX/ports stay on aria2 defaults."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.DATA_DIR", MagicMock()), \
          patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
-         patch("cove.aria2.subprocess.Popen") as popen, \
+         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
 
