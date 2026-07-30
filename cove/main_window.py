@@ -64,6 +64,7 @@ from .dialogs import (
     ClipboardBatchDialog,
     SchedulerDialog,
     SettingsDialog,
+    SourceDetailsDialog,
     torrent_file_problem,
 )
 from .queue import PHASE_METADATA, DownloadTask, QueueManager
@@ -1030,6 +1031,17 @@ class MainWindow(QMainWindow):
         for tid in tids:
             self.queue.remove(tid, delete_file=False)
 
+    def _add_source_action(self, menu, task) -> None:
+        """Add "View source" for `task`. Available in every status: the
+        origin of a download is just as worth checking when it failed."""
+        act = menu.addAction("View source")
+        act.triggered.connect(
+            lambda _=False, t=task: self._show_source_details(t)
+        )
+
+    def _show_source_details(self, task) -> None:
+        SourceDetailsDialog(task, self).exec()
+
     def _open_context_menu(self, pos) -> None:
         menu = QMenu(self)
         item = self.tree.itemAt(pos)
@@ -1079,6 +1091,8 @@ class MainWindow(QMainWindow):
                     retry_a.triggered.connect(
                         lambda: [self.queue.resume(t) for t in selected]
                     )
+                menu.addSeparator()
+                self._add_source_action(menu, task)
                 menu.addSeparator()
                 menu.addAction("Remove\tDel").triggered.connect(
                     lambda: self._remove_selected(delete_file=False)

@@ -4,6 +4,7 @@ subtitle, sections / form rows, accent OK / ghost Cancel.
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTime, Qt, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -45,6 +46,7 @@ from .config import (
 )
 from .debrid import DebridError
 from .netiface import ANY_INTERFACE, ANY_INTERFACE_LABEL, list_interfaces
+from .source_info import redact_url, source_details
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
     configure_speed_spin,
@@ -295,6 +297,85 @@ class AddDownloadDialog(QDialog):
 
     def get_dir(self) -> str:
         return self.dir_edit.text().strip() or self.settings.download_dir
+
+
+class SourceDetailsDialog(QDialog):
+    """Read-only "View source" sheet for one task.
+
+    Renders `source_info.source_details`, which has already masked
+    credentials and dropped anything private. The unmasked URL exists only
+    behind the explicit "Copy original URL" button, so nothing sensitive
+    is ever on screen or on the clipboard without the user asking for it.
+    """
+
+    def __init__(self, task, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Source details")
+        self.setMinimumWidth(560)
+        self._task = task
+        self._redacted_url = redact_url(task.url)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        _title_block(
+            layout,
+            "Source details",
+            "Cookies are never shown. Credentials and signed-link tokens are "
+            "masked wherever they can be recognised.",
+        )
+
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMinimumHeight(180)
+        self.details.setPlainText(
+            "\n".join(f"{label}: {value}" for label, value in source_details(task))
+        )
+        layout.addWidget(self.details)
+
+        copy_row = QHBoxLayout()
+        copy_url = QPushButton("Copy URL")
+        copy_url.setToolTip(
+            "Copy the URL exactly as shown above, with recognised secrets masked."
+        )
+        copy_url.clicked.connect(self.copy_url)
+        copy_row.addWidget(copy_url)
+
+        copy_original = QPushButton("Copy original URL")
+        copy_original.setToolTip(
+            "Copy the unmasked URL, including any credentials it carries."
+        )
+        copy_original.clicked.connect(self.copy_original_url)
+        copy_row.addWidget(copy_original)
+
+        copy_details = QPushButton("Copy details")
+        copy_details.clicked.connect(self.copy_details)
+        copy_row.addWidget(copy_details)
+        copy_row.addStretch(1)
+        layout.addLayout(copy_row)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(self.reject)
+        bb.button(QDialogButtonBox.Close).clicked.connect(self.reject)
+        layout.addWidget(bb)
+
+    def details_text(self) -> str:
+        return self.details.toPlainText()
+
+    def _set_clipboard(self, text: str) -> None:
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+
+    def copy_url(self) -> None:
+        self._set_clipboard(self._redacted_url)
+
+    def copy_original_url(self) -> None:
+        self._set_clipboard(self._task.url or "")
+
+    def copy_details(self) -> None:
+        self._set_clipboard(self.details_text())
 
 
 class ClipboardBatchDialog(QDialog):
