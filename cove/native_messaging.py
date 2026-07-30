@@ -81,6 +81,37 @@ def validate_url(url: str) -> bool:
     return False
 
 
+def deliver_to_primary(request: dict) -> bool:
+    """Hand one browser download to the Cove process running right now.
+
+    Returns True only if a live primary validated the request and its
+    QueueManager accepted it, which is the only condition under which the
+    extension may cancel the browser's own transfer. No primary listening, a
+    primary whose queue isn't ready yet, a rejected add, a shutting-down
+    primary, or a socket timeout all return False - and nothing is written
+    anywhere, so a later Cove launch cannot inherit the request.
+
+    Imported lazily so the Qt local-socket machinery is only pulled in when a
+    download is actually being forwarded (ping/status stay cheap).
+    """
+    try:
+        from PySide6.QtCore import QCoreApplication
+
+        from .config import DATA_DIR
+        from .single_instance import send_browser_download, server_name
+
+        # QLocalSocket needs a QCoreApplication for its event dispatcher. This
+        # host is a short-lived console process with no Qt app of its own, so
+        # create a minimal one; it is never exec()'d, and no GUI is possible
+        # (QCoreApplication, not QApplication) - the browser respawns this
+        # host freely, so accidentally opening a window here would loop.
+        if QCoreApplication.instance() is None:
+            QCoreApplication([])
+        return send_browser_download(server_name(DATA_DIR), request)
+    except Exception:
+        return False
+
+
 def handle_message(
     msg: dict,
     rpc: Aria2RPC | None,
@@ -99,59 +130,44 @@ def handle_message(
         if isinstance(url, str):
             url = url.strip()
         if not validate_url(url):
-            return {"status": "error", "message": f"Invalid or blocked URL: {url!r}"}
-        if rpc is None or settings is None:
-            return {"status": "error", "message": "Cove is not configured"}
+            # Never echo the URL: the extension writes this message to the
+            # browser console, and the URL may carry a session token.
+            return {"status": "error", "message": "Invalid or blocked URL"}
 
-        cookies = _sanitize_header(msg.get("cookies", ""))
-        referrer = _sanitize_header(msg.get("referrer", ""))
-        user_agent = _sanitize_header(msg.get("userAgent", ""))
-        filename = msg.get("filename") or None
+        requested_dir = msg.get("directory")
+        request = {
+            "url": url,
+            "filename": msg.get("filename") or None,
+            "directory": requested_dir if isinstance(requested_dir, str) else None,
+            "cookies": _sanitize_header(msg.get("cookies", "")),
+            "referrer": _sanitize_header(msg.get("referrer", "")),
+            "user_agent": _sanitize_header(msg.get("userAgent", "")),
+            "file_size": msg.get("fileSize") if isinstance(msg.get("fileSize"), int) else 0,
+        }
 
-        # Every download (plain, HLS, or extractor) is handed to the running
-        # GUI process via this drop file rather than added to aria2 directly
-        # here. The native messaging host is a separate process with no
-        # access to the live QueueManager, so an rpc.add_uri() shortcut here
-        # would add the raw URL straight to aria2, bypassing debrid
-        # resolution (Real-Debrid/AllDebrid/TorBox), category routing, and
-        # Cove's own DB row -- exactly the resolution QueueManager.add_url()
-        # performs for a manually pasted URL. The queue's _check_drop_dir()
-        # picks this up and calls add_url() itself, which detects the
-        # correct backend (aria2/ffmpeg/yt-dlp) from the URL.
-        import json as _json
-        import time as _time
-        import uuid as _uuid
-        from .config import DATA_DIR
+        # Every download (plain, HLS, or extractor) is handed to the *running*
+        # Cove GUI process, which calls QueueManager.add_url() itself. This
+        # host is a separate process with no access to the live QueueManager,
+        # so an rpc.add_uri() shortcut here would add the raw URL straight to
+        # aria2, bypassing debrid resolution (Real-Debrid/AllDebrid/TorBox),
+        # category routing, and Cove's own DB row.
+        #
+        # Crucially the handoff is synchronous and nothing is persisted. The
+        # extension cancels the browser's own download the moment it sees
+        # {"status": "ok"}, so "ok" may only be returned once a currently
+        # running Cove has actually accepted this exact request. The previous
+        # implementation wrote a durable drop file and answered "ok" whether
+        # or not any Cove process existed; the file was then consumed at the
+        # next launch, which is what made a download intercepted while Cove
+        # was closed reappear later.
         try:
-            drop_dir = DATA_DIR / "drop"
-            drop_dir.mkdir(parents=True, exist_ok=True)
-            # Random suffix: two drops in the same millisecond must not
-            # overwrite each other.
-            drop_file = drop_dir / (
-                f"download-{int(_time.time() * 1000)}-{_uuid.uuid4().hex[:8]}.json"
-            )
-            payload = {"url": url, "filename": filename}
-            # Only pass a directory the caller explicitly requested, so the
-            # queue's category routing still applies otherwise.
-            requested_dir = msg.get("directory")
-            if requested_dir:
-                payload["dir"] = requested_dir
-            # Browser headers, already CR/LF-sanitized above; the queue
-            # forwards them to the relevant backend so authenticated or
-            # anti-hotlink downloads keep working.
-            if cookies:
-                payload["cookies"] = cookies
-            if referrer:
-                payload["referrer"] = referrer
-            if user_agent:
-                payload["userAgent"] = user_agent
-            # Write via tmp + rename: the queue polls this directory and
-            # must never see a half-written .json file.
-            tmp_file = drop_file.with_suffix(".tmp")
-            tmp_file.write_text(_json.dumps(payload))
-            os.replace(tmp_file, drop_file)
-        except OSError as e:
-            return {"status": "error", "message": f"Could not queue download: {e}"}
+            accepted = deliver_to_primary(request)
+        except Exception:
+            accepted = False
+        if not accepted:
+            # Fixed sentence: never the URL, cookies or referrer, which the
+            # extension logs to the browser console.
+            return {"status": "error", "message": "Cove is not available"}
         return {"status": "ok", "message": "Download queued in Cove"}
 
     if action == "status":

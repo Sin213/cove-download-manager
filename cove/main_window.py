@@ -35,6 +35,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -403,6 +404,95 @@ class MainWindow(QMainWindow):
             self._tray.setToolTip(APP_NAME)
             self._tray.show()
         self._notified_status: dict[int, str] = {}
+        # Set by an explicit Quit (tray menu or application quit) so a close
+        # event raised during that quit is never turned back into a hide -
+        # otherwise close-to-tray would trap the app in a hide loop.
+        self._force_quit = False
+        self._install_tray_menu()
+
+    # ---- system tray ------------------------------------------------------
+
+    def _system_tray_available(self) -> bool:
+        """True only if this process owns a tray icon the platform still
+        shows. Both halves matter: the icon may have been created at startup
+        on a desktop whose tray has since gone away, and hiding the window
+        with no icon to restore it from would strand the user."""
+        return self._tray is not None and QSystemTrayIcon.isSystemTrayAvailable()
+
+    def _install_tray_menu(self) -> None:
+        """Attach Open/Quit to the existing notification tray icon.
+
+        Reuses `self._tray` rather than creating a second QSystemTrayIcon -
+        Cove has shown one for download notifications since long before
+        close-to-tray existed, and a second icon would just duplicate it.
+        Idempotent, so re-running it never installs a second menu.
+        """
+        if self._tray is None or getattr(self, "_tray_menu", None) is not None:
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Open Cove")
+        open_action.triggered.connect(self.show_from_tray)
+        menu.addSeparator()
+        quit_action = menu.addAction("Quit Cove")
+        quit_action.triggered.connect(self.request_quit)
+        self._tray_menu = menu
+        self._tray.setContextMenu(menu)
+        # A plain click (or double-click, which some platforms send instead)
+        # restores the existing window; neither ever constructs a new one.
+        try:
+            self._tray.activated.connect(self._on_tray_activated)
+        except (AttributeError, TypeError):
+            pass
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_from_tray()
+
+    def show_from_tray(self) -> None:
+        """Restore and raise the one existing main window."""
+        # Imported here, not at module scope: cove.app imports this
+        # module, so a top-level import would be circular.
+        from .app import activate_window
+
+        activate_window(self)
+
+    def request_quit(self) -> None:
+        """Explicit Quit: leave for good, whatever close-to-tray says.
+
+        Sets the bypass flag first so the close event Qt delivers while
+        quitting cannot be intercepted back into a hide, drops the tray icon,
+        then quits - which runs the app's single `aboutToQuit` cleanup
+        (API server, aria2, queue timers, single-instance IPC) exactly once.
+        Future browser downloads are then the browser's own business.
+        """
+        self._force_quit = True
+        if self._tray is not None:
+            self._tray.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        """Hide to the tray instead of exiting, only when opted in.
+
+        Default (`close_to_tray` off), an explicit Quit, or a platform with
+        no usable tray all fall through to the normal full shutdown, so X
+        behaves exactly as it always has unless the user asked otherwise.
+        Hiding runs no cleanup at all: aria2, the queue, the single-instance
+        endpoint and browser interception must all keep working.
+        """
+        if (
+            not self._force_quit
+            and getattr(self.settings, "close_to_tray", False) is True
+            and self._system_tray_available()
+        ):
+            event.ignore()
+            self.hide()
+            return
+        if self._tray is not None:
+            self._tray.hide()
+        QMainWindow.closeEvent(self, event)
 
     # ---- UI construction ------------------------------------------------
 

@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QSystemTrayIcon,
     QTimeEdit,
     QVBoxLayout,
     QWidget,
@@ -604,6 +605,28 @@ class SettingsDialog(QDialog):
         )
         form.addRow("Updates", self.auto_update)
 
+        self.close_to_tray = QCheckBox("Close to system tray")
+        self.close_to_tray.setChecked(settings.close_to_tray)
+        form.addRow("Window", self.close_to_tray)
+        tray_note = QLabel(
+            "Keeps Cove running so browser downloads can still be sent to it. "
+            "Use Quit from the tray menu to exit completely."
+        )
+        tray_note.setProperty("role", "muted")
+        tray_note.setWordWrap(True)
+        self.close_to_tray.setToolTip(tray_note.text())
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            # Without a tray there would be no icon to restore Cove from, so
+            # the close handler ignores the setting entirely. Say so and take
+            # the control away rather than offering a switch that does nothing.
+            self.close_to_tray.setChecked(False)
+            self.close_to_tray.setEnabled(False)
+            tray_note.setText(
+                "This system has no notification tray, so closing Cove always "
+                "exits it completely."
+            )
+        form.addRow("", tray_note)
+
         self.smart_segments = QCheckBox("Auto-tune connections based on server support")
         self.smart_segments.setChecked(settings.intelligent_segments)
         self.smart_segments.setToolTip(
@@ -1005,6 +1028,9 @@ class SettingsDialog(QDialog):
         self.settings.speed_limit_unit = self.speed_unit.currentText()
         self.settings.time_format_24h = self.use_24h.isChecked()
         self.settings.auto_update_check = self.auto_update.isChecked()
+        # Read back on the shared Settings object MainWindow already holds, so
+        # the next X press honours the new value without a restart.
+        self.settings.close_to_tray = self.close_to_tray.isChecked()
         self.settings.intelligent_segments = self.smart_segments.isChecked()
         self.settings.notify_on_complete = self.notify_complete.isChecked()
         self.settings.notify_on_error = self.notify_error.isChecked()

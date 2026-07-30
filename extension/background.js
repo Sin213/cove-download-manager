@@ -249,7 +249,12 @@ async function interceptDownload(downloadItem) {
     // browser's original download proceeds unimpeded and future intercepts
     // of the same URL are not blocked.
     recentIntercepted.delete(downloadItem.url);
-    console.error("Cove: native host failed, browser download continues", result.message);
+    // `result` may be null/undefined if the host replied with malformed JSON,
+    // so don't dereference it: an exception here would abort the handler.
+    console.error(
+      "Cove: native host failed, browser download continues",
+      (result && result.message) || "no response"
+    );
   }
 }
 
@@ -319,13 +324,16 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   if (result && result.status === "ok") {
     showNotification("Download sent to Cove", filename || url);
   } else {
-    console.error("Cove: context menu send failed, falling back to browser", result.message);
+    // Same as above: a malformed reply can be null, and throwing here would
+    // skip the browser fallback entirely - the one thing that must not fail.
+    const reason = (result && result.message) || "no response";
+    console.error("Cove: context menu send failed, falling back to browser", reason);
     try {
       markIntercepted(url);
       await browser.downloads.download({ url, filename: filename || undefined, saveAs: false });
       showNotification("Cove unavailable", "Downloading in browser instead");
     } catch (fallbackErr) {
-      showNotification("Cove error", result.message || "Failed to send download");
+      showNotification("Cove error", reason);
     }
   }
 });

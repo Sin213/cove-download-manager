@@ -63,6 +63,54 @@ def parse_launch_urls(argv: list[str]) -> list[str]:
     return urls
 
 
+class BrowserDownloadGate:
+    """Decides whether *this* process may accept a browser download.
+
+    The browser extension cancels its own transfer the moment the native host
+    reports success, so success has to mean "the Cove running right now took
+    it". This gate is the single place that decides that, and it answers False
+    for every condition under which the download would otherwise be lost or
+    deferred:
+
+      * the queue does not exist yet, or aria2 has not finished starting
+        (`ready` is set only after `resume_persisted()`), so an early request
+        is refused rather than buffered - unlike command-line/IPC magnets,
+        which the user explicitly asked for and which do get a startup inbox;
+      * shutdown has begun, so nothing accepted now would be driven to
+        completion;
+      * `add_url` rejected the URL or raised.
+
+    Nothing is written anywhere on failure, so a later launch can never
+    inherit the request. The add itself is deliberately non-interactive (no
+    duplicate dialog), matching how automatically captured browser downloads
+    have always been added.
+    """
+
+    def __init__(self) -> None:
+        self.queue = None
+        self.ready = False
+        self.shutting_down = False
+
+    def accept(self, request: dict) -> bool:
+        if self.shutting_down or not self.ready or self.queue is None:
+            return False
+        try:
+            task_id = self.queue.add_url(
+                request["url"],
+                out_dir=request.get("directory") or None,
+                filename=request.get("filename"),
+                cookies=request.get("cookies") or "",
+                referrer=request.get("referrer") or "",
+                user_agent=request.get("user_agent") or "",
+            )
+        except Exception:
+            # Fixed event name only - the request carries a URL, cookies and
+            # a referrer, none of which may reach the log.
+            logging.getLogger("cove").warning("browser_download_add_failed")
+            return False
+        return task_id is not None
+
+
 def activate_window(window) -> None:
     """Best-effort bring-to-front. Never raises - a compositor that refuses
     focus must not block the magnet that triggered the activation."""
@@ -158,6 +206,15 @@ def run() -> int:
     queue = None
     window = None
 
+    # Browser downloads are delivered synchronously to this process and are
+    # never buffered: the extension cancels the browser's own transfer on the
+    # strength of our answer, so an answer we can't honour right now would
+    # lose the download. Installed before anything else so a request arriving
+    # mid-startup is refused (browser keeps it) rather than racing an
+    # uninitialised queue.
+    browser_gate = BrowserDownloadGate()
+    instance_server.browser_download_handler = browser_gate.accept
+
     # Magnets that arrive before aria2 is up (command line or IPC) are
     # buffered here and drained exactly once, in arrival order, after
     # daemon.start() succeeds and the persisted queue has resumed.
@@ -180,6 +237,9 @@ def run() -> int:
     def _drain_startup_inbox() -> None:
         nonlocal queue_ready
         queue_ready = True
+        # Same moment for the browser path: only now can an add actually be
+        # driven to completion, so only now may we tell a browser we took one.
+        browser_gate.ready = True
         pending, startup_inbox[:] = list(startup_inbox), []
         for url in pending:
             try:
@@ -232,6 +292,7 @@ def run() -> int:
     daemon = Aria2Daemon(settings)
     rpc = Aria2RPC(settings)
     queue = QueueManager(settings, rpc)
+    browser_gate.queue = queue
     scheduler = Scheduler(settings.schedule)
     app.processEvents()
 
@@ -328,6 +389,10 @@ def run() -> int:
         window._updater = updater  # keep a reference
 
     def _cleanup() -> None:
+        # Refuse browser downloads from the first instant of shutdown: an add
+        # accepted now would never be driven to completion, and the browser
+        # would already have cancelled its own copy.
+        browser_gate.shutting_down = True
         # Stop UI repaint timers first so they don't fire on widgets being
         # torn down during shutdown.
         try:

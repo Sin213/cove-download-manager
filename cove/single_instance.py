@@ -41,8 +41,25 @@ _ELECTION_LOCK_TIMEOUT_MS = 2000
 _ELECTION_LOCK_STALE_MS = 5000
 _CONNECTION_READ_TIMEOUT_MS = 5000
 
+# Bounds for the browser-download action. A web page controls the URL and
+# (indirectly) the cookie jar behind these values, so every field is capped
+# before it can reach the queue or grow the IPC frame.
+MAX_BROWSER_URL_LENGTH = 8 * 1024
+MAX_BROWSER_FILENAME_LENGTH = 512
+MAX_BROWSER_DIRECTORY_LENGTH = 4096
+MAX_BROWSER_COOKIES_LENGTH = 32 * 1024
+MAX_BROWSER_REFERRER_LENGTH = 8 * 1024
+MAX_BROWSER_USER_AGENT_LENGTH = 1024
+MAX_BROWSER_FILE_SIZE = 1 << 62
+
+# Schemes the browser extension may hand over. Deliberately the same direct
+# schemes native messaging already accepted - magnets and local schemes are
+# not browser-interception material and must not arrive by this route.
+BROWSER_URL_SCHEMES = ("http://", "https://", "ftp://")
+
 _ERROR_SENTENCES = {
     "unsupported_version": "This request uses an unsupported protocol version.",
+    "rejected": "This request was not accepted.",
     "unknown_action": "This request uses an unsupported action.",
     "malformed_json": "This request could not be read.",
     "invalid_schema": "This request is not in the expected format.",
@@ -162,6 +179,101 @@ def validate_message(obj) -> tuple[str, list[str]]:
     return action, urls
 
 
+BROWSER_DOWNLOAD_ACTION = "browser_download"
+
+
+def _sanitize_header(value, limit: int) -> str:
+    """Bounded, CR/LF-free copy of an optional browser-supplied header.
+
+    CR/LF removal stops an extension- or page-controlled value from injecting
+    extra request headers into the fetch the backend later performs; the
+    length bound stops one page from inflating the IPC frame (and, later, an
+    aria2 command line) without limit. Anything that isn't a string - or that
+    exceeds the bound, or carries other control characters - is a rejected
+    request, not a silently trimmed one, so the browser keeps its download
+    rather than Cove taking it with headers that no longer authenticate.
+    """
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise MessageError("invalid_schema")
+    if len(value) > limit:
+        raise MessageError("oversized_message")
+    cleaned = value.replace("\r", "").replace("\n", "")
+    if not _is_control_free(cleaned):
+        raise MessageError("invalid_schema")
+    return cleaned
+
+
+def validate_browser_download(obj: dict) -> dict:
+    """Shallow-validate a `browser_download` request into queue arguments.
+
+    Returns the exact keyword material `QueueManager.add_url` needs. Deep
+    resolution (debrid routing, category routing, HLS/extractor detection)
+    stays where it already lives, inside `add_url` itself - this only decides
+    whether the request is safe and bounded enough to hand over.
+    """
+    url = obj.get("url")
+    if not isinstance(url, str):
+        raise MessageError("invalid_url")
+    url = url.strip()
+    if (
+        not url
+        or len(url) > MAX_BROWSER_URL_LENGTH
+        or not _is_control_free(url)
+        or not url.lower().startswith(BROWSER_URL_SCHEMES)
+    ):
+        raise MessageError("invalid_url")
+
+    filename = _sanitize_header(obj.get("filename"), MAX_BROWSER_FILENAME_LENGTH)
+    directory = _sanitize_header(obj.get("directory"), MAX_BROWSER_DIRECTORY_LENGTH)
+
+    file_size = obj.get("file_size", obj.get("fileSize", 0))
+    if file_size in (None, ""):
+        file_size = 0
+    if isinstance(file_size, bool) or not isinstance(file_size, int):
+        raise MessageError("invalid_schema")
+    if file_size < 0 or file_size > MAX_BROWSER_FILE_SIZE:
+        raise MessageError("invalid_schema")
+
+    return {
+        "url": url,
+        # "" means "no explicit choice": the queue's own category routing and
+        # default download directory still apply.
+        "filename": filename or None,
+        "directory": directory or None,
+        "cookies": _sanitize_header(
+            obj.get("cookies"), MAX_BROWSER_COOKIES_LENGTH
+        ),
+        "referrer": _sanitize_header(
+            obj.get("referrer"), MAX_BROWSER_REFERRER_LENGTH
+        ),
+        "user_agent": _sanitize_header(
+            obj.get("user_agent", obj.get("userAgent")),
+            MAX_BROWSER_USER_AGENT_LENGTH,
+        ),
+        "file_size": file_size,
+    }
+
+
+def validate_request(obj) -> tuple[str, dict]:
+    """Route one decoded IPC request to the validator for its action.
+
+    `open`/`activate` keep `validate_message` unchanged (magnet policy);
+    `browser_download` gets its own bounded validator. Returns
+    (action, payload) where payload is `{"urls": [...]}` for the magnet
+    actions and the queue arguments for a browser download.
+    """
+    if not isinstance(obj, dict):
+        raise MessageError("invalid_schema")
+    if obj.get("action") == BROWSER_DOWNLOAD_ACTION:
+        if obj.get("version") != PROTOCOL_VERSION:
+            raise MessageError("unsupported_version")
+        return BROWSER_DOWNLOAD_ACTION, validate_browser_download(obj)
+    action, urls = validate_message(obj)
+    return action, {"urls": urls}
+
+
 def encode_message(obj: dict) -> bytes:
     payload = json.dumps(obj, separators=(",", ":")).encode("utf-8")
     if len(payload) > MAX_MESSAGE_BYTES:
@@ -253,16 +365,51 @@ class _PendingConnection(QObject):
         self._done = True
         try:
             obj = decode_payload(payload)
-            action, urls = validate_message(obj)
+            action, request = validate_request(obj)
         except MessageError as exc:
             logger.info("ipc_rejected category=%s", exc.category)
             self._respond_error(exc.category)
             return
+
+        if action == BROWSER_DOWNLOAD_ACTION:
+            self._handle_browser_download(request)
+            return
+
+        urls = request["urls"]
         logger.info("ipc_accepted action=%s url_count=%d", action, len(urls))
         if action == "open":
             self._server.open_requested.emit(urls)
         self._server.activate_requested.emit()
         self._respond_ok(len(urls))
+
+    def _handle_browser_download(self, request: dict) -> None:
+        """Answer ok only once the *running* primary has actually taken the
+        download. The browser cancels its own transfer on this answer, so a
+        signal-and-hope emit would be a lie: Signal delivery says nothing
+        about whether the queue accepted anything. A plain callable is used
+        instead precisely because it returns a value.
+
+        Every failure mode - no handler yet (queue not ready), handler
+        declined, handler raised - answers ok=False, which leaves the browser
+        responsible for its own download. Nothing is buffered for later.
+        """
+        handler = self._server.browser_download_handler
+        accepted = False
+        if handler is not None:
+            try:
+                accepted = bool(handler(request))
+            except Exception:
+                # Fixed event name only: the request holds a URL, cookies and
+                # a referrer, none of which may reach the log.
+                logger.info("ipc_browser_download_handler_error")
+                accepted = False
+        # An automatically captured download must not raise the window, so
+        # activate_requested is deliberately not emitted here.
+        logger.info("ipc_browser_download accepted=%s", accepted)
+        if accepted:
+            self._respond_ok(1)
+        else:
+            self._respond_error("rejected")
 
     def _respond_ok(self, accepted: int) -> None:
         self._write({"version": PROTOCOL_VERSION, "ok": True, "accepted": accepted})
@@ -318,6 +465,11 @@ class SingleInstanceServer(QObject):
         self._name: str | None = None
         self._owned = False
         self._connection_read_timeout_ms = connection_read_timeout_ms
+        # Installed by the running primary once its queue can actually accept
+        # downloads, and cleared again on shutdown. `None` means "this
+        # process cannot take a browser download right now" - the request is
+        # refused rather than buffered, so the browser keeps its transfer.
+        self.browser_download_handler = None
 
     def try_become_primary(self, name: str) -> bool:
         """Attempt to claim `name`. Returns True iff this process is primary.
@@ -414,6 +566,9 @@ class SingleInstanceServer(QObject):
         bind a brand new primary - which our own `removeServer()` would
         then unlink out from under it.
         """
+        # Refuse browser downloads from this instant on: shutdown has begun,
+        # so anything accepted now would never be driven to completion.
+        self.browser_download_handler = None
         if not self._owned or not self._name:
             self._server = None
             return
@@ -447,15 +602,63 @@ def send_to_primary(
     """Forward `urls` (empty => activate-only) to the primary. Never raises."""
     url_list = list(urls)
     action = "open" if url_list else "activate"
+    return _request(
+        name,
+        {"version": PROTOCOL_VERSION, "action": action, "urls": url_list},
+        connect_timeout_ms,
+        ack_timeout_ms,
+    )
+
+
+def send_browser_download(
+    name: str,
+    request: dict,
+    connect_timeout_ms: int = _DEFAULT_CONNECT_TIMEOUT_MS,
+    ack_timeout_ms: int = _DEFAULT_ACK_TIMEOUT_MS,
+) -> bool:
+    """Ask the running primary to take one browser download. Never raises.
+
+    True means a Cove process that is running *right now* validated the
+    request and its queue accepted it. Every other outcome - no primary
+    listening, a primary whose queue isn't ready, a rejected add, a timeout,
+    a malformed reply - returns False, and the caller must leave the browser's
+    own download alone. Nothing is written anywhere on failure, so a later
+    Cove launch can never inherit this request.
+    """
+    message = {"version": PROTOCOL_VERSION, "action": BROWSER_DOWNLOAD_ACTION}
+    for key in (
+        "url",
+        "filename",
+        "directory",
+        "cookies",
+        "referrer",
+        "user_agent",
+        "file_size",
+    ):
+        if request.get(key) not in (None, ""):
+            message[key] = request[key]
+    return _request(name, message, connect_timeout_ms, ack_timeout_ms)
+
+
+def _request(
+    name: str,
+    message_obj: dict,
+    connect_timeout_ms: int,
+    ack_timeout_ms: int,
+) -> bool:
+    """One bounded request/response round trip against `name`. Never raises.
+
+    Shared by every client-side action so framing, the read deadline, and the
+    "only an explicit ok=True counts as success" rule cannot drift apart
+    between the magnet path and the browser path.
+    """
     sock = QLocalSocket()
     try:
         sock.connectToServer(name)
         if not sock.waitForConnected(connect_timeout_ms):
             return False
         try:
-            message = encode_message(
-                {"version": PROTOCOL_VERSION, "action": action, "urls": url_list}
-            )
+            message = encode_message(message_obj)
         except MessageError:
             return False
         sock.write(message)

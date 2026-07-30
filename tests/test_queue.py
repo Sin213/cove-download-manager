@@ -167,7 +167,6 @@ def test_add_url_accepts_api_overrides_and_preserves_hls_backend(tmp_path, monke
     finally:
         queue._poll.stop()
         queue._ext_poll.stop()
-        queue._drop_poll.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +261,6 @@ def queue_env(tmp_path, monkeypatch):
         queue._scheduler_allows = False
         queue._poll.stop()
         queue._ext_poll.stop()
-        queue._drop_poll.stop()
         return queue, rpc, path
 
     return _build
@@ -285,45 +283,67 @@ def _persisted_row(db_path, tid):
         conn.close()
 
 
-def test_check_drop_dir_routes_a_plain_url_through_add_url(queue_env, monkeypatch, tmp_path):
-    """A plain (non-video) URL dropped by the native messaging host must go
-    through the same add_url() path a manually pasted URL would -- that is
-    what lets a debrid-supported hoster link actually resolve through
-    Real-Debrid/AllDebrid/TorBox instead of aria2 fetching the raw hoster
-    page directly."""
+def test_legacy_browser_drop_files_are_purged_without_being_downloaded(
+    queue_env, monkeypatch, tmp_path
+):
+    """The old native-messaging host wrote a durable request here and the
+    queue consumed it at the next launch - which is exactly how a download
+    intercepted while Cove was closed reappeared later. Delivery is now
+    synchronous, so any file left behind by the buggy version must be
+    retired, never added.
+    """
     import json as _json
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
-    queue, _rpc, _db = queue_env()
-
-    calls = []
-    real_add_url = queue.add_url
-
-    def spy_add_url(url, **kwargs):
-        calls.append((url, kwargs))
-        return real_add_url(url, **kwargs)
-
-    monkeypatch.setattr(queue, "add_url", spy_add_url)
 
     drop_dir = tmp_path / "drop"
     drop_dir.mkdir(parents=True)
-    (drop_dir / "download-1-abcd1234.json").write_text(_json.dumps({
-        "url": "https://rapidgator.net/file/abc/f.rar",
-        "filename": "f.rar",
-        "cookies": "s=1",
-        "referrer": "https://rapidgator.net/",
-        "userAgent": "TestUA/1.0",
-    }))
+    legacy = [
+        drop_dir / "download-1-abcd1234.json",
+        drop_dir / "download-2-efab5678.json.bad",
+        drop_dir / "download-3-0badf00d.tmp",
+    ]
+    for f in legacy:
+        f.write_text(_json.dumps({"url": "https://example.invalid/stale.rar"}))
+    unrelated = drop_dir / "notes.txt"
+    unrelated.write_text("user file")
 
-    queue._check_drop_dir()
+    queue, _rpc, _db = queue_env()
+    calls = []
+    monkeypatch.setattr(queue, "add_url", lambda *a, **k: calls.append(a))
 
-    assert len(calls) == 1
-    url, kwargs = calls[0]
-    assert url == "https://rapidgator.net/file/abc/f.rar"
-    assert kwargs["cookies"] == "s=1"
-    assert kwargs["referrer"] == "https://rapidgator.net/"
-    assert kwargs["user_agent"] == "TestUA/1.0"
-    assert len(queue.tasks) == 1
-    assert list(drop_dir.glob("*.json")) == []
+    queue._purge_legacy_drop_dir()
+
+    assert calls == []
+    assert queue.tasks == {}
+    for f in legacy:
+        assert not f.exists()
+    # Only the browser host's own naming convention is touched.
+    assert unrelated.exists()
+
+
+def test_legacy_drop_purge_is_idempotent_and_tolerates_a_missing_dir(
+    queue_env, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "nonexistent")
+    queue, _rpc, _db = queue_env()
+    queue._purge_legacy_drop_dir()
+    queue._purge_legacy_drop_dir()
+
+
+def test_queue_no_longer_polls_a_drop_directory(queue_env, monkeypatch, tmp_path):
+    """The deferred-delivery consumer is retired, not merely disabled."""
+    import json as _json
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    drop_dir = tmp_path / "drop"
+    drop_dir.mkdir(parents=True)
+    (drop_dir / "download-9-99999999.json").write_text(
+        _json.dumps({"url": "https://example.invalid/stale.rar"})
+    )
+
+    queue, _rpc, _db = queue_env()
+    assert not hasattr(queue, "_check_drop_dir")
+    assert not hasattr(queue, "_drop_poll")
+    assert queue.tasks == {}
 
 
 def _persisted_url(db_path, tid):

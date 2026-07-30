@@ -145,6 +145,10 @@ class Settings:
     time_format_24h: bool = False  # default: 12-hour with AM/PM
     auto_update_check: bool = True
     delete_completed_on_exit: bool = False
+    # Pressing the window X hides Cove to the system tray instead of exiting,
+    # keeping it available for browser downloads. Off by default so the
+    # existing "X quits Cove" behavior is unchanged unless the user opts in.
+    close_to_tray: bool = False
     theme: str = "dark"  # "dark" | "light"
     rpc_port: int = 6800
     rpc_secret: str = ""  # populated on first save; never persisted as "cove"
@@ -235,6 +239,10 @@ class Settings:
         s.category_dirs = cat
         if s.theme not in ("dark", "light"):
             s.theme = "dark"
+        # A hand-edited non-boolean must not be read as "enabled" via Python
+        # truthiness - that would hide the window on close with no opt-in.
+        if not isinstance(s.close_to_tray, bool):
+            s.close_to_tray = False
         # Migrate legacy / empty / suspiciously-short secrets up to a real one.
         changed = speed_limit_unit_missing or sched_reset
         if (

@@ -61,22 +61,6 @@ def test_sanitize_header_strips_crlf():
     assert nm._sanitize_header(None) == ""
 
 
-def test_download_does_not_inject_headers_via_crlf(tmp_path, monkeypatch):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    msg = {
-        "action": "download",
-        "url": "https://example.com/f.zip",
-        "cookies": "s=1\r\nX-Evil: 1",
-        "referrer": "https://example.com/\r\nHost: evil",
-    }
-    handle_message(msg, rpc=MagicMock(), settings=MagicMock())
-    drop_files = list((tmp_path / "drop").glob("download-*.json"))
-    assert len(drop_files) == 1
-    data = json.loads(drop_files[0].read_text())
-    assert "\r" not in data["cookies"] and "\n" not in data["cookies"]
-    assert "\r" not in data["referrer"] and "\n" not in data["referrer"]
-
-
 def test_binary_stdio_uses_existing_buffers():
     """When std streams exist (console/dev), reuse their binary buffers."""
     fake_in = io.BytesIO(b"")
@@ -151,85 +135,6 @@ def test_handle_ping():
     assert "version" in result
 
 
-def test_handle_download(tmp_path, monkeypatch):
-    """A plain (non-HLS/extractor) download must be handed to the running
-    GUI process via the drop file, not added to aria2 directly here -- a
-    direct rpc.add_uri() would bypass debrid resolution (Real-Debrid/
-    AllDebrid/TorBox) entirely, since this process has no access to the
-    live QueueManager that performs it."""
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    mock_rpc = MagicMock()
-
-    msg = {
-        "action": "download",
-        "url": "https://example.com/file.zip",
-        "filename": "file.zip",
-        "referrer": "https://example.com/page",
-        "cookies": "session=abc",
-    }
-    result = handle_message(msg, rpc=mock_rpc, settings=MagicMock())
-    assert result == {"status": "ok", "message": "Download queued in Cove"}
-    mock_rpc.add_uri.assert_not_called()
-
-    drop_files = list((tmp_path / "drop").glob("download-*.json"))
-    assert len(drop_files) == 1
-    data = json.loads(drop_files[0].read_text())
-    assert data["url"] == "https://example.com/file.zip"
-    assert data["filename"] == "file.zip"
-    assert data["referrer"] == "https://example.com/page"
-    assert data["cookies"] == "session=abc"
-
-
-def test_handle_youtube_download_queues_extractor(tmp_path, monkeypatch):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    rpc = MagicMock()
-    settings = MagicMock()
-    settings.download_dir = "/tmp/downloads"
-
-    result = handle_message(
-        {
-            "action": "download",
-            "url": "https://www.youtube.com/watch?v=BMcJirSZACw",
-            "filename": "The BEST Way To Cook Pork Tenderloin.mp4",
-        },
-        rpc=rpc,
-        settings=settings,
-    )
-
-    assert result == {"status": "ok", "message": "Download queued in Cove"}
-    drop_files = list((tmp_path / "drop").glob("download-*.json"))
-    assert len(drop_files) == 1
-    assert '"url": "https://www.youtube.com/watch?v=BMcJirSZACw"' in drop_files[0].read_text()
-    rpc.add_uri.assert_not_called()
-
-
-def test_video_drop_payload_preserves_headers_and_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    result = handle_message(
-        {
-            "action": "download",
-            "url": "https://www.youtube.com/watch?v=BMcJirSZACw",
-            "filename": "clip.mp4",
-            "directory": "/tmp/videos",
-            "cookies": "session=abc",
-            "referrer": "https://example.com/page",
-            "userAgent": "TestUA/1.0",
-        },
-        rpc=MagicMock(),
-        settings=MagicMock(),
-    )
-    assert result["status"] == "ok"
-    drop_files = list((tmp_path / "drop").glob("download-*.json"))
-    assert len(drop_files) == 1
-    data = json.loads(drop_files[0].read_text())
-    assert data["dir"] == "/tmp/videos"
-    assert data["cookies"] == "session=abc"
-    assert data["referrer"] == "https://example.com/page"
-    assert data["userAgent"] == "TestUA/1.0"
-    # Atomic write: no half-written .tmp files left behind.
-    assert list((tmp_path / "drop").glob("*.tmp")) == []
-
-
 def test_handle_download_invalid_url():
     result = handle_message(
         {"action": "download", "url": "file:///etc/passwd"},
@@ -260,3 +165,185 @@ def test_handle_status():
 def test_handle_unknown_action():
     result = handle_message({"action": "unknown"}, rpc=None, settings=None)
     assert result["status"] == "error"
+
+
+# --- fail-open browser delivery -----------------------------------------
+#
+# The extension cancels the browser's own download the moment this host
+# answers {"status": "ok"}. So "ok" must mean a Cove process that is running
+# *right now* accepted the download. The host used to write a durable drop
+# file and answer ok regardless, which is exactly why a download intercepted
+# while Cove was closed reappeared at the next launch.
+
+
+class _Delivery:
+    """Records what the host tried to hand to the running primary."""
+
+    def __init__(self, accept: bool):
+        self.accept = accept
+        self.calls = []
+
+    def __call__(self, request):
+        self.calls.append(request)
+        return self.accept
+
+
+def test_download_succeeds_only_when_the_primary_accepts(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+
+    result = handle_message(
+        {
+            "action": "download",
+            "url": "https://example.invalid/file.zip",
+            "filename": "file.zip",
+            "referrer": "https://example.invalid/page",
+            "cookies": "session=dummy",
+            "userAgent": "DummyAgent/1.0",
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+
+    assert result["status"] == "ok"
+    assert len(delivery.calls) == 1
+    sent = delivery.calls[0]
+    assert sent["url"] == "https://example.invalid/file.zip"
+    assert sent["filename"] == "file.zip"
+    assert sent["referrer"] == "https://example.invalid/page"
+    assert sent["cookies"] == "session=dummy"
+    assert sent["user_agent"] == "DummyAgent/1.0"
+
+
+def test_download_preserves_an_explicitly_requested_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+
+    handle_message(
+        {
+            "action": "download",
+            "url": "https://www.youtube.com/watch?v=dummyvideoid",
+            "filename": "clip.mp4",
+            "directory": "/tmp/videos",
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert delivery.calls[0]["directory"] == "/tmp/videos"
+    # Extractor/HLS routing is still decided by the queue from the URL, so the
+    # host forwards the URL untouched rather than classifying it here.
+    assert delivery.calls[0]["url"] == "https://www.youtube.com/watch?v=dummyvideoid"
+
+
+def test_download_strips_crlf_from_header_values(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+
+    handle_message(
+        {
+            "action": "download",
+            "url": "https://example.invalid/f.zip",
+            "cookies": "s=1\r\nX-Evil: 1",
+            "referrer": "https://example.invalid/\r\nHost: evil",
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    sent = delivery.calls[0]
+    assert "\r" not in sent["cookies"] and "\n" not in sent["cookies"]
+    assert "\r" not in sent["referrer"] and "\n" not in sent["referrer"]
+
+
+def test_download_fails_when_no_primary_accepts(tmp_path, monkeypatch):
+    """Cove closed, queue not ready, add rejected, socket timed out - all the
+    same answer, and the browser keeps its download."""
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(nm, "deliver_to_primary", _Delivery(accept=False))
+
+    result = handle_message(
+        {"action": "download", "url": "https://example.invalid/file.zip"},
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert result["status"] == "error"
+
+
+def test_download_writes_no_durable_request_when_the_primary_is_absent(
+    tmp_path, monkeypatch
+):
+    """The bug: a file left behind here is picked up by the next launch."""
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(nm, "deliver_to_primary", _Delivery(accept=False))
+
+    handle_message(
+        {"action": "download", "url": "https://example.invalid/file.zip"},
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_download_writes_no_durable_request_even_when_accepted(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(nm, "deliver_to_primary", _Delivery(accept=True))
+
+    handle_message(
+        {"action": "download", "url": "https://example.invalid/file.zip"},
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert list(tmp_path.rglob("*")) == []
+
+
+def test_download_does_not_deliver_an_invalid_url(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+
+    result = handle_message(
+        {"action": "download", "url": "file:///etc/passwd"},
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert result["status"] == "error"
+    assert delivery.calls == []
+
+
+def test_download_error_never_echoes_the_url_or_cookies(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(nm, "deliver_to_primary", _Delivery(accept=False))
+
+    for msg in (
+        {
+            "action": "download",
+            "url": "https://example.invalid/?token=dummysecrettoken",
+            "cookies": "sid=dummysecretcookie",
+        },
+        {"action": "download", "url": "javascript:dummysecrettoken"},
+        {"action": "download"},
+    ):
+        blob = json.dumps(handle_message(msg, rpc=MagicMock(), settings=MagicMock()))
+        assert "dummysecrettoken" not in blob
+        assert "dummysecretcookie" not in blob
+
+
+def test_download_delivery_failure_is_reported_as_error(tmp_path, monkeypatch):
+    """A crash inside delivery must not become a false 'ok'."""
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+
+    def boom(request):
+        raise RuntimeError("dummy transport failure")
+
+    monkeypatch.setattr(nm, "deliver_to_primary", boom)
+    result = handle_message(
+        {"action": "download", "url": "https://example.invalid/file.zip"},
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+    assert result["status"] == "error"
+    assert list(tmp_path.rglob("*")) == []

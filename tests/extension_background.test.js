@@ -16,8 +16,10 @@ function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
+    contextMenuClicked: event(),
     message: event(),
   };
+  const browserDownloads = [];
   const quietEvent = () => event();
   const store = {
     async get(key) {
@@ -32,14 +34,14 @@ function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
       async setBadgeBackgroundColor() {},
     },
     commands: { onCommand: quietEvent() },
-    contextMenus: { create() {}, onClicked: quietEvent() },
+    contextMenus: { create() {}, onClicked: events.contextMenuClicked },
     cookies: { async getAll() { return []; } },
     downloads: {
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
       async cancel(id) { calls.cancel.push(id); },
       async erase(query) { calls.erase.push(query); },
-      async download() {},
+      async download(options) { browserDownloads.push(options); },
     },
     notifications: { async create() {} },
     runtime: {
@@ -75,7 +77,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
   });
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
-  return { calls, events };
+  return { calls, events, browserDownloads };
 }
 
 async function settle() {
@@ -164,4 +166,113 @@ test("detected stream reports native-host failure instead of false success", asy
 
   assert.equal(response.ok, false);
   assert.equal(response.error, "offline");
+});
+
+// The repaired native host answers "error" whenever no running Cove accepted
+// the download, and nothing is persisted for a later launch. These pin the
+// browser side of that contract: only a positive acknowledgement may cost the
+// user their browser download.
+
+test("a native-host timeout leaves the browser download running", async () => {
+  const { calls, events } = loadBackground({
+    nativeResult: () => Promise.reject(new Error("Native host has exited.")),
+  });
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit({
+    id: 6,
+    url: "https://example.test/timeout.zip",
+    filename: "timeout.zip",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 2_000_000,
+  });
+  await settle();
+
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1);
+  assert.deepEqual(calls.cancel, []);
+  assert.deepEqual(calls.erase, []);
+});
+
+test("a malformed native reply leaves the browser download running", async () => {
+  // `undefined` is omitted: it hits loadBackground's own default reply.
+  for (const reply of [null, {}, { status: "queued" }, "ok", 42]) {
+    const { calls, events } = loadBackground({ nativeResult: reply });
+    await settle();
+    calls.native.length = 0;
+
+    events.downloadCreated.emit({
+      id: 7,
+      url: "https://example.test/malformed.zip",
+      filename: "malformed.zip",
+      state: "in_progress",
+      startTime: new Date().toISOString(),
+      totalBytes: 2_000_000,
+    });
+    await settle();
+
+    assert.deepEqual(calls.cancel, [], `reply ${JSON.stringify(reply)} cancelled`);
+    assert.deepEqual(calls.erase, [], `reply ${JSON.stringify(reply)} erased`);
+  }
+});
+
+test("a failed send is retried rather than blocked by the dedup marker", async () => {
+  // Fail-open depends on the dedup mark being cleared on failure: otherwise
+  // the same URL is silently ignored for the rest of the dedup window.
+  let downloads = 0;
+  const { calls, events } = loadBackground({
+    // Keyed on the action so the extension's startup ping doesn't consume
+    // the first scripted answer.
+    nativeResult: (message) => {
+      if (message.action !== "download") return { status: "ok" };
+      downloads += 1;
+      return downloads === 1
+        ? { status: "error", message: "offline" }
+        : { status: "ok" };
+    },
+  });
+  await settle();
+  calls.native.length = 0;
+
+  const item = {
+    id: 8,
+    url: "https://example.test/retry.zip",
+    filename: "retry.zip",
+    state: "in_progress",
+    totalBytes: 2_000_000,
+  };
+  events.downloadCreated.emit({ ...item, startTime: new Date().toISOString() });
+  await settle();
+  await settle();
+  events.downloadCreated.emit({ ...item, startTime: new Date().toISOString() });
+  await settle();
+  await settle();
+
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 2);
+  assert.deepEqual(calls.cancel, [8]);
+});
+
+test("context menu falls back to a browser download when Cove is closed", async () => {
+  const { calls, events, browserDownloads } = loadBackground({
+    nativeResult: null, // malformed/absent reply, as when no Cove is running
+  });
+  await settle();
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      { menuItemId: "download-with-cove", linkUrl: "https://example.test/manual.zip" },
+      {}
+    )
+  );
+  await settle();
+
+  // The browser downloads it instead; nothing is queued for a later launch.
+  // Compared field-by-field: the options object is created inside the vm
+  // realm, so deepStrictEqual would fail on its prototype alone.
+  assert.equal(browserDownloads.length, 1);
+  assert.equal(browserDownloads[0].url, "https://example.test/manual.zip");
+  assert.equal(browserDownloads[0].filename, "manual.zip");
+  assert.equal(browserDownloads[0].saveAs, false);
+  assert.deepEqual(calls.cancel, []);
 });

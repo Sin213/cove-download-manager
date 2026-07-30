@@ -19,12 +19,14 @@ import pytest
 from PySide6.QtCore import QCoreApplication
 
 from cove.single_instance import (
+    MAX_BROWSER_COOKIES_LENGTH,
     MAX_MESSAGE_BYTES,
     MAX_URLS_PER_MESSAGE,
     MessageError,
     SingleInstanceServer,
     decode_payload,
     encode_message,
+    send_browser_download,
     send_to_primary,
     server_name,
     validate_message,
@@ -798,3 +800,266 @@ def test_no_request_signal_emitted_for_timed_out_connection():
         assert activates == []
     finally:
         server.shutdown()
+
+
+# --- browser_download IPC (fail-open browser delivery) -------------------
+#
+# The browser extension cancels its own download only when the native host
+# reports success, so "success" must mean "the process running right now
+# accepted this exact request". These tests pin that contract at the IPC
+# layer: acceptance is decided by a handler installed by the running primary,
+# and every unavailable/rejected/malformed path must answer ok=False.
+
+BROWSER_URL = "https://example.invalid/dummy-file.bin"
+
+
+def _browser_send_in_subprocess(name: str, payload: dict, timeout: float = 5.0) -> bool:
+    """Run `send_browser_download` in a separate process while pumping this
+    process's Qt event loop so the in-process server can respond."""
+    app = QCoreApplication.instance()
+    script = (
+        "from cove.single_instance import send_browser_download\n"
+        f"ok = send_browser_download({name!r}, {payload!r})\n"
+        'print("OK" if ok else "FAIL")\n'
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + timeout
+    while proc.poll() is None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    out, _ = proc.communicate(timeout=2)
+    return out.strip() == "OK"
+
+
+def test_browser_download_reaches_handler_and_reports_success():
+    name = _unique_name()
+    server = SingleInstanceServer()
+    seen = []
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: (seen.append(req) or True)
+        ok = _browser_send_in_subprocess(
+            name,
+            {
+                "url": BROWSER_URL,
+                "filename": "dummy-file.bin",
+                "cookies": "sid=dummy",
+                "referrer": "https://example.invalid/page",
+                "user_agent": "DummyAgent/1.0",
+            },
+        )
+        assert ok is True
+        assert len(seen) == 1
+        assert seen[0]["url"] == BROWSER_URL
+        assert seen[0]["filename"] == "dummy-file.bin"
+        assert seen[0]["cookies"] == "sid=dummy"
+        assert seen[0]["referrer"] == "https://example.invalid/page"
+        assert seen[0]["user_agent"] == "DummyAgent/1.0"
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_does_not_activate_the_window():
+    """An automatically captured browser download must never raise the GUI."""
+    name = _unique_name()
+    server = SingleInstanceServer()
+    activates = []
+    opens = []
+    server.activate_requested.connect(lambda: activates.append(True))
+    server.open_requested.connect(opens.append)
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: True
+        assert _browser_send_in_subprocess(name, {"url": BROWSER_URL}) is True
+        assert activates == []
+        assert opens == []
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_fails_when_handler_rejects():
+    name = _unique_name()
+    server = SingleInstanceServer()
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: False
+        assert _browser_send_in_subprocess(name, {"url": BROWSER_URL}) is False
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_fails_when_no_handler_installed():
+    """Before the primary is ready to accept downloads there is no handler,
+    and the browser must stay responsible for its own transfer."""
+    name = _unique_name()
+    server = SingleInstanceServer()
+    try:
+        assert server.try_become_primary(name) is True
+        assert _browser_send_in_subprocess(name, {"url": BROWSER_URL}) is False
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_fails_when_handler_raises():
+    name = _unique_name()
+    server = SingleInstanceServer()
+
+    def boom(req):
+        raise RuntimeError("dummy failure")
+
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = boom
+        assert _browser_send_in_subprocess(name, {"url": BROWSER_URL}) is False
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_fails_when_no_primary_is_listening():
+    assert _browser_send_in_subprocess(_unique_name(), {"url": BROWSER_URL}) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "",
+        "magnet:?xt=urn:btih:" + "a" * 40,
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "https://example.invalid/a\nb",
+        12345,
+    ],
+)
+def test_browser_download_rejects_unsupported_urls(url):
+    name = _unique_name()
+    server = SingleInstanceServer()
+    calls = []
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: (calls.append(req) or True)
+        resp = _raw_ipc_roundtrip(
+            name, {"version": 1, "action": "browser_download", "url": url}
+        )
+        assert resp["ok"] is False
+        assert calls == []
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_rejects_oversized_header_fields():
+    name = _unique_name()
+    server = SingleInstanceServer()
+    calls = []
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: (calls.append(req) or True)
+        resp = _raw_ipc_roundtrip(
+            name,
+            {
+                "version": 1,
+                "action": "browser_download",
+                "url": BROWSER_URL,
+                "cookies": "c" * (MAX_BROWSER_COOKIES_LENGTH + 1),
+            },
+        )
+        assert resp["ok"] is False
+        assert calls == []
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_strips_crlf_from_header_values():
+    name = _unique_name()
+    server = SingleInstanceServer()
+    seen = []
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: (seen.append(req) or True)
+        resp = _raw_ipc_roundtrip(
+            name,
+            {
+                "version": 1,
+                "action": "browser_download",
+                "url": BROWSER_URL,
+                "cookies": "sid=dummy\r\nX-Injected: yes",
+                "referrer": "https://example.invalid/\rp",
+                "user_agent": "Dummy\nAgent",
+            },
+        )
+        assert resp["ok"] is True
+        assert seen[0]["cookies"] == "sid=dummyX-Injected: yes"
+        assert seen[0]["referrer"] == "https://example.invalid/p"
+        assert seen[0]["user_agent"] == "DummyAgent"
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_response_never_echoes_the_payload():
+    """Error text must be a fixed sentence - never the URL or a header the
+    sender could read back (it may carry cookies or a private token)."""
+    name = _unique_name()
+    server = SingleInstanceServer()
+    secret = "https://example.invalid/?token=dummysecrettoken"
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: False
+        resp = _raw_ipc_roundtrip(
+            name,
+            {
+                "version": 1,
+                "action": "browser_download",
+                "url": secret,
+                "cookies": "sid=dummysecretcookie",
+            },
+        )
+        assert resp["ok"] is False
+        blob = json.dumps(resp)
+        assert "dummysecrettoken" not in blob
+        assert "dummysecretcookie" not in blob
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_does_not_log_url_or_headers(caplog):
+    name = _unique_name()
+    server = SingleInstanceServer()
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: True
+        with caplog.at_level("DEBUG", logger="cove.single_instance"):
+            _raw_ipc_roundtrip(
+                name,
+                {
+                    "version": 1,
+                    "action": "browser_download",
+                    "url": "https://example.invalid/?token=dummysecrettoken",
+                    "cookies": "sid=dummysecretcookie",
+                    "referrer": "https://example.invalid/dummysecretreferrer",
+                    "filename": "dummysecretname.bin",
+                },
+            )
+        text = caplog.text
+        for needle in (
+            "dummysecrettoken",
+            "dummysecretcookie",
+            "dummysecretreferrer",
+            "dummysecretname",
+        ):
+            assert needle not in text
+    finally:
+        server.shutdown()
+
+
+def test_browser_download_action_is_rejected_by_the_magnet_validator():
+    """validate_message stays the open/activate validator; browser requests
+    are routed through their own bounded validator instead."""
+    with pytest.raises(MessageError):
+        validate_message(
+            {"version": 1, "action": "browser_download", "urls": []}
+        )

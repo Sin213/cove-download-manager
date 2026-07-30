@@ -326,10 +326,7 @@ class QueueManager(QObject):
         self._ext_poll.setInterval(2000)
         self._ext_poll.timeout.connect(self._check_external)
         self._ext_poll.start()
-        self._drop_poll = QTimer(self)
-        self._drop_poll.setInterval(1000)
-        self._drop_poll.timeout.connect(self._check_drop_dir)
-        self._drop_poll.start()
+        self._purge_legacy_drop_dir()
         db.init()
         self._load_persisted()
 
@@ -365,44 +362,52 @@ class QueueManager(QObject):
         "error": "error",
     }
 
-    def _check_drop_dir(self) -> None:
-        """Pick up video downloads queued by the native messaging process."""
+    def _purge_legacy_drop_dir(self) -> None:
+        """Retire browser requests left behind by the old deferred-delivery bug.
+
+        Up to and including 3.2.0 the native messaging host wrote a durable
+        request file here and told the browser the download had been accepted
+        even when no Cove process was running; this queue then consumed it at
+        the next launch. That is the defect being repaired: browser delivery
+        is now a synchronous handoff to the live process (see
+        `single_instance.send_browser_download`) and nothing is ever
+        persisted, so this directory has no remaining producer or consumer.
+
+        An installation upgraded from a buggy version may still hold files
+        written before the upgrade, and those must not suddenly download.
+        They are deleted, never parsed - the contents are a URL with cookies
+        and a referrer, so nothing here reads or logs them, and no filename
+        is logged either. Only the host's own `download-*` naming convention
+        is touched, so an unrelated file a user put in this directory is left
+        alone. Idempotent, and a missing directory or an unreadable entry is
+        simply skipped.
+        """
         from .config import DATA_DIR
         drop_dir = DATA_DIR / "drop"
-        if not drop_dir.is_dir():
-            return
-        import json as _json
         try:
-            entries = sorted(drop_dir.iterdir())
+            if not drop_dir.is_dir():
+                return
+            entries = list(drop_dir.iterdir())
         except OSError:
             return
         for f in entries:
-            if not f.name.endswith(".json"):
+            # `download-<ms>-<hex>.json`, its `.tmp` half-write, and the
+            # `.bad` sideline the retired consumer produced.
+            if not f.name.startswith("download-"):
+                continue
+            if not (
+                f.name.endswith(".json")
+                or f.name.endswith(".json.bad")
+                or f.name.endswith(".tmp")
+            ):
                 continue
             try:
-                data = _json.loads(f.read_text())
-                url = data.get("url", "")
-                if url:
-                    tid = self.add_url(
-                        url,
-                        out_dir=data.get("dir") or None,
-                        filename=data.get("filename"),
-                        cookies=data.get("cookies") or "",
-                        referrer=data.get("referrer") or "",
-                        user_agent=data.get("userAgent") or "",
-                    )
-                    if tid is None:
-                        # The queue rejected the URL; sideline the file
-                        # instead of silently discarding the request.
-                        raise ValueError("queue rejected drop request")
-                f.unlink(missing_ok=True)
-            except Exception:
-                # Sideline the file instead of retrying it every second or
-                # deleting the URL outright; .bad files are skipped above.
-                try:
-                    f.rename(f.with_name(f.name + ".bad"))
-                except OSError:
-                    f.unlink(missing_ok=True)
+                f.unlink()
+            except OSError:
+                # Permission-denied or a concurrent removal: leave it be.
+                # Nothing consumes this directory any more, so a survivor is
+                # inert rather than a deferred download.
+                continue
 
     def _check_external(self) -> None:
         """Pick up downloads added to aria2 outside Cove's queue (e.g. the

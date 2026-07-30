@@ -405,7 +405,6 @@ def test_http_add_enters_real_queue_sqlite_and_ui_signal_immediately(tmp_path, m
         server.stop()
         queue._poll.stop()
         queue._ext_poll.stop()
-        queue._drop_poll.stop()
 
 
 def test_settings_migration_creates_distinct_api_token_without_changing_rpc_secret(
@@ -507,7 +506,6 @@ def test_settings_endpoint_omits_every_debrid_credential_including_torbox(tmp_pa
     finally:
         queue._poll.stop()
         queue._ext_poll.stop()
-        queue._drop_poll.stop()
 
 
 def test_task_snapshot_omits_internal_torbox_identifiers():
