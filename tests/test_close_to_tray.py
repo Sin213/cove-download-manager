@@ -11,6 +11,7 @@ is always faked - a test must never depend on the desktop environment
 actually providing a system tray.
 """
 import pytest
+import shiboken6
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QMainWindow
 
@@ -169,8 +170,11 @@ def _destroy_hosts():
     yield
     while _live_hosts:
         host = _live_hosts.pop()
-        host.setParent(None)
-        host.deleteLater()
+        host.close()
+        # Destroy the C++ object now rather than queueing a deleteLater():
+        # a pending deletion is processed during interpreter shutdown, after
+        # the QApplication is gone, which segfaults Qt.
+        shiboken6.delete(host)
     QApplication.processEvents()
 
 
@@ -306,7 +310,9 @@ def _settings_dialog(close_to_tray):
 
     settings = Settings()
     settings.close_to_tray = close_to_tray
-    return settings, SettingsDialog(settings, None)
+    dlg = SettingsDialog(settings, None)
+    _live_hosts.append(dlg)
+    return settings, dlg
 
 
 def test_settings_checkbox_reflects_the_stored_value(monkeypatch):
@@ -316,7 +322,6 @@ def test_settings_checkbox_reflects_the_stored_value(monkeypatch):
     for stored in (True, False):
         _settings, dlg = _settings_dialog(stored)
         assert dlg.close_to_tray.isChecked() is stored
-        dlg.deleteLater()
 
 
 def test_saving_settings_writes_the_checkbox_value(monkeypatch):
@@ -332,7 +337,6 @@ def test_saving_settings_writes_the_checkbox_value(monkeypatch):
     dlg.close_to_tray.setChecked(False)
     dlg._on_accept()
     assert settings.close_to_tray is False
-    dlg.deleteLater()
 
 
 def test_settings_disables_the_option_when_no_tray_exists(monkeypatch):
@@ -346,4 +350,3 @@ def test_settings_disables_the_option_when_no_tray_exists(monkeypatch):
     # And saving must not leave a setting enabled that cannot be honoured.
     dlg._on_accept()
     assert settings.close_to_tray is False
-    dlg.deleteLater()
