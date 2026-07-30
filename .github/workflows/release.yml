@@ -351,9 +351,17 @@ jobs:
           - **View source.** Right-click any task and choose "View source" to see where it came from: the URL, the referring page, the browser's user agent, the save folder and file name, and for torrents the name and info hash. It works for finished and failed tasks too, which is usually when you want it.
           - **Privacy-conscious display in View source.** Anything secret in a link is masked on screen: credentials embedded in the URL, signed-link parameters such as `token`, `apiKey`, and `X-Amz-Signature`, private-tracker passkeys in both the query and the path, magnet tracker and web-seed URLs, and tokens hidden after the `#`. Stored browser cookies are acknowledged as present but never displayed, and a debrid provider's one-time delivery link is never included at all. Copying is always deliberate: "Copy URL" gives you the masked form, and the unmasked original has its own separate button.
 
+          - **Close to system tray.** Off by default, in Settings -> Window. With it on, the window X hides Cove to the tray instead of quitting, so the browser extension can still hand downloads to a Cove you thought you had closed. The tray icon's menu has Open Cove and Quit Cove, and clicking the icon brings the window back. On a desktop with no tray the setting is disabled rather than offered, because there would be no icon to restore Cove from.
+
+          ### Fixed
+
+          - **YouTube downloads no longer fail with HTTP 413.** Cove was passing the browser's entire cookie jar to yt-dlp as a request header. On a signed-in YouTube session that header is large enough that YouTube rejects the request as too large, so a perfectly public video failed after three retries. Cove no longer forwards browser cookies for YouTube pages, which need no account cookies. Cookies are still sent for direct file and HLS downloads that depend on them.
+          - **Browser downloads are no longer lost when Cove is closed.** If Cove was not running, the extension's hand-off could cancel the browser's own transfer and leave nothing behind. The browser now keeps the download whenever Cove does not positively accept it, and nothing is queued up to appear later.
+
           ### Notes
 
           - Duplicate detection compares canonical URLs and torrent info hashes. Two different links to the same file are not recognised as the same download, and a moved or renamed file no longer counts as a completed match.
+          - Account-required YouTube content such as members-only or private videos is not downloadable through the extension, since browser cookies are no longer forwarded for YouTube.
           - View source masks secrets by name and by shape. A secret that looks like an ordinary word in a path cannot be told apart from a folder name, so treat the masking as a strong guard rather than a guarantee, especially before sharing a screenshot.
 
           ## Downloads

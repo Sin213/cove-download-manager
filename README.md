@@ -80,13 +80,22 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
   Local BitTorrent stays blocked while a proxy is set unless you enable the
   override, because a proxy cannot be trusted to cover peer traffic.
 - **YouTube and video sites** - links yt-dlp supports are extracted and
-  downloaded through it automatically, with the browser's cookies, referrer,
-  and user agent passed along so gated media still works.
+  downloaded through it automatically, with the browser's referrer and user
+  agent passed along. Browser cookies are deliberately not forwarded for
+  YouTube pages, because sending a full cookie jar makes YouTube reject the
+  request outright; public videos need no account cookies. Cookies are still
+  forwarded for direct file and HLS downloads that depend on them.
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
 - **In-page video pill** - a floating "Download with Cove" pill appears on
   video players while hovering or playing; one click sends the media to Cove.
   Supports direct MP4/WebM, detected HLS (M3U8), old Reddit posts, and YouTube.
+- **Close to system tray** - optional, off by default, in Settings -> Window.
+  With it on, the window X hides Cove to the tray instead of quitting, so the
+  browser extension can still hand downloads to it; the tray icon's menu has
+  Open Cove and Quit Cove, and a click on the icon restores the window. On a
+  desktop with no tray the setting is disabled, because there would be no
+  icon to bring Cove back from.
 - **Frameless cove UI** - custom titlebar, mint accent, light and dark
   palettes. Dragging via `startSystemMove`, edge-resize via
   `startSystemResize`, both Wayland-safe.
