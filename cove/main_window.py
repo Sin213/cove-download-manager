@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import APP_NAME, __version__, theme
+from . import APP_NAME, __version__, dedup, theme
 from .clipboard import extract_urls
 from .config import Settings
 from .dialogs import (
@@ -657,6 +657,181 @@ class MainWindow(QMainWindow):
         self.queue.torrent_consent_needed.connect(self._on_torrent_consent_needed)
         self.scheduler.allowed_changed.connect(self._on_scheduler_changed)
 
+    # ---- duplicate-aware adding -----------------------------------------
+    #
+    # Every user-initiated add funnels through `add_urls_checked` (or, for
+    # a `.torrent`, through the queue's `duplicate_check` callback, since
+    # the info hash only exists after the file has been parsed). Automated
+    # paths - the local API, native messaging, queue restore, retry/resume,
+    # `_check_external`, `_materialize_cached_torrent` - keep calling the
+    # queue directly and are never prompted.
+
+    @staticmethod
+    def _candidate(url: str) -> dedup.Candidate:
+        text = (url or "").strip()
+        return dedup.Candidate(url=text, info_hash=dedup.magnet_info_hash(text))
+
+    def _focus_task(self, tid: int | None) -> None:
+        item = self._items.get(tid) if tid is not None else None
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item)
+        self.tree.setFocus()
+
+    @staticmethod
+    def _duplicate_target(match: dedup.DuplicateMatch) -> Path | None:
+        """Where "Open Folder" should point, or None if nothing survives.
+
+        The file itself when it is still there, otherwise the directory it
+        was saved into - a user who moved or deleted the file still wants
+        to land somewhere useful.
+        """
+        if not match.out_dir:
+            return None
+        try:
+            folder = Path(match.out_dir)
+            if match.filename:
+                target = folder / match.filename
+                if target.exists():
+                    return target
+            return folder if folder.is_dir() else None
+        except OSError:
+            return None
+
+    def _confirm_duplicate(
+        self, match: dedup.DuplicateMatch, label: str = ""
+    ) -> bool:
+        """Warn about one duplicate. True only if the user chose to proceed.
+
+        Cancel is both the default and the Escape button, so dismissing the
+        dialog can never start a download. "Download Anyway" applies to this
+        add and nothing else: no suppression is stored anywhere.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        folder: Path | None = None
+        focus_btn = None
+        open_btn = None
+        proceed_btn = None
+        if match.category == dedup.COMPLETED:
+            box.setWindowTitle("Already downloaded")
+            box.setText("This download appears to have already been completed.")
+            folder = self._duplicate_target(match)
+            if folder is not None:
+                open_btn = box.addButton("Open Folder", QMessageBox.ActionRole)
+            proceed_btn = box.addButton("Download Again", QMessageBox.AcceptRole)
+        else:
+            live_torrent = match.identity == dedup.ID_INFO_HASH
+            box.setWindowTitle("Already in queue")
+            box.setText(
+                "This torrent is already in your queue."
+                if live_torrent
+                else "This download is already in your queue."
+            )
+            focus_btn = box.addButton("Focus Existing", QMessageBox.ActionRole)
+            if not live_torrent:
+                # A live torrent cannot be offered "Download Anyway": the
+                # engine's own info-hash guard would refuse it, and an
+                # action that cannot be honoured is worse than no action.
+                proceed_btn = box.addButton(
+                    "Download Anyway", QMessageBox.AcceptRole
+                )
+        detail = label or match.name
+        if detail:
+            box.setInformativeText(detail)
+        cancel_btn = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if focus_btn is not None and clicked is focus_btn:
+            self._focus_task(match.task_id)
+            return False
+        if open_btn is not None and clicked is open_btn and folder is not None:
+            _reveal_in_folder(folder)
+            return False
+        return proceed_btn is not None and clicked is proceed_btn
+
+    def _confirm_duplicate_batch(
+        self, checked: list[tuple[dedup.Candidate, dedup.DuplicateMatch | None]]
+    ) -> list[str]:
+        """One summary for the whole batch; never one modal per item.
+
+        Returns the URLs to add, in the order they were submitted. Only
+        short labels are shown - a signed link's query carries its token
+        and a private-tracker magnet carries its passkey, so no full URL
+        is ever rendered here.
+        """
+        dups = [(c, m) for c, m in checked if m is not None]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Duplicate downloads")
+        box.setText(
+            f"{len(dups)} of {len(checked)} downloads already exist in your "
+            "queue or completed history."
+        )
+        shown = [dedup.safe_label(c) for c, _ in dups[:8]]
+        if len(dups) > len(shown):
+            shown.append(f"...and {len(dups) - len(shown)} more")
+        box.setInformativeText("\n".join(shown))
+        skip_btn = box.addButton("Skip Duplicates", QMessageBox.AcceptRole)
+        all_btn = box.addButton("Add All Anyway", QMessageBox.ActionRole)
+        cancel_btn = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(skip_btn)
+        box.setEscapeButton(cancel_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is all_btn:
+            # Live same-info-hash torrents stay skipped even here: the
+            # engine cannot run one twice, whatever the user picks.
+            return [c.url for c, m in checked if m is None or m.can_duplicate]
+        if clicked is skip_btn:
+            return [c.url for c, m in checked if m is None]
+        return []
+
+    def add_urls_checked(
+        self, urls: list[str], out_dir: str | None = None
+    ) -> list[int]:
+        """Add URLs interactively, warning about anything already present."""
+        cands = [self._candidate(u) for u in urls if (u or "").strip()]
+        if not cands:
+            return []
+        checked: list[tuple[dedup.Candidate, dedup.DuplicateMatch | None]] = []
+        seen: dict[tuple[str, str], dedup.Candidate] = {}
+        for cand in cands:
+            ident = dedup.identity(cand)
+            if ident is not None and ident in seen:
+                # A repeat inside this very batch, which the queue cannot
+                # know about yet because nothing has been added.
+                match = dedup.DuplicateMatch(
+                    category=dedup.LIVE,
+                    identity=ident[0],
+                    name=dedup.safe_label(seen[ident]),
+                    can_duplicate=ident[0] != dedup.ID_INFO_HASH,
+                )
+            else:
+                match = self.queue.find_duplicate(
+                    cand.url, info_hash=cand.info_hash
+                )
+                if ident is not None:
+                    seen[ident] = cand
+            checked.append((cand, match))
+        if all(m is None for _, m in checked):
+            return self.queue.add_urls([c.url for c, _ in checked], out_dir)
+        if len(checked) == 1:
+            cand, match = checked[0]
+            if not self._confirm_duplicate(match, dedup.safe_label(cand)):
+                return []
+            tid = self.queue.add_url(cand.url, out_dir)
+            return [] if tid is None else [tid]
+        chosen = self._confirm_duplicate_batch(checked)
+        return self.queue.add_urls(chosen, out_dir) if chosen else []
+
+    def add_url_interactive(self, url: str) -> None:
+        """Entry point for command-line and second-instance magnets."""
+        self.add_urls_checked([url])
+
     # ---- actions --------------------------------------------------------
 
     def _add_download(self) -> None:
@@ -667,7 +842,11 @@ class MainWindow(QMainWindow):
             self.settings.download_dir = dlg.get_dir()
             self.settings.save()
             self._refresh_folder_chip()
-            self.queue.add_torrent_file(dlg.torrent_path, dlg.get_dir())
+            self.queue.add_torrent_file(
+                dlg.torrent_path,
+                dlg.get_dir(),
+                duplicate_check=self._confirm_duplicate,
+            )
             return
         urls = dlg.get_urls()
         if not urls:
@@ -676,7 +855,7 @@ class MainWindow(QMainWindow):
         self.settings.download_dir = dlg.get_dir()
         self.settings.save()
         self._refresh_folder_chip()
-        self.queue.add_urls(urls)
+        self.add_urls_checked(urls)
 
     def _on_torrent_consent_needed(self, tid: int) -> None:
         """Ask once, before Cove's first local BitTorrent transfer.
@@ -714,13 +893,13 @@ class MainWindow(QMainWindow):
             chosen = dlg.selected()
             if chosen:
                 selected_dir = dlg.get_dir()
-                self.queue.add_urls(chosen, selected_dir)
+                self.add_urls_checked(chosen, selected_dir)
 
     def _paste_urls(self) -> None:
         text = QGuiApplication.clipboard().text() or ""
         urls = extract_urls(text)
         if urls:
-            self.queue.add_urls(urls)
+            self.add_urls_checked(urls)
 
     def _toggle_selected(self) -> None:
         for tid in self._selected_tids():
@@ -1189,8 +1368,12 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         for path in torrents:
-            self.queue.add_torrent_file(path, self.settings.download_dir)
-        added = self.queue.add_urls(urls) if urls else []
+            self.queue.add_torrent_file(
+                path,
+                self.settings.download_dir,
+                duplicate_check=self._confirm_duplicate,
+            )
+        added = self.add_urls_checked(urls) if urls else []
         if added or torrents:
             event.acceptProposedAction()
         else:

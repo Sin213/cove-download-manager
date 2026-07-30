@@ -1116,3 +1116,341 @@ print(json.dumps(out))
     # Open Settings answers nothing and re-evaluates instead.
     assert out["settings_opened"] == [True]
     assert out["reevaluated"] == [11]
+
+
+DUPLICATE_SCRIPT = r'''
+import json, sys
+from PySide6.QtWidgets import QApplication, QMainWindow
+
+from cove import dedup
+import cove.main_window as mw
+
+app = QApplication([])
+out = {}
+
+HEX = "0123456789abcdef0123456789abcdef01234567"
+SIGNED = "https://cdn.example.com/dir/f.zip?token=dummy-token"
+
+# Which button the next dialog should report as clicked, by label. "escape"
+# means "the user hit Escape", which Qt reports as the escape button.
+choice = {"button": "Cancel"}
+boxes = []
+
+real_box = mw.QMessageBox
+
+
+class RecordingBox(real_box):
+    def exec(self):
+        default = self.defaultButton()
+        escape = self.escapeButton()
+        boxes.append({
+            "title": self.windowTitle(),
+            "text": self.text(),
+            "informative": self.informativeText(),
+            "buttons": [b.text() for b in self.buttons()],
+            "default": default.text() if default is not None else None,
+            "escape": escape.text() if escape is not None else None,
+        })
+        return 0
+
+    def clickedButton(self):
+        if choice["button"] == "escape":
+            return self.escapeButton()
+        for b in self.buttons():
+            if b.text() == choice["button"]:
+                return b
+        return None
+
+
+mw.QMessageBox = RecordingBox
+
+
+class FakeTree:
+    def __init__(self):
+        self.current = []
+        self.scrolled = []
+    def setCurrentItem(self, item):
+        self.current.append(item)
+    def scrollToItem(self, item):
+        self.scrolled.append(item)
+    def setFocus(self):
+        pass
+
+
+class FakeQueue:
+    def __init__(self, matches=None):
+        self.matches = matches or {}
+        self.added = []
+        self.batches = []
+    def find_duplicate(self, url, **kw):
+        return self.matches.get(dedup.canonical_url(url) or url)
+    def add_url(self, url, out_dir=None):
+        self.added.append(url)
+        return len(self.added)
+    def add_urls(self, urls, out_dir=None):
+        self.batches.append(list(urls))
+        return [self.add_url(u) for u in urls]
+
+
+class Host(mw.MainWindow):
+    """The real MainWindow methods, without its heavy constructor."""
+    def __init__(self):
+        QMainWindow.__init__(self)
+
+
+def host_with(matches=None):
+    h = Host()
+    h.queue = FakeQueue(matches)
+    h.tree = FakeTree()
+    h._items = {}
+    return h
+
+
+def run(label, host, urls):
+    boxes.clear()
+    ids = mw.MainWindow.add_urls_checked(host, urls)
+    return {
+        "boxes": list(boxes),
+        "added": list(host.queue.added),
+        "batches": list(host.queue.batches),
+        "ids": ids,
+    }
+
+
+# ---- live, non-torrent -------------------------------------------------
+live = dedup.DuplicateMatch(
+    category=dedup.LIVE, identity=dedup.ID_URL, task_id=7, status="queued",
+    name="f.zip", can_duplicate=True,
+)
+matches = {dedup.canonical_url(SIGNED): live}
+
+choice["button"] = "Cancel"
+out["live_cancel"] = run("live_cancel", host_with(matches), [SIGNED])
+
+choice["button"] = "escape"
+out["live_escape"] = run("live_escape", host_with(matches), [SIGNED])
+
+choice["button"] = "Download Anyway"
+out["live_anyway"] = run("live_anyway", host_with(matches), [SIGNED])
+
+choice["button"] = "Focus Existing"
+h = host_with(matches)
+h._items = {7: "row-7", 9: "row-9"}
+out["live_focus"] = run("live_focus", h, [SIGNED])
+out["focused"] = list(h.tree.current)
+out["scrolled_to"] = list(h.tree.scrolled)
+
+# ---- live torrent ------------------------------------------------------
+magnet = "magnet:?xt=urn:btih:%s&tr=https%%3A%%2F%%2Ft%%2Fdummy-passkey" % HEX
+live_torrent = dedup.DuplicateMatch(
+    category=dedup.LIVE, identity=dedup.ID_INFO_HASH, task_id=3, status="active",
+    name="Alpha", can_duplicate=False,
+)
+h = host_with()
+h.queue.matches = {}
+h.queue.find_duplicate = lambda url, **kw: live_torrent
+choice["button"] = "Cancel"
+out["live_torrent"] = run("live_torrent", h, [magnet])
+
+# ---- completed ---------------------------------------------------------
+tmp = sys.argv[1]
+completed_with_path = dedup.DuplicateMatch(
+    category=dedup.COMPLETED, identity=dedup.ID_URL, task_id=None,
+    status="completed", name="f.zip", out_dir=tmp, filename="f.zip",
+)
+completed_no_path = dedup.DuplicateMatch(
+    category=dedup.COMPLETED, identity=dedup.ID_URL, task_id=None,
+    status="completed", name="f.zip", out_dir="", filename="",
+)
+h = host_with()
+h.queue.find_duplicate = lambda url, **kw: completed_with_path
+choice["button"] = "Cancel"
+out["completed_with_path"] = run("cwp", h, [SIGNED])
+
+h = host_with()
+h.queue.find_duplicate = lambda url, **kw: completed_no_path
+choice["button"] = "Download Again"
+out["completed_again"] = run("ca", h, [SIGNED])
+
+# ---- batch -------------------------------------------------------------
+u1 = "https://example.com/a.bin"
+u2 = "https://example.com/b.bin"
+batch = [u1, SIGNED, u2]
+def batch_host():
+    h = host_with()
+    h.queue.find_duplicate = lambda url, **kw: (
+        live if dedup.canonical_url(url) == dedup.canonical_url(SIGNED) else None
+    )
+    return h
+
+choice["button"] = "Skip Duplicates"
+out["batch_skip"] = run("bs", batch_host(), batch)
+choice["button"] = "Add All Anyway"
+out["batch_all"] = run("ba", batch_host(), batch)
+choice["button"] = "Cancel"
+out["batch_cancel"] = run("bc", batch_host(), batch)
+choice["button"] = "escape"
+out["batch_escape"] = run("be", batch_host(), batch)
+
+# A repeat inside the same submission, with nothing pre-existing.
+choice["button"] = "Skip Duplicates"
+out["batch_intra"] = run("bi", host_with(), [u1, u2, u1])
+
+# A live torrent stays skipped even under "Add All Anyway".
+h = host_with()
+h.queue.find_duplicate = lambda url, **kw: (
+    live_torrent if url.startswith("magnet:") else None
+)
+choice["button"] = "Add All Anyway"
+out["batch_all_torrent"] = run("bat", h, [u1, magnet])
+
+# ---- startup / IPC entry point ----------------------------------------
+h = host_with(matches)
+choice["button"] = "Cancel"
+boxes.clear()
+mw.MainWindow.add_url_interactive(h, SIGNED)
+out["interactive"] = {"boxes": list(boxes), "added": list(h.queue.added)}
+
+print(json.dumps(out))
+'''
+
+
+def _run_duplicate_script(tmp_path):
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", DUPLICATE_SCRIPT, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def test_duplicate_warning_dialogs(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+
+    live = out["live_cancel"]
+    assert len(live["boxes"]) == 1
+    box = live["boxes"][0]
+    assert box["text"] == "This download is already in your queue."
+    assert sorted(box["buttons"]) == [
+        "Cancel", "Download Anyway", "Focus Existing",
+    ]
+    # Cancel is both the default and the Escape button, so a dismissed
+    # dialog can never start a download.
+    assert box["default"] == "Cancel"
+    assert box["escape"] == "Cancel"
+    assert live["added"] == []
+    assert out["live_escape"]["added"] == []
+
+    # "Download Anyway" adds exactly once, through the single-URL path.
+    assert out["live_anyway"]["added"] == [
+        "https://cdn.example.com/dir/f.zip?token=dummy-token"
+    ]
+    assert out["live_anyway"]["batches"] == []
+
+    # "Focus Existing" selects and scrolls to the matched row, adds nothing.
+    assert out["live_focus"]["added"] == []
+    assert out["focused"] == ["row-7"]
+    assert out["scrolled_to"] == ["row-7"]
+
+
+def test_live_torrent_duplicate_offers_no_download_anyway(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+    box = out["live_torrent"]["boxes"][0]
+    assert box["text"] == "This torrent is already in your queue."
+    assert sorted(box["buttons"]) == ["Cancel", "Focus Existing"]
+    assert "Download Anyway" not in box["buttons"]
+    # The magnet's tracker passkey must not reach the dialog.
+    assert "dummy-passkey" not in json.dumps(box)
+
+
+def test_completed_duplicate_dialog(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+    box = out["completed_with_path"]["boxes"][0]
+    assert box["text"] == "This download appears to have already been completed."
+    assert sorted(box["buttons"]) == ["Cancel", "Download Again", "Open Folder"]
+    assert box["default"] == "Cancel"
+    assert box["escape"] == "Cancel"
+    assert out["completed_with_path"]["added"] == []
+
+    # No usable path on disk means no "Open Folder" that could not work.
+    no_path = out["completed_again"]["boxes"][0]
+    assert "Open Folder" not in no_path["buttons"]
+    assert out["completed_again"]["added"] == [
+        "https://cdn.example.com/dir/f.zip?token=dummy-token"
+    ]
+
+
+def test_batch_duplicates_show_one_summary(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+    skip = out["batch_skip"]
+    assert len(skip["boxes"]) == 1, "one summary, never one modal per item"
+    box = skip["boxes"][0]
+    assert box["text"] == (
+        "1 of 3 downloads already exist in your queue or completed history."
+    )
+    assert sorted(box["buttons"]) == [
+        "Add All Anyway", "Cancel", "Skip Duplicates",
+    ]
+    assert box["default"] == "Skip Duplicates"
+    assert box["escape"] == "Cancel"
+    # Only a short label is shown; the signed URL and its token are not.
+    assert "dummy-token" not in json.dumps(box)
+    assert "cdn.example.com/f.zip" in box["informative"]
+
+    assert skip["batches"] == [
+        ["https://example.com/a.bin", "https://example.com/b.bin"]
+    ]
+
+    # Add All Anyway keeps the submitted order.
+    assert out["batch_all"]["batches"] == [[
+        "https://example.com/a.bin",
+        "https://cdn.example.com/dir/f.zip?token=dummy-token",
+        "https://example.com/b.bin",
+    ]]
+
+    assert out["batch_cancel"]["batches"] == []
+    assert out["batch_cancel"]["added"] == []
+    assert out["batch_escape"]["added"] == []
+
+
+def test_batch_detects_repeats_inside_the_same_submission(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+    intra = out["batch_intra"]
+    assert len(intra["boxes"]) == 1
+    assert intra["boxes"][0]["text"] == (
+        "1 of 3 downloads already exist in your queue or completed history."
+    )
+    assert intra["batches"] == [
+        ["https://example.com/a.bin", "https://example.com/b.bin"]
+    ]
+
+
+def test_batch_add_all_still_skips_a_live_torrent(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+    # The engine cannot run one info hash twice, whatever the user picks.
+    assert out["batch_all_torrent"]["batches"] == [["https://example.com/a.bin"]]
+
+
+def test_startup_and_ipc_magnets_reach_the_duplicate_check(tmp_path):
+    out = _run_duplicate_script(tmp_path)
+    assert len(out["interactive"]["boxes"]) == 1
+    assert out["interactive"]["added"] == []
+
+    # ...and app.py routes both the startup inbox and second-instance IPC
+    # through the window helper rather than straight at the queue.
+    source = (Path(__file__).resolve().parents[1] / "cove" / "app.py").read_text()
+    assert "window.add_url_interactive(url)" in source
+    assert source.count("_add_interactive(url)") == 2
+    assert "queue.add_url(url)" in source  # the pre-window fallback
+
+
+def test_torrent_file_adds_pass_an_interactive_duplicate_check():
+    source = (Path(__file__).resolve().parents[1] / "cove" / "main_window.py").read_text()
+    # Both interactive .torrent paths (Add dialog, drag-and-drop) opt in.
+    assert source.count("duplicate_check=self._confirm_duplicate") == 2

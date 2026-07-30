@@ -261,6 +261,13 @@ class FakeMainWindow:
         calls["constructed"].append("MainWindow")
         from unittest.mock import MagicMock
         self.titlebar = MagicMock()
+        self._queue = a[1] if len(a) > 1 else k.get("queue")
+
+    def add_url_interactive(self, url):
+        # The real window runs its duplicate check here and then calls the
+        # queue; the delivery contract under test is that the magnet still
+        # lands in queue.add_url exactly once.
+        self._queue.add_url(url)
 
     def isMinimized(self):
         return False

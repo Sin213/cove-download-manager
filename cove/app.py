@@ -164,13 +164,26 @@ def run() -> int:
     startup_inbox: list[str] = list(launch_urls)
     queue_ready = False
 
+    def _add_interactive(url: str) -> None:
+        """Add one externally-delivered magnet the way the GUI would.
+
+        A command-line or second-instance magnet is as user-initiated as
+        one typed into the Add dialog, so it goes through the window's
+        duplicate check whenever the window exists. Before it does (an IPC
+        request that beats the GUI up), the queue is all there is.
+        """
+        if window is not None:
+            window.add_url_interactive(url)
+        else:
+            queue.add_url(url)
+
     def _drain_startup_inbox() -> None:
         nonlocal queue_ready
         queue_ready = True
         pending, startup_inbox[:] = list(startup_inbox), []
         for url in pending:
             try:
-                queue.add_url(url)
+                _add_interactive(url)
             except Exception:
                 logging.getLogger("cove").warning("startup_inbox_add_failed")
 
@@ -178,7 +191,7 @@ def run() -> int:
         if queue_ready and queue is not None:
             for url in urls:
                 try:
-                    queue.add_url(url)
+                    _add_interactive(url)
                 except Exception:
                     logging.getLogger("cove").warning("ipc_add_failed")
         else:

@@ -17,7 +17,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
-from . import db, debrid, netiface, torrent
+from . import db, debrid, dedup, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
@@ -526,6 +526,167 @@ class QueueManager(QObject):
             return str(Path(self.settings.download_dir) / category)
         return self.settings.download_dir
 
+    # ---- duplicate detection -------------------------------------------
+
+    # Statuses that count as "this download already exists". `error` and
+    # `removed` are deliberately absent: a failed or discarded download is
+    # exactly the one a user is most likely to legitimately re-add.
+    _DUP_LIVE_STATUSES = frozenset({"queued", "active", "paused"})
+
+    # Upper bound on the completed rows a URL-identity lookup will scan.
+    # Newest first, because a user re-adding something is overwhelmingly
+    # re-adding something recent.
+    _DUP_HISTORY_LIMIT = 5000
+
+    @staticmethod
+    def _dup_candidate_from_task(t: "DownloadTask") -> dedup.Candidate:
+        return dedup.Candidate(
+            url=t.url,
+            source_type=t.source_type,
+            info_hash=t.info_hash,
+            debrid_route=t.debrid_route,
+            debrid_item_id=t.debrid_item_id,
+            name=t.torrent_name or (t.filename or ""),
+        )
+
+    @staticmethod
+    def _dup_candidate_from_row(row) -> dedup.Candidate:
+        return dedup.Candidate(
+            url=_row_get(row, "url", "") or "",
+            source_type=_row_get(row, "source_type", "") or "",
+            info_hash=_row_get(row, "info_hash", "") or "",
+            debrid_route=_row_get(row, "debrid_route", "") or "",
+            debrid_item_id=_row_get(row, "debrid_item_id", "") or "",
+            name=_row_get(row, "torrent_name", "") or "",
+        )
+
+    def find_duplicate(
+        self,
+        url: str,
+        *,
+        source_type: str = SOURCE_PLAIN,
+        info_hash: str = "",
+        debrid_route: str = "",
+        debrid_item_id: str = "",
+        exclude_task_id: int | None = None,
+    ) -> Optional[dedup.DuplicateMatch]:
+        """Report an existing download that matches this submission.
+
+        Read-only and side-effect free: nothing is mutated, no provider is
+        resolved, aria2 is not touched and no network or content check is
+        performed. The caller decides what, if anything, to say about the
+        result - this method never raises a dialog.
+
+        Live in-memory tasks are checked first, then completed rows in
+        SQLite (so a warning still fires after a restart). Errored and
+        removed tasks never match.
+        """
+        cand = dedup.Candidate(
+            url=url,
+            source_type=source_type,
+            info_hash=info_hash,
+            debrid_route=debrid_route,
+            debrid_item_id=debrid_item_id,
+        )
+        ident = dedup.identity(cand)
+        if ident is None:
+            return None
+
+        completed_task: Optional[DownloadTask] = None
+        for t in self.tasks.values():
+            if exclude_task_id is not None and t.id == exclude_task_id:
+                continue
+            if t.status not in self._DUP_LIVE_STATUSES and t.status != "completed":
+                continue
+            if dedup.identity(self._dup_candidate_from_task(t)) != ident:
+                continue
+            if t.status == "completed":
+                # Keep looking: a live task is the more useful answer, and
+                # "Focus Existing" beats "Open Folder" when both apply.
+                if completed_task is None:
+                    completed_task = t
+                continue
+            return dedup.DuplicateMatch(
+                category=dedup.LIVE,
+                identity=ident[0],
+                task_id=t.id,
+                status=t.status,
+                name=t.torrent_name or (t.filename or ""),
+                out_dir=t.out_dir,
+                filename=t.filename or "",
+                can_duplicate=ident[0] != dedup.ID_INFO_HASH,
+            )
+        if completed_task is not None:
+            return dedup.DuplicateMatch(
+                category=dedup.COMPLETED,
+                identity=ident[0],
+                task_id=completed_task.id,
+                status="completed",
+                name=completed_task.torrent_name or (completed_task.filename or ""),
+                out_dir=completed_task.out_dir,
+                filename=completed_task.filename or "",
+            )
+        return self._find_completed_duplicate(ident, exclude_task_id)
+
+    def _find_completed_duplicate(
+        self, ident: tuple[str, str], exclude_task_id: int | None
+    ) -> Optional[dedup.DuplicateMatch]:
+        """Completed history, from the same table the queue already uses.
+
+        No schema change and no new index: the info-hash and provider
+        lookups narrow in SQL, and the URL lookup falls back to a bounded
+        newest-first scan because a canonical URL is not a stored column.
+        Rows written before the torrent/provider columns existed simply
+        have them empty, which lands them on the URL rule.
+        """
+        kind, key = ident
+        base = (
+            "SELECT id, url, filename, out_dir, source_type, info_hash, "
+            "torrent_name, debrid_route, debrid_item_id "
+            "FROM downloads WHERE status='completed'"
+        )
+        try:
+            with db.connect() as conn:
+                if kind == dedup.ID_INFO_HASH:
+                    rows = conn.execute(
+                        base + " AND info_hash!='' ORDER BY id DESC", ()
+                    ).fetchall()
+                elif kind == dedup.ID_PROVIDER:
+                    route, item_id = key.split("\x00", 1)
+                    rows = conn.execute(
+                        base + " AND debrid_route=? AND debrid_item_id=? "
+                        "ORDER BY id DESC",
+                        (route, item_id),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        base + " ORDER BY id DESC LIMIT ?",
+                        (self._DUP_HISTORY_LIMIT,),
+                    ).fetchall()
+        except Exception:
+            # History is an optimisation on top of the live queue; a
+            # malformed or unreadable row must never block a new add.
+            return None
+        for row in rows:
+            try:
+                if exclude_task_id is not None and row["id"] == exclude_task_id:
+                    continue
+                if dedup.identity(self._dup_candidate_from_row(row)) != ident:
+                    continue
+                filename = _row_get(row, "filename", "") or ""
+                return dedup.DuplicateMatch(
+                    category=dedup.COMPLETED,
+                    identity=kind,
+                    task_id=row["id"],
+                    status="completed",
+                    name=(_row_get(row, "torrent_name", "") or "") or filename,
+                    out_dir=_row_get(row, "out_dir", "") or "",
+                    filename=filename,
+                )
+            except Exception:
+                continue
+        return None
+
     def add_url(
         self,
         url: str,
@@ -715,12 +876,24 @@ class QueueManager(QObject):
             torrent_name=_safe_torrent_name(magnet.display_name),
         )
 
-    def add_torrent_file(self, path: str, out_dir: str | None = None) -> None:
+    def add_torrent_file(
+        self,
+        path: str,
+        out_dir: str | None = None,
+        *,
+        duplicate_check=None,
+    ) -> None:
         """Queue a local `.torrent`.
 
         Reading, bencode parsing, the info-dictionary SHA-1 and the copy
         into Cove's own store all happen on a worker; the GUI thread only
         ever sees the finished metadata and the managed path.
+
+        `duplicate_check` is how an interactive caller gets a say: the info
+        hash is only known after parsing, so the check cannot happen before
+        the call. It is invoked on the GUI thread with the match and the
+        torrent's name, and returning False abandons the add. Automation
+        passes nothing and is never prompted.
         """
         if not self._torrent_enabled():
             return
@@ -732,6 +905,14 @@ class QueueManager(QObject):
             if self._live_torrent(meta.info_hash):
                 self.error.emit("That torrent is already in Cove's queue.")
                 return
+            if duplicate_check is not None:
+                match = self.find_duplicate(
+                    torrent.minimal_magnet(meta.info_hash),
+                    source_type=SOURCE_TORRENT,
+                    info_hash=meta.info_hash,
+                )
+                if match is not None and not duplicate_check(match, meta.name):
+                    return
             # The minimal magnet is the task URL: it identifies the torrent
             # without persisting anything the .torrent might carry. The
             # persisted path is Cove's own copy, not the user's file, so a

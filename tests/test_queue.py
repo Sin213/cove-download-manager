@@ -2997,3 +2997,205 @@ def test_ad_torrent_file_relaunch_regression_with_torbox_gate_on(
     )
     queue._launch(queue.tasks[tid])
     assert rpc.added[0]["uris"] == [TORRENT_NODE_URL]
+
+
+# ---- duplicate detection (QueueManager.find_duplicate) ---------------
+
+DUP_HEX = "0123456789abcdef0123456789abcdef01234567"
+DUP_URL = "https://example.com/dir/f.zip?id=1"
+
+
+def _complete_in_db(db_path, tid, **overrides):
+    """Mark a persisted row completed, the way a finished download leaves it."""
+    values = {"status": "completed", "finished_at": time.time()}
+    values.update(overrides)
+    assignments = ", ".join(f"{k}=?" for k in values)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            f"UPDATE downloads SET {assignments} WHERE id=?",
+            (*values.values(), tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_find_duplicate_matches_a_queued_url(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    match = queue.find_duplicate(DUP_URL)
+    assert match is not None
+    assert match.category == "live"
+    assert match.identity == "url"
+    assert match.task_id == tid
+    assert match.can_duplicate is True
+
+
+def test_find_duplicate_matches_an_active_task(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    queue.tasks[tid].status = "active"
+    match = queue.find_duplicate(DUP_URL)
+    assert match is not None and match.status == "active"
+
+
+def test_find_duplicate_matches_a_paused_task(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    queue.tasks[tid].status = "paused"
+    match = queue.find_duplicate(DUP_URL)
+    assert match is not None and match.status == "paused"
+
+
+def test_find_duplicate_ignores_an_errored_task(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    queue.tasks[tid].status = "error"
+    assert queue.find_duplicate(DUP_URL) is None
+
+
+def test_find_duplicate_ignores_a_removed_task(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    queue.tasks[tid].status = "removed"
+    assert queue.find_duplicate(DUP_URL) is None
+
+
+def test_find_duplicate_ignores_a_different_query_string(queue_env):
+    queue, _rpc, _db = queue_env()
+    queue.add_url(DUP_URL)
+    assert queue.find_duplicate("https://example.com/dir/f.zip?id=2") is None
+
+
+def test_find_duplicate_honours_exclude_task_id(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    assert queue.find_duplicate(DUP_URL, exclude_task_id=tid) is None
+
+
+def test_find_duplicate_matches_completed_history(queue_env):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(DUP_URL)
+    _complete_in_db(db_path, tid, filename="f.zip")
+    queue.tasks.pop(tid)
+    match = queue.find_duplicate(DUP_URL)
+    assert match is not None
+    assert match.category == "completed"
+    assert match.filename == "f.zip"
+    assert match.out_dir
+
+
+def test_completed_history_survives_a_restart(queue_env):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(DUP_URL)
+    _complete_in_db(db_path, tid, filename="f.zip")
+    # A fresh QueueManager over the same database is what a restart is.
+    restarted, _rpc2, _db2 = queue_env()
+    assert tid not in restarted.tasks
+    match = restarted.find_duplicate(DUP_URL)
+    assert match is not None and match.category == "completed"
+
+
+def test_completed_history_ignores_errored_rows(queue_env):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(DUP_URL)
+    _complete_in_db(db_path, tid, status="error", error="boom")
+    queue.tasks.pop(tid)
+    assert queue.find_duplicate(DUP_URL) is None
+
+
+def test_completed_history_ignores_removed_rows(queue_env):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(DUP_URL)
+    _complete_in_db(db_path, tid, status="removed")
+    queue.tasks.pop(tid)
+    assert queue.find_duplicate(DUP_URL) is None
+
+
+def test_find_duplicate_matches_an_equivalent_magnet(queue_env):
+    queue, _rpc, _db = queue_env(torrent_support_enabled=True)
+    tid = queue.add_url(
+        f"magnet:?xt=urn:btih:{DUP_HEX}&dn=Alpha&tr=udp%3A%2F%2Ftracker.a"
+    )
+    assert tid is not None
+    match = queue.find_duplicate(
+        f"magnet:?tr=udp%3A%2F%2Ftracker.b&xt=urn:btih:{DUP_HEX.upper()}&dn=Beta",
+        info_hash=DUP_HEX,
+    )
+    assert match is not None
+    assert match.identity == "info_hash"
+    assert match.category == "live"
+    # The engine cannot run one info hash twice, so no honest "anyway".
+    assert match.can_duplicate is False
+
+
+def test_find_duplicate_matches_a_stable_provider_item(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://hoster.example/a")
+    queue.tasks[tid].debrid_route = "torbox"
+    queue.tasks[tid].debrid_item_id = "item-1"
+    match = queue.find_duplicate(
+        "https://hoster.example/b", debrid_route="torbox", debrid_item_id="item-1"
+    )
+    assert match is not None and match.identity == "provider"
+
+
+def test_differing_provider_items_do_not_match(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://hoster.example/a")
+    queue.tasks[tid].debrid_route = "torbox"
+    queue.tasks[tid].debrid_item_id = "item-1"
+    assert (
+        queue.find_duplicate(
+            "https://hoster.example/b",
+            debrid_route="torbox",
+            debrid_item_id="item-2",
+        )
+        is None
+    )
+
+
+def test_find_duplicate_never_uses_resolved_url(queue_env):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://hoster.example/a")
+    queue.tasks[tid].resolved_url = "https://cdn.example/node?token=dummy-token"
+    assert queue.find_duplicate("https://cdn.example/node?token=dummy-token") is None
+
+
+def test_old_row_without_info_hash_falls_back_to_url(queue_env):
+    queue, _rpc, db_path = queue_env()
+    magnetless = "https://example.com/legacy.bin"
+    tid = queue.add_url(magnetless)
+    _complete_in_db(db_path, tid, info_hash="", source_type="", debrid_route="")
+    queue.tasks.pop(tid)
+    match = queue.find_duplicate(magnetless)
+    assert match is not None and match.identity == "url"
+
+
+def test_malformed_history_values_do_not_crash_lookup(queue_env):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(DUP_URL)
+    _complete_in_db(db_path, tid, url="::not a url::", info_hash="nothex")
+    queue.tasks.pop(tid)
+    assert queue.find_duplicate(DUP_URL) is None
+    assert queue.find_duplicate("::not a url::") is not None
+
+
+def test_find_duplicate_does_not_mutate_or_launch(queue_env):
+    queue, rpc, _db = queue_env()
+    tid = queue.add_url(DUP_URL)
+    before = dict(vars(queue.tasks[tid]))
+    added_before = list(rpc.added)
+    queue.find_duplicate(DUP_URL)
+    queue.find_duplicate(f"magnet:?xt=urn:btih:{DUP_HEX}")
+    assert dict(vars(queue.tasks[tid])) == before
+    assert list(rpc.added) == added_before
+    assert len(queue.tasks) == 1
+
+
+def test_find_duplicate_returns_none_for_unusable_input(queue_env):
+    queue, _rpc, _db = queue_env()
+    queue.add_url(DUP_URL)
+    assert queue.find_duplicate("") is None
+    assert queue.find_duplicate("   ") is None
