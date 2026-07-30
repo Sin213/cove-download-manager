@@ -64,7 +64,11 @@ def ytdlp_command(
         "-f",
         "bv*[height<=1080]+ba/b[height<=1080]/b",
     ]
-    if cookies:
+    # A browser's full cookie jar for a YouTube page is large enough that
+    # YouTube answers yt-dlp's webpage/API requests with HTTP 413. Public
+    # videos need no cookies at all, so drop the header for the pages we
+    # extract rather than trusting each browser call site to omit it.
+    if cookies and not is_extractor_url(url):
         cmd += ["--add-header", f"Cookie: {cookies}"]
     if referrer:
         cmd += ["--referer", referrer]

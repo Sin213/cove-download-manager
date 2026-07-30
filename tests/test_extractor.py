@@ -28,10 +28,73 @@ def test_command_forwards_browser_headers():
         referrer="https://example.com/page",
         user_agent="TestUA/1.0",
     )
-    assert command[command.index("--add-header") + 1] == "Cookie: session=abc"
     assert command[command.index("--referer") + 1] == "https://example.com/page"
     assert command[command.index("--user-agent") + 1] == "TestUA/1.0"
     assert command[-1] == "https://youtu.be/id"
+
+
+BIG_COOKIE = "SID=" + "dummy-cookie-data" * 400
+
+
+def test_youtube_command_drops_browser_cookie_header():
+    """Regression: a raw browser Cookie header made YouTube return HTTP 413."""
+    url = "https://www.youtube.com/watch?v=SCD2tB1qILc"
+    command = ytdlp_command(
+        url,
+        "/tmp/Title.%(ext)s",
+        executable="yt-dlp",
+        cookies=BIG_COOKIE,
+        referrer=url,
+        user_agent="dummy-firefox-user-agent",
+    )
+    assert not any("Cookie:" in arg for arg in command)
+    assert not any("dummy-cookie-data" in arg for arg in command)
+    assert command[command.index("--referer") + 1] == url
+    assert command[command.index("--user-agent") + 1] == "dummy-firefox-user-agent"
+    assert command[command.index("-o") + 1] == "/tmp/Title.%(ext)s"
+    assert command[command.index("-f") + 1] == "bv*[height<=1080]+ba/b[height<=1080]/b"
+    assert "--merge-output-format" in command
+    assert command[-1] == url
+
+
+def test_all_supported_youtube_forms_drop_cookie_header():
+    urls = [
+        "https://www.youtube.com/watch?v=SCD2tB1qILc",
+        "https://youtu.be/SCD2tB1qILc",
+        "https://www.youtube.com/shorts/SCD2tB1qILc",
+        "https://www.youtube.com/live/SCD2tB1qILc",
+        "https://www.youtube.com/embed/SCD2tB1qILc",
+        "https://m.youtube.com/watch?v=SCD2tB1qILc",
+        "https://music.youtube.com/watch?v=SCD2tB1qILc",
+    ]
+    for url in urls:
+        assert is_extractor_url(url), url
+        command = ytdlp_command(
+            url, "/tmp/Title.%(ext)s", executable="yt-dlp", cookies=BIG_COOKIE
+        )
+        assert "--add-header" not in command, url
+        assert not any("dummy-cookie-data" in arg for arg in command), url
+
+
+def test_building_command_does_not_mutate_the_cookie_value():
+    cookies = BIG_COOKIE
+    ytdlp_command(
+        "https://www.youtube.com/watch?v=SCD2tB1qILc",
+        "/tmp/Title.%(ext)s",
+        executable="yt-dlp",
+        cookies=cookies,
+    )
+    assert cookies == BIG_COOKIE
+
+
+def test_non_youtube_extractor_url_keeps_cookie_header():
+    command = ytdlp_command(
+        "https://example.com/video/page",
+        "/tmp/Title.%(ext)s",
+        executable="yt-dlp",
+        cookies="session=abc",
+    )
+    assert command[command.index("--add-header") + 1] == "Cookie: session=abc"
 
 
 def test_command_omits_header_flags_when_absent():
