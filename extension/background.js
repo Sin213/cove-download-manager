@@ -10,7 +10,9 @@ const HOST_NAME = "cove_download_manager";
 function sendNativeMessage(msg) {
   return browser.runtime.sendNativeMessage(HOST_NAME, msg).catch((err) => {
     console.error("Cove native messaging error:", err);
-    return { status: "error", message: err.message || String(err) };
+    // transport: the host could not be reached at all (not installed, or the
+    // browser refused to launch it), as opposed to a reply that says no.
+    return { status: "error", message: err.message || String(err), transport: "error" };
   });
 }
 
@@ -499,7 +501,7 @@ async function handleMediaTabDownload(msg, sender) {
   const url = extractorPageUrl(sender.tab && sender.tab.url) ||
     extractorPageUrl(msg.pageUrl) || msg.url || "";
   if (!/^https?:\/\//i.test(url)) {
-    return { ok: false, error: "Unsupported URL" };
+    return { ok: false, reason: "unsupported", error: "Unsupported URL" };
   }
 
   // Same dedup pattern as interception: mark before sending so a direct-file
@@ -539,7 +541,17 @@ async function handleMediaTabDownload(msg, sender) {
   }
   // Clear the dedup mark so a manual retry is not blocked.
   recentIntercepted.delete(url);
-  return { ok: false, error: result.message || "Native host error" };
+  // "Cove is not available" is the native host's fixed sentence for a request
+  // no running Cove accepted. Together with a transport failure that is the
+  // one case the user can act on, so it is reported as such instead of being
+  // folded into a generic failure that reads as a problem with the media.
+  const unavailable = (result && result.transport === "error") ||
+    (result && result.message === "Cove is not available");
+  return {
+    ok: false,
+    reason: unavailable ? "unavailable" : "failed",
+    error: (result && result.message) || "Native host error",
+  };
 }
 
 // ---- Init ----

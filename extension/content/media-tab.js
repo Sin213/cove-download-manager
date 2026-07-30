@@ -157,7 +157,15 @@
     (document.body || document.documentElement).appendChild(host);
   }
 
-  function setPillState(state) {
+  // Error labels name the side that actually failed. The pill cannot tell
+  // whether a video is playable, so it must never say the video is at fault
+  // for what is almost always a closed Cove.
+  const ERROR_LABELS = {
+    unavailable: "Cove is not running",
+    unsupported: "No video found",
+  };
+
+  function setPillState(state, reason) {
     if (!pill) return;
     pill.classList.remove("cove-sent", "cove-error");
     if (state === "sent") {
@@ -165,7 +173,7 @@
       label.textContent = "Sent to Cove";
     } else if (state === "error") {
       pill.classList.add("cove-error");
-      label.textContent = "Video unavailable";
+      label.textContent = ERROR_LABELS[reason] || "Download failed";
     } else if (state === "detecting") {
       label.textContent = "Finding video…";
     } else {
@@ -342,7 +350,9 @@
       );
       if (!resp || resp.ok !== true) {
         sentUrls.delete(url);
-        setPillState("error");
+        // No reply at all means the background script never answered, which
+        // is the same practical outcome as an unreachable Cove.
+        setPillState("error", resp ? resp.reason : "unavailable");
         return;
       }
 
@@ -354,7 +364,9 @@
       }, SENT_RESET_MS);
     } catch {
       sentUrls.delete(url);
-      setPillState("error");
+      // sendMessage itself threw: the background script is gone, so Cove
+      // could not have been reached either.
+      setPillState("error", "unavailable");
     } finally {
       downloadPending = false;
     }
@@ -474,7 +486,7 @@
   // Bounded retry scans layered on top of the direct-listener/observer
   // mechanism above, for any video the observer's childList-only scope
   // might miss (e.g. a video swapped in place without a childList mutation
-  // reaching document — attribute-only src changes are still caught by the
+  // reaching document - attribute-only src changes are still caught by the
   // direct 'play'/'playing' listeners already attached to that element, so
   // this is a defense-in-depth fallback, not the primary mechanism).
 

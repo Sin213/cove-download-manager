@@ -276,3 +276,90 @@ test("context menu falls back to a browser download when Cove is closed", async 
   assert.equal(browserDownloads[0].saveAs, false);
   assert.deepEqual(calls.cancel, []);
 });
+
+// ---- Media pill failure reporting ----
+
+// Drives the onMessage listener the in-page pill talks to and returns the
+// single reply it sends back.
+async function pillDownload(events, msg) {
+  let reply;
+  events.message.emit(
+    { type: "downloadMedia", url: msg.url, pageUrl: msg.pageUrl || msg.url },
+    { tab: { url: msg.pageUrl || msg.url } },
+    (response) => { reply = response; }
+  );
+  await settle();
+  await settle();
+  return reply;
+}
+
+test("a closed Cove is reported as unavailable, not as a bad video", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "error", message: "Cove is not available" },
+  });
+  await settle();
+
+  const reply = await pillDownload(events, {
+    url: "https://www.youtube.com/watch?v=SCD2tB1qILc",
+  });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unavailable");
+});
+
+test("an unreachable native host is reported as unavailable", async () => {
+  const { events } = loadBackground({
+    nativeResult: () => { throw new Error("No such native application"); },
+  });
+  await settle();
+
+  const reply = await pillDownload(events, {
+    url: "https://www.youtube.com/watch?v=SCD2tB1qILc",
+  });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unavailable");
+});
+
+test("a genuine Cove-side refusal is not blamed on a closed Cove", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "error", message: "Invalid or blocked URL" },
+  });
+  await settle();
+
+  const reply = await pillDownload(events, {
+    url: "https://www.youtube.com/watch?v=SCD2tB1qILc",
+  });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "failed");
+});
+
+test("an unsupported URL is reported as unsupported", async () => {
+  const { events } = loadBackground();
+  await settle();
+
+  const reply = await pillDownload(events, { url: "blob:https://example.test/x" });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+});
+
+test("an accepted media download still reports success", async () => {
+  const { events } = loadBackground({ nativeResult: { status: "ok" } });
+  await settle();
+
+  const reply = await pillDownload(events, {
+    url: "https://www.youtube.com/watch?v=SCD2tB1qILc",
+  });
+
+  assert.equal(reply.ok, true);
+});
+
+test("the pill never labels a failure as a problem with the video", () => {
+  const source = fs.readFileSync("extension/content/media-tab.js", "utf8");
+  // The old catch-all label blamed YouTube for a closed Cove, which sent a
+  // real debugging session chasing a video that was fine all along.
+  assert.equal(source.includes("Video unavailable"), false);
+  assert.equal(source.includes("Cove is not running"), true);
+});
