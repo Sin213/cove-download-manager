@@ -340,34 +340,21 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.1.0
+          ## What's new in 3.2.0
 
-          Magnet links open straight from your browser, and you can bind Cove's downloads to a specific network interface such as a VPN adapter.
+          Cove now stops you re-downloading something you already have, and lets you check where any download came from without exposing the credentials inside its link.
 
           ### Added
 
-          - **Magnet links from your browser.** Register Cove as a magnet handler on Linux or Windows, then click a magnet link and it goes into Cove's normal torrent and debrid pipeline. If Cove is already running, the running window takes the link, so there is no second window and no second aria2 daemon.
-          - **Network interface binding.** Settings -> BitTorrent has a "Network interface" dropdown. Pick an interface and all of Cove's traffic leaves through it. Restart Cove to apply a change.
-          - **Choose what happens to uncached torrents.** "When a torrent is not cached" now offers "Download locally with BitTorrent" or "Cancel the download". Cancelled torrents stay in the list as a failed task with the reason shown.
-          - **A clearer uncached-torrent notice.** Cove explains what local BitTorrent means and offers three choices: open Settings, cancel the download, or download locally. "Don't show this notice again" is only remembered if you choose to download.
-          - **Windows portable magnet registration.** Opt-in from the command line with `--register-magnet-handler` and `--unregister-magnet-handler`. A normal portable launch registers nothing.
-
-          ### Fixed
-
-          - Debrid API calls, the queue's link probe, and update checks used to go out over the default route. They now follow the selected network interface like everything else, so a VPN binding covers all of Cove's traffic and not only aria2 downloads.
-          - A network interface that disappears no longer sends downloads out over another adapter. Cove refuses to start aria2 and says which interface is missing, and the window stays usable so you can change the setting.
-          - Cancelling or dismissing the uncached-torrent notice no longer counts as consent.
-          - A leftover aria2 process from an earlier Cove session no longer breaks downloads. If Cove exited abnormally its aria2 could keep holding port 6800, and the next Cove would attach to it instead of starting its own, so every download failed with "connection refused" once that leftover exited. Cove now shuts down a leftover it recognises and starts a daemon it owns. An aria2 belonging to something else is reported rather than shut down.
+          - **Duplicate detection.** Adding a link, magnet, or `.torrent` that Cove already has is caught before anything downloads. A match still in the queue offers "Focus Existing" to jump to it; a match you already finished offers "Open Folder" to go straight to the file. Either can be overridden for that one add with "Download Anyway", and nothing is remembered or suppressed afterwards, so the next duplicate is still caught. Cancel is the default button, so dismissing the prompt never starts a download.
+          - **One summary for clipboard batches.** Pasting a batch where several links are duplicates gives a single "Duplicate downloads" summary with "Skip Duplicates" or "Add All Anyway", instead of one dialog per link. Only short labels are listed, never a full signed link or a magnet carrying a tracker passkey.
+          - **View source.** Right-click any task and choose "View source" to see where it came from: the URL, the referring page, the browser's user agent, the save folder and file name, and for torrents the name and info hash. It works for finished and failed tasks too, which is usually when you want it.
+          - **Privacy-conscious display in View source.** Anything secret in a link is masked on screen: credentials embedded in the URL, signed-link parameters such as `token`, `apiKey`, and `X-Amz-Signature`, private-tracker passkeys in both the query and the path, magnet tracker and web-seed URLs, and tokens hidden after the `#`. Stored browser cookies are acknowledged as present but never displayed, and a debrid provider's one-time delivery link is never included at all. Copying is always deliberate: "Copy URL" gives you the masked form, and the unmasked original has its own separate button.
 
           ### Notes
 
-          - Magnet registration is per-user everywhere. On Windows that means `HKCU` only, with no administrator rights. Cove only advertises itself as capable of opening magnet links; choosing the default stays your decision.
-          - Cove cannot verify that a VPN is actually active. Binding to its interface is a routing choice, not a guarantee.
-
-          ### Thanks
-
-          - Qb for the suggestions behind this release.
-          - Whooshy for testing.
+          - Duplicate detection compares canonical URLs and torrent info hashes. Two different links to the same file are not recognised as the same download, and a moved or renamed file no longer counts as a completed match.
+          - View source masks secrets by name and by shape. A secret that looks like an ordinary word in a path cannot be told apart from a folder name, so treat the masking as a strong guard rather than a guarantee, especially before sharing a screenshot.
 
           ## Downloads
 

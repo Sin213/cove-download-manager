@@ -7,7 +7,7 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v3.1.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v3.2.0-5eead4?style=flat-square)
 
 ![Cove Download Manager](docs/screenshot.png)
 
@@ -30,7 +30,18 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 - **Delete key + right-click menu** - remove selected, clear completed,
   clear all. Multi-select aware. File deletion is opt-in per row. The
   context menu also covers Open file, Show in folder, Start now
-  (force-start, jumps the queue), and Retry on errored tasks.
+  (force-start, jumps the queue), View source, and Retry on errored tasks.
+- **Duplicate detection** - adding something you already have is caught
+  before it downloads. A match in the queue offers Focus Existing, a
+  completed match offers Open Folder, and either can be overridden for that
+  one add. Clipboard batches get a single summary instead of one dialog per
+  link. Only short labels are shown, never a full signed link or a magnet
+  carrying a tracker passkey.
+- **View source** - right-click any task to see where it came from: the
+  URL, the referring page, the save folder, and for torrents the name and
+  info hash. Credentials, signed-link tokens, and tracker passkeys are
+  masked on screen, cookies are never shown at all, and copying the
+  unmasked URL is a separate deliberate button.
 - **Resumable** - queue state persists in SQLite, partial downloads resume
   via aria2's control files. Closing the app does not lose work.
 - **HLS / M3U8 stream downloads** - any URL ending in `.m3u8` is
