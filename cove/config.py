@@ -197,6 +197,14 @@ class Settings:
     # Set once the user has accepted the one-time P2P privacy disclosure.
     # Not a user-facing checkbox: it records a decision, it isn't an option.
     torrent_ip_disclosure_shown: bool = False
+    # Whether Cove keeps its magnet-handler registration repaired after an
+    # update changes the executable path. This is NOT a claim that Cove is
+    # the current default: only the OS knows that, and it is read live.
+    magnet_handler_enabled: bool = False
+    # Records that the one-time "make Cove your magnet handler" offer has
+    # been made. Like torrent_ip_disclosure_shown, this stores a decision,
+    # it is not a user-facing option.
+    magnet_prompt_shown: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -207,6 +215,7 @@ class Settings:
             s.rpc_secret = _new_rpc_secret()
             s.api_token = _new_distinct_api_token(s.rpc_secret)
             s.save()
+            s.magnet_setting_missing = False
             return s
         try:
             raw = json.loads(CONFIG_FILE.read_text())
@@ -219,8 +228,10 @@ class Settings:
             s.rpc_secret = _new_rpc_secret()
             s.api_token = _new_distinct_api_token(s.rpc_secret)
             s.save()
+            s.magnet_setting_missing = False
             return s
         speed_limit_unit_missing = "speed_limit_unit" not in raw
+        magnet_setting_missing = "magnet_handler_enabled" not in raw
 
         def _sub_fields(data, klass):
             """Keyword args for a nested dataclass, dropping unknown keys
@@ -243,6 +254,15 @@ class Settings:
         # truthiness - that would hide the window on close with no opt-in.
         if not isinstance(s.close_to_tray, bool):
             s.close_to_tray = False
+        # Same reasoning as close_to_tray: a hand-edited non-boolean must not
+        # be read as "enabled" via Python truthiness.
+        if not isinstance(s.magnet_handler_enabled, bool):
+            s.magnet_handler_enabled = False
+        if not isinstance(s.magnet_prompt_shown, bool):
+            s.magnet_prompt_shown = False
+        # Not a dataclass field, so it is never written back to settings.json.
+        # Task 6 consumes it once, at startup, to migrate existing opt-ins.
+        s.magnet_setting_missing = magnet_setting_missing
         # Migrate legacy / empty / suspiciously-short secrets up to a real one.
         changed = speed_limit_unit_missing or sched_reset
         if (

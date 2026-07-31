@@ -58,3 +58,59 @@ def test_hand_edited_non_boolean_close_to_tray_sanitizes_to_false(tmp_path):
     # a truthy non-boolean would silently hide the window on close.
     for bogus in ("yes", 1, 0, None, [], {"on": True}):
         assert _load_close_to_tray(tmp_path, {"close_to_tray": bogus}) is False
+
+
+def test_magnet_fields_default_off_and_flag_absence(tmp_path, monkeypatch):
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text("{}")
+
+    s = config.Settings.load()
+    assert s.magnet_handler_enabled is False
+    assert s.magnet_prompt_shown is False
+    # Absent, so the one-time migration is allowed to consider it.
+    assert s.magnet_setting_missing is True
+
+
+def test_explicit_false_is_never_treated_as_absent(tmp_path, monkeypatch):
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text('{"magnet_handler_enabled": false}')
+
+    s = config.Settings.load()
+    assert s.magnet_handler_enabled is False
+    assert s.magnet_setting_missing is False
+
+
+def test_hand_edited_non_boolean_is_not_read_as_enabled(tmp_path, monkeypatch):
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text('{"magnet_handler_enabled": "yes"}')
+
+    s = config.Settings.load()
+    assert s.magnet_handler_enabled is False
+
+
+def test_magnet_setting_missing_is_not_persisted(tmp_path, monkeypatch):
+    import json
+
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text("{}")
+
+    s = config.Settings.load()
+    s.save()
+    raw = json.loads((tmp_path / "settings.json").read_text())
+    assert "magnet_setting_missing" not in raw
