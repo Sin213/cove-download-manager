@@ -3,6 +3,7 @@ import pytest
 
 import cove.magnet_identity as mi
 from cove import magnet_handler as mh
+from cove import magnet_linux
 from cove import magnet_win
 from tests.conftest import FakeWinreg
 
@@ -124,6 +125,9 @@ def test_enable_on_windows_registers_but_never_sets_a_default(windows_portable):
     result = mh.enable()
     assert result.ok is True
     keys = magnet_win.keys_for(mi.WINDOWS_PORTABLE)
+    # The positive side: the registration really was written, so a no-op
+    # enable() could not pass this test.
+    assert keys.command_key in windows_portable.data
     # Windows forbids an app assigning its own default; only the user can.
     assert magnet_win.USER_CHOICE_KEY not in windows_portable.data
 
@@ -175,3 +179,54 @@ def test_status_on_windows_is_default_only_when_userchoice_names_cove(windows_po
         "ProgId": magnet_win.keys_for(mi.WINDOWS_PORTABLE).prog_id
     }
     assert mh.status().is_default is True
+
+
+# ---- Debian: status must describe the live system, not the package's intent
+
+
+@pytest.fixture
+def debian(monkeypatch, tmp_path):
+    """A .deb install whose system applications dir is redirected to tmp."""
+    state = {"default": ""}
+
+    def fake_run(argv):
+        if argv[:3] == ["xdg-mime", "query", "default"]:
+            return 0, state["default"] + "\n"
+        if argv[:2] == ["xdg-mime", "default"]:
+            state["default"] = argv[2]
+            return 0, ""
+        return 0, ""
+
+    monkeypatch.setattr(mh, "_identity", lambda: mi.DEBIAN)
+    monkeypatch.setattr(mh, "_registration_path", lambda: mi.DEBIAN_LAUNCHER)
+    monkeypatch.setattr(mh, "_run", fake_run)
+    monkeypatch.setattr(magnet_linux, "SYSTEM_APPS_DIR", str(tmp_path))
+    state["dir"] = tmp_path
+    return state
+
+
+def test_debian_reports_registered_only_when_the_entry_is_installed(debian):
+    # A removed or half-installed package must not be reported as registered.
+    assert mh.status().registered is False
+    assert mh.status().owned_by_cove is False
+    assert mh.status().recorded_path == ""
+
+    (debian["dir"] / magnet_linux.DESKTOP_ID_DEBIAN).write_text("[Desktop Entry]\n")
+    state = mh.status()
+    assert state.registered is True
+    assert state.owned_by_cove is True
+    assert state.recorded_path == mi.DEBIAN_LAUNCHER
+    # The packaged path is stable, so it can never be stale.
+    assert state.stale is False
+
+
+def test_debian_default_detection_is_independent_of_the_entry(debian):
+    debian["default"] = magnet_linux.DESKTOP_ID_DEBIAN
+    assert mh.status().is_default is True
+
+
+def test_repair_does_nothing_on_debian(debian):
+    (debian["dir"] / magnet_linux.DESKTOP_ID_DEBIAN).write_text("[Desktop Entry]\n")
+    # Never stale, so there is nothing to repair and nothing to reclaim.
+    assert mh.repair() is True
+    assert debian["default"] == ""

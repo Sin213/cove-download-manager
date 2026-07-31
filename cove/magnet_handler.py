@@ -105,14 +105,22 @@ def _linux_status(identity: str, current: str) -> HandlerStatus:
         is_default = False
 
     if identity == magnet_identity.DEBIAN:
-        # The package owns the entry; its path is stable and never stale.
+        # The package owns the entry and its path is stable, so this can
+        # never be stale. It can still be absent: a removed, corrupted or
+        # half-installed package must not be reported as registered, because
+        # this status line is supposed to describe the live system rather
+        # than what Cove intended.
+        try:
+            installed = magnet_linux.system_entry_path(desktop_id).is_file()
+        except OSError:
+            installed = False
         return HandlerStatus(
             supported=True,
             identity=identity,
-            registered=True,
-            owned_by_cove=True,
+            registered=installed,
+            owned_by_cove=installed,
             stale=False,
-            recorded_path=current,
+            recorded_path=current if installed else "",
             is_default=is_default,
         )
     path = magnet_linux.user_entry_path(desktop_id, _apps_dir())

@@ -142,13 +142,21 @@ def registered_executable(command: str) -> str:
 def same_executable(left: str, right: str) -> bool:
     """Windows-appropriate path comparison (case- and separator-insensitive).
 
-    Windows paths are compared manually rather than through os.path, because
-    this module (and its tests) also run on non-Windows platforms where
-    os.path would not treat backslashes as separators or ignore case.
+    Uses ntpath rather than os.path so the comparison keeps Windows
+    semantics even when this module and its tests run on Linux, where
+    os.path would neither treat backslashes as separators nor ignore case.
+
+    normpath collapses redundant separators and `.` / `..` segments, and
+    normcase lowercases and converts slashes, so two spellings of one path
+    compare equal. Deliberately no abspath: it would resolve against the
+    host's cwd, which is meaningless for a Windows path on Linux. Both
+    callers already pass absolute paths (registration_path() applies
+    abspath, and registry commands are stored absolute).
     """
+    import ntpath
 
     def _normalize(path: str) -> str:
-        return (path or "").replace("/", "\\").lower()
+        return ntpath.normcase(ntpath.normpath(path or ""))
 
     return _normalize(left) == _normalize(right)
 

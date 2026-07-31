@@ -100,6 +100,40 @@ def test_hand_edited_non_boolean_is_not_read_as_enabled(tmp_path, monkeypatch):
     assert s.magnet_handler_enabled is False
 
 
+def test_hand_edited_non_boolean_prompt_shown_sanitizes_to_false(tmp_path, monkeypatch):
+    """A malformed magnet_prompt_shown must not count as a prior decision.
+
+    The design distinguishes absent, explicit False, and explicit True. A
+    truthy non-boolean such as "false" or 1 would otherwise suppress the
+    one-time offer forever, and the user would never be asked at all.
+    """
+    import json
+
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+
+    for bogus in ("false", "true", 1, 0, None, [], {"on": True}):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"magnet_prompt_shown": bogus})
+        )
+        s = config.Settings.load()
+        assert s.magnet_prompt_shown is False, bogus
+
+
+def test_explicit_true_prompt_shown_is_preserved(tmp_path, monkeypatch):
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text('{"magnet_prompt_shown": true}')
+
+    assert config.Settings.load().magnet_prompt_shown is True
+
+
 def test_magnet_setting_missing_is_not_persisted(tmp_path, monkeypatch):
     import json
 

@@ -77,6 +77,20 @@ def test_same_executable_ignores_case_and_separators():
     assert magnet_win.same_executable(r"C:\Cove\Cove.exe", r"C:\Other\Cove.exe") is False
 
 
+def test_same_executable_canonicalizes_dot_and_redundant_segments():
+    """Ownership decides whether Cove may delete a registration, so two
+    spellings of one path must not read as two different programs."""
+    target = r"C:\Cove\Cove.exe"
+    for spelling in (
+        r"C:\Cove\.\Cove.exe",
+        r"C:\Cove\sub\..\Cove.exe",
+        "C:/Cove/Cove.exe",
+        "C:\\Cove\\\\Cove.exe",
+    ):
+        assert magnet_win.same_executable(spelling, target) is True, spelling
+    assert magnet_win.same_executable("", target) is False
+
+
 def test_is_default_only_when_userchoice_names_our_prog_id():
     reg = FakeWinreg({magnet_win.USER_CHOICE_KEY: {"ProgId": PORTABLE.prog_id}})
     assert magnet_win.is_default(reg, PORTABLE) is True

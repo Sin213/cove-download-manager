@@ -18,6 +18,11 @@ MAGNET_MIME = "x-scheme-handler/magnet"
 DESKTOP_ID_DEBIAN = "cove-download-manager.desktop"
 DESKTOP_ID_APPIMAGE = "cove-download-manager-appimage.desktop"
 
+# Where the .deb installs its entry. Status reads this rather than assuming
+# the package is intact: an entry removed or half-installed would otherwise
+# make Cove claim it is registered when the desktop knows nothing about it.
+SYSTEM_APPS_DIR = "/usr/share/applications"
+
 
 def desktop_id(identity: str) -> str:
     if identity == DEBIAN:
@@ -158,6 +163,11 @@ def set_default(run, desktop_id_value: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return query_default(run) == desktop_id_value
+
+
+def system_entry_path(desktop_id_value: str, apps_dir=None) -> Path:
+    """Path of a packaged, system-wide desktop entry."""
+    return Path(apps_dir or SYSTEM_APPS_DIR) / desktop_id_value
 
 
 def user_apps_dir() -> Path:

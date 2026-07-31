@@ -44,7 +44,7 @@ EXE = "/opt/cove/Cove-Portable.exe"
 OTHER_EXE = "/somewhere/else/Cove-Portable.exe"
 
 
-def _register(launcher, fake, exe=EXE):
+def _register(fake, exe=EXE):
     return magnet_win.register(fake, KEYS, exe)
 
 
@@ -84,19 +84,19 @@ def test_unregister_flag_does_not_launch_the_gui(launcher, windows, monkeypatch)
 
 
 def test_register_writes_hkcu_only(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     assert windows.roots_used == {"HKCU"}
 
 
 def test_register_writes_a_fully_quoted_open_command(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     command = windows.data[KEYS.command_key][None]
     assert command == '"{}" "%1"'.format(EXE)
     assert command.endswith('"%1"')
 
 
 def test_register_advertises_magnet_capability(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     assert windows.data[KEYS.prog_id_key]["URL Protocol"] == ""
     assert windows.data[KEYS.url_associations_key]["magnet"] == KEYS.prog_id
     registered = windows.data[magnet_win.REGISTERED_APPS_KEY]
@@ -104,7 +104,7 @@ def test_register_advertises_magnet_capability(launcher, windows):
 
 
 def test_register_does_not_force_the_active_default(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     for path in windows.data:
         assert not path.lower().startswith("software\\classes\\magnet")
         assert "UserChoice" not in path
@@ -123,7 +123,7 @@ def test_portable_identity_is_separate_from_the_installer(launcher, windows):
     assert KEYS.prog_id == "Cove.Magnet.Portable"
     assert KEYS.app_name != "Cove Download Manager"
 
-    _register(launcher, windows)
+    _register(windows)
     for path in windows.data:
         assert not path.startswith("Software\\Classes\\Cove.Magnet\\")
         assert path != "Software\\Classes\\Cove.Magnet"
@@ -133,15 +133,15 @@ def test_portable_identity_is_separate_from_the_installer(launcher, windows):
 
 
 def test_register_is_idempotent(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     first = {path: dict(values) for path, values in windows.data.items()}
-    _register(launcher, windows)
+    _register(windows)
     assert windows.data == first
 
 
 def test_register_after_a_move_rewrites_the_command(launcher, windows):
-    _register(launcher, windows)
-    _register(launcher, windows, exe=OTHER_EXE)
+    _register(windows)
+    _register(windows, exe=OTHER_EXE)
     assert windows.data[KEYS.command_key][None] == '"{}" "%1"'.format(OTHER_EXE)
 
 
@@ -149,7 +149,7 @@ def test_register_after_a_move_rewrites_the_command(launcher, windows):
 
 
 def test_unregister_removes_keys_this_executable_owns(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     assert magnet_win.unregister(windows, KEYS, EXE) is True
     assert KEYS.prog_id_key not in windows.data
     assert KEYS.command_key not in windows.data
@@ -160,7 +160,7 @@ def test_unregister_removes_keys_this_executable_owns(launcher, windows):
 def test_unregister_leaves_another_executables_registration_alone(
     launcher, windows
 ):
-    _register(launcher, windows, exe=OTHER_EXE)
+    _register(windows, exe=OTHER_EXE)
     before = {path: dict(values) for path, values in windows.data.items()}
 
     assert magnet_win.unregister(windows, KEYS, EXE) is False
@@ -168,7 +168,7 @@ def test_unregister_leaves_another_executables_registration_alone(
 
 
 def test_unregister_is_idempotent(launcher, windows):
-    _register(launcher, windows)
+    _register(windows)
     assert magnet_win.unregister(windows, KEYS, EXE) is True
     assert magnet_win.unregister(windows, KEYS, EXE) is True
 
