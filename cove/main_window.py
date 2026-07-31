@@ -57,7 +57,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import APP_NAME, __version__, dedup, theme
+from . import APP_NAME, __version__, dedup, magnet_handler, theme
 from .clipboard import extract_urls
 from .config import Settings
 from .dialogs import (
@@ -336,6 +336,19 @@ class DownloadTree(QTreeWidget):
         sw = sub_metrics.horizontalAdvance(self._empty_sub)
         p.drawText(int(rect.center().x() - sw / 2), cy + 24, self._empty_sub)
         p.end()
+
+
+def _ask_magnet_offer(parent) -> bool:
+    """Ask whether Cove should handle magnet links. True when accepted."""
+    answer = QMessageBox.question(
+        parent,
+        "Magnet links",
+        "Open magnet links with Cove from now on?\n\n"
+        "You can change this later in Settings.",
+        QMessageBox.Yes | QMessageBox.No,
+        QMessageBox.Yes,
+    )
+    return answer == QMessageBox.Yes
 
 
 class MainWindow(QMainWindow):
@@ -938,6 +951,7 @@ class MainWindow(QMainWindow):
                 dlg.get_dir(),
                 duplicate_check=self._confirm_duplicate,
             )
+            self._maybe_offer_magnet_handler()
             return
         urls = dlg.get_urls()
         if not urls:
@@ -947,6 +961,43 @@ class MainWindow(QMainWindow):
         self.settings.save()
         self._refresh_folder_chip()
         self.add_urls_checked(urls)
+
+        from . import torrent
+
+        if any(torrent.is_magnet(u) for u in urls):
+            self._maybe_offer_magnet_handler()
+
+    def _maybe_offer_magnet_handler(self) -> bool:
+        """Offer once, the first time the user adds a magnet or torrent.
+
+        A first-run prompt would arrive before the user knows what Cove does.
+        Someone who just pasted a magnet has demonstrated the exact need.
+        Returns True when the offer was shown.
+        """
+        settings = self.settings
+        if getattr(settings, "magnet_prompt_shown", False):
+            return False
+        try:
+            state = magnet_handler.status()
+        except Exception:
+            return False
+        if not state.supported or state.is_default:
+            return False
+
+        accepted = _ask_magnet_offer(self)
+        settings.magnet_prompt_shown = True
+        if accepted:
+            magnet_handler.enable()
+            # Set regardless of whether enable() could confirm the default.
+            # On Windows it never can: the user still has to choose Cove in
+            # Settings. The preference means "keep the registration
+            # repaired", which is what an accepting user wants either way.
+            settings.magnet_handler_enabled = True
+        try:
+            settings.save()
+        except Exception:
+            pass
+        return True
 
     def _on_torrent_consent_needed(self, tid: int) -> None:
         """Ask once, before Cove's first local BitTorrent transfer.
