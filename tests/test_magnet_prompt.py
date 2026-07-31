@@ -3,9 +3,12 @@ from cove.magnet_handler import HandlerStatus, Result
 
 
 class FakeSettings:
-    def __init__(self, shown=False):
+    def __init__(self, shown=False, setting_missing=True):
         self.magnet_prompt_shown = shown
         self.magnet_handler_enabled = False
+        # Mirrors the real Settings.load() migration marker: True until the
+        # startup migration or this in-app offer has settled the question.
+        self.magnet_setting_missing = setting_missing
         self.saved = False
 
     def save(self):
@@ -30,6 +33,9 @@ def test_offer_is_made_once_and_records_that_it_was(monkeypatch):
     assert _offer(monkeypatch, settings, state, True) is True
     assert settings.magnet_prompt_shown is True
     assert settings.saved is True
+    # The question has now been answered directly; the startup migration
+    # heuristic must never override this answer afterwards.
+    assert settings.magnet_setting_missing is False
 
 
 def test_declining_still_records_that_the_offer_was_made(monkeypatch):
@@ -37,6 +43,10 @@ def test_declining_still_records_that_the_offer_was_made(monkeypatch):
     state = HandlerStatus(supported=True, registered=False, is_default=False)
     assert _offer(monkeypatch, settings, state, False) is True
     assert settings.magnet_prompt_shown is True
+    assert settings.magnet_handler_enabled is False
+    # Regression: a decline must not be silently overridden by a startup
+    # migration thread that reads magnet_setting_missing after this offer.
+    assert settings.magnet_setting_missing is False
 
 
 def test_offer_never_repeats(monkeypatch):

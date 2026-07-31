@@ -1083,12 +1083,16 @@ class SettingsDialog(QDialog):
 
     def _on_magnet_enable(self) -> None:
         result = self._magnet_handler.enable()
+        self._refresh_magnet_status()
+        if not result.ok:
+            if result.message:
+                QMessageBox.information(self, "Magnet links", result.message)
+            return
+        # Only open the Default Apps deep link on success: opening it after
+        # a failed enable() puts the failure message box behind that window.
         url = self._magnet_handler.default_apps_url()
         if url:
             QDesktopServices.openUrl(QUrl(url))
-        self._refresh_magnet_status()
-        if not result.ok and result.message:
-            QMessageBox.information(self, "Magnet links", result.message)
 
     def _on_magnet_disable(self) -> None:
         result = self._magnet_handler.disable()

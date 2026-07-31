@@ -19,6 +19,12 @@ def migrate_and_repair(settings, status_fn=None, repair_fn=None) -> None:
     # have no setting at all. Reading that absence as False would strand them
     # without self-heal despite having opted in. An explicit False is a real
     # decision and is never overridden.
+    #
+    # status_fn() above can take a long time (e.g. a slow xdg-mime call), and
+    # in that window the user may have answered the in-app offer directly,
+    # which clears magnet_setting_missing. Re-read it here, right before
+    # acting, rather than trusting a value that may be stale by now - an
+    # explicit decline that landed mid-probe must never be overridden.
     if getattr(settings, "magnet_setting_missing", False):
         if state.supported and state.registered and state.owned_by_cove:
             settings.magnet_handler_enabled = True

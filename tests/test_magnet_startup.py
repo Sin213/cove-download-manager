@@ -99,6 +99,37 @@ def test_a_failing_repair_never_propagates():
     )  # must not raise
 
 
+def test_a_decline_landing_mid_probe_is_respected():
+    """Regression: status_fn() (a slow xdg-mime probe on a real build) can
+    take long enough for the user to open Add, paste a magnet, and decline
+    the in-app offer while it's running. That offer clears
+    magnet_setting_missing directly on the settings object. migrate_and_repair
+    must re-check the flag right before acting on it, not trust a value it
+    saw before the slow status_fn() call returned - otherwise the decline is
+    silently overridden back to enabled.
+    """
+    settings = FakeSettings(magnet_setting_missing=True)
+
+    def slow_status():
+        # Simulate the offer being answered (declined) while this call is
+        # still in flight, exactly as it would land mid-probe in the app.
+        settings.magnet_prompt_shown = True
+        settings.magnet_setting_missing = False
+        return HandlerStatus(
+            supported=True, registered=True, owned_by_cove=True, stale=True
+        )
+
+    calls = []
+    magnet_startup.migrate_and_repair(
+        settings,
+        status_fn=slow_status,
+        repair_fn=lambda: calls.append("repair") or True,
+    )
+
+    assert settings.magnet_handler_enabled is False
+    assert settings.magnet_setting_missing is False
+
+
 def test_a_failing_status_never_propagates():
     def boom():
         raise OSError("registry unavailable")

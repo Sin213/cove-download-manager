@@ -186,9 +186,15 @@ def disable() -> Result:
                 "Cove is currently your default magnet handler. Choose another "
                 "handler in Windows Settings first, then remove the registration.",
             )
-        magnet_win.unregister(winreg, keys, _registration_path())
+        removed = magnet_win.unregister(winreg, keys, _registration_path())
     except Exception:
         return Result(False, "Could not remove Cove's magnet registration.")
+    if not removed:
+        return Result(
+            False,
+            "The recorded registration belongs to a different copy of Cove "
+            "and was left unchanged.",
+        )
     return Result(True, "Removed Cove's magnet registration.")
 
 

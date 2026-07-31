@@ -148,6 +148,26 @@ def test_disable_on_windows_removes_registration_when_not_the_default(windows_po
     assert keys.command_key not in windows_portable.data
 
 
+def test_disable_on_windows_leaves_a_foreign_registration_unchanged(
+    windows_portable, monkeypatch
+):
+    """After a portable update the recorded exe is the OLD copy: unregister()
+    returns False and disable() must say so, not report success while
+    leaving the stale registration in place."""
+    mh.enable()
+    # Simulate the update: the exe Cove is running from now differs from
+    # what was registered, so the running copy no longer owns the entry.
+    monkeypatch.setattr(mh, "_registration_path", lambda: r"D:\Portable\Cove-new.exe")
+
+    result = mh.disable()
+
+    assert result.ok is False
+    assert "different copy of cove" in result.message.lower()
+    keys = magnet_win.keys_for(mi.WINDOWS_PORTABLE)
+    # Nothing was removed: the stale registration is left exactly as it was.
+    assert keys.command_key in windows_portable.data
+
+
 def test_status_on_windows_is_default_only_when_userchoice_names_cove(windows_portable):
     mh.enable()
     assert mh.status().is_default is False

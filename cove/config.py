@@ -1,6 +1,8 @@
 import json
 import os
 import secrets
+import tempfile
+import threading
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List
@@ -28,6 +30,14 @@ MAX_CONNECTIONS_PER_SERVER = 16
 # Legacy default. Anything matching this on load is upgraded to a fresh
 # random secret so existing installs stop using the predictable token.
 _LEGACY_RPC_SECRET = "cove"
+
+# Guards Settings.save() against interleaving. The magnet self-heal daemon
+# thread (cove/magnet_startup.py) is the first caller of save() off the GUI
+# thread, so two threads can now race to write settings.json at once. Each
+# save uses its own unique temp file (see save()), so the lock's only job is
+# to serialize the read-modify-os.replace sequence - without it, one
+# thread's os.replace can publish the other thread's half-written file.
+_SAVE_LOCK = threading.Lock()
 
 # Debrid providers Cove can resolve links through. cove.debrid imports these
 # so the accepted setting values and the resolver can't drift apart. Order
@@ -350,14 +360,34 @@ class Settings:
         # readable by other local users. NOTE: chmod 0o600 only restricts
         # access on POSIX; on Windows it's effectively a no-op and the file
         # inherits the parent directory's ACL.
-        tmp = CONFIG_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, CONFIG_FILE)
-        try:
-            os.chmod(CONFIG_FILE, 0o600)
-        except OSError:
-            pass
+        #
+        # The magnet self-heal daemon thread can call save() concurrently
+        # with the GUI thread. A shared fixed tmp path would let one
+        # thread's os.replace publish the other thread's half-written file,
+        # so each call gets its own unique temp file in CONFIG_DIR (same
+        # filesystem, so os.replace stays atomic), and the lock serializes
+        # the whole write-then-replace sequence so the two saves can't
+        # interleave at all.
+        with _SAVE_LOCK:
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=CONFIG_FILE.name + ".", suffix=".tmp", dir=str(CONFIG_DIR)
+            )
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(json.dumps(data, indent=2))
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+                os.replace(tmp, CONFIG_FILE)
+            except BaseException:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            try:
+                os.chmod(CONFIG_FILE, 0o600)
+            except OSError:
+                pass

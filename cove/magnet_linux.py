@@ -28,9 +28,15 @@ def desktop_id(identity: str) -> str:
 
 
 def run_command(argv) -> tuple[int, str]:
-    """Default runner: exit code and stdout, stderr discarded."""
+    """Default runner: exit code and stdout, stderr discarded.
+
+    These are short query and set operations, but they run synchronously
+    during Settings dialog construction, so a wedged xdg-mime would freeze
+    the dialog for as long as the timeout. Kept short (5s) rather than the
+    15s previously used elsewhere.
+    """
     proc = subprocess.run(
-        list(argv), capture_output=True, text=True, timeout=15, check=False
+        list(argv), capture_output=True, text=True, timeout=5, check=False
     )
     return proc.returncode, proc.stdout
 

@@ -114,3 +114,67 @@ def test_magnet_setting_missing_is_not_persisted(tmp_path, monkeypatch):
     s.save()
     raw = json.loads((tmp_path / "settings.json").read_text())
     assert "magnet_setting_missing" not in raw
+
+
+def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeypatch):
+    """Two threads calling save() at once must never publish a truncated or
+    half-written settings.json.
+
+    Regression for the magnet self-heal daemon thread: it is the first code
+    in this app to call Settings.save() off the GUI thread, so a save from
+    that thread can now race a save from the GUI thread. A shared fixed tmp
+    path let one thread's os.replace publish the other thread's
+    partially-written file; save() now uses a unique temp file per call plus
+    a lock.
+    """
+    import threading
+
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+
+    base = config.Settings.load()
+    errors: list[Exception] = []
+    stop = threading.Event()
+    iterations = 200
+
+    def hammer(rpc_secret_value: str):
+        try:
+            fields = {
+                k: v for k, v in base.__dict__.items()
+                if k in config.Settings.__dataclass_fields__
+            }
+            fields["rpc_secret"] = rpc_secret_value
+            s = config.Settings(**fields)
+            for _ in range(iterations):
+                s.save()
+        except Exception as e:  # pragma: no cover - failure path only
+            errors.append(e)
+
+    threads = [
+        threading.Thread(target=hammer, args=(f"secret-{i}",)) for i in range(6)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive()
+
+    assert not errors
+
+    # The file must exist, parse as JSON, and be a complete settings object
+    # after every interleaving - never truncated or a mix of two writes.
+    raw_text = (tmp_path / "settings.json").read_text()
+    parsed = json.loads(raw_text)
+    assert isinstance(parsed, dict)
+    assert "rpc_secret" in parsed
+    assert parsed["rpc_secret"].startswith("secret-")
+
+    # No leftover unique temp files: every save cleaned up after itself.
+    leftovers = [
+        p for p in tmp_path.iterdir()
+        if p.name != "settings.json" and p.name.startswith("settings.json")
+    ]
+    assert leftovers == []

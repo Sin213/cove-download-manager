@@ -986,6 +986,10 @@ class MainWindow(QMainWindow):
 
         accepted = _ask_magnet_offer(self)
         settings.magnet_prompt_shown = True
+        # The question has now been asked directly, so the startup migration
+        # heuristic (which only exists to infer an answer nobody gave) must
+        # never fire after this, whichever way the user answered.
+        settings.magnet_setting_missing = False
         if accepted:
             try:
                 magnet_handler.enable()
