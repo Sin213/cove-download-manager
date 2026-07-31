@@ -167,49 +167,52 @@ Cove only ever advertises itself as *capable* of opening magnet links.
 Choosing the default handler stays your decision on every platform, and
 installing Cove never silently replaces a handler you already use.
 
-**Linux (AppImage)**
+Cove can register itself from **Settings -> Magnet links**. The row shows
+what the operating system currently reports, not what Cove would prefer, so
+a default changed elsewhere is visible immediately.
 
-The AppImage ships a desktop entry that declares
-`x-scheme-handler/magnet`. Downloading the AppImage on its own is not
-enough: the desktop entry has to be installed first, either by integrating
-the AppImage (AppImageLauncher, your file manager's "integrate" prompt, or
-Gearlever) or by installing the entry by hand. After that, pick Cove as the
-magnet handler in your desktop environment's default-applications settings,
-or with your distribution's MIME tooling.
+**Keeping it working after an update**
 
-**Linux (Debian / Ubuntu)**
+The portable executable and the AppImage carry their version in the file
+name, so an update changes the path the registration points at. When
+"Repair Cove's magnet registration after updates" is on, Cove repairs its
+own registration the next time the updated build is launched.
 
-The `.deb` installs Cove's desktop entry with the same magnet declaration,
-and its post-install script refreshes the desktop and MIME caches so Cove
-shows up as a choice. It does not make Cove the default, so you may still
-need to select Cove for magnet links once in your desktop settings.
+The precise promise: after the updated build is launched once, Cove repairs
+a stale registration it already owns. It does not silently reclaim a default
+you changed to another application. If you delete the old file and click a
+magnet link before ever launching the new one, Cove has not run yet and
+cannot repair anything.
 
-**Windows (Setup)**
+Cove only ever repairs a registration it owns. A portable copy and an
+installed copy keep separate identities and never modify each other.
 
-The installer offers an optional task, **Register Cove as a magnet link
-handler**, on the file-associations page. It is per-user, needs no
-administrator rights, and only advertises Cove. Windows may still ask you to
-pick Cove under **Settings -> Apps -> Default apps**, and the task never
-takes an existing default away from another application.
+**Linux**
 
-**Windows (portable)**
+The AppImage installs its own desktop entry
+(`cove-download-manager-appimage.desktop`) and sets the default directly.
+The `.deb` ships its entry system-wide, so Cove only needs to set the
+default. Cove verifies the result afterwards and reports honestly if your
+desktop declined the change.
 
-A normal portable launch registers nothing. Registration is opt-in, from a
-terminal in the folder holding the executable:
+**Windows**
+
+Since Windows 10, no application may make itself the default handler. Cove
+registers itself as capable and opens Settings at its own entry; the final
+choice is yours. Registration is per-user and needs no administrator rights.
+
+The command-line flags still work for scripted setups:
 
 ```powershell
 .\Cove-Download-Manager-<version>-Portable.exe --register-magnet-handler
 .\Cove-Download-Manager-<version>-Portable.exe --unregister-magnet-handler
 ```
 
-Both are per-user. Registration records the executable's current location,
-so if you move the portable `.exe` afterwards, run
-`--register-magnet-handler` again from the new location.
+**Running from source**
 
-Installed Cove and portable Cove register under separate identities of their
-own, so they never unregister each other: uninstalling the installed build
-leaves a portable registration alone, and `--unregister-magnet-handler` only
-removes a registration the portable executable owns.
+A source checkout cannot register: the path it would record belongs to the
+Python interpreter, not to Cove. Settings explains this rather than failing
+silently.
 
 ---
 
