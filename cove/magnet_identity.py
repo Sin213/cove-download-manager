@@ -17,6 +17,9 @@ UNSUPPORTED = "unsupported"
 # The wrapper script the .deb installs (see scripts/build-deb.sh:89).
 DEBIAN_LAUNCHER = "/usr/bin/cove-download-manager"
 
+# The PyInstaller bundle the /usr/bin wrapper execs (scripts/build-deb.sh:89-91).
+DEBIAN_BINARY = "/usr/lib/cove-download-manager/cove-download-manager"
+
 
 def _is_portable() -> bool:
     # Indirected so tests can choose the branch without faking a data dir.
@@ -46,13 +49,21 @@ def build_identity() -> str:
     if sys.platform.startswith("linux"):
         if _appimage_path():
             return APPIMAGE
-        if getattr(sys, "frozen", False):
-            # Frozen with no APPIMAGE: an extracted AppDir or an unknown
-            # bundle. Its path is temporary, so refuse it.
-            return UNSUPPORTED
+        # Debian must be checked before the frozen-means-unsupported rule
+        # below: the packaged build IS frozen (a PyInstaller bundle exec'd
+        # by the /usr/bin wrapper), so treating "frozen" as disqualifying
+        # would misclassify every real Debian install as UNSUPPORTED.
         argv0 = (sys.argv[0] if sys.argv else "") or ""
-        if os.path.realpath(argv0) == DEBIAN_LAUNCHER:
+        executable = getattr(sys, "executable", "") or ""
+        if (
+            os.path.realpath(argv0) == DEBIAN_LAUNCHER
+            or os.path.realpath(executable) == DEBIAN_BINARY
+        ):
             return DEBIAN
+        if getattr(sys, "frozen", False):
+            # Frozen, no APPIMAGE, and not the Debian bundle: an extracted
+            # AppDir or an unknown bundle. Its path is temporary, so refuse it.
+            return UNSUPPORTED
         return UNSUPPORTED
     return UNSUPPORTED
 

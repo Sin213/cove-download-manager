@@ -51,6 +51,33 @@ def test_debian_install_is_recognized(monkeypatch):
     assert mi.registration_path() == mi.DEBIAN_LAUNCHER
 
 
+def test_debian_frozen_bundle_is_recognized(monkeypatch):
+    # The .deb's /usr/bin wrapper execs the PyInstaller bundle at
+    # DEBIAN_BINARY, so sys.executable (not argv[0]) is the frozen bundle
+    # path. Registration must still record the stable /usr/bin wrapper
+    # path, not the /usr/lib bundle path, since that is what the desktop
+    # entry's Exec= line points at.
+    monkeypatch.setattr(mi.sys, "platform", "linux")
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setattr(mi.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mi.sys, "executable", mi.DEBIAN_BINARY)
+    monkeypatch.setattr(mi.sys, "argv", [mi.DEBIAN_BINARY])
+    assert mi.build_identity() == mi.DEBIAN
+    assert mi.registration_path() == mi.DEBIAN_LAUNCHER
+
+
+def test_frozen_linux_with_unrelated_executable_is_unsupported(monkeypatch):
+    # A frozen process whose executable matches neither the live AppImage
+    # nor the Debian bundle path is an extracted AppDir or unknown bundle
+    # whose path is temporary, so it must still be refused.
+    monkeypatch.setattr(mi.sys, "platform", "linux")
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setattr(mi.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mi.sys, "executable", "/tmp/.mount_CoveXYZ/AppRun")
+    monkeypatch.setattr(mi.sys, "argv", ["/tmp/.mount_CoveXYZ/AppRun"])
+    assert mi.build_identity() == mi.UNSUPPORTED
+
+
 def test_windows_portable_and_setup_are_distinguished(monkeypatch):
     monkeypatch.setattr(mi.sys, "platform", "win32")
     monkeypatch.setattr(mi.sys, "frozen", True, raising=False)
