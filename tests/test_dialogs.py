@@ -1454,3 +1454,41 @@ def test_torrent_file_adds_pass_an_interactive_duplicate_check():
     source = (Path(__file__).resolve().parents[1] / "cove" / "main_window.py").read_text()
     # Both interactive .torrent paths (Add dialog, drag-and-drop) opt in.
     assert source.count("duplicate_check=self._confirm_duplicate") == 2
+
+
+def test_magnet_status_text_never_claims_default_without_confirmation():
+    from cove.config import Settings
+    from cove.dialogs import SettingsDialog
+    from cove.magnet_handler import HandlerStatus
+    import cove.magnet_identity as mi
+
+    dialog = SettingsDialog(Settings())
+    try:
+        registered_only = HandlerStatus(
+            supported=True, identity=mi.WINDOWS_PORTABLE, registered=True,
+            owned_by_cove=True, is_default=False,
+        )
+        text = dialog._magnet_status_text(registered_only)
+        assert "not currently selected as default" in text
+        assert "Cove is the current default" not in text
+
+        confirmed = HandlerStatus(
+            supported=True, identity=mi.WINDOWS_PORTABLE, registered=True,
+            owned_by_cove=True, is_default=True,
+        )
+        assert "Cove is the current default" in dialog._magnet_status_text(confirmed)
+    finally:
+        dialog.close()
+
+
+def test_magnet_row_explains_an_unsupported_build():
+    from cove.config import Settings
+    from cove.dialogs import SettingsDialog
+    from cove.magnet_handler import HandlerStatus
+
+    dialog = SettingsDialog(Settings())
+    try:
+        text = dialog._magnet_status_text(HandlerStatus(supported=False))
+        assert "installed or portable build" in text
+    finally:
+        dialog.close()

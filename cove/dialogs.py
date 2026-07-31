@@ -3,8 +3,8 @@ subtitle, sections / form rows, accent OK / ghost Cancel.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTime, Qt, Signal
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTime, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -627,6 +627,50 @@ class SettingsDialog(QDialog):
             )
         form.addRow("", tray_note)
 
+        # Magnet links. Actions plus live status, deliberately not a
+        # checkbox: on Windows a checkbox would stay ticked after the user
+        # closed Settings without choosing Cove, stating something false.
+        from . import magnet_handler
+        from .magnet_identity import WINDOWS_PORTABLE, WINDOWS_SETUP
+
+        self._magnet_handler = magnet_handler
+        magnet_state = magnet_handler.status()
+        self.magnet_status_label = QLabel(self._magnet_status_text(magnet_state))
+        self.magnet_status_label.setProperty("role", "muted")
+        self.magnet_status_label.setWordWrap(True)
+
+        is_windows = magnet_state.identity in (WINDOWS_SETUP, WINDOWS_PORTABLE)
+        self.magnet_action_btn = QPushButton(
+            "Choose Cove as default" if is_windows else "Make Cove default"
+        )
+        self.magnet_remove_btn = QPushButton("Remove Cove registration")
+        self.magnet_repair_check = QCheckBox(
+            "Repair Cove's magnet registration after updates"
+        )
+        self.magnet_repair_check.setChecked(
+            bool(getattr(settings, "magnet_handler_enabled", False))
+        )
+
+        magnet_buttons = QHBoxLayout()
+        magnet_buttons.addWidget(self.magnet_action_btn)
+        magnet_buttons.addWidget(self.magnet_remove_btn)
+        magnet_buttons.addStretch(1)
+
+        magnet_box = QVBoxLayout()
+        magnet_box.addWidget(self.magnet_status_label)
+        magnet_box.addLayout(magnet_buttons)
+        magnet_box.addWidget(self.magnet_repair_check)
+        form.addRow("Magnet links", magnet_box)
+
+        if not magnet_state.supported:
+            self.magnet_action_btn.setEnabled(False)
+            self.magnet_remove_btn.setEnabled(False)
+            self.magnet_repair_check.setEnabled(False)
+            self.magnet_repair_check.setChecked(False)
+
+        self.magnet_action_btn.clicked.connect(self._on_magnet_enable)
+        self.magnet_remove_btn.clicked.connect(self._on_magnet_disable)
+
         self.smart_segments = QCheckBox("Auto-tune connections based on server support")
         self.smart_segments.setChecked(settings.intelligent_segments)
         self.smart_segments.setToolTip(
@@ -1019,6 +1063,41 @@ class SettingsDialog(QDialog):
             value, self._speed_display_unit
         )
 
+    def _magnet_status_text(self, state) -> str:
+        """Wording derived from the system, never from the stored setting."""
+        if not state.supported:
+            return (
+                "Magnet registration needs an installed or portable build. "
+                "Running Cove from source cannot register a stable path."
+            )
+        if state.is_default:
+            return "Status: Cove is the current default"
+        if state.registered:
+            return "Status: Registered, but not currently selected as default"
+        return "Status: Not registered"
+
+    def _refresh_magnet_status(self) -> None:
+        self.magnet_status_label.setText(
+            self._magnet_status_text(self._magnet_handler.status())
+        )
+
+    def _on_magnet_enable(self) -> None:
+        result = self._magnet_handler.enable()
+        url = self._magnet_handler.default_apps_url()
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+        self._refresh_magnet_status()
+        if not result.ok and result.message:
+            QMessageBox.information(self, "Magnet links", result.message)
+
+    def _on_magnet_disable(self) -> None:
+        result = self._magnet_handler.disable()
+        self._refresh_magnet_status()
+        if not result.ok and result.message:
+            QMessageBox.information(self, "Magnet links", result.message)
+            return
+        self.magnet_repair_check.setChecked(False)
+
     def _on_accept(self) -> None:
         self.settings.download_dir = self.dir_edit.text().strip() or self.settings.download_dir
         self.settings.connections_per_server = self.connections.currentData()
@@ -1031,6 +1110,7 @@ class SettingsDialog(QDialog):
         # Read back on the shared Settings object MainWindow already holds, so
         # the next X press honours the new value without a restart.
         self.settings.close_to_tray = self.close_to_tray.isChecked()
+        self.settings.magnet_handler_enabled = self.magnet_repair_check.isChecked()
         self.settings.intelligent_segments = self.smart_segments.isChecked()
         self.settings.notify_on_complete = self.notify_complete.isChecked()
         self.settings.notify_on_error = self.notify_error.isChecked()
