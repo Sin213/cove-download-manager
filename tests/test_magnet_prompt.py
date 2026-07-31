@@ -55,3 +55,30 @@ def test_no_offer_when_cove_is_already_the_default(monkeypatch):
 def test_no_offer_on_an_unsupported_build(monkeypatch):
     settings = FakeSettings()
     assert _offer(monkeypatch, settings, HandlerStatus(supported=False), True) is False
+
+
+def test_a_failing_enable_does_not_break_the_add_path(monkeypatch):
+    """enable() may raise an unanticipated exception; the add path must survive.
+
+    The user already said yes, so the answer must still be recorded and
+    settings saved, otherwise the question would wrongly be asked again.
+    """
+    from cove import main_window as mw
+
+    settings = FakeSettings()
+    state = HandlerStatus(supported=True, registered=False, is_default=False)
+
+    def _boom():
+        raise RuntimeError("enable exploded")
+
+    monkeypatch.setattr(mw.magnet_handler, "status", lambda: state)
+    monkeypatch.setattr(mw.magnet_handler, "enable", _boom)
+    monkeypatch.setattr(mw, "_ask_magnet_offer", lambda parent: True)
+
+    result = mw.MainWindow._maybe_offer_magnet_handler(
+        type("Stub", (), {"settings": settings})()
+    )
+
+    assert result is True
+    assert settings.magnet_prompt_shown is True
+    assert settings.saved is True

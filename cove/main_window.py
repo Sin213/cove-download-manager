@@ -987,11 +987,17 @@ class MainWindow(QMainWindow):
         accepted = _ask_magnet_offer(self)
         settings.magnet_prompt_shown = True
         if accepted:
-            magnet_handler.enable()
-            # Set regardless of whether enable() could confirm the default.
-            # On Windows it never can: the user still has to choose Cove in
-            # Settings. The preference means "keep the registration
-            # repaired", which is what an accepting user wants either way.
+            try:
+                magnet_handler.enable()
+            except Exception:
+                # The user already answered; a broken enable() must not
+                # surface into the Add-dialog accept path or re-ask later.
+                pass
+            # Set regardless of whether enable() could confirm the default,
+            # or raised outright. On Windows it never can: the user still
+            # has to choose Cove in Settings. The preference means "keep the
+            # registration repaired", which is what an accepting user wants
+            # either way.
             settings.magnet_handler_enabled = True
         try:
             settings.save()
