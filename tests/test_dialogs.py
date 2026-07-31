@@ -1456,39 +1456,36 @@ def test_torrent_file_adds_pass_an_interactive_duplicate_check():
     assert source.count("duplicate_check=self._confirm_duplicate") == 2
 
 
-def test_magnet_status_text_never_claims_default_without_confirmation():
-    from cove.config import Settings
+# Every other SettingsDialog test in this file runs the dialog in a
+# subprocess, because constructing one inside the pytest process leaves Qt
+# state that crashes the interpreter at shutdown. _magnet_status_text never
+# touches self, so these call it unbound and need no dialog at all.
+def _status_text(state):
     from cove.dialogs import SettingsDialog
+
+    return SettingsDialog._magnet_status_text(None, state)
+
+
+def test_magnet_status_text_never_claims_default_without_confirmation():
     from cove.magnet_handler import HandlerStatus
     import cove.magnet_identity as mi
 
-    dialog = SettingsDialog(Settings())
-    try:
-        registered_only = HandlerStatus(
-            supported=True, identity=mi.WINDOWS_PORTABLE, registered=True,
-            owned_by_cove=True, is_default=False,
-        )
-        text = dialog._magnet_status_text(registered_only)
-        assert "not currently selected as default" in text
-        assert "Cove is the current default" not in text
+    registered_only = HandlerStatus(
+        supported=True, identity=mi.WINDOWS_PORTABLE, registered=True,
+        owned_by_cove=True, is_default=False,
+    )
+    text = _status_text(registered_only)
+    assert "not currently selected as default" in text
+    assert "Cove is the current default" not in text
 
-        confirmed = HandlerStatus(
-            supported=True, identity=mi.WINDOWS_PORTABLE, registered=True,
-            owned_by_cove=True, is_default=True,
-        )
-        assert "Cove is the current default" in dialog._magnet_status_text(confirmed)
-    finally:
-        dialog.close()
+    confirmed = HandlerStatus(
+        supported=True, identity=mi.WINDOWS_PORTABLE, registered=True,
+        owned_by_cove=True, is_default=True,
+    )
+    assert "Cove is the current default" in _status_text(confirmed)
 
 
 def test_magnet_row_explains_an_unsupported_build():
-    from cove.config import Settings
-    from cove.dialogs import SettingsDialog
     from cove.magnet_handler import HandlerStatus
 
-    dialog = SettingsDialog(Settings())
-    try:
-        text = dialog._magnet_status_text(HandlerStatus(supported=False))
-        assert "installed or portable build" in text
-    finally:
-        dialog.close()
+    assert "installed or portable build" in _status_text(HandlerStatus(supported=False))
