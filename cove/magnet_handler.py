@@ -5,24 +5,17 @@ magnet association is never important enough to interrupt startup or a
 download. Status is always read from the operating system, never from a
 stored preference, so a default changed outside Cove shows up immediately.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from . import magnet_identity, magnet_linux
 
 
-def _always_false() -> bool:
-    return False
-
-
 @dataclass(frozen=True)
 class HandlerStatus:
-    """`is_default` is read from the OS lazily, on first access.
+    """Status is always read fresh from the OS, never cached or lazy.
 
-    Checking whether a registration is stale never needs to know who the
-    current default is, so a plain status() call for that purpose (as
-    repair() makes internally) does no extra OS or mock work. Nothing is
-    cached across separate status() calls, so a fresh status() object still
-    reflects a default changed a moment ago the first time it is asked.
+    A fresh status() call always reflects the current default, so two
+    statuses that differ only in who holds the default compare unequal.
     """
 
     supported: bool = False
@@ -31,14 +24,7 @@ class HandlerStatus:
     owned_by_cove: bool = False
     stale: bool = False
     recorded_path: str = ""
-    _default_probe: object = field(default=_always_false, repr=False, compare=False)
-    _default_cache: list = field(default_factory=list, repr=False, compare=False)
-
-    @property
-    def is_default(self) -> bool:
-        if not self._default_cache:
-            self._default_cache.append(bool(self._default_probe()))
-        return self._default_cache[0]
+    is_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,11 +80,10 @@ def _windows_status(identity: str, current: str) -> HandlerStatus:
         return HandlerStatus(supported=True, identity=identity)
     recorded = magnet_win.registered_executable(command) if command else ""
 
-    def probe_default() -> bool:
-        try:
-            return magnet_win.is_default(_winreg(), keys)
-        except Exception:
-            return False
+    try:
+        is_default = magnet_win.is_default(_winreg(), keys)
+    except Exception:
+        is_default = False
 
     return HandlerStatus(
         supported=True,
@@ -107,15 +92,17 @@ def _windows_status(identity: str, current: str) -> HandlerStatus:
         owned_by_cove=bool(recorded),
         stale=bool(recorded) and not magnet_win.same_executable(recorded, current),
         recorded_path=recorded,
-        _default_probe=probe_default,
+        is_default=is_default,
     )
 
 
 def _linux_status(identity: str, current: str) -> HandlerStatus:
     desktop_id = magnet_linux.desktop_id(identity)
 
-    def probe_default() -> bool:
-        return magnet_linux.query_default(_run) == desktop_id
+    try:
+        is_default = magnet_linux.query_default(_run) == desktop_id
+    except Exception:
+        is_default = False
 
     if identity == magnet_identity.DEBIAN:
         # The package owns the entry; its path is stable and never stale.
@@ -126,13 +113,13 @@ def _linux_status(identity: str, current: str) -> HandlerStatus:
             owned_by_cove=True,
             stale=False,
             recorded_path=current,
-            _default_probe=probe_default,
+            is_default=is_default,
         )
     path = magnet_linux.user_entry_path(desktop_id, _apps_dir())
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return HandlerStatus(supported=True, identity=identity, _default_probe=probe_default)
+        return HandlerStatus(supported=True, identity=identity, is_default=is_default)
     recorded = magnet_linux.entry_exec_path(text)
     return HandlerStatus(
         supported=True,
@@ -141,7 +128,7 @@ def _linux_status(identity: str, current: str) -> HandlerStatus:
         owned_by_cove=bool(recorded),
         stale=bool(recorded) and recorded != current,
         recorded_path=recorded,
-        _default_probe=probe_default,
+        is_default=is_default,
     )
 
 
@@ -230,7 +217,7 @@ def repair() -> bool:
             return True
     except Exception:
         return False
-    return True
+    return False
 
 
 def default_apps_url() -> str:
