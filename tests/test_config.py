@@ -140,6 +140,35 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
     stop = threading.Event()
     iterations = 200
 
+    # The bug's signature is a truncated file visible WHILE the race is on,
+    # not after it. Checking only once every thread has joined would pass
+    # against the broken implementation unless the very last os.replace
+    # happened to publish a partial file, so a reader samples throughout.
+    reads = []
+
+    def watcher():
+        while not stop.is_set():
+            try:
+                text = (tmp_path / "settings.json").read_text()
+            except FileNotFoundError:
+                # os.replace is atomic, so the path is never absent. If it
+                # is, that is itself the defect.
+                errors.append(AssertionError("settings.json vanished mid-save"))
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as e:
+                errors.append(
+                    AssertionError("observed a partial settings.json: %s" % e)
+                )
+                continue
+            if not isinstance(parsed, dict) or "rpc_secret" not in parsed:
+                errors.append(
+                    AssertionError("observed an incomplete settings object")
+                )
+                continue
+            reads.append(1)
+
     def hammer(rpc_secret_value: str):
         try:
             fields = {
@@ -156,13 +185,20 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
     threads = [
         threading.Thread(target=hammer, args=(f"secret-{i}",)) for i in range(6)
     ]
+    reader = threading.Thread(target=watcher, daemon=True)
+    reader.start()
     for t in threads:
         t.start()
     for t in threads:
         t.join(timeout=30)
         assert not t.is_alive()
+    stop.set()
+    reader.join(timeout=10)
+    assert not reader.is_alive()
 
     assert not errors
+    # A watcher that never got a sample in would prove nothing.
+    assert reads, "the reader observed no writes, so the race was never exercised"
 
     # The file must exist, parse as JSON, and be a complete settings object
     # after every interleaving - never truncated or a mix of two writes.
