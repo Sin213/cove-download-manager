@@ -326,6 +326,17 @@ def run() -> int:
         target=_register_native_hosts, name="native-host-install", daemon=True
     ).start()
 
+    # Same reasoning as the native-host thread above: registry and xdg-mime
+    # work can block, and a magnet association must never delay the window.
+    def _heal_magnet_handler() -> None:
+        from .magnet_startup import migrate_and_repair
+
+        migrate_and_repair(settings)
+
+    threading.Thread(
+        target=_heal_magnet_handler, name="magnet-self-heal", daemon=True
+    ).start()
+
     def _boot_daemon() -> None:
         while True:
             try:
