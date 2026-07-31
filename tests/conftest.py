@@ -28,6 +28,68 @@ _app = QApplication.instance() or QApplication([])
 import pytest  # noqa: E402
 
 
+class FakeKey:
+    """In-memory stand-in for a winreg key handle, used as a context manager."""
+
+    def __init__(self, store, path=None):
+        self.store = store
+        self.path = path
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeWinreg:
+    """Minimal in-memory stand-in for the winreg module.
+
+    Shared by tests/test_magnet_win.py and tests/test_portable_magnet_registration.py
+    so both suites exercise one fake registry instead of two near-duplicates.
+    Never touches the real winreg module or the machine's registry.
+    """
+
+    HKEY_CURRENT_USER = "HKCU"
+    KEY_WRITE = 2
+    KEY_READ = 1
+    REG_SZ = 1
+
+    def __init__(self, initial=None):
+        self.data = dict(initial or {})
+        self.roots_used = set()
+
+    def CreateKeyEx(self, root, path, reserved=0, access=0):
+        self.roots_used.add(root)
+        self.data.setdefault(path, {})
+        return FakeKey(self.data[path], path)
+
+    def OpenKey(self, root, path, reserved=0, access=0):
+        self.roots_used.add(root)
+        if path not in self.data:
+            raise OSError("missing key: {}".format(path))
+        return FakeKey(self.data[path], path)
+
+    def SetValueEx(self, key, name, reserved, value_type, value):
+        key.store[name] = value
+
+    def QueryValueEx(self, key, name):
+        if name not in key.store:
+            raise OSError("missing value: {}".format(name))
+        return key.store[name], self.REG_SZ
+
+    def DeleteKey(self, root, path):
+        self.roots_used.add(root)
+        if path not in self.data:
+            raise OSError("missing key: {}".format(path))
+        del self.data[path]
+
+    def DeleteValue(self, key, name):
+        if name not in key.store:
+            raise OSError("missing value: {}".format(name))
+        del key.store[name]
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _drain_qt_deletions():
     """Flush Qt's deferred-deletion queue before the interpreter exits.

@@ -19,24 +19,9 @@ os.environ["COVE_PORTABLE"] = "1"
 REGISTER_FLAG = "--register-magnet-handler"
 UNREGISTER_FLAG = "--unregister-magnet-handler"
 
-# The portable build deliberately owns a *different* ProgID and capability
-# identity from the Setup installer (which uses Cove.Magnet). A portable copy
-# and an installed copy can coexist on one machine, and sharing the identity
-# would let either one's unregister/uninstall wipe the other's registration.
-PROG_ID = "Cove.Magnet.Portable"
-PROG_ID_KEY = r"Software\Classes\Cove.Magnet.Portable"
-SHELL_KEY = r"Software\Classes\Cove.Magnet.Portable\shell"
-SHELL_OPEN_KEY = r"Software\Classes\Cove.Magnet.Portable\shell\open"
-COMMAND_KEY = r"Software\Classes\Cove.Magnet.Portable\shell\open\command"
-ICON_KEY = r"Software\Classes\Cove.Magnet.Portable\DefaultIcon"
-CAPABILITIES_KEY = (
-    r"Software\Cove\Cove Download Manager Portable\Capabilities"
-)
-URL_ASSOCIATIONS_KEY = (
-    r"Software\Cove\Cove Download Manager Portable\Capabilities\URLAssociations"
-)
-REGISTERED_APPS_KEY = r"Software\RegisteredApplications"
-APP_NAME = "Cove Download Manager Portable"
+# The registry primitives live in cove.magnet_win so the GUI and this
+# launcher share one implementation. That module imports no Qt and does not
+# import cove.entry, so importing it here still never starts the GUI.
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -46,121 +31,6 @@ EXIT_USAGE = 2
 def executable_path() -> str:
     """Absolute path of the running portable executable."""
     return os.path.abspath(sys.executable)
-
-
-def open_command(exe_path: str) -> str:
-    """Shell open command; both the executable and %1 stay quoted."""
-    return '"{}" "%1"'.format(exe_path)
-
-
-def _same_executable(left: str, right: str) -> bool:
-    """Windows-appropriate path comparison (case- and separator-insensitive)."""
-    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
-        os.path.abspath(right)
-    )
-
-
-def _registered_executable(command: str) -> str:
-    """Pull the executable out of a `"exe" "%1"` command string."""
-    command = command.strip()
-    if command.startswith('"'):
-        end = command.find('"', 1)
-        if end == -1:
-            return ""
-        return command[1:end]
-    return command.split(" ")[0]
-
-
-def register(winreg, exe_path: str) -> int:
-    """Advertise Cove as a magnet-capable application for the current user."""
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, PROG_ID_KEY, 0, winreg.KEY_WRITE
-    ) as key:
-        winreg.SetValueEx(
-            key,
-            None,
-            0,
-            winreg.REG_SZ,
-            "Magnet Link (Cove Download Manager Portable)",
-        )
-        winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, ICON_KEY, 0, winreg.KEY_WRITE
-    ) as key:
-        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, '"{}",0'.format(exe_path))
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, COMMAND_KEY, 0, winreg.KEY_WRITE
-    ) as key:
-        winreg.SetValueEx(key, None, 0, winreg.REG_SZ, open_command(exe_path))
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, CAPABILITIES_KEY, 0, winreg.KEY_WRITE
-    ) as key:
-        winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, APP_NAME)
-        winreg.SetValueEx(
-            key,
-            "ApplicationDescription",
-            0,
-            winreg.REG_SZ,
-            "Multi-connection download manager with magnet link support",
-        )
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, URL_ASSOCIATIONS_KEY, 0, winreg.KEY_WRITE
-    ) as key:
-        winreg.SetValueEx(key, "magnet", 0, winreg.REG_SZ, PROG_ID)
-    with winreg.CreateKeyEx(
-        winreg.HKEY_CURRENT_USER, REGISTERED_APPS_KEY, 0, winreg.KEY_WRITE
-    ) as key:
-        winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, CAPABILITIES_KEY)
-
-    print("Registered Cove as a magnet link handler for the current user.")
-    print("Pick Cove under Windows Default Apps to make it the default.")
-    return EXIT_OK
-
-
-def _delete_key(winreg, path: str) -> None:
-    """Delete a key, ignoring an already-absent one (keeps this idempotent)."""
-    try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
-    except OSError:
-        pass
-
-
-def unregister(winreg, exe_path: str) -> int:
-    """Remove the registration, but only when this executable owns it."""
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, COMMAND_KEY, 0, winreg.KEY_READ
-        ) as key:
-            command, _ = winreg.QueryValueEx(key, None)
-    except OSError:
-        print("No Cove magnet registration found for the current user.")
-        return EXIT_OK
-
-    owner = _registered_executable(str(command))
-    if not owner or not _same_executable(owner, exe_path):
-        print(
-            "Magnet registration belongs to another Cove installation; "
-            "left unchanged."
-        )
-        return EXIT_ERROR
-
-    _delete_key(winreg, COMMAND_KEY)
-    _delete_key(winreg, SHELL_OPEN_KEY)
-    _delete_key(winreg, SHELL_KEY)
-    _delete_key(winreg, ICON_KEY)
-    _delete_key(winreg, PROG_ID_KEY)
-    _delete_key(winreg, URL_ASSOCIATIONS_KEY)
-    _delete_key(winreg, CAPABILITIES_KEY)
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, REGISTERED_APPS_KEY, 0, winreg.KEY_WRITE
-        ) as key:
-            winreg.DeleteValue(key, APP_NAME)
-    except OSError:
-        pass
-
-    print("Removed the Cove magnet link handler registration.")
-    return EXIT_OK
 
 
 def handle_registration_args(argv):
@@ -188,10 +58,26 @@ def handle_registration_args(argv):
 
     import winreg  # Windows-only; never imported on other platforms.
 
+    from cove import magnet_win
+    from cove.magnet_identity import WINDOWS_PORTABLE
+
+    keys = magnet_win.keys_for(WINDOWS_PORTABLE)
     exe_path = executable_path()
+
     if flags[0] == REGISTER_FLAG:
-        return register(winreg, exe_path)
-    return unregister(winreg, exe_path)
+        magnet_win.register(winreg, keys, exe_path)
+        print("Registered Cove as a magnet link handler for the current user.")
+        print("Pick Cove under Windows Default Apps to make it the default.")
+        return EXIT_OK
+
+    if magnet_win.unregister(winreg, keys, exe_path):
+        print("Removed the Cove magnet link handler registration.")
+        return EXIT_OK
+    print(
+        "Magnet registration belongs to another Cove installation; "
+        "left unchanged."
+    )
+    return EXIT_ERROR
 
 
 def main(argv=None):
