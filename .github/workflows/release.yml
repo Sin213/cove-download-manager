@@ -340,29 +340,30 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.2.0
+          ## What's new in 3.3.0
 
-          Cove now stops you re-downloading something you already have, and lets you check where any download came from without exposing the credentials inside its link.
+          Cove can now be set as your magnet link handler from inside Settings, and keeps that registration working after an update.
 
           ### Added
 
-          - **Duplicate detection.** Adding a link, magnet, or `.torrent` that Cove already has is caught before anything downloads. A match still in the queue offers "Focus Existing" to jump to it; a match you already finished offers "Open Folder" to go straight to the file. Either can be overridden for that one add with "Download Anyway", and nothing is remembered or suppressed afterwards, so the next duplicate is still caught. Cancel is the default button, so dismissing the prompt never starts a download.
-          - **One summary for clipboard batches.** Pasting a batch where several links are duplicates gives a single "Duplicate downloads" summary with "Skip Duplicates" or "Add All Anyway", instead of one dialog per link. Only short labels are listed, never a full signed link or a magnet carrying a tracker passkey.
-          - **View source.** Right-click any task and choose "View source" to see where it came from: the URL, the referring page, the browser's user agent, the save folder and file name, and for torrents the name and info hash. It works for finished and failed tasks too, which is usually when you want it.
-          - **Privacy-conscious display in View source.** Anything secret in a link is masked on screen: credentials embedded in the URL, signed-link parameters such as `token`, `apiKey`, and `X-Amz-Signature`, private-tracker passkeys in both the query and the path, magnet tracker and web-seed URLs, and tokens hidden after the `#`. Stored browser cookies are acknowledged as present but never displayed, and a debrid provider's one-time delivery link is never included at all. Copying is always deliberate: "Copy URL" gives you the masked form, and the unmasked original has its own separate button.
-
-          - **Close to system tray.** Off by default, in Settings -> Window. With it on, the window X hides Cove to the tray instead of quitting, so the browser extension can still hand downloads to a Cove you thought you had closed. The tray icon's menu has Open Cove and Quit Cove, and clicking the icon brings the window back. On a desktop with no tray the setting is disabled rather than offered, because there would be no icon to restore Cove from.
+          - **Magnet registration from Settings.** A new "Magnet links" row in Settings registers Cove as your magnet handler with no terminal command. On Linux it sets the default and confirms the result with your desktop before claiming success. On Windows it registers Cove and opens Settings at Cove's own entry, because since Windows 10 no application is allowed to make itself the default; the final choice stays yours.
+          - **Honest, live status.** The row reports what the operating system currently says, not what Cove would prefer, so a default you changed in another application shows up immediately. It is deliberately not a checkbox: a ticked box would keep claiming Cove was the default after you closed Windows Settings without picking it.
+          - **Registration survives updates.** The portable `.exe` and the AppImage carry their version in the filename, so updating used to leave the registration pointing at a file that no longer exists. Cove now repairs its own registration the next time the updated build is launched. It never silently reclaims a default you have since given to another application.
+          - **A one-time offer.** The first time you add a magnet or torrent by hand, Cove offers to handle magnet links. It asks once and remembers your answer either way.
+          - **Close to system tray.** Off by default, in Settings -> Window. The window X hides Cove to the tray instead of quitting, so the browser extension can still hand downloads to it. The tray menu has Open Cove and Quit Cove.
 
           ### Fixed
 
-          - **YouTube downloads no longer fail with HTTP 413.** Cove was passing the browser's entire cookie jar to yt-dlp as a request header. On a signed-in YouTube session that header is large enough that YouTube rejects the request as too large, so a perfectly public video failed after three retries. Cove no longer forwards browser cookies for YouTube pages, which need no account cookies. Cookies are still sent for direct file and HLS downloads that depend on them.
-          - **Browser downloads are no longer lost when Cove is closed.** If Cove was not running, the extension's hand-off could cancel the browser's own transfer and leave nothing behind. The browser now keeps the download whenever Cove does not positively accept it, and nothing is queued up to appear later.
+          - **Settings could be corrupted by two saves at once.** Cove wrote to a single shared temporary file before replacing the real one, so two saves happening together could publish a half-written file and lose your stored settings, including the local API secret. Each save now uses its own temporary file and saves are serialised.
+          - **"Remove Cove registration" could report success while doing nothing.** After updating the portable build, the recorded registration belonged to the older executable, so nothing was removed even though Cove said it had been. It now tells you the registration belongs to a different copy of Cove and leaves it untouched.
+          - **A declined magnet prompt could be silently overridden.** A background check running at startup could turn a "no" into a "yes" if you answered while it was still working.
+          - **Debian installs no longer claim to be registered when they are not.** The status now checks that the packaged desktop entry is actually installed.
+          - **Running from source no longer tries to register.** The path it would record belongs to the Python interpreter, not to Cove, so registration is refused and Settings explains why.
 
           ### Notes
 
-          - Duplicate detection compares canonical URLs and torrent info hashes. Two different links to the same file are not recognised as the same download, and a moved or renamed file no longer counts as a completed match.
-          - Account-required YouTube content such as members-only or private videos is not downloadable through the extension, since browser cookies are no longer forwarded for YouTube.
-          - View source masks secrets by name and by shape. A secret that looks like an ordinary word in a path cannot be told apart from a folder name, so treat the masking as a strong guard rather than a guarantee, especially before sharing a screenshot.
+          - Account-required YouTube content such as members-only or private videos is still not downloadable through the extension, since browser cookies are not forwarded for YouTube.
+          - If you delete an old portable `.exe` or AppImage and click a magnet link before ever launching the new build, Cove has not run yet and cannot repair anything.
 
           ## Downloads
 

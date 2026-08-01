@@ -7,7 +7,7 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v3.2.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v3.3.0-5eead4?style=flat-square)
 
 ![Cove Download Manager](docs/screenshot.png)
 
@@ -67,6 +67,12 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
   to the existing torrent / debrid pipeline. An already-running Cove picks
   the link up in place, so there is no second window and no second aria2
   daemon. See [Opening magnet links from your browser](#opening-magnet-links-from-your-browser).
+- **Magnet registration from Settings** - register Cove as your magnet handler
+  from Settings -> Magnet links, with no terminal command. The row shows what
+  the operating system currently reports rather than what Cove would prefer,
+  so a default changed elsewhere is visible straight away. Cove also repairs
+  its own registration after an update moves the executable, which the
+  versioned portable `.exe` and AppImage filenames used to break.
 - **Torrents and magnets** - Cove downloads torrents itself, no external
   client. Enabled debrid accounts are checked for a cached copy first and
   the files come down over HTTPS; anything uncached falls back to Cove's
