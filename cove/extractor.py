@@ -11,6 +11,7 @@ from urllib.parse import parse_qs, urlparse
 _YOUTUBE_PATH = re.compile(r"^/(?:shorts|live|embed)/[^/]+")
 _PROGRESS = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _SPEED = re.compile(r"\bat\s+(\d+(?:\.\d+)?)\s*([KMG]iB)/s", re.IGNORECASE)
+FINAL_PATH_MARKER = "__COVE_FINAL_FILE__:"
 
 
 def is_extractor_url(url: str) -> bool:
@@ -61,6 +62,11 @@ def ytdlp_command(
         "--no-playlist",
         "--merge-output-format",
         "mp4",
+        "--no-overwrites",
+        "--no-post-overwrites",
+        "--progress",
+        "--print",
+        f"after_move:{FINAL_PATH_MARKER}%(filepath)s",
         "-f",
         "bv*[height<=1080]+ba/b[height<=1080]/b",
     ]
@@ -76,6 +82,13 @@ def ytdlp_command(
         cmd += ["--user-agent", user_agent]
     cmd += ["-o", output_template, url]
     return cmd
+
+
+def parse_ytdlp_final_path(line: str) -> str | None:
+    if not line.startswith(FINAL_PATH_MARKER):
+        return None
+    value = line[len(FINAL_PATH_MARKER) :].strip()
+    return value or None
 
 
 def parse_ytdlp_progress(line: str) -> dict[str, float]:

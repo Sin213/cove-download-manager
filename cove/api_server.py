@@ -22,6 +22,7 @@ from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 
 from . import __version__
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
+from .output_paths import OutputPathError, validate_public_filename
 from .queue import DownloadTask, QueueManager
 
 API_PREFIX = "/api/v1"
@@ -30,13 +31,6 @@ BRIDGE_TIMEOUT_SECONDS = 5.0
 REQUEST_TIMEOUT_SECONDS = 5.0
 ALLOWED_URL_SCHEMES = {"http", "https", "ftp", "magnet"}
 _TASK_PATH_RE = re.compile(r"^/api/v1/downloads/([^/]+)(?:/(pause|resume|cancel))?$")
-_WINDOWS_RESERVED_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-
-
 class ApiProblem(Exception):
     """A stable API error safe to serialize to a client."""
 
@@ -76,19 +70,10 @@ def validate_url(value: Any) -> str:
 def validate_filename(value: Any) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value or value in {".", ".."}:
-        raise _problem(400, "invalid_filename", "The filename is empty or reserved.")
-    if len(value) > 255:
-        raise _problem(400, "invalid_filename", "The filename is too long.")
-    if any(char in value for char in '/\\:<>"|?*'):
-        raise _problem(400, "invalid_filename", "The filename must be a basename without reserved characters.")
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        raise _problem(400, "invalid_filename", "Control characters are not allowed in filenames.")
-    if value.endswith((" ", ".")):
-        raise _problem(400, "invalid_filename", "Filenames may not end with a space or period.")
-    if value.split(".", 1)[0].upper() in _WINDOWS_RESERVED_NAMES:
-        raise _problem(400, "invalid_filename", "The filename is reserved by Windows.")
-    return value
+    try:
+        return validate_public_filename(value)
+    except OutputPathError as exc:
+        raise _problem(400, "invalid_filename", "The filename is invalid.") from exc
 
 
 def validate_directory(value: Any, create: bool) -> str | None:

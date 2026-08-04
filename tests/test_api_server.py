@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import threading
 import time
@@ -17,10 +18,13 @@ from cove.api_server import (
     QueueApiBridge,
     task_snapshot,
     validate_add_payload,
+    validate_filename,
 )
 from cove import config
 from cove import db
+from cove import output_paths
 from cove.config import Settings
+from cove.output_paths import OutputPathError, validate_public_filename
 from cove.queue import QueueManager
 from cove.queue import DownloadTask
 
@@ -177,6 +181,95 @@ def test_add_validation(payload, code):
     with pytest.raises(ApiProblem) as caught:
         validate_add_payload(payload)
     assert caught.value.code == code
+
+
+@pytest.mark.parametrize("filename", ["report.txt", "notes-2026.txt"])
+def test_api_filename_accepts_ordinary_ascii(filename):
+    assert validate_filename(filename) == filename
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["", ".", "..", "/absolute.txt", "../escape.txt", "nested/file.txt", r"nested\file.txt"],
+)
+def test_api_filename_rejects_invalid_components(filename):
+    with pytest.raises(ApiProblem) as caught:
+        validate_filename(filename)
+    assert caught.value.code == "invalid_filename"
+
+
+@pytest.mark.parametrize(
+    ("windows", "accepted", "rejected"),
+    [
+        (False, "é" * 125 + "a.txt", "é" * 126 + ".txt"),
+        (True, "😀" * 125 + "a.txt", "😀" * 126 + ".txt"),
+    ],
+    ids=["posix-encoded-bytes", "windows-utf16-units"],
+)
+def test_api_filename_uses_platform_component_length(monkeypatch, windows, accepted, rejected):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: windows)
+
+    assert validate_filename(accepted) == accepted
+    measured_length = len(accepted.encode("utf-16-le")) // 2 if windows else len(os.fsencode(accepted))
+    assert measured_length == 255
+    assert len(rejected) < 255
+    with pytest.raises(ApiProblem) as caught:
+        validate_filename(rejected)
+    assert caught.value.code == "invalid_filename"
+
+
+@pytest.mark.parametrize("windows", [False, True], ids=["posix", "windows"])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "report.txt",
+        "世界.txt",
+        "😀.txt",
+        "a" * 255,
+        "é" * 127 + "a",
+        "😀" * 127 + "a",
+        "",
+        ".",
+        "..",
+        "/absolute.txt",
+        "../escape.txt",
+        "nested/file.txt",
+        r"nested\file.txt",
+        "CON.txt",
+        "trailing.",
+    ],
+)
+def test_api_and_publication_filename_validity_match(monkeypatch, windows, filename):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: windows)
+
+    try:
+        validate_filename(filename)
+        api_valid = True
+    except ApiProblem:
+        api_valid = False
+    try:
+        validate_public_filename(filename)
+        publication_valid = True
+    except OutputPathError:
+        publication_valid = False
+
+    assert api_valid is publication_valid
+
+
+def test_rejected_api_filename_is_not_queued(api_server, monkeypatch):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: False)
+    server, bridge = api_server
+
+    status, payload = call(
+        server,
+        "POST",
+        "/api/v1/downloads",
+        body={"url": "https://example.com/file.bin", "filename": "é" * 126 + ".txt"},
+        headers=auth(),
+    )
+
+    assert (status, payload["error"]["code"]) == (400, "invalid_filename")
+    assert bridge.calls == []
 
 
 def test_add_keeps_omitted_defaults_for_queue_thread(api_server):

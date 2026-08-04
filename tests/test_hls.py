@@ -56,7 +56,7 @@ class TestFfmpegCommand:
     def test_basic_command(self):
         cmd = ffmpeg_command("https://example.com/stream.m3u8", "/tmp/out.mp4")
         assert cmd == [
-            "ffmpeg", "-y", "-i", "https://example.com/stream.m3u8",
+            "ffmpeg", "-n", "-i", "https://example.com/stream.m3u8",
             "-c", "copy", "/tmp/out.mp4",
         ]
 

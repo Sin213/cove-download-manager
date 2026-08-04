@@ -1,4 +1,10 @@
-from cove.extractor import is_extractor_url, parse_ytdlp_progress, ytdlp_command
+from cove.extractor import (
+    FINAL_PATH_MARKER,
+    is_extractor_url,
+    parse_ytdlp_final_path,
+    parse_ytdlp_progress,
+    ytdlp_command,
+)
 
 
 def test_recognizes_supported_youtube_pages():
@@ -16,7 +22,15 @@ def test_command_uses_mp4_output_template():
     assert command[0] == "yt-dlp"
     assert "--cookies-from-browser" not in command
     assert "--merge-output-format" in command
+    assert "--no-overwrites" in command
+    assert "--no-post-overwrites" in command
+    assert f"after_move:{FINAL_PATH_MARKER}%(filepath)s" in command
     assert "/tmp/Title.%(ext)s" in command
+
+
+def test_parses_machine_readable_final_path():
+    assert parse_ytdlp_final_path(f"{FINAL_PATH_MARKER}/tmp/final.mp4") == "/tmp/final.mp4"
+    assert parse_ytdlp_final_path("[download] 100% of 1.00MiB") is None
 
 
 def test_command_forwards_browser_headers():

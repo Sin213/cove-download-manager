@@ -52,7 +52,7 @@ def ffmpeg_command(
 ) -> list[str]:
     # No explicit "-bsf:a aac_adtstoasc": the MP4 muxer auto-inserts it for
     # ADTS AAC input, and forcing it fails HLS streams with non-AAC audio.
-    cmd = ["ffmpeg", "-y"]
+    cmd = ["ffmpeg", "-n"]
     header_lines = []
     if cookies:
         header_lines.append(f"Cookie: {cookies}")

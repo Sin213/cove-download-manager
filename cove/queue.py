@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -21,6 +22,14 @@ from . import db, debrid, dedup, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
+from .output_paths import (
+    OutputPathError,
+    WorkDirectory,
+    cleanup_work_directory,
+    create_work_directory,
+    publish_output,
+    validate_public_filename,
+)
 from .torrent import TorrentError
 
 URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+", re.IGNORECASE)
@@ -316,8 +325,14 @@ class QueueManager(QObject):
         self._hls_procs: dict[int, QProcess] = {}
         self._hls_duration: dict[int, float] = {}
         self._hls_stderr: dict[int, str] = {}
+        self._hls_work: dict[int, WorkDirectory] = {}
         self._extractor_procs: dict[int, QProcess] = {}
         self._extractor_output: dict[int, str] = {}
+        self._extractor_work: dict[int, WorkDirectory] = {}
+        self._extractor_pause_pending: dict[int, QProcess] = {}
+        self._extractor_paused_work: set[int] = set()
+        self._extractor_final_path: dict[int, str] = {}
+        self._extractor_line_buffer: dict[int, str] = {}
         self._poll = QTimer(self)
         self._poll.setInterval(500)
         self._poll.timeout.connect(self._poll_active)
@@ -1438,25 +1453,127 @@ class QueueManager(QObject):
         self.task_changed.emit(tid)
         self._maybe_start_next()
 
+    def _cleanup_engine_work(self, work: WorkDirectory | None) -> None:
+        if work is None:
+            return
+        try:
+            cleanup_work_directory(work)
+        except (OSError, OutputPathError) as exc:
+            self.error.emit(f"Could not clean private output directory: {exc}")
+
+    def _stop_engine_process(
+        self,
+        proc: QProcess | tuple[QProcess | None, ...] | None,
+        work: WorkDirectory | None,
+        on_stopped=None,
+    ) -> None:
+        completed = False
+        processes = proc if isinstance(proc, tuple) else (proc,)
+        remaining: list[QProcess] = []
+        for candidate in processes:
+            if candidate is not None and all(candidate is not item for item in remaining):
+                remaining.append(candidate)
+
+        def _complete(*_args) -> None:
+            nonlocal completed
+            if completed:
+                return
+            completed = True
+            self._cleanup_engine_work(work)
+            if on_stopped is not None:
+                on_stopped()
+
+        if not remaining:
+            _complete()
+            return
+
+        def _process_stopped(candidate: QProcess) -> None:
+            for index, item in enumerate(remaining):
+                if item is candidate:
+                    remaining.pop(index)
+                    break
+            if not remaining:
+                _complete()
+
+        for candidate in tuple(remaining):
+            candidate.finished.connect(
+                lambda *_args, stopped=candidate: _process_stopped(stopped)
+            )
+            if candidate.state() == QProcess.NotRunning:
+                _process_stopped(candidate)
+            else:
+                candidate.terminate()
+
+        def _force_kill() -> None:
+            for candidate in tuple(remaining):
+                try:
+                    if candidate.state() != QProcess.NotRunning:
+                        candidate.kill()
+                    else:
+                        _process_stopped(candidate)
+                except RuntimeError:
+                    _process_stopped(candidate)
+
+        QTimer.singleShot(5000, _force_kill)
+
+    def _retire_hls_run(self, tid: int) -> None:
+        proc = self._hls_procs.pop(tid, None)
+        self._hls_duration.pop(tid, None)
+        self._hls_stderr.pop(tid, None)
+        work = self._hls_work.pop(tid, None)
+        self._stop_engine_process(proc, work)
+
+    def _retire_extractor_run(self, tid: int) -> None:
+        self._extractor_paused_work.discard(tid)
+        proc = self._extractor_procs.pop(tid, None)
+        pending_proc = self._extractor_pause_pending.get(tid)
+        self._extractor_output.pop(tid, None)
+        self._extractor_final_path.pop(tid, None)
+        self._extractor_line_buffer.pop(tid, None)
+        work = self._extractor_work.pop(tid, None)
+
+        def _retired() -> None:
+            if self._extractor_pause_pending.get(tid) is pending_proc:
+                self._extractor_pause_pending.pop(tid, None)
+            self._maybe_start_next()
+
+        self._stop_engine_process((proc, pending_proc), work, _retired)
+
     def pause(self, tid: int) -> None:
         t = self.tasks.get(tid)
         if not t or t.status not in {"active", "queued"}:
             return
         proc = None
-        if tid in self._hls_procs:
-            proc = self._hls_procs.pop(tid)
+        work = None
+        if tid in self._hls_procs or tid in self._hls_work:
+            proc = self._hls_procs.pop(tid, None)
             self._hls_duration.pop(tid, None)
             self._hls_stderr.pop(tid, None)
-        elif tid in self._extractor_procs:
-            proc = self._extractor_procs.pop(tid)
+            work = self._hls_work.pop(tid, None)
+        elif tid in self._extractor_procs or tid in self._extractor_work:
+            proc = self._extractor_procs.pop(tid, None)
             self._extractor_output.pop(tid, None)
-        if proc is not None:
-            # ffmpeg/yt-dlp can't be suspended: pause kills the process and
-            # resume relaunches from scratch (yt-dlp continues from .part
-            # files). Popping the proc first makes on_finished treat this
-            # run as superseded instead of marking the task errored.
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
+            self._extractor_final_path.pop(tid, None)
+            self._extractor_line_buffer.pop(tid, None)
+            work = self._extractor_work.get(tid)
+            if proc is not None and work is not None:
+                self._extractor_pause_pending[tid] = proc
+
+                def _paused_after_stop():
+                    if self._extractor_pause_pending.get(tid) is not proc:
+                        return
+                    if tid not in self.tasks or self._extractor_work.get(tid) is not work:
+                        return
+                    self._extractor_pause_pending.pop(tid, None)
+                    self._extractor_paused_work.add(tid)
+                    self._mark_paused(tid)
+
+                self._stop_engine_process(proc, None, _paused_after_stop)
+                return
+        if proc is not None or work is not None:
+            # ffmpeg can't be suspended: pause kills the process and resume
+            # relaunches from scratch.
+            self._stop_engine_process(proc, work)
             self._mark_paused(tid)
             return
         if t.status == "active" and not t.gid and t.backend == "aria2":
@@ -1546,20 +1663,16 @@ class QueueManager(QObject):
 
         # Normal path: drop from local state, ask aria2 to forget the gid
         # if it had one, optionally unlink the file on disk.
-        if tid in self._hls_procs:
-            proc = self._hls_procs.pop(tid)
-            self._hls_duration.pop(tid, None)
-            self._hls_stderr.pop(tid, None)
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
-        if tid in self._extractor_procs:
-            proc = self._extractor_procs.pop(tid)
-            self._extractor_output.pop(tid, None)
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
+        private_run = False
+        if tid in self._hls_procs or tid in self._hls_work:
+            private_run = True
+            self._retire_hls_run(tid)
+        if tid in self._extractor_procs or tid in self._extractor_work:
+            private_run = True
+            self._retire_extractor_run(tid)
         self.tasks.pop(tid, None)
         gid = t.gid
-        path = self._task_path(t)
+        path = None if private_run else self._task_path(t)
         with db.connect() as conn:
             conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
 
@@ -1808,17 +1921,15 @@ class QueueManager(QObject):
         aria2 downloads. Active tasks are marked paused even if the pause_all
         RPC fails - the video processes are already gone by then, so leaving
         their tasks "active" would persist a state that cannot resume."""
-        for proc in list(self._hls_procs.values()):
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
-        self._hls_procs.clear()
+        for tid in set(self._hls_procs) | set(self._hls_work):
+            self._retire_hls_run(tid)
+        for tid in set(self._extractor_procs) | set(self._extractor_work):
+            self._retire_extractor_run(tid)
         self._hls_duration.clear()
         self._hls_stderr.clear()
-        for proc in list(self._extractor_procs.values()):
-            if proc.state() != QProcess.NotRunning:
-                proc.terminate()
-        self._extractor_procs.clear()
         self._extractor_output.clear()
+        self._extractor_final_path.clear()
+        self._extractor_line_buffer.clear()
 
         def _on_fail(msg: str) -> None:
             self.error.emit(msg)
@@ -1869,6 +1980,7 @@ class QueueManager(QObject):
                 if t.status == "queued"
                 and not t.gid
                 and t.id not in self._pending_launch
+                and t.id not in self._extractor_pause_pending
             ),
             key=lambda t: t.created_at,
         )
@@ -1877,21 +1989,25 @@ class QueueManager(QObject):
 
     def _launch_hls(self, t: DownloadTask) -> None:
         from .hls import ffmpeg_command, parse_ffmpeg_progress
-        # ffmpeg does not create missing directories (aria2 and yt-dlp do).
+
+        requested = t.filename or "stream.mp4"
+        try:
+            requested = validate_public_filename(requested)
+        except OutputPathError as exc:
+            self._fail_task(t.id, f"Could not prepare private output directory: {exc}")
+            return
+        self._retire_hls_run(t.id)
         try:
             os.makedirs(t.out_dir, exist_ok=True)
-        except OSError as e:
-            t.status = "error"
-            t.error = f"Could not create download directory: {e}"
-            t.finished_at = time.time()
-            self._persist(t)
-            self.task_changed.emit(t.id)
-            self._maybe_start_next()
+            run_work = create_work_directory(t.out_dir)
+        except (OSError, OutputPathError) as exc:
+            self._fail_task(t.id, f"Could not prepare private output directory: {exc}")
             return
-        output_path = os.path.join(t.out_dir, t.filename or "stream.mp4")
+
+        output_path = run_work.path / requested
         cmd = ffmpeg_command(
             t.url,
-            output_path,
+            str(output_path),
             cookies=t.cookies,
             referrer=t.referrer,
             user_agent=t.user_agent,
@@ -1902,8 +2018,11 @@ class QueueManager(QObject):
         self._hls_procs[t.id] = proc
         self._hls_duration[t.id] = 0.0
         self._hls_stderr[t.id] = ""
+        self._hls_work[t.id] = run_work
 
         def on_read():
+            if self._hls_procs.get(t.id) is not proc:
+                return
             data = proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
             self._hls_stderr[t.id] = (self._hls_stderr.get(t.id, "") + data)[-12000:]
             for line in data.splitlines():
@@ -1920,24 +2039,37 @@ class QueueManager(QObject):
                     self.task_changed.emit(t.id)
 
         def on_finished(exit_code, _exit_status):
-            proc.deleteLater()
             if self._hls_procs.get(t.id) is not proc:
-                # Superseded: paused/stopped/removed terminated this run and
-                # already cleaned up; its exit must not touch the task.
+                proc.deleteLater()
+                self._cleanup_engine_work(run_work)
                 return
+            proc.deleteLater()
             self._hls_procs.pop(t.id, None)
             self._hls_duration.pop(t.id, None)
             stderr = self._hls_stderr.pop(t.id, "")
+            work = self._hls_work.pop(t.id, None) or run_work
             if t.id not in self.tasks:
+                self._cleanup_engine_work(work)
                 return
             if exit_code == 0:
-                t.status = "completed"
-                t.finished_at = time.time()
-                t.error = None
+                try:
+                    published = publish_output(work, output_path, requested)
+                except (OSError, OutputPathError) as exc:
+                    self._cleanup_engine_work(work)
+                    t.status = "error"
+                    t.error = f"Could not publish HLS output: {exc}"
+                    t.finished_at = time.time()
+                else:
+                    t.filename = published.name
+                    t.status = "completed"
+                    t.finished_at = time.time()
+                    t.error = None
             else:
+                self._cleanup_engine_work(work)
                 t.status = "error"
                 last_lines = "\n".join(stderr.splitlines()[-5:])
                 t.error = last_lines or f"ffmpeg exited with code {exit_code}"
+                t.finished_at = time.time()
             self._persist(t)
             self.task_changed.emit(t.id)
             self._maybe_start_next()
@@ -1947,12 +2079,16 @@ class QueueManager(QObject):
             # would sit "active" forever.
             if err != QProcess.FailedToStart:
                 return
-            proc.deleteLater()
             if self._hls_procs.get(t.id) is not proc:
+                proc.deleteLater()
+                self._cleanup_engine_work(run_work)
                 return
+            proc.deleteLater()
             self._hls_procs.pop(t.id, None)
             self._hls_duration.pop(t.id, None)
             self._hls_stderr.pop(t.id, None)
+            work = self._hls_work.pop(t.id, None) or run_work
+            self._cleanup_engine_work(work)
             if t.id not in self.tasks:
                 return
             t.status = "error"
@@ -1968,11 +2104,55 @@ class QueueManager(QObject):
         proc.start(cmd[0], cmd[1:])
 
     def _launch_extractor(self, t: DownloadTask) -> None:
-        from .extractor import parse_ytdlp_progress, ytdlp_command
-        stem = os.path.splitext(t.filename or "video.mp4")[0]
+        from .extractor import (
+            parse_ytdlp_final_path,
+            parse_ytdlp_progress,
+            ytdlp_command,
+        )
+
+        requested = t.filename or "video.mp4"
+        try:
+            requested = validate_public_filename(requested)
+        except OutputPathError as exc:
+            self._fail_task(t.id, f"Could not prepare private output directory: {exc}")
+            return
+        run_work = None
+        if t.id in self._extractor_paused_work:
+            candidate = self._extractor_work.get(t.id)
+            try:
+                work_info = candidate.path.lstat() if candidate else None
+                destination_info = candidate.destination.stat() if candidate else None
+                requested_destination = os.path.realpath(t.out_dir)
+                reusable = bool(
+                    candidate
+                    and work_info
+                    and destination_info
+                    and stat.S_ISDIR(work_info.st_mode)
+                    and stat.S_ISDIR(destination_info.st_mode)
+                    and (work_info.st_dev, work_info.st_ino) == (candidate.device, candidate.inode)
+                    and (destination_info.st_dev, destination_info.st_ino)
+                    == (candidate.destination_device, candidate.destination_inode)
+                    and requested_destination == str(candidate.destination)
+                )
+            except OSError:
+                reusable = False
+            self._extractor_paused_work.discard(t.id)
+            if reusable:
+                run_work = candidate
+
+        if run_work is None:
+            self._retire_extractor_run(t.id)
+            try:
+                os.makedirs(t.out_dir, exist_ok=True)
+                run_work = create_work_directory(t.out_dir)
+            except (OSError, OutputPathError) as exc:
+                self._fail_task(t.id, f"Could not prepare private output directory: {exc}")
+                return
+
+        stem = os.path.splitext(requested)[0]
         # Literal % in the directory or stem would be parsed as yt-dlp
         # output-template fields; %% is yt-dlp's escape for a literal %.
-        escaped_dir = t.out_dir.replace("%", "%%")
+        escaped_dir = str(run_work.path).replace("%", "%%")
         escaped_stem = stem.replace("%", "%%")
         output_template = os.path.join(escaped_dir, f"{escaped_stem}.%(ext)s")
         cmd = ytdlp_command(
@@ -1987,11 +2167,26 @@ class QueueManager(QObject):
         proc.setProcessChannelMode(QProcess.MergedChannels)
         self._extractor_procs[t.id] = proc
         self._extractor_output[t.id] = ""
+        self._extractor_work[t.id] = run_work
+        self._extractor_final_path[t.id] = ""
+        self._extractor_line_buffer[t.id] = ""
 
         def on_read():
+            if self._extractor_procs.get(t.id) is not proc:
+                return
             data = proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
             self._extractor_output[t.id] = (self._extractor_output.get(t.id, "") + data)[-12000:]
-            for line in data.splitlines():
+            pending = self._extractor_line_buffer.get(t.id, "") + data
+            lines = pending.splitlines(keepends=True)
+            if lines and not lines[-1].endswith(("\n", "\r")):
+                self._extractor_line_buffer[t.id] = lines.pop()
+            else:
+                self._extractor_line_buffer[t.id] = ""
+            for raw_line in lines:
+                line = raw_line.rstrip("\r\n")
+                final_path = parse_ytdlp_final_path(line)
+                if final_path:
+                    self._extractor_final_path[t.id] = final_path
                 info = parse_ytdlp_progress(line)
                 if info:
                     t.total_bytes = 1000
@@ -2000,25 +2195,46 @@ class QueueManager(QObject):
                     self.task_changed.emit(t.id)
 
         def on_finished(exit_code, _exit_status):
-            proc.deleteLater()
             if self._extractor_procs.get(t.id) is not proc:
-                # Superseded: paused/stopped/removed terminated this run and
-                # already cleaned up; its exit must not touch the task.
+                proc.deleteLater()
                 return
+            on_read()
+            proc.deleteLater()
             self._extractor_procs.pop(t.id, None)
+            self._extractor_pause_pending.pop(t.id, None)
+            self._extractor_paused_work.discard(t.id)
             output = self._extractor_output.pop(t.id, "")
+            reported = self._extractor_final_path.pop(t.id, "")
+            pending = self._extractor_line_buffer.pop(t.id, "")
+            if not reported and pending:
+                reported = parse_ytdlp_final_path(pending.rstrip("\r\n")) or ""
+            work = self._extractor_work.pop(t.id, None) or run_work
             if t.id not in self.tasks:
+                self._cleanup_engine_work(work)
                 return
             if exit_code == 0:
-                t.status = "completed"
-                t.finished_at = time.time()
-                t.total_bytes = max(t.total_bytes, 1000)
-                t.completed_bytes = t.total_bytes
-                t.error = None
+                try:
+                    if not reported:
+                        raise OutputPathError("yt-dlp did not report a final output path")
+                    published = publish_output(work, reported, requested)
+                except (OSError, OutputPathError) as exc:
+                    self._cleanup_engine_work(work)
+                    t.status = "error"
+                    t.error = f"Could not publish extractor output: {exc}"
+                    t.finished_at = time.time()
+                else:
+                    t.filename = published.name
+                    t.status = "completed"
+                    t.finished_at = time.time()
+                    t.total_bytes = max(t.total_bytes, 1000)
+                    t.completed_bytes = t.total_bytes
+                    t.error = None
             else:
+                self._cleanup_engine_work(work)
                 t.status = "error"
                 last_lines = "\n".join(output.splitlines()[-5:])
                 t.error = last_lines or f"yt-dlp exited with code {exit_code}"
+                t.finished_at = time.time()
             self._persist(t)
             self.task_changed.emit(t.id)
             self._maybe_start_next()
@@ -2028,11 +2244,18 @@ class QueueManager(QObject):
             # would sit "active" forever.
             if err != QProcess.FailedToStart:
                 return
-            proc.deleteLater()
             if self._extractor_procs.get(t.id) is not proc:
+                proc.deleteLater()
                 return
+            proc.deleteLater()
             self._extractor_procs.pop(t.id, None)
+            self._extractor_pause_pending.pop(t.id, None)
+            self._extractor_paused_work.discard(t.id)
             self._extractor_output.pop(t.id, None)
+            self._extractor_final_path.pop(t.id, None)
+            self._extractor_line_buffer.pop(t.id, None)
+            work = self._extractor_work.pop(t.id, None) or run_work
+            self._cleanup_engine_work(work)
             if t.id not in self.tasks:
                 return
             t.status = "error"

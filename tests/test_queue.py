@@ -5,9 +5,14 @@ was accessed with row.get("backend", ...), raising AttributeError whenever
 a persisted queued/active/paused task was restored on startup.
 """
 
+import errno
+import hashlib
 import os
 import sqlite3
+import subprocess
 import time
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +22,17 @@ from cove import config, db, debrid
 from cove.config import CategoryDirs, Settings
 from cove.aria2 import Aria2Error
 from cove.debrid import ALL_DEBRID, DebridError, Unrestricted
+from cove.extractor import FINAL_PATH_MARKER
+import cove.output_paths as output_paths
+import cove.queue as queue_module
+from cove.output_paths import (
+    OutputPathError,
+    cleanup_work_directory,
+    collision_candidates,
+    create_work_directory,
+    publish_output,
+    validate_public_filename,
+)
 from cove.queue import QueueManager, _row_get, _task_from_persisted_row
 
 
@@ -3219,3 +3235,1697 @@ def test_find_duplicate_returns_none_for_unusable_input(queue_env):
     queue.add_url(DUP_URL)
     assert queue.find_duplicate("") is None
     assert queue.find_duplicate("   ") is None
+
+
+class _FakeSignal:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in list(self._callbacks):
+            callback(*args)
+
+
+class _FakeBuffer:
+    def __init__(self, data):
+        self._data = data
+
+    def data(self):
+        return self._data
+
+
+class _FakeQProcess:
+    NotRunning = 0
+    Running = 1
+    FailedToStart = 2
+    MergedChannels = 3
+    instances = []
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.state_value = self.NotRunning
+        self.readyReadStandardOutput = _FakeSignal()
+        self.finished = _FakeSignal()
+        self.errorOccurred = _FakeSignal()
+        self.output = b""
+        self.deleted = False
+        self.finish_on_terminate = True
+        self.finish_on_state_check = False
+        self.terminate_calls = 0
+        self.kill_calls = 0
+
+    def setProcessChannelMode(self, mode):
+        self.channel_mode = mode
+
+    def state(self):
+        if self.finish_on_state_check:
+            self.finish_on_state_check = False
+            self.finish(-15)
+        return self.state_value
+
+    def start(self, program, args):
+        self.program = program
+        self.args = list(args)
+        self.state_value = self.Running
+        type(self).instances.append(self)
+
+    def readAllStandardOutput(self):
+        data = self.output
+        self.output = b""
+        return _FakeBuffer(data)
+
+    def emit_output(self, data):
+        self.output += data.encode()
+        self.readyReadStandardOutput.emit()
+
+    def finish(self, exit_code=0):
+        self.state_value = self.NotRunning
+        self.finished.emit(exit_code, 0)
+
+    def fail_to_start(self):
+        self.state_value = self.NotRunning
+        self.errorOccurred.emit(self.FailedToStart)
+
+    def terminate(self):
+        self.terminate_calls += 1
+        if self.state_value != self.NotRunning and self.finish_on_terminate:
+            self.finish(-15)
+
+    def kill(self):
+        self.kill_calls += 1
+        if self.state_value != self.NotRunning:
+            self.finish(-9)
+
+    def deleteLater(self):
+        self.deleted = True
+
+    def errorString(self):
+        return "fake process error"
+
+
+@pytest.fixture
+def fake_process(monkeypatch):
+    _FakeQProcess.instances = []
+    monkeypatch.setattr(queue_module, "QProcess", _FakeQProcess)
+    return _FakeQProcess
+
+
+def _start_hls(queue, fake_process, tmp_path, filename="movie.mp4"):
+    tid = queue.add_url(
+        "https://example.com/live/stream.m3u8",
+        out_dir=str(tmp_path),
+        filename=filename,
+    )
+    task = queue.tasks[tid]
+    queue._launch_hls(task)
+    return task, fake_process.instances[-1]
+
+
+def _start_extractor(queue, fake_process, tmp_path, filename="movie.mp4"):
+    tid = queue.add_url(
+        "https://www.youtube.com/watch?v=fake",
+        out_dir=str(tmp_path),
+        filename=filename,
+    )
+    task = queue.tasks[tid]
+    queue._launch_extractor(task)
+    return task, fake_process.instances[-1]
+
+
+def _hls_private_path(proc):
+    return Path(proc.args[-1])
+
+
+def _extractor_private_path(proc):
+    template = proc.args[proc.args.index("-o") + 1]
+    return Path(template.replace("%(ext)s", "mp4"))
+
+
+def _assert_no_work_dirs(tmp_path):
+    assert list(tmp_path.glob(".cove-work-*")) == []
+
+
+def test_fake_extractor_pause_preserves_and_resume_reuses_private_work(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, paused_proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    private = _extractor_private_path(paused_proc)
+    work_path = private.parent
+    partial = work_path / "movie.mp4.part"
+    partial_bytes = b"yt-dlp resumable partial\x00data"
+    partial.write_bytes(partial_bytes)
+    paused_proc.finish_on_terminate = False
+
+    queue.pause(task.id)
+
+    assert task.status == "active"
+    assert partial.read_bytes() == partial_bytes
+    paused_proc.finish(-15)
+    assert task.status == "paused"
+    assert partial.read_bytes() == partial_bytes
+
+    queue.resume(task.id)
+    resumed_proc = fake_process.instances[-1]
+    resumed_private = _extractor_private_path(resumed_proc)
+    assert resumed_proc is not paused_proc
+    assert resumed_private.parent == work_path
+    assert resumed_proc.args[resumed_proc.args.index("-o") + 1] == str(
+        work_path / "movie.%(ext)s"
+    )
+    assert partial.read_bytes() == partial_bytes
+
+    paused_proc.finish(-15)
+    assert task.status == "active"
+    assert partial.read_bytes() == partial_bytes
+
+    resumed_private.write_bytes(b"completed output")
+    resumed_proc.emit_output(f"{FINAL_PATH_MARKER}{resumed_private}\n")
+    resumed_proc.finish(0)
+
+    assert task.status == "completed"
+    assert (tmp_path / "movie.mp4").read_bytes() == b"completed output"
+    assert not work_path.exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_pause_completes_when_process_is_already_stopped(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    work_path = _extractor_private_path(proc).parent
+    partial = work_path / "movie.mp4.part"
+    partial.write_bytes(b"resumable")
+    proc.state_value = proc.NotRunning
+
+    queue.pause(task.id)
+
+    assert task.status == "paused"
+    assert task.id not in queue._extractor_pause_pending
+    assert partial.read_bytes() == b"resumable"
+    queue.resume(task.id)
+    resumed_proc = fake_process.instances[-1]
+    assert task.status == "active"
+    assert resumed_proc is not proc
+    assert _extractor_private_path(resumed_proc).parent == work_path
+    assert partial.read_bytes() == b"resumable"
+
+
+def test_fake_extractor_pause_stop_setup_race_completes_exactly_once(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    work_path = _extractor_private_path(proc).parent
+    partial = work_path / "movie.mp4.part"
+    partial.write_bytes(b"resumable")
+    proc.finish_on_state_check = True
+    pause_transitions = 0
+    mark_paused = queue._mark_paused
+
+    def counted_mark_paused(tid):
+        nonlocal pause_transitions
+        pause_transitions += 1
+        mark_paused(tid)
+
+    queue._mark_paused = counted_mark_paused
+    queue.pause(task.id)
+
+    assert task.status == "paused"
+    assert pause_transitions == 1
+    assert task.id not in queue._extractor_pause_pending
+    assert partial.read_bytes() == b"resumable"
+    proc.finished.emit(-15, 0)
+    assert pause_transitions == 1
+
+    queue.resume(task.id)
+    assert task.status == "active"
+    assert _extractor_private_path(fake_process.instances[-1]).parent == work_path
+    proc.finished.emit(-15, 0)
+    assert task.status == "active"
+    assert pause_transitions == 1
+
+
+def test_fake_extractor_pause_kill_fallback_completes(
+    queue_env, fake_process, tmp_path, monkeypatch
+):
+    callbacks = []
+    monkeypatch.setattr(queue_module.QTimer, "singleShot", lambda _ms, cb: callbacks.append(cb))
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    work_path = _extractor_private_path(proc).parent
+    (work_path / "movie.mp4.part").write_bytes(b"resumable")
+    proc.finish_on_terminate = False
+
+    queue.pause(task.id)
+    assert task.status == "active"
+    assert proc.terminate_calls == 1
+    assert len(callbacks) == 1
+
+    callbacks[0]()
+
+    assert proc.kill_calls == 1
+    assert task.status == "paused"
+    assert task.id not in queue._extractor_pause_pending
+    assert work_path.exists()
+
+
+def test_fake_extractor_remove_during_pause_owns_process_until_stopped(
+    queue_env, fake_process, tmp_path, monkeypatch
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    work_path = _extractor_private_path(proc).parent
+    (work_path / "movie.mp4.part").write_bytes(b"partial")
+    proc.finish_on_terminate = False
+    cleanup_states = []
+    original_cleanup = queue._cleanup_engine_work
+
+    def record_cleanup(work):
+        if work is not None:
+            cleanup_states.append(proc.state())
+        original_cleanup(work)
+
+    monkeypatch.setattr(queue, "_cleanup_engine_work", record_cleanup)
+
+    queue.pause(task.id)
+    assert queue._extractor_pause_pending[task.id] is proc
+    queue.remove(task.id)
+
+    assert task.id not in queue.tasks
+    assert queue._extractor_pause_pending[task.id] is proc
+    assert proc.state() == fake_process.Running
+    assert work_path.exists()
+    assert cleanup_states == []
+
+    proc.finish(-15)
+
+    assert task.id not in queue._extractor_pause_pending
+    assert cleanup_states == [fake_process.NotRunning]
+    assert not work_path.exists()
+
+    proc.finished.emit(-15, 0)
+    assert task.status != "paused"
+    assert cleanup_states == [fake_process.NotRunning]
+
+
+def test_fake_extractor_queue_pause_blocks_resume_until_pending_stops(
+    queue_env, fake_process, tmp_path
+):
+    queue, rpc, _db_path = queue_env()
+    rpc.pause_all = lambda: None
+    _sync_spawn(queue)
+    task, old_proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    old_work = _extractor_private_path(old_proc).parent
+    (old_work / "movie.mp4.part").write_bytes(b"partial")
+    old_proc.finish_on_terminate = False
+
+    queue.pause(task.id)
+    queue.stop_queue()
+
+    assert task.status == "paused"
+    assert queue._extractor_pause_pending[task.id] is old_proc
+    queue.start_queue()
+
+    assert task.status == "queued"
+    assert fake_process.instances == [old_proc]
+    assert old_proc.state() == fake_process.Running
+
+    old_proc.finish(-15)
+
+    new_proc = fake_process.instances[-1]
+    new_work = _extractor_private_path(new_proc).parent
+    assert new_proc is not old_proc
+    assert task.status == "active"
+    assert queue._extractor_procs[task.id] is new_proc
+
+    old_proc.finished.emit(-15, 0)
+    assert task.status == "active"
+    assert queue._extractor_procs[task.id] is new_proc
+    assert new_work.exists()
+
+
+def test_retire_extractor_deduplicates_active_and_pending_process(
+    queue_env, fake_process, tmp_path, monkeypatch
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    work_path = _extractor_private_path(proc).parent
+    work = queue._extractor_work[task.id]
+    queue._extractor_pause_pending[task.id] = proc
+    cleanup_calls = []
+    original_cleanup = queue._cleanup_engine_work
+
+    def record_cleanup(work):
+        cleanup_calls.append(work)
+        original_cleanup(work)
+
+    monkeypatch.setattr(queue, "_cleanup_engine_work", record_cleanup)
+
+    queue._retire_extractor_run(task.id)
+
+    assert proc.terminate_calls == 1
+    assert cleanup_calls == [work]
+    assert task.id not in queue._extractor_procs
+    assert task.id not in queue._extractor_pause_pending
+    assert not work_path.exists()
+
+
+def test_fake_extractor_removal_while_paused_cleans_preserved_work(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    work_path = _extractor_private_path(proc).parent
+    (work_path / "movie.mp4.part").write_bytes(b"partial")
+
+    queue.pause(task.id)
+    assert task.status == "paused"
+    assert work_path.exists()
+    queue.remove(task.id)
+
+    assert task.id not in queue.tasks
+    assert not work_path.exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_active_removal_and_terminal_failure_clean_work(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    removed, removed_proc = _start_extractor(queue, fake_process, tmp_path, "removed.mp4")
+    removed_work = _extractor_private_path(removed_proc).parent
+    (removed_work / "removed.mp4.part").write_bytes(b"partial")
+
+    queue.remove(removed.id)
+    assert removed.id not in queue.tasks
+    assert not removed_work.exists()
+
+    failed, failed_proc = _start_extractor(queue, fake_process, tmp_path, "failed.mp4")
+    failed_work = _extractor_private_path(failed_proc).parent
+    (failed_work / "failed.mp4.part").write_bytes(b"partial")
+    failed_proc.finish(1)
+
+    assert failed.status == "error"
+    assert not failed_work.exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_repeated_pause_resume_reuses_one_work_directory(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _running(queue)
+    task.status = "active"
+    work_path = _extractor_private_path(proc).parent
+    partial = work_path / "movie.mp4.part"
+    partial.write_bytes(b"same partial")
+
+    for _ in range(3):
+        queue.pause(task.id)
+        assert task.status == "paused"
+        assert partial.read_bytes() == b"same partial"
+        assert list(tmp_path.glob(".cove-work-*")) == [work_path]
+        queue.resume(task.id)
+        proc = fake_process.instances[-1]
+        assert task.status == "active"
+        assert _extractor_private_path(proc).parent == work_path
+        assert list(tmp_path.glob(".cove-work-*")) == [work_path]
+
+
+def test_fake_hls_publishes_private_output_and_persists_actual_path(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+
+    _hls_private_path(proc).write_bytes(b"hls output")
+    proc.finish(0)
+
+    target = tmp_path / "movie.mp4"
+    assert task.status == "completed"
+    assert task.filename == target.name
+    assert target.read_bytes() == b"hls output"
+    assert queue._task_path(task) == target
+    assert _persisted_row(db_path, task.id)["filename"] == target.name
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_hls_collision_renames_without_modifying_existing_target(
+    queue_env, fake_process, tmp_path
+):
+    existing = tmp_path / "movie.mp4"
+    existing.write_bytes(b"original")
+    before = hashlib.sha256(existing.read_bytes()).hexdigest()
+    queue, _rpc, db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+
+    _hls_private_path(proc).write_bytes(b"replacement")
+    proc.finish(0)
+
+    selected = tmp_path / "movie (1).mp4"
+    assert task.status == "completed"
+    assert task.filename == selected.name
+    assert hashlib.sha256(existing.read_bytes()).hexdigest() == before
+    assert selected.read_bytes() == b"replacement"
+    assert _persisted_row(db_path, task.id)["filename"] == selected.name
+    restored = _task_from_persisted_row(_persisted_row(db_path, task.id))
+    assert restored.filename == selected.name
+    assert queue._task_path(restored) == selected
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_hls_failure_cleans_private_output_and_keeps_public_target(
+    queue_env, fake_process, tmp_path
+):
+    existing = tmp_path / "movie.mp4"
+    existing.write_bytes(b"original")
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+
+    _hls_private_path(proc).write_bytes(b"partial")
+    proc.finish(1)
+
+    assert task.status == "error"
+    assert existing.read_bytes() == b"original"
+    assert not (tmp_path / "movie (1).mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_hls_cancellation_cleans_private_output_without_publishing(
+    queue_env, fake_process, tmp_path
+):
+    existing = tmp_path / "movie.mp4"
+    existing.write_bytes(b"original")
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+
+    _hls_private_path(proc).write_bytes(b"partial")
+    queue.pause(task.id)
+
+    assert task.status == "paused"
+    assert existing.read_bytes() == b"original"
+    assert not (tmp_path / "movie (1).mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_hls_concurrent_collision_tasks_publish_unique_files(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    first, first_proc = _start_hls(queue, fake_process, tmp_path)
+    second, second_proc = _start_hls(queue, fake_process, tmp_path)
+
+    _hls_private_path(first_proc).write_bytes(b"first")
+    _hls_private_path(second_proc).write_bytes(b"second")
+    first_proc.finish(0)
+    second_proc.finish(0)
+
+    assert first.status == "completed"
+    assert second.status == "completed"
+    assert {first.filename, second.filename} == {"movie.mp4", "movie (1).mp4"}
+    assert (tmp_path / first.filename).read_bytes() == (b"first" if first.filename == "movie.mp4" else b"second")
+    assert (tmp_path / second.filename).read_bytes() == (b"first" if second.filename == "movie.mp4" else b"second")
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_collision_publishes_reported_final_path(
+    queue_env, fake_process, tmp_path
+):
+    existing = tmp_path / "movie.mp4"
+    existing.write_bytes(b"original")
+    queue, _rpc, db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    private = _extractor_private_path(proc)
+    private.write_bytes(b"extractor output")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    selected = tmp_path / "movie (1).mp4"
+    assert task.status == "completed"
+    assert task.filename == selected.name
+    assert existing.read_bytes() == b"original"
+    assert selected.read_bytes() == b"extractor output"
+    assert _persisted_row(db_path, task.id)["filename"] == selected.name
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_rejects_output_outside_owned_work_directory(
+    queue_env, fake_process, tmp_path
+):
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{outside}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert outside.read_bytes() == b"outside"
+    assert not (tmp_path / "movie.mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_rejects_symlink_escape(
+    queue_env, fake_process, tmp_path
+):
+    outside = tmp_path / "outside.mp4"
+    outside.write_bytes(b"outside")
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    private = _extractor_private_path(proc)
+    escaped = private.with_name("escape.mp4")
+    os.symlink(outside, escaped)
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{escaped}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert outside.read_bytes() == b"outside"
+    assert not (tmp_path / "movie.mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_missing_result_does_not_complete(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _extractor_private_path(proc).write_bytes(b"unreported")
+
+    proc.emit_output("Download complete\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert not (tmp_path / "movie.mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_hls_publication_failure_does_not_complete(
+    queue_env, fake_process, tmp_path, monkeypatch
+):
+    existing = tmp_path / "movie.mp4"
+    existing.write_bytes(b"original")
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+    _hls_private_path(proc).write_bytes(b"new output")
+
+    def fail_publish(*_args, **_kwargs):
+        raise OutputPathError("atomic publication failed")
+
+    monkeypatch.setattr(queue_module, "publish_output", fail_publish)
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert existing.read_bytes() == b"original"
+    assert not (tmp_path / "movie (1).mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_hls_superseded_process_cannot_publish_or_clean_new_run(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db_path = queue_env()
+    task, old_proc = _start_hls(queue, fake_process, tmp_path)
+    old_private = _hls_private_path(old_proc)
+    old_work = old_private.parent
+    old_private.write_bytes(b"old")
+
+    queue._launch_hls(task)
+    new_proc = fake_process.instances[-1]
+    new_private = _hls_private_path(new_proc)
+    assert new_private.parent != old_work
+    assert new_private.parent.exists()
+
+    old_proc.finish(0)
+
+    assert not (tmp_path / "movie.mp4").exists()
+    assert new_private.parent.exists()
+
+    new_private.write_bytes(b"new")
+    new_proc.finish(0)
+    assert task.status == "completed"
+    assert (tmp_path / task.filename).read_bytes() == b"new"
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_output_helper_collision_sequence_and_unsupported_no_clobber(
+    tmp_path, monkeypatch
+):
+    assert [next(collision_candidates("name.ext"))]
+    candidates = collision_candidates("name.ext")
+    assert [next(candidates), next(candidates), next(candidates)] == [
+        "name.ext",
+        "name (1).ext",
+        "name (2).ext",
+    ]
+
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    target = tmp_path / "name.ext"
+    target.write_bytes(b"existing")
+
+    def unsupported_link(*_args, **_kwargs):
+        raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
+
+    monkeypatch.setattr(output_paths, "_link_pinned_fd", unsupported_link)
+    with pytest.raises(OutputPathError):
+        publish_output(work, source, "name.ext")
+    assert target.read_bytes() == b"existing"
+    assert source.read_bytes() == b"private"
+    cleanup_work_directory(work)
+
+
+def test_collision_candidates_bound_ascii_names_and_suffix_growth(monkeypatch):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: False)
+    filename = f"{'a' * 251}.ext"
+
+    first_run = collision_candidates(filename)
+    candidates = [next(first_run) for _ in range(101)]
+    second_run = collision_candidates(filename)
+
+    assert candidates[0] == filename
+    assert candidates[1] == f"{'a' * 247} (1).ext"
+    assert candidates[2] == f"{'a' * 247} (2).ext"
+    assert candidates[9].endswith(" (9).ext")
+    assert candidates[10].endswith(" (10).ext")
+    assert candidates[99].endswith(" (99).ext")
+    assert candidates[100].endswith(" (100).ext")
+    assert candidates == [next(second_run) for _ in range(101)]
+    assert all(len(os.fsencode(candidate)) <= 255 for candidate in candidates)
+    assert all(validate_public_filename(candidate) == candidate for candidate in candidates)
+
+
+def test_collision_candidates_use_posix_encoded_length_without_splitting_unicode(
+    monkeypatch,
+):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: False)
+    filename = f"{'é' * 125}a.ext"
+
+    candidates = collision_candidates(filename)
+    original = next(candidates)
+    collision = next(candidates)
+
+    assert original == filename
+    assert collision == f"{'é' * 123} (1).ext"
+    assert collision.encode("utf-8").decode("utf-8") == collision
+    assert len(os.fsencode(collision)) <= 255
+    assert validate_public_filename(collision) == collision
+
+
+def test_collision_candidates_use_windows_utf16_component_length(monkeypatch):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: True)
+    filename = f"{'😀' * 125}a.ext"
+
+    candidates = collision_candidates(filename)
+    original = next(candidates)
+    collision = next(candidates)
+
+    assert original == filename
+    assert collision == f"{'😀' * 123} (1).ext"
+    assert len(collision.encode("utf-16-le")) // 2 <= 255
+    assert validate_public_filename(collision) == collision
+
+
+def test_collision_candidates_truncate_pathological_extension_deterministically(
+    monkeypatch,
+):
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: False)
+    filename = f"a.{'x' * 253}"
+
+    candidates = collision_candidates(filename)
+    assert next(candidates) == filename
+    collision = next(candidates)
+
+    assert collision == f" (1).{'x' * 250}"
+    assert len(os.fsencode(collision)) == 255
+    assert validate_public_filename(collision) == collision
+    repeated = collision_candidates(filename)
+    next(repeated)
+    assert next(repeated) == collision
+
+
+def test_output_helper_rejects_noncanonical_names_without_nested_output(tmp_path):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    escaped = tmp_path.parent / f"{tmp_path.name}-escape.ext"
+    invalid_names = (
+        "",
+        ".",
+        "..",
+        "/absolute.ext",
+        r"\absolute.ext",
+        r"C:\absolute.ext",
+        "nested/child.ext",
+        r"nested\child.ext",
+        f"../{tmp_path.name}-escape.ext",
+        "line\nbreak.ext",
+        "CON.txt",
+        "name. ",
+        "name.",
+        "x" * 256,
+    )
+
+    assert validate_public_filename("世界.ext") == "世界.ext"
+    assert not escaped.exists()
+    try:
+        for filename in invalid_names:
+            with pytest.raises(OutputPathError):
+                publish_output(work, source, filename)
+            assert source.read_bytes() == b"private"
+            assert not escaped.exists()
+            assert not (tmp_path / "nested").exists()
+            assert not (tmp_path / "child.ext").exists()
+    finally:
+        cleanup_work_directory(work)
+
+
+def test_output_helper_fails_closed_without_directory_relative_link(
+    tmp_path, monkeypatch
+):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    path_based_calls = []
+
+    def path_based_link(*args, **kwargs):
+        path_based_calls.append((args, kwargs))
+
+    monkeypatch.setattr(output_paths, "_relative_link_supported", lambda: False)
+    monkeypatch.setattr(output_paths.os, "link", path_based_link)
+    try:
+        with pytest.raises(
+            OutputPathError, match="Descriptor-relative publication is unsupported"
+        ):
+            publish_output(work, source, "name.ext")
+        assert path_based_calls == []
+        assert source.read_bytes() == b"private"
+        assert not (tmp_path / "name.ext").exists()
+    finally:
+        monkeypatch.undo()
+        cleanup_work_directory(work)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_near_limit_collisions_preserve_existing_files(tmp_path):
+    filename = f"{'a' * 251}.ext"
+
+    published = []
+    for content in (b"first", b"second", b"third"):
+        work = create_work_directory(tmp_path)
+        source = work.path / "source.ext"
+        source.write_bytes(content)
+        published.append(publish_output(work, source, filename))
+
+    assert [path.name for path in published] == [
+        filename,
+        f"{'a' * 247} (1).ext",
+        f"{'a' * 247} (2).ext",
+    ]
+    assert [path.read_bytes() for path in published] == [b"first", b"second", b"third"]
+    assert all(len(os.fsencode(path.name)) <= 255 for path in published)
+    assert all(validate_public_filename(path.name) == path.name for path in published)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_publication_pins_validated_inode(tmp_path):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    source_info = source.stat()
+
+    result = publish_output(work, source, "name.ext")
+
+    result_info = result.stat()
+    assert result.read_bytes() == b"private"
+    assert (result_info.st_dev, result_info.st_ino) == (
+        source_info.st_dev,
+        source_info.st_ino,
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_collision_preserves_existing_target(tmp_path):
+    target = tmp_path / "name.ext"
+    target.write_bytes(b"existing")
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result == tmp_path / "name (1).ext"
+    assert result.read_bytes() == b"private"
+    assert target.read_bytes() == b"existing"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_two_collisions_use_second_suffix(tmp_path):
+    (tmp_path / "name.ext").write_bytes(b"first")
+    (tmp_path / "name (1).ext").write_bytes(b"second")
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result == tmp_path / "name (2).ext"
+    assert result.read_bytes() == b"private"
+    assert (tmp_path / "name.ext").read_bytes() == b"first"
+    assert (tmp_path / "name (1).ext").read_bytes() == b"second"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_retries_only_eexist(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    real_link = output_paths._link_pinned_fd
+    calls = []
+
+    def collide_once(source_fd, destination_fd, candidate):
+        calls.append(candidate)
+        if len(calls) == 1:
+            raise FileExistsError(errno.EEXIST, "collision", candidate)
+        real_link(source_fd, destination_fd, candidate)
+
+    monkeypatch.setattr(output_paths, "_link_pinned_fd", collide_once)
+    result = publish_output(work, source, "name.ext")
+
+    assert result.name == "name (1).ext"
+    assert calls == ["name.ext", "name (1).ext"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_missing_proc_fd_fails_closed(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    real_stat = output_paths.os.stat
+
+    def inaccessible_proc(path, *args, **kwargs):
+        if os.fspath(path).startswith("/proc/self/fd/"):
+            raise PermissionError(errno.EACCES, "procfs unavailable", path)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(output_paths.os, "stat", inaccessible_proc)
+    with pytest.raises(OutputPathError, match="Pinned descriptor reference is unavailable"):
+        publish_output(work, source, "name.ext")
+
+    assert source.read_bytes() == b"private"
+    assert not (tmp_path / "name.ext").exists()
+    cleanup_work_directory(work)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_mismatched_proc_fd_fails_closed(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    real_stat = output_paths.os.stat
+
+    def mismatched_proc(path, *args, **kwargs):
+        result = real_stat(path, *args, **kwargs)
+        if os.fspath(path).startswith("/proc/self/fd/"):
+            return result.__class__(
+                (result.st_mode, result.st_ino + 1, result.st_dev) + tuple(result)[3:]
+            )
+        return result
+
+    monkeypatch.setattr(output_paths.os, "stat", mismatched_proc)
+    with pytest.raises(
+        OutputPathError, match="Pinned descriptor reference does not identify the source"
+    ):
+        publish_output(work, source, "name.ext")
+
+    assert source.read_bytes() == b"private"
+    assert not (tmp_path / "name.ext").exists()
+    cleanup_work_directory(work)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_linkat_uses_proc_fd_follow_semantics(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    source_fd = output_paths._open_pinned_source(work, source)
+    destination_fd = os.open(tmp_path, os.O_RDONLY)
+    calls = []
+
+    class FakeLinkat:
+        def __call__(self, *args):
+            calls.append(args)
+            return 0
+
+    class FakeLibc:
+        linkat = FakeLinkat()
+
+    monkeypatch.setattr(output_paths.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+    try:
+        output_paths._link_pinned_fd(source_fd, destination_fd, "name.ext")
+    finally:
+        os.close(destination_fd)
+        os.close(source_fd)
+
+    assert calls == [
+        (-100, f"/proc/self/fd/{source_fd}".encode(), destination_fd, b"name.ext", 0x400)
+    ]
+    cleanup_work_directory(work)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_cleanup_failure_does_not_undo_publication(
+    tmp_path, monkeypatch
+):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+
+    def cleanup_failure(_work):
+        raise OSError("private cleanup failed")
+
+    monkeypatch.setattr(output_paths, "cleanup_work_directory", cleanup_failure)
+    result = publish_output(work, source, "name.ext")
+
+    assert result.read_bytes() == b"private"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+@pytest.mark.parametrize("replacement_kind", ["symlink", "regular"])
+def test_output_helper_posix_path_replacement_cannot_change_published_inode(
+    tmp_path, monkeypatch, replacement_kind
+):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"validated")
+    validated_info = source.stat()
+    replacement = tmp_path / "replacement.ext"
+    replacement.write_bytes(b"replacement")
+    real_link = output_paths._link_pinned_fd
+
+    def replace_path_then_link(source_fd, destination_fd, candidate):
+        source.rename(work.path / "validated-source.ext")
+        if replacement_kind == "symlink":
+            source.symlink_to(replacement)
+        else:
+            source.write_bytes(b"different regular file")
+        real_link(source_fd, destination_fd, candidate)
+
+    monkeypatch.setattr(output_paths, "_link_pinned_fd", replace_path_then_link)
+    result = publish_output(work, source, "name.ext")
+
+    result_info = result.stat()
+    assert not result.is_symlink()
+    assert result.read_bytes() == b"validated"
+    assert (result_info.st_dev, result_info.st_ino) == (
+        validated_info.st_dev,
+        validated_info.st_ino,
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_unlinked_pinned_source_fails_closed(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"validated")
+    replacement = tmp_path / "replacement.ext"
+    replacement.write_bytes(b"replacement")
+    real_link = output_paths._link_pinned_fd
+
+    def unlink_path_then_link(source_fd, destination_fd, candidate):
+        source.unlink()
+        source.symlink_to(replacement)
+        real_link(source_fd, destination_fd, candidate)
+
+    monkeypatch.setattr(output_paths, "_link_pinned_fd", unlink_path_then_link)
+    with pytest.raises(OutputPathError, match="Could not publish output"):
+        publish_output(work, source, "name.ext")
+
+    assert source.is_symlink()
+    assert not (tmp_path / "name.ext").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_rejects_nonregular_pinned_source(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    directory = work.path / "replacement"
+    directory.mkdir()
+    monkeypatch.setattr(output_paths, "validate_engine_output", lambda *_args: directory)
+
+    with pytest.raises(OutputPathError, match="Pinned engine output is not a regular file"):
+        publish_output(work, source, "name.ext")
+
+    assert source.read_bytes() == b"private"
+    assert not (tmp_path / "name.ext").exists()
+    cleanup_work_directory(work)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
+def test_output_helper_posix_publication_failure_preserves_private_source(
+    tmp_path, monkeypatch
+):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+
+    def fail_closed(*_args):
+        raise OSError(errno.EOPNOTSUPP, "pinned publication unsupported")
+
+    monkeypatch.setattr(output_paths, "_link_pinned_fd", fail_closed)
+    with pytest.raises(OutputPathError, match="Could not publish output"):
+        publish_output(work, source, "name.ext")
+
+    assert source.read_bytes() == b"private"
+    assert not (tmp_path / "name.ext").exists()
+    cleanup_work_directory(work)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor cleanup")
+def test_output_helper_posix_cleanup_removes_descendants_and_preserves_symlink_target(
+    tmp_path,
+):
+    work = create_work_directory(tmp_path)
+    nested = work.path / "nested"
+    nested.mkdir()
+    (nested / "private.bin").write_bytes(b"private")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "keep.bin"
+    target.write_bytes(b"keep")
+    (work.path / "escape").symlink_to(outside, target_is_directory=True)
+
+    cleanup_work_directory(work)
+
+    assert not work.path.exists()
+    assert target.read_bytes() == b"keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor cleanup")
+def test_output_helper_posix_root_replacement_cannot_redirect_cleanup(
+    tmp_path, monkeypatch
+):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    pinned_root = tmp_path / "pinned-root"
+    real_remove = output_paths._remove_pinned_descendants
+
+    def replace_root_then_remove(directory_fd):
+        work.path.rename(pinned_root)
+        work.path.mkdir()
+        (work.path / "unrelated.bin").write_bytes(b"unrelated")
+        real_remove(directory_fd)
+
+    monkeypatch.setattr(
+        output_paths, "_remove_pinned_descendants", replace_root_then_remove
+    )
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result.read_bytes() == b"private"
+    assert not (pinned_root / "name.ext").exists()
+    assert (work.path / "unrelated.bin").read_bytes() == b"unrelated"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor cleanup")
+def test_output_helper_posix_root_identity_mismatch_fails_closed(tmp_path):
+    work = create_work_directory(tmp_path)
+    (work.path / "private.bin").write_bytes(b"private")
+    owned_root = tmp_path / "owned-root"
+    work.path.rename(owned_root)
+    work.path.mkdir()
+    replacement = work.path / "unrelated.bin"
+    replacement.write_bytes(b"unrelated")
+
+    with pytest.raises(OutputPathError):
+        cleanup_work_directory(work)
+
+    assert (owned_root / "private.bin").read_bytes() == b"private"
+    assert replacement.read_bytes() == b"unrelated"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor cleanup")
+def test_output_helper_posix_child_replacement_is_not_followed(tmp_path, monkeypatch):
+    work = create_work_directory(tmp_path)
+    child = work.path / "child"
+    child.mkdir()
+    (child / "private.bin").write_bytes(b"private")
+    moved_child = tmp_path / "moved-child"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "keep.bin"
+    target.write_bytes(b"keep")
+    real_open = output_paths._open_owned_child_directory
+    replaced = False
+
+    def replace_child_then_open(parent_fd, name, device, inode):
+        nonlocal replaced
+        if name == "child" and not replaced:
+            replaced = True
+            child.rename(moved_child)
+            child.symlink_to(outside, target_is_directory=True)
+        return real_open(parent_fd, name, device, inode)
+
+    monkeypatch.setattr(
+        output_paths, "_open_owned_child_directory", replace_child_then_open
+    )
+
+    cleanup_work_directory(work)
+
+    assert not work.path.exists()
+    assert (moved_child / "private.bin").read_bytes() == b"private"
+    assert target.read_bytes() == b"keep"
+
+
+class _FakeWindowsPublicationApi:
+    def __init__(self, failures=None):
+        self.failures = failures or {}
+        self.identities = {}
+        self.calls = []
+        self.cleanup_calls = []
+
+    def capture_directory_identity(self, path):
+        path = Path(path).resolve()
+        return self.identities.setdefault(path, (1, len(self.identities) + 1))
+
+    def publish_no_replace(self, work, source_path, candidate):
+        self.calls.append(candidate)
+        failure = self.failures.get(candidate)
+        if failure is not None:
+            operation, winerror = failure
+            raise output_paths._WindowsApiError(operation, winerror, candidate)
+        if (
+            work.native_work_identity != self.identities[work.path]
+            or work.native_destination_identity != self.identities[work.destination]
+        ):
+            raise output_paths._WindowsApiError(
+                "directory identity validation",
+                output_paths._WINDOWS_ERROR_INVALID_HANDLE,
+                work.destination,
+            )
+        target = work.destination / candidate
+        if target.exists():
+            raise output_paths._WindowsApiError(
+                "rename",
+                output_paths._WINDOWS_ERROR_ALREADY_EXISTS,
+                candidate,
+            )
+        source_path.rename(target)
+
+    def pin_cleanup_root(self, work):
+        self.cleanup_calls.append(work.path)
+        failure = self.failures.get("__cleanup__")
+        if failure is not None:
+            operation, winerror = failure
+            raise output_paths._WindowsApiError(operation, winerror, work.path)
+        if (
+            work.native_work_identity != self.identities.get(work.path)
+            or work.native_destination_identity != self.identities.get(work.destination)
+        ):
+            raise output_paths._WindowsApiError(
+                "directory identity validation",
+                output_paths._WINDOWS_ERROR_INVALID_HANDLE,
+                work.path,
+            )
+        self._delete_cleanup_children(work.path, work.path)
+        self.cleanup_calls.append(("delete", Path(".")))
+        work.path.rmdir()
+
+    def _delete_cleanup_children(self, root, directory):
+        relative = directory.relative_to(root)
+        self.cleanup_calls.append(("enumerate", relative))
+        for child in list(directory.iterdir()):
+            relative = child.relative_to(root)
+            self.cleanup_calls.append(("open", relative))
+            if child.is_dir() and not child.is_symlink():
+                self._delete_cleanup_children(root, child)
+            failure = self.failures.get("__delete__")
+            if failure is not None:
+                operation, winerror = failure
+                raise output_paths._WindowsApiError(operation, winerror, child)
+            self.cleanup_calls.append(("delete", relative))
+            if child.is_dir() and not child.is_symlink():
+                child.rmdir()
+            else:
+                child.unlink()
+
+
+def _windows_test_work(tmp_path, monkeypatch, failures=None):
+    api = _FakeWindowsPublicationApi(failures)
+    monkeypatch.setattr(output_paths, "_is_windows_runtime", lambda: True)
+    monkeypatch.setattr(
+        output_paths, "_windows_publication_api_factory", lambda: api
+    )
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    return api, work, source
+
+
+def test_output_helper_windows_publication_succeeds_without_target(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(tmp_path, monkeypatch)
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result == tmp_path / "name.ext"
+    assert result.read_bytes() == b"private"
+    assert api.calls == ["name.ext"]
+    assert not work.path.exists()
+
+
+def test_output_helper_windows_collision_preserves_existing_target(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(tmp_path, monkeypatch)
+    target = tmp_path / "name.ext"
+    target.write_bytes(b"existing")
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result == tmp_path / "name (1).ext"
+    assert result.read_bytes() == b"private"
+    assert target.read_bytes() == b"existing"
+    assert api.calls == ["name.ext", "name (1).ext"]
+
+
+def test_output_helper_windows_two_collisions_use_second_suffix(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(tmp_path, monkeypatch)
+    (tmp_path / "name.ext").write_bytes(b"first")
+    (tmp_path / "name (1).ext").write_bytes(b"second")
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result == tmp_path / "name (2).ext"
+    assert result.read_bytes() == b"private"
+    assert (tmp_path / "name.ext").read_bytes() == b"first"
+    assert (tmp_path / "name (1).ext").read_bytes() == b"second"
+    assert api.calls == ["name.ext", "name (1).ext", "name (2).ext"]
+
+
+def test_output_helper_windows_retries_only_error_already_exists(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(
+        tmp_path,
+        monkeypatch,
+        {"name.ext": ("rename", output_paths._WINDOWS_ERROR_ALREADY_EXISTS)},
+    )
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result.name == "name (1).ext"
+    assert api.calls == ["name.ext", "name (1).ext"]
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        (("rename", 80), "unexpected Windows API error"),
+        (("rename", output_paths._WINDOWS_ERROR_ACCESS_DENIED), "permission"),
+        (("rename", output_paths._WINDOWS_ERROR_NOT_SAME_DEVICE), "cross-device"),
+        (("rename", output_paths._WINDOWS_ERROR_NOT_SUPPORTED), "unsupported"),
+    ],
+)
+def test_output_helper_windows_noncollision_errors_fail_closed(
+    tmp_path, monkeypatch, failure, message
+):
+    api, work, source = _windows_test_work(
+        tmp_path, monkeypatch, {"name.ext": failure}
+    )
+
+    with pytest.raises(OutputPathError, match=message):
+        publish_output(work, source, "name.ext")
+
+    assert api.calls == ["name.ext"]
+    assert source.read_bytes() == b"private"
+    assert not (tmp_path / "name.ext").exists()
+    cleanup_work_directory(work)
+
+
+def test_output_helper_windows_rejects_replaced_destination_identity(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(tmp_path, monkeypatch)
+    broken_work = replace(work, native_destination_identity=(99, 99))
+
+    with pytest.raises(OutputPathError, match="invalid or replaced directory handle"):
+        publish_output(broken_work, source, "name.ext")
+
+    assert api.calls == ["name.ext"]
+    assert source.read_bytes() == b"private"
+    cleanup_work_directory(work)
+
+
+def test_output_helper_windows_rejects_reparse_destination_state(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(
+        tmp_path,
+        monkeypatch,
+        {
+            "name.ext": (
+                "reparse-point validation",
+                output_paths._WINDOWS_ERROR_CANT_ACCESS_FILE,
+            )
+        },
+    )
+
+    with pytest.raises(OutputPathError, match="reparse-point or containment"):
+        publish_output(work, source, "name.ext")
+
+    assert api.calls == ["name.ext"]
+    assert source.read_bytes() == b"private"
+    cleanup_work_directory(work)
+
+
+def test_output_helper_windows_cleanup_root_replacement_fails_closed(
+    tmp_path, monkeypatch
+):
+    api, work, source = _windows_test_work(tmp_path, monkeypatch)
+    owned_root = tmp_path / "owned-root"
+    work.path.rename(owned_root)
+    work.path.mkdir()
+    replacement = work.path / "unrelated.bin"
+    replacement.write_bytes(b"unrelated")
+    api.identities[work.path] = (99, 99)
+
+    with pytest.raises(OutputPathError, match="invalid or replaced directory handle"):
+        cleanup_work_directory(work)
+
+    assert replacement.read_bytes() == b"unrelated"
+    assert (owned_root / source.name).read_bytes() == b"private"
+
+
+def test_output_helper_windows_cleanup_reparse_condition_fails_closed(
+    tmp_path, monkeypatch
+):
+    _api, work, source = _windows_test_work(
+        tmp_path,
+        monkeypatch,
+        {
+            "__cleanup__": (
+                "reparse-point validation",
+                output_paths._WINDOWS_ERROR_CANT_ACCESS_FILE,
+            )
+        },
+    )
+
+    with pytest.raises(OutputPathError, match="reparse-point or containment"):
+        cleanup_work_directory(work)
+
+    assert source.read_bytes() == b"private"
+
+
+def test_windows_cleanup_boundary_requests_recursive_and_root_deletion(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    work = create_work_directory(destination)
+    private = work.path
+    source = private / "private.bin"
+    source.write_bytes(b"private")
+    work = replace(
+        work,
+        native_work_identity=(5, 6),
+        native_destination_identity=(7, 8),
+    )
+    api = object.__new__(output_paths._WindowsPublicationApi)
+    opened = []
+    closed = []
+    deleted = []
+
+    def open_directory(path, identity):
+        opened.append((path, identity))
+        return len(opened), identity
+
+    def open_cleanup_directory(path, identity):
+        opened.append((path, identity))
+        return len(opened)
+
+    monkeypatch.setattr(api, "_open_directory", open_directory)
+    monkeypatch.setattr(api, "_open_cleanup_directory", open_cleanup_directory)
+    monkeypatch.setattr(api, "_delete_directory_contents", deleted.append)
+    monkeypatch.setattr(
+        api, "_delete_handle", lambda handle, path: deleted.append((handle, path))
+    )
+    monkeypatch.setattr(api, "_close", closed.append)
+
+    api.pin_cleanup_root(work)
+
+    assert opened == [
+        (destination, (7, 8)),
+        (private, (5, 6)),
+    ]
+    assert deleted == [private, (2, private)]
+    assert closed == [2, 1]
+
+
+def test_windows_cleanup_tree_deletes_opened_objects_and_skips_reparse(monkeypatch):
+    root = Path("C:/private")
+    children = {
+        root: ["file.bin", "nested", "escape"],
+        root / "nested": ["inner.bin"],
+    }
+    opened = {
+        root / "file.bin": (10, 0),
+        root / "nested": (20, output_paths._FILE_ATTRIBUTE_DIRECTORY),
+        root / "nested" / "inner.bin": (30, 0),
+        root / "escape": (
+            40,
+            output_paths._FILE_ATTRIBUTE_DIRECTORY
+            | output_paths._FILE_ATTRIBUTE_REPARSE_POINT,
+        ),
+    }
+    api = object.__new__(output_paths._WindowsPublicationApi)
+    enumerated = []
+    deleted = []
+    monkeypatch.setattr(
+        api,
+        "_enumerate_children",
+        lambda path: enumerated.append(path) or children[path],
+    )
+    monkeypatch.setattr(api, "_open_cleanup_child", lambda path: opened[path])
+    monkeypatch.setattr(
+        api, "_delete_handle", lambda handle, path: deleted.append((handle, path))
+    )
+    monkeypatch.setattr(api, "_close", lambda _handle: None)
+
+    api._delete_directory_contents(root)
+
+    assert enumerated == [root, root / "nested"]
+    assert deleted == [
+        (10, root / "file.bin"),
+        (30, root / "nested" / "inner.bin"),
+        (20, root / "nested"),
+        (40, root / "escape"),
+    ]
+
+
+def test_windows_cleanup_root_open_denies_rename_and_validates_identity(monkeypatch):
+    api = object.__new__(output_paths._WindowsPublicationApi)
+    calls = []
+    info = SimpleNamespace(
+        file_attributes=output_paths._FILE_ATTRIBUTE_DIRECTORY,
+        volume_serial_number=5,
+        file_index_high=0,
+        file_index_low=6,
+    )
+    monkeypatch.setattr(
+        api,
+        "_open_handle",
+        lambda path, access, *, share_mode: calls.append(
+            (path, access, share_mode)
+        ) or 11,
+    )
+    monkeypatch.setattr(api, "_file_information", lambda _handle, _path: info)
+    monkeypatch.setattr(api, "_close", lambda _handle: None)
+
+    handle = api._open_cleanup_directory(Path("C:/private"), (5, 6))
+
+    assert handle == 11
+    _, access, share_mode = calls[0]
+    assert access & output_paths._FILE_LIST_DIRECTORY
+    assert access & output_paths._DELETE
+    assert share_mode == (
+        output_paths._FILE_SHARE_READ | output_paths._FILE_SHARE_WRITE
+    )
+    assert not share_mode & output_paths._FILE_SHARE_DELETE
+
+
+@pytest.mark.parametrize(
+    ("attributes", "identity", "message"),
+    [
+        (
+            output_paths._FILE_ATTRIBUTE_DIRECTORY
+            | output_paths._FILE_ATTRIBUTE_REPARSE_POINT,
+            (5, 6),
+            "reparse-point",
+        ),
+        (output_paths._FILE_ATTRIBUTE_DIRECTORY, (9, 9), "identity"),
+    ],
+)
+def test_windows_cleanup_root_reparse_or_identity_mismatch_fails_closed(
+    monkeypatch, attributes, identity, message
+):
+    api = object.__new__(output_paths._WindowsPublicationApi)
+    info = SimpleNamespace(
+        file_attributes=attributes,
+        volume_serial_number=identity[0],
+        file_index_high=0,
+        file_index_low=identity[1],
+    )
+    monkeypatch.setattr(api, "_open_handle", lambda *_args, **_kwargs: 11)
+    monkeypatch.setattr(api, "_file_information", lambda _handle, _path: info)
+    monkeypatch.setattr(api, "_close", lambda _handle: None)
+
+    with pytest.raises(output_paths._WindowsApiError, match=message):
+        api._open_cleanup_directory(Path("C:/private"), (5, 6))
+
+
+def test_windows_cleanup_deletion_failure_is_reported_and_root_remains(
+    tmp_path, monkeypatch
+):
+    _api, work, source = _windows_test_work(
+        tmp_path,
+        monkeypatch,
+        {"__delete__": ("delete cleanup object", output_paths._WINDOWS_ERROR_ACCESS_DENIED)},
+    )
+
+    with pytest.raises(OutputPathError, match="permission"):
+        cleanup_work_directory(work)
+
+    assert work.path.exists()
+    assert source.read_bytes() == b"private"
+
+
+def test_windows_fake_cleanup_recurses_and_unlinks_reparse_entry(tmp_path, monkeypatch):
+    api, work, source = _windows_test_work(tmp_path, monkeypatch)
+    nested = work.path / "nested"
+    nested.mkdir()
+    (nested / "inner.bin").write_bytes(b"inner")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "keep.bin"
+    target.write_bytes(b"keep")
+    (work.path / "escape").symlink_to(outside, target_is_directory=True)
+
+    cleanup_work_directory(work)
+
+    assert not work.path.exists()
+    assert target.read_bytes() == b"keep"
+    assert ("enumerate", Path("escape")) not in api.cleanup_calls
+    assert api.cleanup_calls[-1] == ("delete", Path("."))
+
+
+def test_output_helper_windows_cleanup_failure_does_not_undo_publication(
+    tmp_path, monkeypatch
+):
+    _api, work, source = _windows_test_work(tmp_path, monkeypatch)
+
+    def cleanup_failure(_work):
+        raise OSError("private cleanup failed")
+
+    monkeypatch.setattr(output_paths, "cleanup_work_directory", cleanup_failure)
+    result = publish_output(work, source, "name.ext")
+
+    assert result.read_bytes() == b"private"
+    assert not source.exists()
+
+
+def test_output_helper_windows_supports_unicode_canonical_filename(
+    tmp_path, monkeypatch
+):
+    _api, work, source = _windows_test_work(tmp_path, monkeypatch)
+    filename = "世界-δοκιμή.ext"
+
+    result = publish_output(work, source, filename)
+
+    assert result == tmp_path / filename
+    assert result.read_bytes() == b"private"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+def test_output_helper_windows_real_publication(tmp_path):
+    work = create_work_directory(tmp_path)
+    source = work.path / "name.ext"
+    source.write_bytes(b"private")
+    target = tmp_path / "name.ext"
+    target.write_bytes(b"existing")
+
+    result = publish_output(work, source, "name.ext")
+
+    assert result == tmp_path / "name (1).ext"
+    assert result.read_bytes() == b"private"
+    assert target.read_bytes() == b"existing"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+def test_output_helper_windows_cleanup_real_tree_and_failure(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "keep.bin"
+    target.write_bytes(b"keep")
+    work = create_work_directory(tmp_path)
+    nested = work.path / "nested"
+    nested.mkdir()
+    (nested / "private.bin").write_bytes(b"private")
+    link = work.path / "escape"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+        check=True,
+        capture_output=True,
+    )
+
+    cleanup_work_directory(work)
+
+    assert not work.path.exists()
+    assert target.read_bytes() == b"keep"
+
+    blocked = create_work_directory(tmp_path)
+    blocked_file = blocked.path / "blocked.bin"
+    blocked_file.write_bytes(b"blocked")
+    api = output_paths._WindowsPublicationApi()
+    blocker = api._open_handle(
+        blocked_file,
+        output_paths._FILE_READ_ATTRIBUTES,
+        share_mode=(
+            output_paths._FILE_SHARE_READ | output_paths._FILE_SHARE_WRITE
+        ),
+    )
+    try:
+        with pytest.raises(OutputPathError):
+            cleanup_work_directory(blocked)
+        assert blocked.path.exists()
+    finally:
+        api._close(blocker)
+        cleanup_work_directory(blocked)
