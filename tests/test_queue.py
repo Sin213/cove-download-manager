@@ -3910,7 +3910,12 @@ def test_output_helper_collision_sequence_and_unsupported_no_clobber(
     def unsupported_link(*_args, **_kwargs):
         raise OSError(errno.EOPNOTSUPP, "hard links unsupported")
 
-    monkeypatch.setattr(output_paths, "_link_pinned_fd", unsupported_link)
+    # Each platform reaches the destination through its own primitive.
+    monkeypatch.setattr(
+        output_paths,
+        "_windows_link_candidate" if os.name == "nt" else "_link_pinned_fd",
+        unsupported_link,
+    )
     with pytest.raises(OutputPathError):
         publish_output(work, source, "name.ext")
     assert target.read_bytes() == b"existing"
@@ -4998,7 +5003,8 @@ def test_output_helper_windows_supports_unicode_canonical_filename(
 def test_windows_real_publication_file_rename_info_abi(monkeypatch):
     rename_info = output_paths._WindowsFileRenameInfo
     candidate = "世界-δοκιμή.ext"
-    encoded_name = candidate.encode("utf-16-le")
+    destination_directory = "C:\\δοκιμή dir"
+    encoded_name = f"{destination_directory}\\{candidate}".encode("utf-16-le")
     observed = {}
 
     assert output_paths.ctypes.sizeof(output_paths._WindowsFileRenameInfoOptions) == 4
@@ -5044,14 +5050,14 @@ def test_windows_real_publication_file_rename_info_abi(monkeypatch):
         return True
 
     monkeypatch.setattr(api, "_set_file_information", set_file_information)
-    api._rename_no_replace(101, 202, candidate)
+    api._rename_no_replace(101, destination_directory, candidate)
 
     assert observed == {
         "source_handle": 101,
         "info_class": output_paths._FILE_RENAME_INFO,
         "buffer_length": output_paths.ctypes.sizeof(rename_info) + len(encoded_name),
         "replace_if_exists": 0,
-        "root_directory": 202,
+        "root_directory": None,
         "file_name_length": len(encoded_name),
         "encoded_name": encoded_name,
         "terminating_nul": b"\0" * output_paths.ctypes.sizeof(output_paths.ctypes.c_wchar),
@@ -5136,9 +5142,12 @@ def test_output_helper_windows_cleanup_real_tree_and_failure(tmp_path):
     blocked_file = blocked.path / "blocked.bin"
     blocked_file.write_bytes(b"blocked")
     api = output_paths._WindowsPublicationApi()
+    # An attributes-only open is exempt from Windows share arbitration, so it
+    # never blocks a delete; it only defers one.  Request real data access so the
+    # handle genuinely denies DELETE while it is held.
     blocker = api._open_handle(
         blocked_file,
-        output_paths._FILE_READ_ATTRIBUTES,
+        output_paths._FILE_READ_DATA | output_paths._FILE_READ_ATTRIBUTES,
         share_mode=(
             output_paths._FILE_SHARE_READ | output_paths._FILE_SHARE_WRITE
         ),
@@ -5147,7 +5156,11 @@ def test_output_helper_windows_cleanup_real_tree_and_failure(tmp_path):
         with pytest.raises(OutputPathError, match="permission"):
             cleanup_work_directory(blocked)
         assert blocked.path.exists()
-        assert blocked_file.read_bytes() == b"blocked"
     finally:
         api._close(blocker)
-        cleanup_work_directory(blocked)
+    # The blocking handle denied FILE_SHARE_DELETE, so the file could only be
+    # inspected once it was closed.  A failed cleanup must not have left it
+    # delete-pending.
+    assert blocked_file.exists()
+    assert blocked_file.read_bytes() == b"blocked"
+    cleanup_work_directory(blocked)

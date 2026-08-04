@@ -108,6 +108,7 @@ _WINDOWS_ERROR_CALL_NOT_IMPLEMENTED = 120
 _WINDOWS_ERROR_DIRECTORY = 267
 _WINDOWS_ERROR_CANT_ACCESS_FILE = 1920
 
+_FILE_READ_DATA = 0x0001
 _FILE_LIST_DIRECTORY = 0x0001
 _FILE_ADD_FILE = 0x0002
 _FILE_TRAVERSE = 0x0020
@@ -244,6 +245,8 @@ class _WindowsPublicationApi:
         self,
         path: Path,
         expected_identity: tuple[int, int] | None,
+        *,
+        share_mode: int = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
     ) -> tuple[int, tuple[int, int]]:
         handle = self._open_handle(
             path,
@@ -251,6 +254,7 @@ class _WindowsPublicationApi:
             | _FILE_ADD_FILE
             | _FILE_TRAVERSE
             | _FILE_READ_ATTRIBUTES,
+            share_mode=share_mode,
         )
         try:
             info = self._file_information(handle, path)
@@ -446,8 +450,32 @@ class _WindowsPublicationApi:
             size = int(length) + 1
         raise _WindowsApiError("final path validation", _WINDOWS_ERROR_INVALID_HANDLE, subject)
 
-    def _rename_no_replace(self, source_handle: int, destination_handle: int, candidate: str) -> None:
-        encoded_name = candidate.encode("utf-16-le")
+    @staticmethod
+    def _win32_path(final_path: str) -> str:
+        """Convert a ``GetFinalPathNameByHandleW`` result to a plain Win32 path.
+
+        ``SetFileInformationByHandle``/``FileRenameInfo`` rejects the ``\\\\?\\``
+        extended-length prefix with ``ERROR_INVALID_NAME`` (and silently renames
+        somewhere else when ``ReplaceIfExists`` is false), so the validated
+        destination has to be expressed as an ordinary absolute path.
+        """
+
+        if final_path.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + final_path[len("\\\\?\\UNC\\"):]
+        if final_path.startswith("\\\\?\\"):
+            return final_path[len("\\\\?\\"):]
+        return final_path
+
+    def _rename_no_replace(
+        self, source_handle: int, destination_directory: str, candidate: str
+    ) -> None:
+        # SetFileInformationByHandle is a Win32 wrapper over NtSetInformationFile
+        # that does not honour a RootDirectory handle: the relative form always
+        # fails with ERROR_INVALID_PARAMETER.  RootDirectory must be NULL and
+        # FileName must be the fully qualified destination path.  Containment is
+        # still enforced by holding the validated destination directory handle
+        # open without FILE_SHARE_DELETE for the duration of the rename.
+        encoded_name = ntpath.join(destination_directory, candidate).encode("utf-16-le")
         name_offset = _WindowsFileRenameInfo.file_name.offset
         fixed_size = ctypes.sizeof(_WindowsFileRenameInfo)
         assert ctypes.sizeof(_WindowsFileRenameInfoOptions) == ctypes.sizeof(wintypes.DWORD)
@@ -459,7 +487,7 @@ class _WindowsPublicationApi:
         buffer = ctypes.create_string_buffer(fixed_size + len(encoded_name))
         info = ctypes.cast(buffer, ctypes.POINTER(_WindowsFileRenameInfo)).contents
         info.replace_if_exists = 0
-        info.root_directory = destination_handle
+        info.root_directory = None
         info.file_name_length = len(encoded_name)
         ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded_name, len(encoded_name))
         if not self._set_file_information(
@@ -486,6 +514,7 @@ class _WindowsPublicationApi:
             destination_handle, destination_identity = self._open_directory(
                 work.destination,
                 work.native_destination_identity,
+                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
             )
             if work_identity != work.native_work_identity or destination_identity != work.native_destination_identity:
                 raise _WindowsApiError(
@@ -504,7 +533,10 @@ class _WindowsPublicationApi:
                     _WINDOWS_ERROR_CANT_ACCESS_FILE,
                     source_path,
                 )
-            self._rename_no_replace(source_handle, destination_handle, candidate)
+            destination_directory = self._win32_path(
+                self._final_path(destination_handle, work.destination)
+            )
+            self._rename_no_replace(source_handle, destination_directory, candidate)
         finally:
             self._close(source_handle)
             self._close(destination_handle)
