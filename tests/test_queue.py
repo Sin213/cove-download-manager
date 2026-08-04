@@ -4023,6 +4023,7 @@ def test_output_helper_rejects_noncanonical_names_without_nested_output(tmp_path
         cleanup_work_directory(work)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="requires POSIX descriptor publication")
 def test_output_helper_fails_closed_without_directory_relative_link(
     tmp_path, monkeypatch
 ):
@@ -4551,13 +4552,20 @@ def test_output_helper_windows_two_collisions_use_second_suffix(
     assert api.calls == ["name.ext", "name (1).ext", "name (2).ext"]
 
 
-def test_output_helper_windows_retries_only_error_already_exists(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "winerror",
+    [
+        output_paths._WINDOWS_ERROR_FILE_EXISTS,
+        output_paths._WINDOWS_ERROR_ALREADY_EXISTS,
+    ],
+)
+def test_output_helper_windows_retries_only_file_exists_errors(
+    tmp_path, monkeypatch, winerror
 ):
     api, work, source = _windows_test_work(
         tmp_path,
         monkeypatch,
-        {"name.ext": ("rename", output_paths._WINDOWS_ERROR_ALREADY_EXISTS)},
+        {"name.ext": ("rename", winerror)},
     )
 
     result = publish_output(work, source, "name.ext")
@@ -4569,7 +4577,10 @@ def test_output_helper_windows_retries_only_error_already_exists(
 @pytest.mark.parametrize(
     ("failure", "message"),
     [
-        (("rename", 80), "unexpected Windows API error"),
+        (
+            ("rename", output_paths._WINDOWS_ERROR_INVALID_PARAMETER),
+            "unexpected Windows API error",
+        ),
         (("rename", output_paths._WINDOWS_ERROR_ACCESS_DENIED), "permission"),
         (("rename", output_paths._WINDOWS_ERROR_NOT_SAME_DEVICE), "cross-device"),
         (("rename", output_paths._WINDOWS_ERROR_NOT_SUPPORTED), "unsupported"),
@@ -4589,6 +4600,78 @@ def test_output_helper_windows_noncollision_errors_fail_closed(
     assert source.read_bytes() == b"private"
     assert not (tmp_path / "name.ext").exists()
     cleanup_work_directory(work)
+
+
+@pytest.mark.parametrize(
+    ("winerror", "message"),
+    [
+        (output_paths._WINDOWS_ERROR_ACCESS_DENIED, "permission"),
+        (output_paths._WINDOWS_ERROR_SHARING_VIOLATION, "permission"),
+        (output_paths._WINDOWS_ERROR_LOCK_VIOLATION, "permission"),
+        (output_paths._WINDOWS_ERROR_INVALID_PARAMETER, "unexpected Windows API error"),
+    ],
+)
+def test_windows_api_error_preserves_raw_code(winerror, message):
+    error = output_paths._WindowsApiError("rename", winerror, "name.ext")
+
+    assert error.winerror_code == winerror
+    assert message in str(output_paths._windows_output_error(error))
+
+
+def test_windows_publication_handles_request_relative_rename_access(monkeypatch):
+    api = object.__new__(output_paths._WindowsPublicationApi)
+    calls = []
+    default_share_mode = (
+        output_paths._FILE_SHARE_READ
+        | output_paths._FILE_SHARE_WRITE
+        | output_paths._FILE_SHARE_DELETE
+    )
+
+    def open_handle(path, access, *, share_mode=default_share_mode):
+        calls.append((path, access, share_mode))
+        return len(calls)
+
+    directory_info = SimpleNamespace(
+        file_attributes=output_paths._FILE_ATTRIBUTE_DIRECTORY,
+        volume_serial_number=1,
+        file_index_high=0,
+        file_index_low=2,
+    )
+    source_info = SimpleNamespace(
+        file_attributes=0,
+        volume_serial_number=1,
+        file_index_high=0,
+        file_index_low=3,
+    )
+    monkeypatch.setattr(api, "_open_handle", open_handle)
+    monkeypatch.setattr(
+        api,
+        "_file_information",
+        lambda handle, _path: directory_info if handle == 1 else source_info,
+    )
+
+    api._open_directory(Path("C:/destination"), None)
+    api._open_source(Path("C:/private/source.ext"))
+
+    assert calls == [
+        (
+            Path("C:/destination"),
+            output_paths._FILE_LIST_DIRECTORY
+            | output_paths._FILE_ADD_FILE
+            | output_paths._FILE_TRAVERSE
+            | output_paths._FILE_READ_ATTRIBUTES,
+            output_paths._FILE_SHARE_READ
+            | output_paths._FILE_SHARE_WRITE
+            | output_paths._FILE_SHARE_DELETE,
+        ),
+        (
+            Path("C:/private/source.ext"),
+            output_paths._DELETE | output_paths._FILE_READ_ATTRIBUTES,
+            output_paths._FILE_SHARE_READ
+            | output_paths._FILE_SHARE_WRITE
+            | output_paths._FILE_SHARE_DELETE,
+        ),
+    ]
 
 
 def test_output_helper_windows_rejects_replaced_destination_identity(
@@ -4695,6 +4778,7 @@ def test_windows_cleanup_boundary_requests_recursive_and_root_deletion(
     monkeypatch.setattr(api, "_open_directory", open_directory)
     monkeypatch.setattr(api, "_open_cleanup_directory", open_cleanup_directory)
     monkeypatch.setattr(api, "_delete_directory_contents", deleted.append)
+    monkeypatch.setattr(api, "_verify_cleanup_empty", lambda _path: None)
     monkeypatch.setattr(
         api, "_delete_handle", lambda handle, path: deleted.append((handle, path))
     )
@@ -4707,6 +4791,42 @@ def test_windows_cleanup_boundary_requests_recursive_and_root_deletion(
         (private, (5, 6)),
     ]
     assert deleted == [private, (2, private)]
+    assert closed == [2, 1]
+
+
+def test_windows_cleanup_descendant_failure_prevents_root_deletion(
+    tmp_path, monkeypatch
+):
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    work = replace(
+        create_work_directory(destination),
+        native_work_identity=(5, 6),
+        native_destination_identity=(7, 8),
+    )
+    api = object.__new__(output_paths._WindowsPublicationApi)
+    failure = output_paths._WindowsApiError(
+        "delete cleanup object",
+        output_paths._WINDOWS_ERROR_SHARING_VIOLATION,
+        work.path / "blocked.bin",
+    )
+    deleted = []
+    closed = []
+    monkeypatch.setattr(api, "_open_directory", lambda _path, identity: (1, identity))
+    monkeypatch.setattr(api, "_open_cleanup_directory", lambda _path, _identity: 2)
+    monkeypatch.setattr(api, "_delete_directory_contents", lambda _path: None)
+    monkeypatch.setattr(api, "_enumerate_children", lambda _path: ["blocked.bin"])
+    monkeypatch.setattr(
+        api, "_open_cleanup_child", lambda _path: (_ for _ in ()).throw(failure)
+    )
+    monkeypatch.setattr(api, "_delete_handle", lambda handle, path: deleted.append((handle, path)))
+    monkeypatch.setattr(api, "_close", closed.append)
+
+    with pytest.raises(output_paths._WindowsApiError) as caught:
+        api.pin_cleanup_root(work)
+
+    assert caught.value is failure
+    assert deleted == []
     assert closed == [2, 1]
 
 
@@ -4875,18 +4995,119 @@ def test_output_helper_windows_supports_unicode_canonical_filename(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
-def test_output_helper_windows_real_publication(tmp_path):
+def test_windows_real_publication_file_rename_info_abi(monkeypatch):
+    rename_info = output_paths._WindowsFileRenameInfo
+    candidate = "世界-δοκιμή.ext"
+    encoded_name = candidate.encode("utf-16-le")
+    observed = {}
+
+    assert output_paths.ctypes.sizeof(output_paths._WindowsFileRenameInfoOptions) == 4
+    assert output_paths.ctypes.sizeof(rename_info) == 24
+    assert rename_info.replace_if_exists.offset == 0
+    assert rename_info.root_directory.offset == 8
+    assert rename_info.file_name_length.offset == 16
+    assert rename_info.file_name.offset == 20
+    assert rename_info.root_directory.offset % output_paths.ctypes.alignment(
+        output_paths.wintypes.HANDLE
+    ) == 0
+    assert rename_info.file_name.offset == (
+        rename_info.file_name_length.offset
+        + output_paths.ctypes.sizeof(output_paths.wintypes.DWORD)
+    )
+    assert output_paths.ctypes.sizeof(rename_info) >= (
+        rename_info.file_name.offset
+        + output_paths.ctypes.sizeof(output_paths.ctypes.c_wchar)
+    )
+
+    api = output_paths._WindowsPublicationApi()
+
+    def set_file_information(source_handle, info_class, buffer, buffer_length):
+        info = output_paths.ctypes.cast(
+            buffer, output_paths.ctypes.POINTER(rename_info)
+        ).contents
+        observed.update(
+            source_handle=source_handle,
+            info_class=info_class,
+            buffer_length=buffer_length,
+            replace_if_exists=info.replace_if_exists,
+            root_directory=info.root_directory,
+            file_name_length=info.file_name_length,
+            encoded_name=output_paths.ctypes.string_at(
+                buffer.value + rename_info.file_name.offset,
+                info.file_name_length,
+            ),
+            terminating_nul=output_paths.ctypes.string_at(
+                buffer.value + rename_info.file_name.offset + info.file_name_length,
+                output_paths.ctypes.sizeof(output_paths.ctypes.c_wchar),
+            ),
+        )
+        return True
+
+    monkeypatch.setattr(api, "_set_file_information", set_file_information)
+    api._rename_no_replace(101, 202, candidate)
+
+    assert observed == {
+        "source_handle": 101,
+        "info_class": output_paths._FILE_RENAME_INFO,
+        "buffer_length": output_paths.ctypes.sizeof(rename_info) + len(encoded_name),
+        "replace_if_exists": 0,
+        "root_directory": 202,
+        "file_name_length": len(encoded_name),
+        "encoded_name": encoded_name,
+        "terminating_nul": b"\0" * output_paths.ctypes.sizeof(output_paths.ctypes.c_wchar),
+    }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+@pytest.mark.parametrize(
+    ("filename", "existing_names", "expected_name"),
+    [
+        ("name.ext", (), "name.ext"),
+        ("name.ext", ("name.ext",), "name (1).ext"),
+        ("name.ext", ("name.ext", "name (1).ext"), "name (2).ext"),
+        ("世界-δοκιμή.ext", (), "世界-δοκιμή.ext"),
+    ],
+)
+def test_output_helper_windows_real_publication(
+    tmp_path, filename, existing_names, expected_name
+):
     work = create_work_directory(tmp_path)
-    source = work.path / "name.ext"
+    source = work.path / "private.bin"
+    source.write_bytes(b"private")
+    existing = {}
+    for index, name in enumerate(existing_names):
+        contents = f"existing-{index}".encode()
+        (tmp_path / name).write_bytes(contents)
+        existing[name] = contents
+
+    result = publish_output(work, source, filename)
+
+    assert result == tmp_path / expected_name
+    assert result.read_bytes() == b"private"
+    for name, contents in existing.items():
+        assert (tmp_path / name).read_bytes() == contents
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+def test_windows_real_publication_collision_preserves_raw_winerror(tmp_path):
+    work = create_work_directory(tmp_path)
+    source = work.path / "private.bin"
     source.write_bytes(b"private")
     target = tmp_path / "name.ext"
     target.write_bytes(b"existing")
 
-    result = publish_output(work, source, "name.ext")
+    with pytest.raises(output_paths._WindowsApiError) as caught:
+        output_paths._WindowsPublicationApi().publish_no_replace(
+            work, source, "name.ext"
+        )
 
-    assert result == tmp_path / "name (1).ext"
-    assert result.read_bytes() == b"private"
+    assert caught.value.winerror_code in {
+        output_paths._WINDOWS_ERROR_FILE_EXISTS,
+        output_paths._WINDOWS_ERROR_ALREADY_EXISTS,
+    }
+    assert source.read_bytes() == b"private"
     assert target.read_bytes() == b"existing"
+    cleanup_work_directory(work)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
@@ -4923,9 +5144,10 @@ def test_output_helper_windows_cleanup_real_tree_and_failure(tmp_path):
         ),
     )
     try:
-        with pytest.raises(OutputPathError):
+        with pytest.raises(OutputPathError, match="permission"):
             cleanup_work_directory(blocked)
         assert blocked.path.exists()
+        assert blocked_file.read_bytes() == b"blocked"
     finally:
         api._close(blocker)
         cleanup_work_directory(blocked)
