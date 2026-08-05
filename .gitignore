@@ -15,9 +15,12 @@ dist/
 release/
 *.spec
 cove_icon.ico
+# Generated from cove_dm_icon.png by the Windows release workflow.
+cove_dm_icon.ico
 
 # Local cove runtime state (only relevant when running from the source tree)
 cove/cove_icon.png
+cove/cove_dm_icon.png
 cove/Archive.zip
 
 # Chrome extension signing key (private — NEVER commit). The public key is

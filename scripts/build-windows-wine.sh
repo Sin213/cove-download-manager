@@ -76,25 +76,28 @@ if [ ! -f "$YTDLP_EXE" ]; then
 fi
 
 # ---------------------------------------------------------------- 2. Icon (.ico)
-echo "==> Generating cove_icon.ico"
+echo "==> Generating cove_dm_icon.ico"
 wine "$WIN_PY" -c "
 from PIL import Image
-Image.open(r'cove_icon.png').save(
-    r'cove_icon.ico',
+Image.open(r'cove_dm_icon.png').save(
+    r'cove_dm_icon.ico',
     sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)],
 )" >/dev/null
 
 # ---------------------------------------------------------------- 3. Clean
 rm -rf "$ROOT/build/win-onedir" "$ROOT/build/win-onefile" "$ROOT/dist"
 
-ASSET_DATA="cove_icon.png;cove"
+ASSET_DATA="cove_dm_icon.png;cove"
+# The suite icon stays bundled as find_icon()'s fallback.
+FALLBACK_ASSET_DATA="cove_icon.png;cove"
 
 COMMON_ARGS=(
     --noconfirm --clean --log-level WARN
     --windowed
-    --icon cove_icon.ico
+    --icon cove_dm_icon.ico
     --paths .
     --add-data "$ASSET_DATA"
+    --add-data "$FALLBACK_ASSET_DATA"
     --add-binary "${ARIA_EXE};."
     --add-binary "${YTDLP_EXE};."
     --hidden-import cove
@@ -126,7 +129,7 @@ wine "$WIN_PY" -m PyInstaller \
 
 ONEDIR="$ROOT/build/win-onedir/dist/$APP"
 [ -d "$ONEDIR" ] || { echo "onedir output missing: $ONEDIR"; exit 1; }
-cp -f cove_icon.png "$ONEDIR/"
+cp -f cove_dm_icon.png "$ONEDIR/"
 [ -f README.md ] && cp -f README.md "$ONEDIR/"
 [ -f LICENSE ]   && cp -f LICENSE   "$ONEDIR/"
 
@@ -158,7 +161,7 @@ fi
 echo "==> Building Setup.exe with Inno Setup"
 SRC_WIN=$(winepath -w "$ONEDIR")
 OUT_WIN=$(winepath -w "$RELEASE_DIR")
-ICON_WIN=$(winepath -w "$ROOT/cove_icon.ico")
+ICON_WIN=$(winepath -w "$ROOT/cove_dm_icon.ico")
 
 wine "$ISCC_UNIX" \
     "/DAppVersion=$VERSION" \

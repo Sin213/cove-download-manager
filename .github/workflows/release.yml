@@ -158,10 +158,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller pillow
 
-      - name: Generate cove_icon.ico
+      - name: Generate cove_dm_icon.ico
         shell: pwsh
         run: |
-          python -c "from PIL import Image; Image.open('cove_icon.png').save('cove_icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+          python -c "from PIL import Image; Image.open('cove_dm_icon.png').save('cove_dm_icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 
       - name: Download patched aria2 backend
         uses: actions/download-artifact@v4
@@ -186,9 +186,10 @@ jobs:
           python -m PyInstaller `
             --noconfirm --clean --log-level WARN `
             --windowed `
-            --icon cove_icon.ico `
+            --icon cove_dm_icon.ico `
             --name cove-download-manager `
             --paths . `
+            --add-data "cove_dm_icon.png;cove" `
             --add-data "cove_icon.png;cove" `
             --add-binary "build/aria2-win/aria2c.exe;." `
             --add-binary "build/yt-dlp-win/yt-dlp.exe;." `
@@ -212,7 +213,7 @@ jobs:
             --workpath build/win-onedir/work `
             packaging/launcher.py
           if (-not (Test-Path "build/win-onedir/dist/cove-download-manager")) { throw "one-dir bundle missing" }
-          Copy-Item cove_icon.png build/win-onedir/dist/cove-download-manager/
+          Copy-Item cove_dm_icon.png build/win-onedir/dist/cove-download-manager/
           if (Test-Path README.md) { Copy-Item README.md build/win-onedir/dist/cove-download-manager/ }
           if (Test-Path LICENSE)   { Copy-Item LICENSE   build/win-onedir/dist/cove-download-manager/ }
 
@@ -222,9 +223,10 @@ jobs:
           python -m PyInstaller `
             --noconfirm --clean --log-level WARN `
             --windowed --onefile `
-            --icon cove_icon.ico `
+            --icon cove_dm_icon.ico `
             --name cove-download-manager-portable `
             --paths . `
+            --add-data "cove_dm_icon.png;cove" `
             --add-data "cove_icon.png;cove" `
             --add-binary "build/aria2-win/aria2c.exe;." `
             --add-binary "build/yt-dlp-win/yt-dlp.exe;." `
@@ -258,7 +260,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path release | Out-Null
           $src  = (Resolve-Path "build/win-onedir/dist/cove-download-manager").Path
           $out  = (Resolve-Path "release").Path
-          $icon = (Resolve-Path "cove_icon.ico").Path
+          $icon = (Resolve-Path "cove_dm_icon.ico").Path
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
             "/DAppVersion=${{ steps.ver.outputs.version }}" `
             "/DSourceDir=$src" `

@@ -82,7 +82,7 @@ if ($LASTEXITCODE -ne 0) {
     throw "Build Python is missing Pillow, PyInstaller, PySide6, or requests."
 }
 
-& $Python -c "from PIL import Image; Image.open(r'cove_icon.png').save(r'cove_icon.ico', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])"
+& $Python -c "from PIL import Image; Image.open(r'cove_dm_icon.png').save(r'cove_dm_icon.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"
 if ($LASTEXITCODE -ne 0) {
     throw "Icon generation failed"
 }
@@ -94,8 +94,9 @@ New-Item -ItemType Directory -Force -Path $WorkRoot, (Join-Path $Root "release")
 $CommonArgs = @(
     "--noconfirm", "--clean", "--log-level", "WARN",
     "--windowed",
-    "--icon", "cove_icon.ico",
+    "--icon", "cove_dm_icon.ico",
     "--paths", ".",
+    "--add-data", "cove_dm_icon.png;cove",
     "--add-data", "cove_icon.png;cove",
     "--add-binary", "$Aria2Exe;.",
     "--add-binary", "$YtDlpExe;.",
@@ -150,11 +151,11 @@ if ($Setup) {
         throw "One-directory PyInstaller build failed"
     }
     $Bundle = Join-Path $OneDirDist "cove-download-manager"
-    Copy-Item -LiteralPath "cove_icon.png" -Destination $Bundle -Force
+    Copy-Item -LiteralPath "cove_dm_icon.png" -Destination $Bundle -Force
     Copy-Item -LiteralPath "README.md" -Destination $Bundle -Force
     Copy-Item -LiteralPath "LICENSE" -Destination $Bundle -Force
     $ReleaseDir = Join-Path $Root "release"
-    & $Iscc "/DAppVersion=$Version" "/DSourceDir=$Bundle" "/DOutputDir=$ReleaseDir" "/DIconFile=$(Join-Path $Root 'cove_icon.ico')" "packaging\installer.iss"
+    & $Iscc "/DAppVersion=$Version" "/DSourceDir=$Bundle" "/DOutputDir=$ReleaseDir" "/DIconFile=$(Join-Path $Root 'cove_dm_icon.ico')" "packaging\installer.iss"
     if ($LASTEXITCODE -ne 0) {
         throw "Inno Setup build failed"
     }

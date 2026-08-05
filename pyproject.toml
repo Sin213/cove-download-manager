@@ -24,4 +24,4 @@ packages = ["cove"]
 include-package-data = true
 
 [tool.setuptools.package-data]
-cove = ["cove_icon.png"]
+cove = ["cove_dm_icon.png", "cove_icon.png"]

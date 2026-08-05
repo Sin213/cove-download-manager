@@ -37,48 +37,78 @@ from PySide6.QtWidgets import (
 )
 
 
-def find_icon() -> Path | None:
-    """Locate cove_icon.png. Works from source, from PyInstaller bundles
-    (one-file via _MEIPASS, one-dir via sys.executable), from the
-    python-appimage layout, and from the cove-compressor-style AppImage
-    (icon at $APPDIR root + hicolor tree)."""
+def _named_icon_candidates(name: str) -> list[Path]:
+    """Every place `name` can live: source tree, bundles, installed trees."""
     import os
     import sys
 
     here = Path(__file__).resolve().parent
     candidates: list[Path] = [
-        here / "cove_icon.png",                     # package data
-        here.parent / "cove_icon.png",              # source-tree root
-        Path.cwd() / "cove_icon.png",
+        here / name,                                # package data
+        here.parent / name,                         # source-tree root
+        Path.cwd() / name,
     ]
 
     # PyInstaller one-file: assets are extracted under _MEIPASS at runtime.
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
-        candidates.insert(0, Path(meipass) / "cove" / "cove_icon.png")
-        candidates.insert(0, Path(meipass) / "cove_icon.png")
+        candidates.insert(0, Path(meipass) / "cove" / name)
+        candidates.insert(0, Path(meipass) / name)
 
     # PyInstaller one-dir: assets sit next to the executable (or under
     # _internal/ depending on the PyInstaller version).
     if getattr(sys, "frozen", False):
         exe_dir = Path(sys.executable).resolve().parent
         candidates += [
-            exe_dir / "cove" / "cove_icon.png",
-            exe_dir / "_internal" / "cove" / "cove_icon.png",
-            exe_dir / "cove_icon.png",
+            exe_dir / "cove" / name,
+            exe_dir / "_internal" / "cove" / name,
+            exe_dir / name,
         ]
 
     appdir = os.environ.get("APPDIR")
     if appdir:
         appdir_path = Path(appdir)
         candidates += [
-            appdir_path / "cove_icon.png",
-            appdir_path / "cove.png",
-            appdir_path / "usr/share/icons/hicolor/256x256/apps/cove.png",
-            appdir_path / "usr/share/icons/hicolor/256x256/apps/cove-download-manager.png",
-            appdir_path / "usr/share/icons/hicolor/512x512/apps/cove.png",
-            appdir_path / "usr/lib/cove-download-manager/cove/cove_icon.png",
+            appdir_path / name,
+            appdir_path / f"usr/lib/cove-download-manager/cove/{name}",
         ]
+    return candidates
+
+
+def _installed_icon_candidates() -> list[Path]:
+    """Icons installed under their packaging names rather than a source name.
+
+    The AppImage and .deb both install whichever artwork the build copied in
+    under these fixed names, so they need no name preference of their own.
+    """
+    import os
+
+    appdir = os.environ.get("APPDIR")
+    if not appdir:
+        return []
+    appdir_path = Path(appdir)
+    return [
+        appdir_path / "cove.png",
+        appdir_path / "usr/share/icons/hicolor/256x256/apps/cove.png",
+        appdir_path / "usr/share/icons/hicolor/256x256/apps/cove-download-manager.png",
+        appdir_path / "usr/share/icons/hicolor/512x512/apps/cove.png",
+    ]
+
+
+def find_icon() -> Path | None:
+    """Locate the app icon. Works from source, from PyInstaller bundles
+    (one-file via _MEIPASS, one-dir via sys.executable), from the
+    python-appimage layout, and from the cove-compressor-style AppImage
+    (icon at $APPDIR root + hicolor tree).
+
+    The download-manager mark wins everywhere it exists; the shared suite
+    icon is the fallback so a build without the new asset still has an icon.
+    """
+    candidates = [
+        *_named_icon_candidates("cove_dm_icon.png"),
+        *_named_icon_candidates("cove_icon.png"),
+        *_installed_icon_candidates(),
+    ]
     for p in candidates:
         if p.exists():
             return p

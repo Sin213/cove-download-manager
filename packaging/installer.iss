@@ -1,7 +1,7 @@
 ; Inno Setup script for Cove Download Manager (Windows)
 ; Invoked from build-windows-wine.sh via:
 ;   iscc /DAppVersion=X.Y.Z /DSourceDir=<abs dist\cove-download-manager> \
-;        /DOutputDir=<abs release> /DIconFile=<abs cove_icon.ico> installer.iss
+;        /DOutputDir=<abs release> /DIconFile=<abs cove_dm_icon.ico> installer.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -13,7 +13,7 @@
   #define OutputDir "..\release"
 #endif
 #ifndef IconFile
-  #define IconFile "..\cove_icon.ico"
+  #define IconFile "..\cove_dm_icon.ico"
 #endif
 
 [Setup]

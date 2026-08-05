@@ -24,7 +24,7 @@ RELEASE_DIR="$ROOT/release"
 DIST_DIR="$ROOT/dist"
 DEB_BUILD="$ROOT/build/deb"
 BUILD_ENV="$ROOT/.buildenv"
-ICON_SRC="$ROOT/cove_icon.png"
+ICON_SRC="$ROOT/cove_dm_icon.png"
 
 mkdir -p "$RELEASE_DIR"
 rm -rf "$DIST_DIR" "$ROOT/build/deb" "$ROOT/build/work"
@@ -49,6 +49,7 @@ echo "==> PyInstaller bundle"
     --windowed \
     --name "$APP_NAME" \
     --paths . \
+    --add-data "cove_dm_icon.png:cove" \
     --add-data "cove_icon.png:cove" \
     --hidden-import cove \
     --hidden-import cove.app \

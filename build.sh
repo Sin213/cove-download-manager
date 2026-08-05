@@ -23,7 +23,9 @@ EOF
 # Refresh bundled icon — once into build/recipe (for python-appimage's
 # .desktop integration) and once into the package itself (so the running
 # app can find it via importlib's package data search).
-cp -f cove_icon.png build/recipe/cove.png
+cp -f cove_dm_icon.png build/recipe/cove.png
+cp -f cove_dm_icon.png cove/cove_dm_icon.png
+# The suite icon stays bundled as find_icon()'s fallback.
 cp -f cove_icon.png cove/cove_icon.png
 
 # Clear stale build artifacts.
