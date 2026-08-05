@@ -1,8 +1,10 @@
+import errno
 import json
 import os
 import secrets
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List
@@ -38,6 +40,49 @@ _LEGACY_RPC_SECRET = "cove"
 # to serialize the read-modify-os.replace sequence - without it, one
 # thread's os.replace can publish the other thread's half-written file.
 _SAVE_LOCK = threading.Lock()
+
+# Windows shares files by handle, not by inode. CPython's open() asks for
+# FILE_SHARE_READ | FILE_SHARE_WRITE but *not* FILE_SHARE_DELETE, so while any
+# reader holds settings.json open, MoveFileExW cannot unlink the destination
+# and os.replace fails with ERROR_ACCESS_DENIED (5); the reverse race makes a
+# reader fail against a delete-pending target with the same code. Neither is a
+# real failure - the loser just has to look again a moment later. Retrying
+# keeps the publication atomic (a reader still never observes a partial file)
+# while making save() and load() survive the interleaving. Nothing to do on
+# POSIX, where rename(2) is unaffected by open descriptors.
+_WINDOWS_SHARING_ERRORS = frozenset((5, 32, 33))
+_SHARING_RETRY_SECONDS = 2.0
+_SHARING_RETRY_BACKOFF = 0.001
+
+
+def _is_transient_sharing_error(exc: OSError) -> bool:
+    if os.name != "nt":
+        return False
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return winerror in _WINDOWS_SHARING_ERRORS
+    # os.replace surfaces the Win32 code, but open() goes through the CRT and
+    # raises a bare PermissionError(EACCES) with no winerror at all, so the
+    # read side has to be recognised by errno. A genuine ACL denial also lands
+    # here; it just costs one retry window before being re-raised.
+    return exc.errno == errno.EACCES
+
+
+def _retry_on_sharing_error(operation):
+    """Run ``operation`` until it stops losing a Windows sharing race."""
+
+    deadline = time.monotonic() + _SHARING_RETRY_SECONDS
+    delay = _SHARING_RETRY_BACKOFF
+    while True:
+        try:
+            return operation()
+        except OSError as exc:
+            if not _is_transient_sharing_error(exc) or time.monotonic() >= deadline:
+                raise
+        time.sleep(delay)
+        # The contended window is microseconds wide, so the cap stays small:
+        # backing off further just adds latency without reducing contention.
+        delay = min(delay * 2, 0.005)
 
 # Debrid providers Cove can resolve links through. cove.debrid imports these
 # so the accepted setting values and the resolver can't drift apart. Order
@@ -227,13 +272,22 @@ class Settings:
             s.save()
             s.magnet_setting_missing = False
             return s
+        # Retry first, so a brief sharing race is not mistaken for anything.
+        # A read that still fails afterwards propagates deliberately: the file
+        # exists but could not be read, which is not corruption. Treating it as
+        # corruption would run the fallback below, regenerating rpc_secret and
+        # api_token and overwriting every stored setting with defaults - so a
+        # backup or antivirus agent holding settings.json open for longer than
+        # the retry window would silently destroy the user's configuration and
+        # rotate their secrets. Failing closed leaves the file intact.
+        text = _retry_on_sharing_error(CONFIG_FILE.read_text)
         try:
-            raw = json.loads(CONFIG_FILE.read_text())
-        except (OSError, json.JSONDecodeError):
+            raw = json.loads(text)
+        except json.JSONDecodeError:
             raw = None
         if not isinstance(raw, dict):
-            # Unreadable or corrupted (valid JSON that isn't an object):
-            # start over with defaults rather than crashing on load.
+            # Genuinely corrupt: unparseable, or valid JSON that isn't an
+            # object. Start over with defaults rather than crashing on load.
             s = cls()
             s.rpc_secret = _new_rpc_secret()
             s.api_token = _new_distinct_api_token(s.rpc_secret)
@@ -380,7 +434,7 @@ class Settings:
                     os.chmod(tmp, 0o600)
                 except OSError:
                     pass
-                os.replace(tmp, CONFIG_FILE)
+                _retry_on_sharing_error(lambda: os.replace(tmp, CONFIG_FILE))
             except BaseException:
                 try:
                     tmp.unlink()
