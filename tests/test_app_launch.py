@@ -209,6 +209,8 @@ class FakeSettings:
     @classmethod
     def load(cls):
         calls["constructed"].append("Settings")
+        if __SETTINGS_UNREADABLE__:
+            raise PermissionError(13, "Access is denied")
         return cls()
 
 
@@ -360,11 +362,13 @@ print(json.dumps(calls))
 
 
 def _run_harness(argv, is_primary, daemon_fails=False, early_ipc=None, late_ipc=None,
-                  forward_ok=True, bad_url="", return_raw=False):
+                  forward_ok=True, bad_url="", return_raw=False,
+                  settings_unreadable=False):
     script = (
         _HARNESS
         .replace("__ARGV__", repr(argv))
         .replace("__IS_PRIMARY__", repr(is_primary))
+        .replace("__SETTINGS_UNREADABLE__", repr(settings_unreadable))
         .replace("__DAEMON_FAILS__", repr(daemon_fails))
         .replace("__EARLY_IPC__", repr(early_ipc))
         .replace("__LATE_IPC__", repr(late_ipc))
@@ -527,3 +531,23 @@ def test_native_messaging_bypasses_single_instance_and_gui():
     )
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
+
+
+def test_unreadable_settings_exits_without_constructing_services():
+    """An unreadable settings.json must stop startup, not reset the file.
+
+    Settings.load() fails closed on a read error rather than falling back to
+    defaults, because the fallback regenerates rpc_secret and api_token and
+    discards every stored setting. run() has to honour that: exit non-zero
+    before aria2, the queue, or the window exist, so nothing downstream runs
+    against half-initialised state and the file is left recoverable.
+    """
+    out, result = _run_harness(
+        argv=[], is_primary=True, settings_unreadable=True, return_raw=True
+    )
+
+    assert out["returncode"] == 1
+    assert "Settings" in out["constructed"]
+    for heavy in ("Aria2Daemon", "Aria2RPC", "QueueManager", "MainWindow", "LocalApiServer"):
+        assert heavy not in out["constructed"], heavy
+    assert "settings_unreadable" in result.stderr

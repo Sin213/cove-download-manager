@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_close_to_tray(tmp_path, raw: dict):
     script = r'''
@@ -179,8 +181,14 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
     # against the broken implementation unless the very last os.replace
     # happened to publish a partial file, so a reader samples throughout.
     reads = []
+    # "assert not reader.is_alive()" is satisfied by a thread that died from an
+    # exception just as much as by one that returned, and "assert reads" needs
+    # only a single sample before a crash. Without an explicit completion
+    # sentinel a dead observer is indistinguishable from a healthy one, and the
+    # run degrades to a warning that the default pytest invocation ignores.
+    watcher_completed = []
 
-    def watcher():
+    def _watch_loop():
         while not stop.is_set():
             try:
                 text = (tmp_path / "settings.json").read_text()
@@ -189,6 +197,15 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
                 # is, that is itself the defect.
                 errors.append(AssertionError("settings.json vanished mid-save"))
                 continue
+            except PermissionError as e:
+                # Windows only: opening a delete-pending target during the
+                # replace loses a sharing race. That is an expected
+                # interleaving, not a torn file - keep sampling instead of
+                # letting the thread die, which would end the observation
+                # window almost immediately and hollow out this test.
+                if config._is_transient_sharing_error(e):
+                    continue
+                raise
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError as e:
@@ -202,6 +219,16 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
                 )
                 continue
             reads.append(1)
+
+    def watcher():
+        # Surface a crash as a test failure instead of an unhandled-thread
+        # warning, and record that the loop actually ran to completion.
+        try:
+            _watch_loop()
+        except BaseException as e:  # pragma: no cover - failure path only
+            errors.append(e)
+        else:
+            watcher_completed.append(True)
 
     def hammer(rpc_secret_value: str):
         try:
@@ -233,6 +260,7 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
     assert not errors
     # A watcher that never got a sample in would prove nothing.
     assert reads, "the reader observed no writes, so the race was never exercised"
+    assert watcher_completed, "the reader thread died before the run finished"
 
     # The file must exist, parse as JSON, and be a complete settings object
     # after every interleaving - never truncated or a mix of two writes.
@@ -248,3 +276,51 @@ def test_concurrent_saves_never_produce_a_broken_settings_file(tmp_path, monkeyp
         if p.name != "settings.json" and p.name.startswith("settings.json")
     ]
     assert leftovers == []
+
+
+def test_unreadable_settings_never_regenerates_secrets(tmp_path, monkeypatch):
+    """A file that exists but cannot be read is not corruption.
+
+    Windows shares by handle, so a backup or antivirus agent can hold
+    settings.json open for longer than the sharing retry window. Treating that
+    as corruption would regenerate rpc_secret and api_token and overwrite every
+    stored setting with defaults, silently destroying the user's configuration
+    and rotating their secrets. load() must fail closed and leave the file
+    exactly as it found it.
+    """
+    from cove import config
+
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "settings.json")
+
+    seeded = config.Settings.load()
+    seeded.download_dir = str(tmp_path / "chosen")
+    seeded.save()
+    before = (tmp_path / "settings.json").read_bytes()
+
+    # Deny only this file, and only while the flag is set. monkeypatch.undo()
+    # would also revert CONFIG_FILE/CONFIG_DIR and send the reload below at the
+    # real user config.
+    blocked = {"on": True}
+    real_read_text = Path.read_text
+
+    def unreadable(self, *args, **kwargs):
+        if blocked["on"] and self == tmp_path / "settings.json":
+            raise PermissionError(13, "Access is denied")
+        return real_read_text(self, *args, **kwargs)
+
+    # Outlast the retry window without actually sleeping through it.
+    monkeypatch.setattr(config, "_SHARING_RETRY_SECONDS", 0.05)
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    with pytest.raises(OSError):
+        config.Settings.load()
+
+    blocked["on"] = False
+    after = (tmp_path / "settings.json").read_bytes()
+    assert after == before, "load() rewrote a file it could not read"
+    reloaded = config.Settings.load()
+    assert reloaded.rpc_secret == seeded.rpc_secret
+    assert reloaded.api_token == seeded.api_token
+    assert reloaded.download_dir == seeded.download_dir
