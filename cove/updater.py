@@ -30,26 +30,16 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QObject, QThread, Qt, Signal
 from PySide6.QtWidgets import QApplication, QMessageBox, QProgressDialog
 
 from . import netiface
-from .system_open import child_env
+from .system_open import open_url
 
 
-def _open_url(url: str) -> None:
-    """Open `url` in the default browser without leaking AppImage env.
-
-    QDesktopServices.openUrl spawns xdg-open with the current environment,
-    which inside an AppImage carries LD_LIBRARY_PATH into the browser and
-    crashes it. Spawn xdg-open ourselves with a scrubbed env in that case.
-    """
-    env = child_env()
-    if env is not None and sys.platform.startswith("linux") and shutil.which("xdg-open"):
-        subprocess.Popen(["xdg-open", url], env=env)
-        return
-    QDesktopServices.openUrl(QUrl(url))
+# Kept as a module-local name: the same opener is now shared with the rest
+# of the app (see cove.system_open.open_url).
+_open_url = open_url
 
 
 @dataclass

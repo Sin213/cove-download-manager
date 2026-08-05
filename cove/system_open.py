@@ -13,6 +13,9 @@ must keep the AppImage env, so this never mutates os.environ.
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess
+import sys
 
 _SCRUB_VARS = (
     "LD_LIBRARY_PATH",
@@ -38,3 +41,21 @@ def child_env() -> dict[str, str] | None:
     for key in _SCRUB_VARS:
         env.pop(key, None)
     return env
+
+
+def open_url(url: str) -> None:
+    """Open `url` in the default browser without leaking AppImage env.
+
+    QDesktopServices.openUrl spawns xdg-open with the current environment,
+    which inside an AppImage carries LD_LIBRARY_PATH into the browser and
+    crashes it. Spawn xdg-open ourselves with a scrubbed env in that case.
+    """
+    env = child_env()
+    if env is not None and sys.platform.startswith("linux") and shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], env=env)
+        return
+    # Imported here so this module stays importable without a Qt GUI stack.
+    from PySide6.QtCore import QUrl
+    from PySide6.QtGui import QDesktopServices
+
+    QDesktopServices.openUrl(QUrl(url))

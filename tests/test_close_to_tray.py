@@ -186,6 +186,7 @@ class _Host(QMainWindow):
     show_from_tray = mw.MainWindow.show_from_tray
     _install_tray_menu = mw.MainWindow._install_tray_menu
     _on_tray_activated = mw.MainWindow._on_tray_activated
+    _open_extension_help = mw.MainWindow._open_extension_help
 
     def __init__(self, close_to_tray=False, tray=True, tray_available=True):
         QMainWindow.__init__(self)
@@ -289,7 +290,7 @@ def test_tray_menu_is_installed_once_and_offers_open_and_quit():
     first = host._tray.menu
     assert first is not None
     labels = [a.text() for a in first.actions() if not a.isSeparator()]
-    assert labels == ["Open Cove", "Quit Cove"]
+    assert labels == ["Open Cove", "Get the browser extension", "Quit Cove"]
 
     # Idempotent: no second controller, no second icon.
     mw.MainWindow._install_tray_menu(host)

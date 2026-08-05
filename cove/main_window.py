@@ -75,7 +75,12 @@ from .speed_limit import (
     configure_speed_spin,
     speed_value_to_kbps,
 )
-from .system_open import child_env
+from .browser_extension import (
+    CHROME_EXTENSION_URL,
+    EXTENSION_HELP_TEXT,
+    FIREFOX_EXTENSION_URL,
+)
+from .system_open import child_env, open_url
 from .widgets import (
     Footer,
     FramelessResizer,
@@ -280,7 +285,9 @@ class DownloadTree(QTreeWidget):
         super().__init__(parent)
         self._empty_title = "No downloads yet"
         self._empty_sub = (
-            "Press Ctrl+N to add a URL, or drop a link onto this window."
+            "Press Ctrl+N to add a URL, or drop a link onto this window.\n"
+            "Install the Cove browser extension to capture downloads "
+            "automatically."
         )
         self._get_task = None  # set by MainWindow after construction
         self.setDragEnabled(True)
@@ -333,8 +340,13 @@ class DownloadTree(QTreeWidget):
         p.setFont(sub_font)
         p.setPen(sub_color)
         sub_metrics = p.fontMetrics()
-        sw = sub_metrics.horizontalAdvance(self._empty_sub)
-        p.drawText(int(rect.center().x() - sw / 2), cy + 24, self._empty_sub)
+        # Each hint gets its own centered line; drawText(point, ...) does not
+        # break on newlines itself.
+        line_y = cy + 24
+        for line in self._empty_sub.split("\n"):
+            sw = sub_metrics.horizontalAdvance(line)
+            p.drawText(int(rect.center().x() - sw / 2), line_y, line)
+            line_y += sub_metrics.height() + 2
         p.end()
 
 
@@ -445,6 +457,11 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         open_action = menu.addAction("Open Cove")
         open_action.triggered.connect(self.show_from_tray)
+        menu.addSeparator()
+        # Permanent, so the extension stays reachable from a running app
+        # rather than only from README.md.
+        extension_action = menu.addAction("Get the browser extension")
+        extension_action.triggered.connect(self._open_extension_help)
         menu.addSeparator()
         quit_action = menu.addAction("Quit Cove")
         quit_action.triggered.connect(self.request_quit)
@@ -1078,6 +1095,21 @@ class MainWindow(QMainWindow):
             self.scheduler.update_window(self.settings.schedule)
             self._refresh_status_pill()
             self._refresh_schedule_section()
+
+    def _open_extension_help(self) -> None:
+        """Explain the browser extension and offer both store listings."""
+        box = QMessageBox(self)
+        box.setWindowTitle("Browser extension")
+        box.setText(EXTENSION_HELP_TEXT)
+        firefox = box.addButton("Firefox add-on", QMessageBox.ActionRole)
+        chrome = box.addButton("Chrome Web Store", QMessageBox.ActionRole)
+        box.addButton("Close", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is firefox:
+            open_url(FIREFOX_EXTENSION_URL)
+        elif clicked is chrome:
+            open_url(CHROME_EXTENSION_URL)
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.settings, self)
