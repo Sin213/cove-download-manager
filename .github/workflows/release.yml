@@ -340,7 +340,7 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.3.0
+          ## What's new in 3.3.1
 
           Cove can now be set as your magnet link handler from inside Settings, and keeps that registration working after an update.
 
