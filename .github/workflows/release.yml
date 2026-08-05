@@ -342,28 +342,16 @@ jobs:
           cat > "$NOTES_FILE" <<'NOTESEOF'
           ## What's new in 3.3.1
 
-          Cove can now be set as your magnet link handler from inside Settings, and keeps that registration working after an update.
-
-          ### Added
-
-          - **Magnet registration from Settings.** A new "Magnet links" row in Settings registers Cove as your magnet handler with no terminal command. On Linux it sets the default and confirms the result with your desktop before claiming success. On Windows it registers Cove and opens Settings at Cove's own entry, because since Windows 10 no application is allowed to make itself the default; the final choice stays yours.
-          - **Honest, live status.** The row reports what the operating system currently says, not what Cove would prefer, so a default you changed in another application shows up immediately. It is deliberately not a checkbox: a ticked box would keep claiming Cove was the default after you closed Windows Settings without picking it.
-          - **Registration survives updates.** The portable `.exe` and the AppImage carry their version in the filename, so updating used to leave the registration pointing at a file that no longer exists. Cove now repairs its own registration the next time the updated build is launched. It never silently reclaims a default you have since given to another application.
-          - **A one-time offer.** The first time you add a magnet or torrent by hand, Cove offers to handle magnet links. It asks once and remembers your answer either way.
-          - **Close to system tray.** Off by default, in Settings -> Window. The window X hides Cove to the tray instead of quitting, so the browser extension can still hand downloads to it. The tray menu has Open Cove and Quit Cove.
+          This maintenance release hardens download finalization and protects saved settings, especially on Windows.
 
           ### Fixed
 
-          - **Settings could be corrupted by two saves at once.** Cove wrote to a single shared temporary file before replacing the real one, so two saves happening together could publish a half-written file and lose your stored settings, including the local API secret. Each save now uses its own temporary file and saves are serialised.
-          - **"Remove Cove registration" could report success while doing nothing.** After updating the portable build, the recorded registration belonged to the older executable, so nothing was removed even though Cove said it had been. It now tells you the registration belongs to a different copy of Cove and leaves it untouched.
-          - **A declined magnet prompt could be silently overridden.** A background check running at startup could turn a "no" into a "yes" if you answered while it was still working.
-          - **Debian installs no longer claim to be registered when they are not.** The status now checks that the packaged desktop entry is actually installed.
-          - **Running from source no longer tries to register.** The path it would record belongs to the Python interpreter, not to Cove, so registration is refused and Settings explains why.
-
-          ### Notes
-
-          - Account-required YouTube content such as members-only or private videos is still not downloadable through the extension, since browser cookies are not forwarded for YouTube.
-          - If you delete an old portable `.exe` or AppImage and click a magnet link before ever launching the new build, Cove has not run yet and cannot repair anything.
+          - **Secure download publication.** Completed downloads are now published from private work directories without overwriting existing files. Name collisions use deterministic `(1)`, `(2)`, and later suffixes.
+          - **Native Windows publication failures.** Corrected the Windows `FileRenameInfo` buffer and destination-path handling that could produce `ERROR_INVALID_PARAMETER`.
+          - **Windows long paths and Unicode names.** Extended-length paths are preserved, and publication now handles long destinations and Unicode filenames correctly.
+          - **Safer cleanup.** Temporary download trees are validated before deletion, cleanup does not cross reparse points, and a cleanup failure no longer undoes a successfully published download.
+          - **Settings sharing races.** Cove now retries transient Windows sharing violations while reading or atomically replacing `settings.json`.
+          - **Unreadable settings no longer reset configuration.** Cove stops safely instead of silently replacing settings and rotating the local API credentials when the settings file remains inaccessible.
 
           ## Downloads
 
