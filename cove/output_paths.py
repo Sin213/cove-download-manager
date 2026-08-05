@@ -29,10 +29,14 @@ class _WindowsApiError(OSError):
     """An error returned by the small Windows publication boundary."""
 
     def __init__(self, operation: str, winerror: int, subject: object):
+        raw_winerror = int(winerror)
+        super().__init__(
+            raw_winerror,
+            f"{operation} failed with Windows error {raw_winerror}: {subject}",
+        )
         self.operation = operation
-        self.winerror = winerror
+        self.winerror_code = raw_winerror
         self.subject = subject
-        super().__init__(winerror, f"{operation} failed with Windows error {winerror}: {subject}")
 
 
 class _WindowsByHandleFileInformation(ctypes.Structure):
@@ -50,9 +54,17 @@ class _WindowsByHandleFileInformation(ctypes.Structure):
     ]
 
 
-class _WindowsFileRenameInfo(ctypes.Structure):
+class _WindowsFileRenameInfoOptions(ctypes.Union):
     _fields_ = [
         ("replace_if_exists", wintypes.BOOLEAN),
+        ("flags", wintypes.DWORD),
+    ]
+
+
+class _WindowsFileRenameInfo(ctypes.Structure):
+    _anonymous_ = ("options",)
+    _fields_ = [
+        ("options", _WindowsFileRenameInfoOptions),
         ("root_directory", wintypes.HANDLE),
         ("file_name_length", wintypes.DWORD),
         ("file_name", ctypes.c_wchar * 1),
@@ -81,19 +93,25 @@ class _WindowsFindData(ctypes.Structure):
 _WINDOWS_ERROR_FILE_NOT_FOUND = 2
 _WINDOWS_ERROR_PATH_NOT_FOUND = 3
 _WINDOWS_ERROR_NO_MORE_FILES = 18
+_WINDOWS_ERROR_FILE_EXISTS = 80
+_WINDOWS_ERROR_INVALID_PARAMETER = 87
 _WINDOWS_ERROR_ALREADY_EXISTS = 183
 _WINDOWS_ERROR_INVALID_HANDLE = 6
 _WINDOWS_ERROR_NOT_SAME_DEVICE = 17
 _WINDOWS_ERROR_ACCESS_DENIED = 5
 _WINDOWS_ERROR_SHARING_VIOLATION = 32
+_WINDOWS_ERROR_LOCK_VIOLATION = 33
+_WINDOWS_ERROR_DIR_NOT_EMPTY = 145
 _WINDOWS_ERROR_INVALID_FUNCTION = 1
 _WINDOWS_ERROR_NOT_SUPPORTED = 50
 _WINDOWS_ERROR_CALL_NOT_IMPLEMENTED = 120
 _WINDOWS_ERROR_DIRECTORY = 267
 _WINDOWS_ERROR_CANT_ACCESS_FILE = 1920
 
+_FILE_READ_DATA = 0x0001
 _FILE_LIST_DIRECTORY = 0x0001
 _FILE_ADD_FILE = 0x0002
+_FILE_TRAVERSE = 0x0020
 _FILE_READ_ATTRIBUTES = 0x0080
 _DELETE = 0x00010000
 _FILE_SHARE_READ = 0x00000001
@@ -227,10 +245,16 @@ class _WindowsPublicationApi:
         self,
         path: Path,
         expected_identity: tuple[int, int] | None,
+        *,
+        share_mode: int = _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
     ) -> tuple[int, tuple[int, int]]:
         handle = self._open_handle(
             path,
-            _FILE_LIST_DIRECTORY | _FILE_ADD_FILE | _FILE_READ_ATTRIBUTES,
+            _FILE_LIST_DIRECTORY
+            | _FILE_ADD_FILE
+            | _FILE_TRAVERSE
+            | _FILE_READ_ATTRIBUTES,
+            share_mode=share_mode,
         )
         try:
             info = self._file_information(handle, path)
@@ -323,7 +347,10 @@ class _WindowsPublicationApi:
                 share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
             )
         except _WindowsApiError as exc:
-            if exc.winerror in {_WINDOWS_ERROR_FILE_NOT_FOUND, _WINDOWS_ERROR_PATH_NOT_FOUND}:
+            if exc.winerror_code in {
+                _WINDOWS_ERROR_FILE_NOT_FOUND,
+                _WINDOWS_ERROR_PATH_NOT_FOUND,
+            }:
                 return None
             raise
         try:
@@ -359,6 +386,20 @@ class _WindowsPublicationApi:
             finally:
                 self._close(child_handle)
 
+    def _verify_cleanup_empty(self, path: Path) -> None:
+        remaining = self._enumerate_children(path)
+        if not remaining:
+            return
+        child_path = path / remaining[0]
+        opened = self._open_cleanup_child(child_path)
+        if opened is not None:
+            self._close(opened[0])
+        raise _WindowsApiError(
+            "delete cleanup descendant",
+            _WINDOWS_ERROR_DIR_NOT_EMPTY,
+            child_path,
+        )
+
     def pin_cleanup_root(self, work: "WorkDirectory") -> None:
         """Delete the exact validated non-reparse private directory tree."""
 
@@ -378,6 +419,7 @@ class _WindowsPublicationApi:
                 work.path, work.native_work_identity
             )
             self._delete_directory_contents(work.path)
+            self._verify_cleanup_empty(work.path)
             self._delete_handle(work_handle, work.path)
         finally:
             self._close(work_handle)
@@ -408,15 +450,46 @@ class _WindowsPublicationApi:
             size = int(length) + 1
         raise _WindowsApiError("final path validation", _WINDOWS_ERROR_INVALID_HANDLE, subject)
 
-    def _rename_no_replace(self, source_handle: int, destination_handle: int, candidate: str) -> None:
-        encoded_name = candidate.encode("utf-16-le")
+    @staticmethod
+    def _win32_path(final_path: str) -> str:
+        """Return the Win32 path ``FILE_RENAME_INFO`` should carry.
+
+        ``GetFinalPathNameByHandleW`` returns the extended-length ``\\\\?\\``
+        form, and that form is kept verbatim.  Native probing showed the
+        earlier no-clobber violation was caused by an undersized
+        ``FILE_RENAME_INFO`` buffer (the header was sized from
+        ``FileName.offset`` instead of ``ctypes.sizeof``), not by the prefix:
+        with the correct buffer size the ``\\\\?\\`` form renames correctly and
+        still reports collisions as ``ERROR_ALREADY_EXISTS``.  Keeping the
+        prefix removes any dependence on ``LongPathsEnabled``, interpreter
+        long-path awareness, or the application manifest, so publication to a
+        destination beyond ``MAX_PATH`` works everywhere.
+        """
+
+        return final_path
+
+    def _rename_no_replace(
+        self, source_handle: int, destination_directory: str, candidate: str
+    ) -> None:
+        # SetFileInformationByHandle is a Win32 wrapper over NtSetInformationFile
+        # that does not honour a RootDirectory handle: the relative form always
+        # fails with ERROR_INVALID_PARAMETER.  RootDirectory must be NULL and
+        # FileName must be the fully qualified destination path.  Containment is
+        # still enforced by holding the validated destination directory handle
+        # open without FILE_SHARE_DELETE for the duration of the rename.
+        encoded_name = ntpath.join(destination_directory, candidate).encode("utf-16-le")
         name_offset = _WindowsFileRenameInfo.file_name.offset
-        buffer = ctypes.create_string_buffer(
-            ctypes.sizeof(_WindowsFileRenameInfo) + len(encoded_name)
+        fixed_size = ctypes.sizeof(_WindowsFileRenameInfo)
+        assert ctypes.sizeof(_WindowsFileRenameInfoOptions) == ctypes.sizeof(wintypes.DWORD)
+        assert _WindowsFileRenameInfo.root_directory.offset % ctypes.alignment(wintypes.HANDLE) == 0
+        assert name_offset == (
+            _WindowsFileRenameInfo.file_name_length.offset + ctypes.sizeof(wintypes.DWORD)
         )
+        assert fixed_size >= name_offset + ctypes.sizeof(ctypes.c_wchar)
+        buffer = ctypes.create_string_buffer(fixed_size + len(encoded_name))
         info = ctypes.cast(buffer, ctypes.POINTER(_WindowsFileRenameInfo)).contents
         info.replace_if_exists = 0
-        info.root_directory = destination_handle
+        info.root_directory = None
         info.file_name_length = len(encoded_name)
         ctypes.memmove(ctypes.addressof(buffer) + name_offset, encoded_name, len(encoded_name))
         if not self._set_file_information(
@@ -443,6 +516,7 @@ class _WindowsPublicationApi:
             destination_handle, destination_identity = self._open_directory(
                 work.destination,
                 work.native_destination_identity,
+                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
             )
             if work_identity != work.native_work_identity or destination_identity != work.native_destination_identity:
                 raise _WindowsApiError(
@@ -461,7 +535,10 @@ class _WindowsPublicationApi:
                     _WINDOWS_ERROR_CANT_ACCESS_FILE,
                     source_path,
                 )
-            self._rename_no_replace(source_handle, destination_handle, candidate)
+            destination_directory = self._win32_path(
+                self._final_path(destination_handle, work.destination)
+            )
+            self._rename_no_replace(source_handle, destination_directory, candidate)
         finally:
             self._close(source_handle)
             self._close(destination_handle)
@@ -473,19 +550,30 @@ def _windows_publication_api_factory() -> _WindowsPublicationApi:
 
 
 def _windows_output_error(exc: _WindowsApiError) -> OutputPathError:
-    if "reparse" in exc.operation or "containment" in exc.operation or exc.winerror == _WINDOWS_ERROR_CANT_ACCESS_FILE:
+    if (
+        "reparse" in exc.operation
+        or "containment" in exc.operation
+        or exc.winerror_code == _WINDOWS_ERROR_CANT_ACCESS_FILE
+    ):
         category = "reparse-point or containment failure"
-    elif "identity" in exc.operation or exc.winerror == _WINDOWS_ERROR_INVALID_HANDLE:
+    elif (
+        "identity" in exc.operation
+        or exc.winerror_code == _WINDOWS_ERROR_INVALID_HANDLE
+    ):
         category = "invalid or replaced directory handle"
-    elif exc.winerror in {
+    elif exc.winerror_code in {
         _WINDOWS_ERROR_INVALID_FUNCTION,
         _WINDOWS_ERROR_NOT_SUPPORTED,
         _WINDOWS_ERROR_CALL_NOT_IMPLEMENTED,
     }:
         category = "unsupported filesystem or Windows API"
-    elif exc.winerror == _WINDOWS_ERROR_NOT_SAME_DEVICE:
+    elif exc.winerror_code == _WINDOWS_ERROR_NOT_SAME_DEVICE:
         category = "cross-device operation"
-    elif exc.winerror in {_WINDOWS_ERROR_ACCESS_DENIED, _WINDOWS_ERROR_SHARING_VIOLATION}:
+    elif exc.winerror_code in {
+        _WINDOWS_ERROR_ACCESS_DENIED,
+        _WINDOWS_ERROR_SHARING_VIOLATION,
+        _WINDOWS_ERROR_LOCK_VIOLATION,
+    }:
         category = "permission or sharing failure"
     else:
         category = "unexpected Windows API error"
@@ -806,9 +894,12 @@ def _windows_link_candidate(work: WorkDirectory, source_path: Path, candidate: s
     try:
         _windows_publication_api_factory().publish_no_replace(work, source_path, candidate)
     except _WindowsApiError as exc:
-        if exc.operation == "rename" and exc.winerror == _WINDOWS_ERROR_ALREADY_EXISTS:
+        if exc.operation == "rename" and exc.winerror_code in {
+            _WINDOWS_ERROR_FILE_EXISTS,
+            _WINDOWS_ERROR_ALREADY_EXISTS,
+        }:
             collision = FileExistsError(errno.EEXIST, f"Public output already exists: {exc.subject}")
-            collision.winerror = exc.winerror
+            collision.winerror = exc.winerror_code
             raise collision from exc
         raise _windows_output_error(exc) from exc
 
