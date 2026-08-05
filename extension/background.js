@@ -297,7 +297,13 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   console.log("Cove: context menu clicked", info.menuItemId, info.linkUrl || info.srcUrl);
   if (info.menuItemId !== "download-with-cove") return;
 
-  const url = info.linkUrl || info.srcUrl;
+  // A link target is what the user pointed at, so it always wins. A media
+  // srcUrl does not: MSE players (YouTube) expose a blob: URL that nothing
+  // downstream can fetch, so fall back to the extractor page URL the pill
+  // already sends for the same video.
+  const target = info.linkUrl || info.srcUrl || "";
+  const extractorUrl = extractorPageUrl(tab && tab.url) || extractorPageUrl(info.pageUrl);
+  const url = /^https?:\/\//i.test(target) ? target : extractorUrl;
   if (!url) return;
 
   let cookieStr = "";
@@ -306,13 +312,15 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
   } catch {}
 
-  let filename = null;
-  try {
-    const pathname = new URL(url).pathname;
-    const parts = pathname.split("/");
-    const last = parts[parts.length - 1];
-    if (last && last.includes(".")) filename = decodeURIComponent(last);
-  } catch {}
+  let filename = url === extractorUrl ? mediaFilename(tab, url) : null;
+  if (!filename) {
+    try {
+      const pathname = new URL(url).pathname;
+      const parts = pathname.split("/");
+      const last = parts[parts.length - 1];
+      if (last && last.includes(".")) filename = decodeURIComponent(last);
+    } catch {}
+  }
 
   const result = await sendNativeMessage({
     action: "download",
@@ -329,6 +337,11 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     // Same as above: a malformed reply can be null, and throwing here would
     // skip the browser fallback entirely - the one thing that must not fail.
     const reason = (result && result.message) || "no response";
+    if (url === extractorUrl) {
+      // The browser would save the watch page's HTML, not the video.
+      showNotification("Cove error", reason);
+      return;
+    }
     console.error("Cove: context menu send failed, falling back to browser", reason);
     try {
       markIntercepted(url);

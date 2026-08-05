@@ -190,6 +190,18 @@
     }
   }
 
+  // Fraction of the anchor video that must be inside the viewport for the
+  // pill to be shown, and for that video to be picked as the anchor at all.
+  const MIN_VISIBLE_FRACTION = 0.5;
+
+  function visibleFraction(rect) {
+    const area = rect.width * rect.height;
+    if (area <= 0) return 0;
+    const visibleWidth = Math.max(0, Math.min(rect.right, window.innerWidth) - Math.max(rect.left, 0));
+    const visibleHeight = Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0));
+    return (visibleWidth * visibleHeight) / area;
+  }
+
   // Positions the host directly above the video, right-aligned to its
   // top-right edge. Falls back to just inside the video's own top-right
   // corner when "above" would clip outside the viewport. An invalid,
@@ -199,6 +211,16 @@
     if (!video || !video.isConnected) return false;
     const rect = video.getBoundingClientRect();
     if (rect.width < 80 || rect.height < 60) return false;
+
+    // A video scrolled out of view still reports a full-size rect (with a
+    // negative top), and the clamping below would then pin the pill to the
+    // top of the viewport, attached to nothing. Hide it while the anchor is
+    // out of view; a later reposition() brings it back. The anchor is still
+    // valid, so this is not a deactivation.
+    if (visibleFraction(rect) < MIN_VISIBLE_FRACTION) {
+      if (host) host.style.display = "none";
+      return true;
+    }
 
     ensurePill();
     // Measure the pill's own footprint before placing it so the "would it
@@ -210,13 +232,18 @@
     const pillHeight = pillRect.height || 30;
     const pillWidth = pillRect.width || 160;
 
+    // The video's visible band, not the whole viewport: a partly scrolled
+    // video is still eligible, and clamping to the viewport would park the
+    // pill at y=4 with the video's visible part somewhere else entirely.
+    const bandTop = Math.max(rect.top, 0);
+    const bandBottom = Math.min(rect.bottom, window.innerHeight);
+
     let top = rect.top - pillHeight - PILL_GAP_PX;
     if (top < 4) {
-      // Clipped above the viewport: sit just inside the video's own
+      // Clipped above the viewport: sit just inside the video's own visible
       // top-right corner instead of jumping to an unrelated page corner.
-      top = rect.top + PILL_GAP_PX;
+      top = Math.min(bandTop + PILL_GAP_PX, Math.max(bandTop, bandBottom - pillHeight));
     }
-    top = Math.max(4, Math.min(top, window.innerHeight - pillHeight - 4));
 
     let right = Math.max(4, window.innerWidth - rect.right);
     const maxRight = window.innerWidth - pillWidth - 4;
@@ -266,7 +293,25 @@
   }
 
   function reposition() {
-    if (!activeVideo || !host || host.style.display === "none") return;
+    // Neither a hidden nor a not-yet-created host is skipped: the pill is
+    // hidden (not deactivated) while its anchor is scrolled out of view, and
+    // a video that started playing off-screen has no host at all yet. This
+    // is what creates or restores it once the anchor scrolls back in.
+    if (!activeVideo) return;
+    // The anchor scrolled mostly out of view: hand the pill to another
+    // playing video that is visible rather than leaving it hidden until the
+    // next hover or bounded scan.
+    if (visibleFraction(activeVideo.getBoundingClientRect()) < MIN_VISIBLE_FRACTION) {
+      const found = findAlreadyPlayingVideo();
+      if (
+        found &&
+        found.video !== activeVideo &&
+        visibleFraction(found.video.getBoundingClientRect()) >= MIN_VISIBLE_FRACTION
+      ) {
+        activateVideo(found.video, found.url);
+        return;
+      }
+    }
     if (!positionPill(activeVideo)) deactivateVideo();
   }
 
@@ -279,8 +324,10 @@
     cancelHide();
     hideTimer = setTimeout(() => {
       // A pill anchored to a still-playing video is not hover-dismissed;
-      // only a hover-only pill (nothing actively playing) times out.
-      if (activeVideo && isCurrentlyPlaying(activeVideo)) return;
+      // only a hover-only pill (nothing actively playing) times out. A
+      // detached video never counts as playing, or a torn-down preview
+      // (which is never paused before removal) would keep the pill forever.
+      if (activeVideo && activeVideo.isConnected && isCurrentlyPlaying(activeVideo)) return;
       deactivateVideo();
     }, HIDE_DELAY_MS);
   }
@@ -392,6 +439,18 @@
     if (!pillEnabled) return;
     if (!isCurrentlyPlaying(video)) return;
     scheduleDetectedStreamRefreshes();
+    // A mostly off-screen video does not take the pill from a visible video
+    // that is still playing: its own pill would be hidden on arrival, so the
+    // handover would just make the pill vanish.
+    if (
+      activeVideo &&
+      activeVideo !== video &&
+      isCurrentlyPlaying(activeVideo) &&
+      visibleFraction(video.getBoundingClientRect()) < MIN_VISIBLE_FRACTION &&
+      visibleFraction(activeVideo.getBoundingClientRect()) >= MIN_VISIBLE_FRACTION
+    ) {
+      return;
+    }
     const url = videoUrl(video);
     activateVideo(video, url);
   }
@@ -402,13 +461,17 @@
     // Hand off to another currently-playing qualifying video if one exists
     // on the page (e.g. a feed where the next post auto-plays); otherwise
     // hide.
-    for (const v of knownVideos) {
-      if (v === video || !isCurrentlyPlaying(v)) continue;
-      if (isDrmProtected(v)) continue;
-      activateVideo(v, videoUrl(v));
+    // Same visibility-aware selection as the startup scan, so a mostly
+    // off-screen video cannot take the pill ahead of a visible one.
+    const found = findAlreadyPlayingVideo();
+    if (found && found.video !== video) {
+      activateVideo(found.video, found.url);
       return;
     }
-    deactivateVideo();
+    // Not an immediate hide: a feed preview stops the moment the pointer
+    // leaves the thumbnail, which is exactly while the pointer is travelling
+    // to the pill. The grace period is what makes the pill clickable there.
+    scheduleHide();
   }
 
   // Videos that already have direct listeners attached. Prevents duplicate
@@ -474,9 +537,12 @@
         const removedActive =
           node === activeVideo ||
           (activeVideo && typeof node.contains === "function" && node.contains(activeVideo));
-        if (removedActive) deactivateVideo();
+        // Same grace period as a stopped preview: YouTube detaches the
+        // inline player element on pointer-out, and hiding right then is
+        // what makes the pill unclickable on the feed.
+        if (removedActive) scheduleHide();
       }
-      if (activeVideo && !activeVideo.isConnected) deactivateVideo();
+      if (activeVideo && !activeVideo.isConnected) scheduleHide();
     }
   });
   observeVideoRoot(document.documentElement);
@@ -497,7 +563,9 @@
       isCurrentlyPlaying(lastKnownPlayingVideo)
     ) {
       const rect = lastKnownPlayingVideo.getBoundingClientRect();
-      if (rect.width >= 80 && rect.height >= 60) {
+      // A mostly off-screen last-known target is not usable: its pill would
+      // be hidden on sight, suppressing a visible playing video's pill.
+      if (rect.width >= 80 && rect.height >= 60 && visibleFraction(rect) >= MIN_VISIBLE_FRACTION) {
         if (!isDrmProtected(lastKnownPlayingVideo)) {
           return { video: lastKnownPlayingVideo, url: videoUrl(lastKnownPlayingVideo) };
         }
@@ -507,7 +575,8 @@
     // visible currently-playing qualifying video. Never a thumbnail/poster
     // (readyState gate) or an offscreen/zero-size element (rect gate).
     let best = null;
-    let bestArea = 0;
+    let bestScore = -1;
+    let bestQualifies = false;
     for (const video of knownVideos) {
       if (!video.isConnected) {
         knownVideos.delete(video);
@@ -519,9 +588,19 @@
       const rect = video.getBoundingClientRect();
       if (rect.width < 80 || rect.height < 60) continue;
       const url = videoUrl(video);
-      const area = rect.width * rect.height;
-      if (area > bestArea) {
-        bestArea = area;
+      // Sufficiently visible candidates always outrank the rest, and only
+      // then does size decide: a bigger but mostly off-screen video would
+      // otherwise take the pill and immediately hide it, even though it can
+      // still have more visible pixels than a smaller fully visible one.
+      // A below-threshold candidate can still win when it is the only one;
+      // its pill then appears once it scrolls into view.
+      const fraction = visibleFraction(rect);
+      const qualifies = fraction >= MIN_VISIBLE_FRACTION;
+      const score = fraction * rect.width * rect.height;
+      const better = qualifies === bestQualifies ? score > bestScore : qualifies;
+      if (better) {
+        bestQualifies = qualifies;
+        bestScore = score;
         best = { video, url };
       }
     }
@@ -530,7 +609,14 @@
 
   function scanForActiveVideo() {
     if (!pillEnabled) return;
-    if (activeVideo && isCurrentlyPlaying(activeVideo)) {
+    // An active video whose pill is hidden for being off-screen does not
+    // hold the pill against a visible playing video; fall through so the
+    // search below can hand it over.
+    if (
+      activeVideo &&
+      isCurrentlyPlaying(activeVideo) &&
+      visibleFraction(activeVideo.getBoundingClientRect()) >= MIN_VISIBLE_FRACTION
+    ) {
       const url = videoUrl(activeVideo);
       if (url && url !== currentUrl) {
         currentUrl = url;
@@ -609,8 +695,15 @@
       const video = videoFromEvent(e);
       if (video) {
         // Playback is authoritative: don't steal the pill from a different
-        // video that's actively playing.
-        if (activeVideo && activeVideo !== video && isCurrentlyPlaying(activeVideo)) {
+        // video that's actively playing - unless that video has scrolled
+        // mostly out of view, in which case its pill is hidden anyway and
+        // the hovered one is what the user can actually see.
+        if (
+          activeVideo &&
+          activeVideo !== video &&
+          isCurrentlyPlaying(activeVideo) &&
+          visibleFraction(activeVideo.getBoundingClientRect()) >= MIN_VISIBLE_FRACTION
+        ) {
           return;
         }
         const url = videoUrl(video);

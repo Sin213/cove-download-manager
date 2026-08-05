@@ -277,6 +277,92 @@ test("context menu falls back to a browser download when Cove is closed", async 
   assert.deepEqual(calls.cancel, []);
 });
 
+test("context menu on a YouTube player sends the watch page, not the blob src", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      {
+        menuItemId: "download-with-cove",
+        srcUrl: "blob:https://www.youtube.com/2b0f8c1e-0000-4000-8000-000000000000",
+        pageUrl: "https://www.youtube.com/watch?v=abc123",
+      },
+      { url: "https://www.youtube.com/watch?v=abc123", title: "Clip - YouTube" }
+    )
+  );
+  await settle();
+
+  const sent = calls.native.filter((m) => m.action === "download");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, "https://www.youtube.com/watch?v=abc123");
+  assert.equal(sent[0].filename, "Clip.mp4");
+});
+
+test("context menu keeps a real link target on an extractor page", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      {
+        menuItemId: "download-with-cove",
+        linkUrl: "https://example.test/manual.zip",
+        pageUrl: "https://www.youtube.com/watch?v=abc123",
+      },
+      { url: "https://www.youtube.com/watch?v=abc123" }
+    )
+  );
+  await settle();
+
+  const sent = calls.native.filter((m) => m.action === "download");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, "https://example.test/manual.zip");
+});
+
+test("an extractor page URL is never handed to the browser downloader", async () => {
+  const { events, browserDownloads } = loadBackground({ nativeResult: null });
+  await settle();
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      {
+        menuItemId: "download-with-cove",
+        srcUrl: "blob:https://www.youtube.com/2b0f8c1e-0000-4000-8000-000000000000",
+        pageUrl: "https://www.youtube.com/watch?v=abc123",
+      },
+      { url: "https://www.youtube.com/watch?v=abc123" }
+    )
+  );
+  await settle();
+
+  // The browser would save the watch page's HTML, not the video.
+  assert.equal(browserDownloads.length, 0);
+});
+
+test("context menu ignores an unusable blob src off an extractor page", async () => {
+  const { calls, events, browserDownloads } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      {
+        menuItemId: "download-with-cove",
+        srcUrl: "blob:https://example.test/2b0f8c1e-0000-4000-8000-000000000000",
+        pageUrl: "https://example.test/player",
+      },
+      { url: "https://example.test/player" }
+    )
+  );
+  await settle();
+
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0);
+  assert.equal(browserDownloads.length, 0);
+});
+
 // ---- Media pill failure reporting ----
 
 // Drives the onMessage listener the in-page pill talks to and returns the

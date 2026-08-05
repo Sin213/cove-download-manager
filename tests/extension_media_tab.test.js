@@ -1,0 +1,441 @@
+// Drives extension/content/media-tab.js against a hand-rolled DOM stub.
+//
+// The content script only touches a small, well-known slice of the DOM
+// (createElement/attachShadow/appendChild, getBoundingClientRect, event
+// listeners, MutationObserver, ResizeObserver), so a stub is enough and
+// keeps the extension tests dependency-free like the background ones.
+
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const test = require("node:test");
+const vm = require("node:vm");
+
+class StubNode {
+  constructor(tagName = "DIV") {
+    this.tagName = tagName.toUpperCase();
+    this.nodeType = 1;
+    this.children = [];
+    this.parentNode = null;
+    this.shadowRoot = null;
+    this.style = {};
+    this.listeners = new Map();
+    this.isConnected = true;
+    this.rect = { top: 0, left: 0, width: 0, height: 0, right: 0, bottom: 0 };
+    this.classList = {
+      _set: new Set(),
+      add: (...names) => names.forEach((n) => this.classList._set.add(n)),
+      remove: (...names) => names.forEach((n) => this.classList._set.delete(n)),
+      contains: (name) => this.classList._set.has(name),
+    };
+  }
+
+  appendChild(child) {
+    this.children.push(child);
+    child.parentNode = this;
+    return child;
+  }
+
+  setAttribute() {}
+
+  addEventListener(type, listener) {
+    if (!this.listeners.has(type)) this.listeners.set(type, []);
+    this.listeners.get(type).push(listener);
+  }
+
+  removeEventListener() {}
+
+  dispatch(type, event = {}) {
+    for (const listener of this.listeners.get(type) || []) listener(event);
+  }
+
+  attachShadow() {
+    this.shadowRoot = new StubNode("SHADOW");
+    this.shadowRoot.nodeType = 11;
+    return this.shadowRoot;
+  }
+
+  getBoundingClientRect() {
+    return this.rect;
+  }
+
+  closest(selector) {
+    return selector === "video" && this.tagName === "VIDEO" ? this : null;
+  }
+
+  querySelector() {
+    return null;
+  }
+
+  getAttribute(name) {
+    return name in this ? this[name] : null;
+  }
+
+  contains(node) {
+    if (node === this) return true;
+    return this.children.some((child) => child.contains && child.contains(node));
+  }
+
+  querySelectorAll() {
+    return [];
+  }
+}
+
+// A <video> placed at `top` with the given size, in viewport coordinates.
+function stubVideo({ top = 100, width = 640, height = 360 } = {}) {
+  const video = new StubNode("VIDEO");
+  video.paused = false;
+  video.ended = false;
+  video.currentSrc = "https://example.test/clip.mp4";
+  video.src = "https://example.test/clip.mp4";
+  video.scrollTo = (nextTop) => {
+    video.rect = { ...video.rect, top: nextTop, bottom: nextTop + height };
+  };
+  video.rect = { top, left: 0, width, height, right: width, bottom: top + height };
+  return video;
+}
+
+function loadMediaTab({ href = "https://example.test/watch", videos = [] } = {}) {
+  const timers = [];
+  const documentElement = new StubNode("HTML");
+  const body = new StubNode("BODY");
+  documentElement.appendChild(body);
+  for (const video of videos) body.appendChild(video);
+  // The script's startup scan is what attaches the direct play/pause
+  // listeners, so the videos have to be discoverable from the root.
+  documentElement.querySelectorAll = (selector) => (selector === "video" ? videos : []);
+
+  const doc = {
+    documentElement,
+    body,
+    listeners: new Map(),
+    createElement: (tag) => new StubNode(tag),
+    querySelector: () => null,
+    addEventListener(type, listener) {
+      if (!doc.listeners.has(type)) doc.listeners.set(type, []);
+      doc.listeners.get(type).push(listener);
+    },
+    dispatch(type, event) {
+      for (const listener of doc.listeners.get(type) || []) listener(event);
+    },
+  };
+
+  const win = {
+    innerWidth: 1280,
+    innerHeight: 720,
+    listeners: new Map(),
+    addEventListener(type, listener) {
+      if (!win.listeners.has(type)) win.listeners.set(type, []);
+      win.listeners.get(type).push(listener);
+    },
+    dispatch(type, event = {}) {
+      for (const listener of win.listeners.get(type) || []) listener(event);
+    },
+  };
+
+  const browser = {
+    runtime: {
+      id: "cove-test",
+      sendMessage: async () => ({ mediaPillEnabled: true }),
+      onMessage: { addListener() {} },
+    },
+    storage: { onChanged: { addListener() {} } },
+  };
+
+  const context = vm.createContext({
+    globalThis: undefined,
+    browser,
+    chrome: browser,
+    document: doc,
+    window: win,
+    location: { href },
+    console: { log() {}, error() {}, warn() {} },
+    // The playback listeners type-check their target; the stub videos are
+    // not real elements, so match on the tag name instead.
+    HTMLVideoElement: class {
+      static [Symbol.hasInstance](value) {
+        return !!value && value.tagName === "VIDEO";
+      }
+    },
+    URL,
+    Date,
+    Math,
+    Promise,
+    Set,
+    Map,
+    WeakSet,
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    ResizeObserver: class {
+      observe() {}
+      disconnect() {}
+    },
+    setTimeout: (fn, ms) => {
+      const handle = { fn, ms };
+      timers.push(handle);
+      return handle;
+    },
+    clearTimeout: (handle) => {
+      const index = timers.indexOf(handle);
+      if (index >= 0) timers.splice(index, 1);
+    },
+  });
+  context.globalThis = context;
+
+  const source = fs.readFileSync("extension/content/media-tab.js", "utf8");
+  vm.runInContext(source, context, { filename: "extension/content/media-tab.js" });
+
+  // The pill host is the only node the script itself appends to the body.
+  const pillHost = () =>
+    body.children.find((node) => node.className === "cove-media-tab-host") || null;
+  const runTimers = () => {
+    const pending = timers.splice(0, timers.length);
+    for (const handle of pending) handle.fn();
+  };
+  return { doc, win, body, pillHost, runTimers, timers };
+}
+
+// Brings a video up as the active pill target through the hover path.
+function hover(harness, video) {
+  harness.doc.dispatch("mouseover", { target: video });
+  const host = harness.pillHost();
+  if (host) host.rect = { top: 0, left: 0, width: 160, height: 30, right: 160, bottom: 30 };
+  harness.doc.dispatch("mouseover", { target: video });
+  return harness.pillHost();
+}
+
+test("the pill is anchored above its video while the video is in view", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+
+  assert.ok(host, "expected a pill host to be created");
+  assert.equal(host.style.display, "block");
+  // 200 (video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "162px");
+});
+
+test("the pill hides instead of pinning itself to the top of the viewport", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+  assert.equal(host.style.display, "block");
+
+  // Scroll the video off the top of the viewport.
+  video.scrollTo(-400);
+  harness.win.dispatch("scroll");
+
+  assert.equal(host.style.display, "none");
+  assert.notEqual(host.style.top, "4px");
+});
+
+test("the pill comes back when its video scrolls into view again", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+
+  video.scrollTo(-400);
+  harness.win.dispatch("scroll");
+  assert.equal(host.style.display, "none");
+
+  video.scrollTo(200);
+  harness.win.dispatch("scroll");
+
+  assert.equal(host.style.display, "block");
+  assert.equal(host.style.top, "162px");
+});
+
+test("a video that starts playing off-screen gets its pill on scroll-in", () => {
+  const video = stubVideo({ top: 900 }); // below a 720px viewport
+  const harness = loadMediaTab({ videos: [video] });
+  harness.doc.dispatch("mouseover", { target: video });
+  assert.equal(harness.pillHost(), null, "no pill host is created off-screen");
+
+  video.scrollTo(200);
+  harness.win.dispatch("scroll");
+
+  const host = harness.pillHost();
+  assert.ok(host, "expected the pill to appear once the video scrolled in");
+  assert.equal(host.style.display, "block");
+});
+
+test("a visible playing video wins the pill over a bigger off-screen one", () => {
+  const visible = stubVideo({ top: 100, width: 640, height: 360 });
+  const offscreen = stubVideo({ top: 900, width: 1280, height: 720 });
+  for (const video of [visible, offscreen]) video.readyState = 4;
+  // Registration order makes the off-screen video the last one to claim the
+  // pill, so the bounded startup scans are what must hand it back.
+  const harness = loadMediaTab({ videos: [visible, offscreen] });
+  harness.runTimers();
+
+  const host = harness.pillHost();
+  assert.ok(host, "expected a pill for the visible video");
+  assert.equal(host.style.display, "block");
+  // 100 (visible video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "62px");
+});
+
+test("a stopped video hands the pill to a visible video, not an off-screen one", () => {
+  const offscreen = stubVideo({ top: 900, width: 1280, height: 720 });
+  const visible = stubVideo({ top: 300, width: 640, height: 360 });
+  const active = stubVideo({ top: 100, width: 640, height: 360 });
+  for (const video of [offscreen, visible, active]) video.readyState = 4;
+  const harness = loadMediaTab({ videos: [offscreen, visible, active] });
+
+  active.paused = true;
+  active.dispatch("pause", { target: active });
+
+  const host = harness.pillHost();
+  assert.equal(host.style.display, "block");
+  // 300 (visible video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "262px");
+});
+
+test("a small fully visible video outranks a large mostly off-screen one", () => {
+  // 1920x1080 with only ~40% on screen still has more visible pixels than a
+  // fully visible 640x360, so visible area alone would pick the wrong one.
+  const big = stubVideo({ top: 260, width: 1920, height: 1080 });
+  const small = stubVideo({ top: 100, width: 640, height: 360 });
+  for (const video of [big, small]) video.readyState = 4;
+  const harness = loadMediaTab({ videos: [small, big] });
+  harness.runTimers();
+
+  const host = harness.pillHost();
+  assert.equal(host.style.display, "block");
+  // 100 (small video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "62px");
+});
+
+test("an off-screen video starting playback does not steal the pill", () => {
+  const visible = stubVideo({ top: 100, width: 640, height: 360 });
+  const offscreen = stubVideo({ top: 900, width: 1280, height: 720 });
+  visible.readyState = 4;
+  offscreen.readyState = 4;
+  offscreen.paused = true;
+  const harness = loadMediaTab({ videos: [visible, offscreen] });
+
+  offscreen.paused = false;
+  offscreen.dispatch("playing", { target: offscreen });
+
+  const host = harness.pillHost();
+  assert.equal(host.style.display, "block");
+  // 100 (visible video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "62px");
+});
+
+test("hovering a visible video takes the pill from an off-screen player", () => {
+  const playing = stubVideo({ top: 100, width: 640, height: 360 });
+  const hovered = stubVideo({ top: 300, width: 640, height: 360 });
+  playing.readyState = 4;
+  hovered.paused = true;
+  const harness = loadMediaTab({ videos: [playing, hovered] });
+
+  // The playing video scrolls away but keeps playing, so it stays active.
+  playing.scrollTo(-400);
+  harness.win.dispatch("scroll");
+  assert.equal(harness.pillHost().style.display, "none");
+
+  harness.doc.dispatch("mouseover", { target: hovered });
+
+  const host = harness.pillHost();
+  assert.equal(host.style.display, "block");
+  // 300 (hovered video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "262px");
+});
+
+test("a partly scrolled video keeps the pill inside its visible band", () => {
+  // 260 of 360 px still on screen: eligible, but "above the video" is off
+  // the top of the viewport.
+  const video = stubVideo({ top: 200, height: 360 });
+  const harness = loadMediaTab({ videos: [video] });
+  hover(harness, video);
+
+  video.scrollTo(-100);
+  harness.win.dispatch("scroll");
+
+  const host = harness.pillHost();
+  assert.equal(host.style.display, "block");
+  // Just inside the visible top edge of the video, not clamped to y=4.
+  assert.equal(host.style.top, "8px");
+});
+
+test("scrolling the active video away hands the pill to a visible one", () => {
+  const active = stubVideo({ top: 100, width: 640, height: 360 });
+  const other = stubVideo({ top: 400, width: 640, height: 360 });
+  active.readyState = 4;
+  other.readyState = 4;
+  const harness = loadMediaTab({ videos: [other, active] });
+
+  active.scrollTo(-400);
+  harness.win.dispatch("scroll");
+
+  const host = harness.pillHost();
+  assert.equal(host.style.display, "block");
+  // 400 (other video top) - 30 (pill height) - 8 (gap)
+  assert.equal(host.style.top, "362px");
+});
+
+test("a video scrolled just past the halfway mark hides the pill", () => {
+  const video = stubVideo({ top: 0, height: 360 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+  assert.equal(host.style.display, "block");
+
+  video.scrollTo(-200); // 160 of 360 px visible
+  harness.win.dispatch("scroll");
+
+  assert.equal(host.style.display, "none");
+});
+
+test("a paused feed preview keeps the pill up long enough to click it", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+  assert.equal(host.style.display, "block");
+
+  // YouTube tears its inline preview down as soon as the pointer leaves the
+  // thumbnail, which is exactly when the pointer is travelling to the pill.
+  video.paused = true;
+  video.dispatch("pause", { target: video });
+
+  assert.equal(host.style.display, "block");
+});
+
+test("a torn-down feed preview hides the pill once the grace period expires", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+
+  video.paused = true;
+  video.dispatch("pause", { target: video });
+  harness.runTimers();
+
+  assert.equal(host.style.display, "none");
+});
+
+test("a detached preview that never paused still times out", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+
+  // YouTube removes the inline preview element without pausing it first.
+  video.isConnected = false;
+  video.dispatch("emptied", { target: video });
+  harness.runTimers();
+
+  assert.equal(host.style.display, "none");
+});
+
+test("hovering the pill itself cancels the pending hide", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ videos: [video] });
+  const host = hover(harness, video);
+
+  video.paused = true;
+  video.dispatch("pause", { target: video });
+  host.dispatch("mouseenter", {});
+  harness.runTimers();
+
+  assert.equal(host.style.display, "block");
+});
