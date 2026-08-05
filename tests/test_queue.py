@@ -8,6 +8,7 @@ a persisted queued/active/paused task was restored on startup.
 import errno
 import hashlib
 import os
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -5164,3 +5165,191 @@ def test_output_helper_windows_cleanup_real_tree_and_failure(tmp_path):
     assert blocked_file.exists()
     assert blocked_file.read_bytes() == b"blocked"
     cleanup_work_directory(blocked)
+
+
+# --- publication beyond MAX_PATH -------------------------------------------
+#
+# A review raised that _win32_path stripping the \\?\ prefix could break
+# publication to destinations longer than MAX_PATH (260). Native probing
+# settled it: the silent no-clobber violation came from an undersized
+# FILE_RENAME_INFO buffer, not from the prefix. With the correct
+# ctypes.sizeof() header the \\?\ form renames correctly and still reports
+# collisions, so the prefix is now preserved and publication no longer depends
+# on LongPathsEnabled or interpreter long-path awareness.
+
+_WINDOWS_LONG_PATH_PREFIX = "\\\\?\\"
+
+
+def _windows_long_destination(tmp_path):
+    r"""A destination directory whose path exceeds 260 UTF-16 code units.
+
+    Created through the \\?\ form, which reaches the object manager directly
+    and therefore works regardless of the LongPathsEnabled machine policy. The
+    representation handed to the code under test is the plain path when this
+    runtime can resolve it, and the extended-length path otherwise - the test
+    must exercise real publication either way, never skip.
+    """
+    destination = tmp_path
+    while len(str(destination)) <= 260:
+        destination = destination / ("d" * 50)
+    os.makedirs(_WINDOWS_LONG_PATH_PREFIX + str(destination), exist_ok=True)
+    try:
+        destination.stat()
+    except OSError:  # pragma: no cover - depends on machine policy
+        return Path(_WINDOWS_LONG_PATH_PREFIX + str(destination))
+    return destination
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+def test_output_helper_windows_real_publication_long_path(tmp_path, monkeypatch):
+    destination = _windows_long_destination(tmp_path)
+    assert len(str(destination)) > 260
+
+    observed = []
+    rename_info = output_paths._WindowsFileRenameInfo
+    real_factory = output_paths._windows_publication_api_factory
+
+    def observing_factory():
+        api = real_factory()
+        real_set = api._set_file_information
+
+        def observing_set(handle, info_class, buffer, buffer_length):
+            # Not a mock: the real SetFileInformationByHandle still performs the
+            # rename. This only records what the production code handed it.
+            if info_class == output_paths._FILE_RENAME_INFO:
+                info = output_paths.ctypes.cast(
+                    buffer, output_paths.ctypes.POINTER(rename_info)
+                ).contents
+                name = output_paths.ctypes.string_at(
+                    buffer.value + rename_info.file_name.offset,
+                    info.file_name_length,
+                ).decode("utf-16-le")
+                observed.append(
+                    {
+                        "name": name,
+                        "root_directory": info.root_directory,
+                        "replace_if_exists": info.replace_if_exists,
+                        "buffer_length": buffer_length,
+                        "expected_length": (
+                            output_paths.ctypes.sizeof(rename_info)
+                            + info.file_name_length
+                        ),
+                        "undersized_length": (
+                            rename_info.file_name.offset + info.file_name_length
+                        ),
+                    }
+                )
+            return real_set(handle, info_class, buffer, buffer_length)
+
+        api._set_file_information = observing_set
+        return api
+
+    monkeypatch.setattr(
+        output_paths, "_windows_publication_api_factory", observing_factory
+    )
+
+    def publish(filename, payload):
+        work = create_work_directory(destination)
+        source = work.path / "private.bin"
+        source.write_bytes(payload)
+        published = publish_output(work, source, filename)
+        # The private copy must be gone, not merely superseded.
+        assert not source.exists()
+        assert not work.path.exists()
+        return published
+
+    first = publish("name.ext", b"first")
+    assert first == destination / "name.ext"
+    assert len(str(first)) > 260
+    assert first.read_bytes() == b"first"
+
+    # Collisions must still resolve deterministically and never overwrite.
+    second = publish("name.ext", b"second")
+    assert second == destination / "name (1).ext"
+    assert second.read_bytes() == b"second"
+    assert first.read_bytes() == b"first"
+
+    third = publish("name.ext", b"third")
+    assert third == destination / "name (2).ext"
+    assert third.read_bytes() == b"third"
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
+
+    unicode_published = publish("世界-δοκιμή.ext", b"unicode")
+    assert unicode_published == destination / "世界-δοκιμή.ext"
+    assert len(str(unicode_published)) > 260
+    assert unicode_published.read_bytes() == b"unicode"
+
+    # Every rename the production code issued kept the extended-length prefix,
+    # used a NULL RootDirectory, refused replacement, and sized its buffer from
+    # the complete ctypes.sizeof() header.
+    assert observed
+    for record in observed:
+        assert record["name"].startswith(_WINDOWS_LONG_PATH_PREFIX)
+        assert len(record["name"]) > 260
+        assert record["root_directory"] is None
+        assert record["replace_if_exists"] == 0
+        assert record["buffer_length"] == record["expected_length"]
+        assert record["buffer_length"] != record["undersized_length"]
+
+    # A collision on a >260 destination must surface the raw Windows error.
+    collision_work = create_work_directory(destination)
+    collision_source = collision_work.path / "private.bin"
+    collision_source.write_bytes(b"collision")
+    with pytest.raises(output_paths._WindowsApiError) as caught:
+        observing_factory().publish_no_replace(
+            collision_work, collision_source, "name.ext"
+        )
+    assert caught.value.winerror_code in {
+        output_paths._WINDOWS_ERROR_FILE_EXISTS,
+        output_paths._WINDOWS_ERROR_ALREADY_EXISTS,
+    }
+    assert first.read_bytes() == b"first"
+    assert collision_source.read_bytes() == b"collision"
+    cleanup_work_directory(collision_work)
+
+    # pytest's own tmp_path reaper cannot always remove a >260 tree.
+    shutil.rmtree(_WINDOWS_LONG_PATH_PREFIX + str(tmp_path), ignore_errors=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+def test_windows_rename_buffer_uses_complete_structure_header(monkeypatch):
+    """The header must be ctypes.sizeof(), not FileName.offset.
+
+    The undersized form leaves no room for the trailing FileName element and
+    silently breaks no-clobber renames.
+    """
+    rename_info = output_paths._WindowsFileRenameInfo
+    destination_directory = r"\\?\C:\folder"
+    candidate = "name.ext"
+    encoded_name = f"{destination_directory}\\{candidate}".encode("utf-16-le")
+    seen = {}
+
+    api = output_paths._WindowsPublicationApi()
+
+    def set_file_information(handle, info_class, buffer, buffer_length):
+        seen["buffer_length"] = buffer_length
+        return True
+
+    monkeypatch.setattr(api, "_set_file_information", set_file_information)
+    api._rename_no_replace(101, destination_directory, candidate)
+
+    assert seen["buffer_length"] == (
+        output_paths.ctypes.sizeof(rename_info) + len(encoded_name)
+    )
+    assert seen["buffer_length"] != rename_info.file_name.offset + len(encoded_name)
+    assert rename_info.file_name.offset < output_paths.ctypes.sizeof(rename_info)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires a Windows runtime")
+@pytest.mark.parametrize(
+    ("final_path", "expected"),
+    [
+        # The extended-length representation is preserved, never downgraded.
+        (r"\\?\C:\folder\file.ext", r"\\?\C:\folder\file.ext"),
+        (r"\\?\UNC\server\share\file.ext", r"\\?\UNC\server\share\file.ext"),
+        (r"C:\folder\file.ext", r"C:\folder\file.ext"),
+    ],
+)
+def test_windows_win32_path_preserves_final_path_forms(final_path, expected):
+    assert output_paths._WindowsPublicationApi._win32_path(final_path) == expected

@@ -452,18 +452,20 @@ class _WindowsPublicationApi:
 
     @staticmethod
     def _win32_path(final_path: str) -> str:
-        """Convert a ``GetFinalPathNameByHandleW`` result to a plain Win32 path.
+        """Return the Win32 path ``FILE_RENAME_INFO`` should carry.
 
-        ``SetFileInformationByHandle``/``FileRenameInfo`` rejects the ``\\\\?\\``
-        extended-length prefix with ``ERROR_INVALID_NAME`` (and silently renames
-        somewhere else when ``ReplaceIfExists`` is false), so the validated
-        destination has to be expressed as an ordinary absolute path.
+        ``GetFinalPathNameByHandleW`` returns the extended-length ``\\\\?\\``
+        form, and that form is kept verbatim.  Native probing showed the
+        earlier no-clobber violation was caused by an undersized
+        ``FILE_RENAME_INFO`` buffer (the header was sized from
+        ``FileName.offset`` instead of ``ctypes.sizeof``), not by the prefix:
+        with the correct buffer size the ``\\\\?\\`` form renames correctly and
+        still reports collisions as ``ERROR_ALREADY_EXISTS``.  Keeping the
+        prefix removes any dependence on ``LongPathsEnabled``, interpreter
+        long-path awareness, or the application manifest, so publication to a
+        destination beyond ``MAX_PATH`` works everywhere.
         """
 
-        if final_path.startswith("\\\\?\\UNC\\"):
-            return "\\\\" + final_path[len("\\\\?\\UNC\\"):]
-        if final_path.startswith("\\\\?\\"):
-            return final_path[len("\\\\?\\"):]
         return final_path
 
     def _rename_no_replace(
