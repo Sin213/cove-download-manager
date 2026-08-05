@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 from . import APP_NAME, __version__, theme
 from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC
 from .api_server import LocalApiServer
-from .config import Settings
+from .config import CONFIG_FILE, Settings
 from .main_window import MainWindow
 from .queue import QueueManager
 from .scheduler import Scheduler
@@ -271,7 +271,27 @@ def run() -> int:
     if icon_path:
         app.setWindowIcon(QIcon(str(icon_path)))
 
-    settings = Settings.load()
+    try:
+        settings = Settings.load()
+    except OSError as e:
+        # settings.json exists but could not be read - typically a backup or
+        # antivirus agent holding it open past the sharing-retry window on
+        # Windows, or an ACL that denies us. Settings.load() deliberately fails
+        # closed here instead of falling back to defaults, because that would
+        # rotate rpc_secret and api_token and discard every stored setting.
+        # Exiting keeps the file intact and recoverable.
+        #
+        # No window exists yet and QMessageBox(None, ...) crashes on some
+        # Wayland systems (see module docstring), so report this the way the
+        # other pre-window failures above do.
+        logging.getLogger("cove").error(
+            "settings_unreadable: could not read %s (%s). Cove stopped rather "
+            "than resetting it. Close whatever is holding the file open, or fix "
+            "its permissions, then start Cove again.",
+            CONFIG_FILE,
+            e,
+        )
+        return 1
     app.processEvents()
 
     def _register_native_hosts() -> None:
