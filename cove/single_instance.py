@@ -181,6 +181,11 @@ def validate_message(obj) -> tuple[str, list[str]]:
 
 BROWSER_DOWNLOAD_ACTION = "browser_download"
 
+# A "the extension just talked to me" heartbeat from the native host. It
+# carries no payload and never activates the window: the browser sends it on
+# its own schedule, so treating it as user intent would raise Cove unbidden.
+EXTENSION_PING_ACTION = "extension_ping"
+
 
 def _sanitize_header(value, limit: int) -> str:
     """Bounded, CR/LF-free copy of an optional browser-supplied header.
@@ -270,6 +275,14 @@ def validate_request(obj) -> tuple[str, dict]:
         if obj.get("version") != PROTOCOL_VERSION:
             raise MessageError("unsupported_version")
         return BROWSER_DOWNLOAD_ACTION, validate_browser_download(obj)
+    if obj.get("action") == EXTENSION_PING_ACTION:
+        if obj.get("version") != PROTOCOL_VERSION:
+            raise MessageError("unsupported_version")
+        # Payload-free by contract: anything carrying extra fields is a
+        # different message, not a heartbeat, and must not be accepted as one.
+        if set(obj) != {"version", "action"}:
+            raise MessageError("invalid_schema")
+        return EXTENSION_PING_ACTION, {}
     action, urls = validate_message(obj)
     return action, {"urls": urls}
 
@@ -375,6 +388,12 @@ class _PendingConnection(QObject):
             self._handle_browser_download(request)
             return
 
+        if action == EXTENSION_PING_ACTION:
+            logger.info("ipc_accepted action=%s", action)
+            self._server.extension_seen.emit()
+            self._respond_ok(0)
+            return
+
         urls = request["urls"]
         logger.info("ipc_accepted action=%s url_count=%d", action, len(urls))
         if action == "open":
@@ -395,6 +414,9 @@ class _PendingConnection(QObject):
         """
         handler = self._server.browser_download_handler
         accepted = False
+        # extension_seen is emitted only once acceptance is known, so the
+        # indicator never claims a connection off a request this process
+        # refused. The heartbeat is what proves presence in that case.
         if handler is not None:
             try:
                 accepted = bool(handler(request))
@@ -407,6 +429,7 @@ class _PendingConnection(QObject):
         # activate_requested is deliberately not emitted here.
         logger.info("ipc_browser_download accepted=%s", accepted)
         if accepted:
+            self._server.extension_seen.emit()
             self._respond_ok(1)
         else:
             self._respond_error("rejected")
@@ -445,6 +468,9 @@ class SingleInstanceServer(QObject):
 
     open_requested = Signal(list)
     activate_requested = Signal()
+    # The browser extension reached this process, via a heartbeat or a
+    # download. Presence only - it carries nothing about the request.
+    extension_seen = Signal()
 
     def __init__(
         self,
@@ -638,6 +664,24 @@ def send_browser_download(
         if request.get(key) not in (None, ""):
             message[key] = request[key]
     return _request(name, message, connect_timeout_ms, ack_timeout_ms)
+
+
+def send_extension_ping(
+    name: str,
+    connect_timeout_ms: int = _DEFAULT_CONNECT_TIMEOUT_MS,
+    ack_timeout_ms: int = _DEFAULT_ACK_TIMEOUT_MS,
+) -> bool:
+    """Tell the running primary that the extension is alive. Never raises.
+
+    False just means no primary answered, which is the normal case when Cove
+    is closed; the native host answers the browser for itself either way.
+    """
+    return _request(
+        name,
+        {"version": PROTOCOL_VERSION, "action": EXTENSION_PING_ACTION},
+        connect_timeout_ms,
+        ack_timeout_ms,
+    )
 
 
 def _request(

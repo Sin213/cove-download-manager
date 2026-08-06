@@ -319,6 +319,10 @@ def run() -> int:
     window = MainWindow(settings, queue, scheduler)
     api_server = LocalApiServer(settings, queue)
     window._single_instance_server = instance_server  # keep a strong reference
+    # Presence only: a heartbeat or a forwarded download proves the extension
+    # is installed and can reach this process. Connected after the window
+    # exists, so an early ping simply leaves the indicator at "not detected".
+    instance_server.extension_seen.connect(window.note_extension_seen)
     app.processEvents()
 
     def _start_api_server() -> None:

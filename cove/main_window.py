@@ -374,6 +374,8 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.queue = queue
         self.scheduler = scheduler
+        # Set before _build_ui: the extension indicator is built from it.
+        self._extension_seen = False
 
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setWindowTitle(f"{APP_NAME} Download Manager")
@@ -726,8 +728,43 @@ class MainWindow(QMainWindow):
         sec_sched.body().addWidget(edit)
         panel.addWidget(sec_sched)
 
+        panel.addWidget(self._build_extension_section())
+
         panel.addStretch(1)
         return panel
+
+    def _build_extension_section(self) -> Section:
+        """Whether the browser extension has reached this process yet.
+
+        Presence is per-session and never decays: the extension pings on
+        browser startup, so an age-out would report "not detected" for a
+        perfectly healthy setup whose browser has simply been open a while.
+        """
+        section = Section("Browser extension")
+        self.extension_pill = StatusPill()
+        self._set_extension_state(False)
+        hint = QLabel(
+            "Cove captures browser downloads through the extension. This "
+            "reads 'connected' once it has talked to Cove."
+        )
+        hint.setProperty("role", "muted")
+        hint.setWordWrap(True)
+        section.body().addWidget(self.extension_pill)
+        section.body().addWidget(hint)
+        return section
+
+    def _set_extension_state(self, seen: bool) -> None:
+        self.extension_pill.set_state(
+            "ok" if seen else "off",
+            "Connected" if seen else "Not detected",
+        )
+
+    def note_extension_seen(self) -> None:
+        """The extension reached this process (heartbeat or download)."""
+        if self._extension_seen:
+            return
+        self._extension_seen = True
+        self._set_extension_state(True)
 
     def _build_actionbar(self) -> QHBoxLayout:
         row = QHBoxLayout()

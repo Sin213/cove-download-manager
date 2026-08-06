@@ -112,6 +112,27 @@ def deliver_to_primary(request: dict) -> bool:
         return False
 
 
+def notify_primary_extension_seen() -> bool:
+    """Tell a running Cove that the extension just made contact.
+
+    Best effort and never authoritative: the ping reply below is this host's
+    own answer, so a closed Cove (or any IPC failure) must not turn a healthy
+    ping into an error. Imported lazily for the same reason as
+    deliver_to_primary - a ping should stay cheap.
+    """
+    try:
+        from PySide6.QtCore import QCoreApplication
+
+        from .config import DATA_DIR
+        from .single_instance import send_extension_ping, server_name
+
+        if QCoreApplication.instance() is None:
+            QCoreApplication([])
+        return send_extension_ping(server_name(DATA_DIR))
+    except Exception:
+        return False
+
+
 def handle_message(
     msg: dict,
     rpc: Aria2RPC | None,
@@ -120,6 +141,12 @@ def handle_message(
     action = msg.get("action", "")
 
     if action == "ping":
+        # The extension's own heartbeat doubles as the GUI's "extension is
+        # installed and talking" signal. Failure here changes nothing.
+        try:
+            notify_primary_extension_seen()
+        except Exception:
+            pass
         return {"status": "ok", "version": __version__}
 
     if action == "download":

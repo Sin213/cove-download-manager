@@ -271,6 +271,9 @@ class FakeMainWindow:
         # lands in queue.add_url exactly once.
         self._queue.add_url(url)
 
+    def note_extension_seen(self):
+        calls["constructed"].append("extension_seen")
+
     def isMinimized(self):
         return False
 
@@ -304,6 +307,7 @@ class FakeLocalApiServer:
 class FakeSingleInstanceServer(QObject):
     open_requested = Signal(list)
     activate_requested = Signal()
+    extension_seen = Signal()
 
     def __init__(self, *a, **k):
         super().__init__()
