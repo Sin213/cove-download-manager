@@ -7,7 +7,7 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v3.3.1-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v3.4.0-5eead4?style=flat-square)
 
 ![Cove Download Manager](docs/screenshot.png)
 
@@ -57,8 +57,10 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
   before installing, never silent, and refuses to install assets that
   don't match a published `SHA256SUMS` digest.
 - **Browser extension** - intercept downloads from Firefox, Chrome, and
-  their derivatives (Zen, LibreWolf, Edge, Brave, and more). See
-  [Browser Extension](#browser-extension).
+  their derivatives (Zen, LibreWolf, Edge, Brave, and more). Cove offers the
+  extension once on first run, keeps a permanent tray entry with both store
+  listings, and shows in the window whether an extension has actually reached
+  it. See [Browser Extension](#browser-extension).
 - **Debrid accounts** - optional Real-Debrid, AllDebrid, and TorBox
   integration. Links on hosts your account supports are resolved
   automatically before downloading. See [Debrid services](#debrid-services).
@@ -104,7 +106,11 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
   icon to bring Cove back from.
 - **Frameless cove UI** - custom titlebar, mint accent, light and dark
   palettes. Dragging via `startSystemMove`, edge-resize via
-  `startSystemResize`, both Wayland-safe.
+  `startSystemResize`, both Wayland-safe. The controls column scrolls when
+  the window is short rather than squeezing its sections together.
+- **Its own app icon** - the skull keeps the Cove suite identity and gains a
+  teal download arrow, so Cove Download Manager is distinguishable from the
+  other Cove apps in the taskbar, tray, and launcher down to 16px.
 
 ---
 
@@ -239,6 +245,26 @@ and Chromium.
 3. Open the extension's settings page and click **Test Connection to Cove**
    to confirm the link is active.
 
+On first run Cove offers the extension once, with a banner above the download
+list linking both store listings plus **Set up later**. It is answered exactly
+once - dismissed, acted on, or made moot by an extension that connects - and
+never asks again. The offer is also permanently available from the tray menu
+under **Get the browser extension**.
+
+### Connection status and setup problems
+
+The **Browser extension** panel in the main window reports **Connected** or
+**Not detected**, so you can tell an installed extension from a missing one
+without waiting for a download to arrive. Any extension ping counts as proof,
+as does an accepted browser download.
+
+If registering the native messaging host fails - the usual reason an
+extension cannot connect - the panel shows a **Setup problem** row with a
+**Details** button explaining what went wrong, instead of leaving it in the
+log file. Registration status is reported independently of the connection
+indicator, because registration can fail for one browser while another talks
+to Cove fine.
+
 ### Building the extension
 
 `python scripts/build_extension.py` produces `dist/firefox/` and
@@ -372,6 +398,21 @@ What happens to a torrent you add:
    configured - Cove falls back to its own **built-in aria2 BitTorrent
    engine** and downloads it locally. Cove does not wait for TorBox (or any
    other provider) to cloud-download an uncached torrent first.
+
+### Packed multi-file torrents
+
+Real-Debrid sometimes compresses a cached multi-file torrent into a single
+packed archive and returns one link for the whole thing rather than one link
+per file. Cove recognises that answer and downloads it as **one honest file**,
+named and sized from the provider's own metadata, instead of failing with
+"the response could not be understood".
+
+Cove does not extract the archive, and it does not pretend the individual
+files arrived separately: you get one queue row and one file, which is
+exactly what the provider delivered. Unpack it with whatever you normally
+use. A response where the link count does not match the selected files in
+this specific way is still treated as malformed and refused, rather than
+guessing which link belongs to which file.
 
 ### What local BitTorrent means for your privacy
 

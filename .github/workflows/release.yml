@@ -342,18 +342,25 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.3.1
+          ## What's new in 3.4.0
 
-          This maintenance release hardens download finalization and protects saved settings, especially on Windows.
+          This release makes the browser extension discoverable from inside the app, gives Cove Download Manager its own icon, and teaches Real-Debrid torrents to handle packed multi-file results.
+
+          ### Added
+
+          - **Cove now offers the browser extension.** The app never mentioned that download interception and the in-page pill come from an extension; the setup instructions only existed in the README, which a running app never shows. A first-run banner above the download list links both store listings plus **Set up later**, and it is answered exactly once - dismissed, acted on, or made moot by an extension that connects. A permanent tray entry, **Get the browser extension**, keeps both links available afterwards, and the empty state mentions it too.
+          - **Extension connection status in the window.** The native host used to answer pings by itself, so a running Cove could not tell an installed extension from a missing one until a download actually arrived. The Browser extension panel now reports **Connected** or **Not detected**; any extension ping counts as proof, as does an accepted browser download.
+          - **Native-host setup problems are visible.** A failed native messaging registration is the usual reason an extension cannot connect, and it only ever reached the log file. The panel now shows a **Setup problem** row with a **Details** button explaining what failed. It stays independent of the connection indicator, because registration can fail for one browser while another talks to Cove fine.
+          - **Its own app icon.** Cove Download Manager used the shared Cove suite skull everywhere, so its window, taskbar, tray and launcher were indistinguishable from the other Cove apps. It now ships a distinct icon: the suite skull plus a teal download arrow with the brand keyline, sized so the distinction still reads at 16px. Every packaging path installs it - AppImage, deb, Inno Setup, the release workflow and both local Windows builders.
+          - **Real-Debrid packed multi-file torrents.** Real-Debrid sometimes compresses a cached multi-file torrent into a single packed archive and returns one link for the whole thing. Cove now recognises that answer and downloads it as one honest file, named and sized from the provider's own unrestrict metadata. No extraction, no pretending the individual files arrived separately: one queue row, one file, which is what the provider delivered. Any other link-count mismatch is still refused as malformed rather than guessed at.
 
           ### Fixed
 
-          - **Secure download publication.** Completed downloads are now published from private work directories without overwriting existing files. Name collisions use deterministic `(1)`, `(2)`, and later suffixes.
-          - **Native Windows publication failures.** Corrected the Windows `FileRenameInfo` buffer and destination-path handling that could produce `ERROR_INVALID_PARAMETER`.
-          - **Windows long paths and Unicode names.** Extended-length paths are preserved, and publication now handles long destinations and Unicode filenames correctly.
-          - **Safer cleanup.** Temporary download trees are validated before deletion, cleanup does not cross reparse points, and a cleanup failure no longer undoes a successfully published download.
-          - **Settings sharing races.** Cove now retries transient Windows sharing violations while reading or atomically replacing `settings.json`.
-          - **Unreadable settings no longer reset configuration.** Cove stops safely instead of silently replacing settings and rotating the local API credentials when the settings file remains inaccessible.
+          - **Real-Debrid multi-file selection settling.** Real-Debrid populates its link array gradually after file selection, so Cove could read a partially filled response and reject a perfectly good cached torrent. Selection is now followed by a bounded settling window, and the response is only judged once the links have stopped arriving.
+          - **Right-click downloads on blob URLs.** The context menu now falls back to the extractor page URL when a media `srcUrl` is a `blob:`, so right-click downloads on YouTube work the same way the in-page pill already did.
+          - **In-page pill scrolling behaviour.** The pill used to clamp itself to the top of the viewport when its video scrolled away. It now hides while its anchor video is mostly out of view and comes back on scroll-in, and video selection and placement are visibility-aware across every activation path, so an off-screen video cannot take or suppress the pill.
+          - **Pill disappearing from feed previews.** Tearing down a feed preview now uses the existing 500ms grace period, so the pill stays reachable long enough to actually click.
+          - **Controls panel no longer squeezes itself.** The Browser extension section pushed the right-hand column past the window height, and a layout short of space shrinks its children rather than overflowing - so hint labels were drawn on top of the widgets above them. The panel now scrolls: sections keep their height and the overflow scrolls instead.
 
           ## Downloads
 
