@@ -260,6 +260,9 @@ class Settings:
     # been made. Like torrent_ip_disclosure_shown, this stores a decision,
     # it is not a user-facing option.
     magnet_prompt_shown: bool = False
+    # Whether the first-run "install the browser extension" banner has been
+    # answered (dismissed, acted on, or made moot by a connected extension).
+    extension_prompt_shown: bool = False
 
     @classmethod
     def load(cls) -> "Settings":
@@ -324,6 +327,10 @@ class Settings:
             s.magnet_handler_enabled = False
         if not isinstance(s.magnet_prompt_shown, bool):
             s.magnet_prompt_shown = False
+        # Same reasoning again: a truthy non-boolean must not silence a
+        # prompt the user has never actually answered.
+        if not isinstance(s.extension_prompt_shown, bool):
+            s.extension_prompt_shown = False
         # Not a dataclass field, so it is never written back to settings.json.
         # Task 6 consumes it once, at startup, to migrate existing opt-ins.
         s.magnet_setting_missing = magnet_setting_missing

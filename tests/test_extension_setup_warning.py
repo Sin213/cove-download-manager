@@ -65,6 +65,13 @@ def test_the_failure_text_names_the_error():
 
 # ---- Window surface ----------------------------------------------------
 
+class _FakeSettings:
+    extension_prompt_shown = False
+
+    def save(self):
+        pass
+
+
 _live_hosts = []
 
 
@@ -108,6 +115,8 @@ class _FakeBox:
 
 class _Host(QMainWindow):
     _build_extension_section = mw.MainWindow._build_extension_section
+    _build_extension_banner = mw.MainWindow._build_extension_banner
+    _dismiss_extension_banner = mw.MainWindow._dismiss_extension_banner
     _set_extension_state = mw.MainWindow._set_extension_state
     note_extension_seen = mw.MainWindow.note_extension_seen
     note_extension_setup_failed = mw.MainWindow.note_extension_setup_failed
@@ -119,7 +128,11 @@ class _Host(QMainWindow):
         _live_hosts.append(self)
         self._extension_seen = False
         self._extension_setup_error = ""
+        # The real window always has both; note_extension_seen retires the
+        # banner, so a host without one would not exercise the real path.
+        self.settings = _FakeSettings()
         self.section = self._build_extension_section()
+        self.banner = self._build_extension_banner()
 
 
 def test_no_warning_is_shown_when_registration_worked():

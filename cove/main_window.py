@@ -10,6 +10,7 @@ Layout matches the cove-screen-recorder shell:
 """
 from __future__ import annotations
 
+import logging
 import os
 import platform as _platform
 import shutil
@@ -622,6 +623,8 @@ class MainWindow(QMainWindow):
         stage.setContentsMargins(0, 0, 0, 0)
         stage.setSpacing(0)
 
+        stage.addWidget(self._build_extension_banner())
+
         self.tree = DownloadTree()
         self.tree.setColumnCount(5)
         self.tree.setHeaderLabels(["Name", "Status", "Progress", "Size", "Speed"])
@@ -735,6 +738,63 @@ class MainWindow(QMainWindow):
         panel.addStretch(1)
         return panel
 
+    def _build_extension_banner(self) -> QWidget:
+        """One-time first-run prompt for the browser extension.
+
+        The tray entry and the empty-state hint only reach a user who goes
+        looking; this reaches one who does not. It is answered exactly once -
+        dismissed, acted on, or made moot by an extension that connects - and
+        never returns.
+        """
+        self.extension_banner = Section("Browser extension")
+        text = QLabel(
+            "Install the Cove browser extension to capture downloads from "
+            "your browser automatically."
+        )
+        text.setProperty("role", "muted")
+        text.setWordWrap(True)
+        self.extension_banner.body().addWidget(text)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        firefox = QPushButton("Firefox add-on")
+        firefox.setProperty("kind", "accent")
+        firefox.clicked.connect(
+            lambda: self._open_extension_store(FIREFOX_EXTENSION_URL)
+        )
+        row.addWidget(firefox)
+        chrome = QPushButton("Chrome Web Store")
+        chrome.clicked.connect(
+            lambda: self._open_extension_store(CHROME_EXTENSION_URL)
+        )
+        row.addWidget(chrome)
+        row.addStretch(1)
+        later = QPushButton("Set up later")
+        later.clicked.connect(self._dismiss_extension_banner)
+        row.addWidget(later)
+        self.extension_banner.body().addLayout(row)
+
+        self.extension_banner.setVisible(not self.settings.extension_prompt_shown)
+        return self.extension_banner
+
+    def _open_extension_store(self, url: str) -> None:
+        """Open one store listing and retire the banner: the user answered."""
+        self._dismiss_extension_banner()
+        open_url(url)
+
+    def _dismiss_extension_banner(self) -> None:
+        self.extension_banner.setVisible(False)
+        if self.settings.extension_prompt_shown:
+            return
+        self.settings.extension_prompt_shown = True
+        try:
+            self.settings.save()
+        except Exception:
+            # An unwritable settings file means the banner comes back next
+            # launch. That is a nuisance; refusing to hide it now would be
+            # worse, and the save failure is reported through other paths.
+            logging.getLogger("cove").warning("extension_prompt_save_failed")
+
     def _build_extension_section(self) -> Section:
         """Whether the browser extension has reached this process yet.
 
@@ -783,6 +843,8 @@ class MainWindow(QMainWindow):
             return
         self._extension_seen = True
         self._set_extension_state(True)
+        # Nothing left to prompt for: it is installed and demonstrably working.
+        self._dismiss_extension_banner()
 
     def note_extension_setup_failed(self, details: str) -> None:
         """Native-host registration failed; say so instead of only logging.

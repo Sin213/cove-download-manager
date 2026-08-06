@@ -220,6 +220,13 @@ def test_a_ping_still_succeeds_when_no_cove_is_running(monkeypatch):
 
 # ---- Window indicator --------------------------------------------------
 
+class _FakeSettings:
+    extension_prompt_shown = False
+
+    def save(self):
+        pass
+
+
 _live_hosts = []
 
 
@@ -237,6 +244,8 @@ class _Host(QMainWindow):
     """The real indicator methods without MainWindow's heavy constructor."""
 
     _build_extension_section = mw.MainWindow._build_extension_section
+    _build_extension_banner = mw.MainWindow._build_extension_banner
+    _dismiss_extension_banner = mw.MainWindow._dismiss_extension_banner
     _set_extension_state = mw.MainWindow._set_extension_state
     note_extension_seen = mw.MainWindow.note_extension_seen
     note_extension_setup_failed = mw.MainWindow.note_extension_setup_failed
@@ -248,7 +257,11 @@ class _Host(QMainWindow):
         _live_hosts.append(self)
         self._extension_seen = False
         self._extension_setup_error = ""
+        # The real window always has both; note_extension_seen retires the
+        # banner, so a host without one would not exercise the real path.
+        self.settings = _FakeSettings()
         self.section = self._build_extension_section()
+        self.banner = self._build_extension_banner()
 
 
 def test_the_indicator_starts_as_not_detected():
