@@ -1527,13 +1527,100 @@ def test_real_debrid_selects_all_files_then_rechecks():
     assert select[0][2]["data"] == {"files": "all"}
 
 
-def test_real_debrid_repeated_selection_state_is_not_a_loop():
-    session = _rd_env([_rd_info("waiting_files_selection")] * 5)
+def test_real_debrid_sleeps_before_the_first_post_selection_recheck():
+    session = _rd_env([_rd_info("waiting_files_selection"), _rd_info("downloaded")])
+    clock = FakeClock()
+    debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert clock.slept == [debrid.RD_TORRENT_POLL_INTERVAL]
+    # Order: info -> selectFiles -> info, with the sleep in between.
+    paths = [c[1].rsplit("/api", 1)[-1] for c in session.calls]
+    assert paths[1].endswith("/torrents/info/rd-1")
+    assert paths[2].endswith("/torrents/selectFiles/rd-1")
+    assert paths[3].endswith("/torrents/info/rd-1")
+
+
+def test_real_debrid_repeated_selection_state_settles_into_a_cached_result():
+    session = _rd_env([
+        _rd_info("waiting_files_selection"),
+        _rd_info("waiting_files_selection"),
+        _rd_info("downloaded"),
+    ])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    assert len(cached.files) == 2
+    assert len(_rd_calls(session, "/torrents/selectFiles/rd-1")) == 1
+    assert _rd_calls(session, "/torrents/delete/rd-1") == []
+    assert clock.slept == [debrid.RD_TORRENT_POLL_INTERVAL] * 2
+
+
+def test_real_debrid_delayed_links_settle_into_a_cached_result():
+    session = _rd_env([
+        _rd_info("waiting_files_selection"),
+        _rd_info("downloaded", links=[RD_LOCKED_1]),
+        _rd_info("downloaded"),
+    ])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    assert [f.locked_link for f in cached.files] == [RD_LOCKED_1, RD_LOCKED_2]
+    assert len(_rd_calls(session, "/torrents/selectFiles/rd-1")) == 1
+    assert _rd_calls(session, "/torrents/delete/rd-1") == []
+
+
+def test_real_debrid_selection_that_never_settles_is_uncached_and_cleaned_up():
+    session = _rd_env([_rd_info("waiting_files_selection")] * 40)
     clock = FakeClock()
     assert debrid.real_debrid_cached_torrent(
         INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
     ) is None
     assert len(_rd_calls(session, "/torrents/selectFiles/rd-1")) == 1
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+    assert sum(clock.slept) <= (
+        debrid.RD_SELECTION_SETTLE_WAIT + debrid.RD_TORRENT_POLL_INTERVAL
+    )
+
+
+def test_real_debrid_links_that_never_settle_are_refused_and_cleaned_up():
+    session = _rd_env(
+        [_rd_info("waiting_files_selection")]
+        + [_rd_info("downloaded", links=[RD_LOCKED_1])] * 40
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert excinfo.value.code == "bad_response"
+    assert excinfo.value.user_message == "the response could not be understood."
+    assert len(_rd_calls(session, "/torrents/selectFiles/rd-1")) == 1
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_selection_error_is_mapped_and_stops_the_probe():
+    session = _rd_env(
+        [_rd_info("waiting_files_selection")] * 5,
+        **{"/torrents/selectFiles/rd-1": _Resp(
+            {"error": "infringing_file", "error_code": 35}, status_code=403
+        )},
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    err = excinfo.value
+    assert err.code == 35
+    assert err.user_message == "the file was refused as infringing."
+    assert err.fallback_allowed is False
+    # No settling poll happens after a failed selection.
+    assert len(_rd_calls(session, "/torrents/info/rd-1")) == 1
     assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
 
 

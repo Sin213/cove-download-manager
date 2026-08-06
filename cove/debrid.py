@@ -1357,6 +1357,9 @@ def resolve(
 # downloaded, it is the provider looking the torrent up.
 RD_TORRENT_POLL_INTERVAL = 2.0
 RD_TORRENT_MAX_WAIT = 15.0
+# After selectFiles succeeds the provider needs a moment to leave
+# waiting_files_selection and to publish one link per selected file.
+RD_SELECTION_SETTLE_WAIT = 15.0
 
 # Real-Debrid states that mean the provider is (or would be) fetching the
 # torrent itself. Seeing any of these means "not cached", full stop.
@@ -1608,6 +1611,21 @@ def _rd_delete_torrent(session, token: str, torrent_id) -> None:
                 return
 
 
+def _rd_links_incomplete(info: dict) -> bool:
+    """True for the one shape that means "links have not landed yet".
+
+    Fewer links than selected files right after a selection is the provider
+    still filling the array in. Any other mismatch is malformed and stays
+    malformed, so it is left to `_rd_cached_files` to refuse.
+    """
+    raw_files = info.get("files")
+    links = info.get("links")
+    if not isinstance(raw_files, list) or not isinstance(links, list):
+        return False
+    selected = [f for f in raw_files if isinstance(f, dict) and f.get("selected")]
+    return bool(selected) and len(links) < len(selected)
+
+
 def _rd_cached_files(info: dict, info_hash: str) -> tuple:
     name = _torrent_root_name(info.get("filename"), info_hash, REAL_DEBRID)
     raw_files = info.get("files")
@@ -1684,7 +1702,7 @@ def real_debrid_cached_torrent(
     keep = False
     try:
         deadline = clock() + RD_TORRENT_MAX_WAIT
-        selected = False
+        settle_deadline = None
         while True:
             info = _rd_payload(_request(
                 session, "get", f"{RD_BASE}/torrents/info/{torrent_id}",
@@ -1700,18 +1718,27 @@ def real_debrid_cached_torrent(
                 # Provider would have to fetch it (or can't): not cached.
                 return None
             if status == "downloaded":
+                if (settle_deadline is not None and clock() < settle_deadline
+                        and _rd_links_incomplete(info)):
+                    sleep(RD_TORRENT_POLL_INTERVAL)
+                    continue
                 name, files = _rd_cached_files(info, info_hash)
                 keep = True
                 return CachedTorrent(REAL_DEBRID, info_hash, name, files)
             if status == "waiting_files_selection":
-                if selected:
-                    # Selecting twice would be a loop, not progress.
-                    return None
-                selected = True
+                if settle_deadline is not None:
+                    # Selection already went in; give the provider a bounded
+                    # window to leave this state instead of selecting twice.
+                    if clock() >= settle_deadline:
+                        return None
+                    sleep(RD_TORRENT_POLL_INTERVAL)
+                    continue
                 _rd_no_content(_request(
                     session, "post", f"{RD_BASE}/torrents/selectFiles/{torrent_id}",
                     REAL_DEBRID, headers=_bearer(token), data={"files": "all"},
                 ))
+                settle_deadline = clock() + RD_SELECTION_SETTLE_WAIT
+                sleep(RD_TORRENT_POLL_INTERVAL)
                 continue
             if status != "magnet_conversion":
                 raise _bad_response(REAL_DEBRID)
