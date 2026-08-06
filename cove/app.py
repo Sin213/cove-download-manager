@@ -14,7 +14,7 @@ import sys
 import logging
 import threading
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -33,6 +33,7 @@ from .single_instance import (
     server_name,
 )
 from .updater import UpdateController
+from .browser_extension import setup_failure_text
 from .native_host_install import install_native_hosts
 from .widgets import find_icon
 
@@ -109,6 +110,30 @@ class BrowserDownloadGate:
             logging.getLogger("cove").warning("browser_download_add_failed")
             return False
         return task_id is not None
+
+
+class NativeHostRegistration(QObject):
+    """Registers the native messaging host and reports a failure to the GUI.
+
+    Registration runs off the GUI thread (flatpak can take ~10s per browser),
+    so the outcome comes back as a signal rather than a direct widget call.
+    Failure is non-fatal - Cove still runs without the extension - but it is
+    the usual "the extension cannot connect" root cause, so it must not stay
+    log-only.
+    """
+
+    failed = Signal(str)
+
+    def run(self) -> bool:
+        try:
+            install_native_hosts()
+        except Exception as exc:
+            logging.getLogger("cove").warning(
+                "native messaging host registration failed", exc_info=True
+            )
+            self.failed.emit(setup_failure_text(exc))
+            return False
+        return True
 
 
 def activate_window(window) -> None:
@@ -294,17 +319,6 @@ def run() -> int:
         return 1
     app.processEvents()
 
-    def _register_native_hosts() -> None:
-        try:
-            install_native_hosts()
-        except Exception:
-            # Non-fatal (the app still runs without the extension), but don't
-            # swallow it silently — this is the usual "extension can't connect"
-            # root cause.
-            logging.getLogger("cove").warning(
-                "native messaging host registration failed", exc_info=True
-            )
-
     theme.set_theme(settings.theme)
     _apply_palette(app)
     app.setStyleSheet(theme.QSS)
@@ -346,8 +360,12 @@ def run() -> int:
 
     # Registration shells out to flatpak (up to 10 s per browser); run it
     # off the GUI thread so a slow or hung flatpak can't freeze the window.
+    # The window keeps a strong reference: the thread outlives this scope.
+    native_host_registration = NativeHostRegistration()
+    native_host_registration.failed.connect(window.note_extension_setup_failed)
+    window._native_host_registration = native_host_registration
     threading.Thread(
-        target=_register_native_hosts, name="native-host-install", daemon=True
+        target=native_host_registration.run, name="native-host-install", daemon=True
     ).start()
 
     # Same reasoning as the native-host thread above: registry and xdg-mime

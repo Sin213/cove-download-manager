@@ -78,6 +78,7 @@ from .speed_limit import (
 from .browser_extension import (
     CHROME_EXTENSION_URL,
     EXTENSION_HELP_TEXT,
+    EXTENSION_SETUP_FAILED_TEXT,
     FIREFOX_EXTENSION_URL,
 )
 from .system_open import child_env, open_url
@@ -374,8 +375,9 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.queue = queue
         self.scheduler = scheduler
-        # Set before _build_ui: the extension indicator is built from it.
+        # Set before _build_ui: the extension indicator is built from them.
         self._extension_seen = False
+        self._extension_setup_error = ""
 
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setWindowTitle(f"{APP_NAME} Download Manager")
@@ -751,6 +753,22 @@ class MainWindow(QMainWindow):
         hint.setWordWrap(True)
         section.body().addWidget(self.extension_pill)
         section.body().addWidget(hint)
+
+        # Hidden until registration actually fails, so a healthy setup shows
+        # nothing. Non-modal by design: this is diagnostic, and Cove still
+        # runs without the extension.
+        self.extension_problem = QWidget()
+        problem_row = QHBoxLayout(self.extension_problem)
+        problem_row.setContentsMargins(0, 0, 0, 0)
+        problem_row.setSpacing(8)
+        problem_label = QLabel("Setup problem")
+        problem_label.setProperty("role", "muted")
+        problem_row.addWidget(problem_label, 1)
+        details_btn = QPushButton("Details")
+        details_btn.clicked.connect(self._show_extension_setup_details)
+        problem_row.addWidget(details_btn, 0)
+        self.extension_problem.setVisible(False)
+        section.body().addWidget(self.extension_problem)
         return section
 
     def _set_extension_state(self, seen: bool) -> None:
@@ -765,6 +783,23 @@ class MainWindow(QMainWindow):
             return
         self._extension_seen = True
         self._set_extension_state(True)
+
+    def note_extension_setup_failed(self, details: str) -> None:
+        """Native-host registration failed; say so instead of only logging.
+
+        Independent of the presence indicator: registration can fail for one
+        browser while an extension in another is talking to Cove happily.
+        """
+        self._extension_setup_error = details
+        self.extension_problem.setVisible(True)
+
+    def _show_extension_setup_details(self) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Browser connector not registered")
+        box.setText(EXTENSION_SETUP_FAILED_TEXT)
+        box.setDetailedText(self._extension_setup_error)
+        box.exec()
 
     def _build_actionbar(self) -> QHBoxLayout:
         row = QHBoxLayout()

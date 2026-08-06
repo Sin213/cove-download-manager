@@ -274,6 +274,9 @@ class FakeMainWindow:
     def note_extension_seen(self):
         calls["constructed"].append("extension_seen")
 
+    def note_extension_setup_failed(self, details):
+        calls["constructed"].append("extension_setup_failed")
+
     def isMinimized(self):
         return False
 

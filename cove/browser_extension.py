@@ -14,6 +14,21 @@ CHROME_EXTENSION_URL = (
     "liakghhamogjcmmgnmcpephlfecmilnf"
 )
 
+EXTENSION_SETUP_FAILED_TEXT = (
+    "Cove could not register its browser connector, so the extension will "
+    "not be able to talk to Cove even once it is installed."
+)
+
+
+def setup_failure_text(exc: BaseException) -> str:
+    """One-line reason for a native-host registration failure.
+
+    Names the exception type as well as its message: the message alone is
+    often an empty string or a bare path, which tells a user nothing.
+    """
+    return f"{type(exc).__name__}: {exc}"
+
+
 EXTENSION_HELP_TEXT = (
     "Cove captures downloads from your browser through the Cove browser "
     "extension.\n\n"

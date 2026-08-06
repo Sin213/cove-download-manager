@@ -239,12 +239,15 @@ class _Host(QMainWindow):
     _build_extension_section = mw.MainWindow._build_extension_section
     _set_extension_state = mw.MainWindow._set_extension_state
     note_extension_seen = mw.MainWindow.note_extension_seen
+    note_extension_setup_failed = mw.MainWindow.note_extension_setup_failed
+    _show_extension_setup_details = mw.MainWindow._show_extension_setup_details
     _open_extension_help = mw.MainWindow._open_extension_help
 
     def __init__(self):
         QMainWindow.__init__(self)
         _live_hosts.append(self)
         self._extension_seen = False
+        self._extension_setup_error = ""
         self.section = self._build_extension_section()
 
 
