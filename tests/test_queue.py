@@ -758,6 +758,9 @@ MAGNET = (
 AD_LOCKED_1 = "https://alldebrid.com/f/LOCKEDONE"
 AD_LOCKED_2 = "https://alldebrid.com/f/LOCKEDTWO"
 TORRENT_NODE_URL = "https://s1.debrid.it/dl/SECRETNODE/ep1.mkv"
+RD_LOCKED_1 = "https://real-debrid.com/d/LOCKEDONE"
+# The short-lived delivery URL a packed link unrestricts into. Never persisted.
+RD_PACKED_DELIVERY = "https://sgp.download.real-debrid.com/d/PACKEDONE/Season+1.rar"
 
 
 def _torrent_settings(**extra):
@@ -1052,6 +1055,32 @@ def test_cached_single_file_torrent_writes_into_the_output_dir(queue_env, monkey
     assert row["out_dir"] == str(tmp_path)
     assert row["filename"] == "movie.mkv"
     assert row["total_bytes"] == 9
+
+
+def test_packed_cached_torrent_becomes_one_flat_row(queue_env, monkeypatch, tmp_path):
+    """Real-Debrid can pack a multi-file torrent into one file. The queue has
+    to treat that honestly: one row, no torrent wrapper folder."""
+    queue, rpc, db_path = queue_env(**_torrent_settings(
+        real_debrid_enabled=True, real_debrid_api_token="rd-token-value",
+    ))
+    _sync_spawn(queue)
+    packed = _cached(
+        files=[CachedTorrentFile(0, ("Season 1.rar",), 4096, RD_LOCKED_1)],
+        provider=REAL_DEBRID,
+    )
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: packed)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    rows = _rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "Season 1.rar"
+    assert rows[0]["out_dir"] == str(tmp_path)
+    assert rows[0]["url"] == RD_LOCKED_1
+    assert rows[0]["total_bytes"] == 4096
+    assert rows[0]["debrid_route"] == REAL_DEBRID
+    assert RD_PACKED_DELIVERY not in repr(rows[0])
 
 
 def test_provider_filesize_seeds_the_task(queue_env, monkeypatch):

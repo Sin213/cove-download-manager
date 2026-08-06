@@ -1626,6 +1626,50 @@ def _rd_links_incomplete(info: dict) -> bool:
     return bool(selected) and len(links) < len(selected)
 
 
+_RD_PACKED_UNSUPPORTED = (
+    "Real-Debrid returned this torrent as a packed file, but Cove could not "
+    "determine a safe filename for it."
+)
+
+
+def _rd_packed_response(info: dict) -> bool:
+    """True for the one shape that means "the provider compressed this".
+
+    Real-Debrid may pack a cached multi-file torrent into a single link,
+    which is why the link count can legitimately be 1 while several files
+    are selected. That link is the whole torrent, not one of its files, so
+    it must never be mapped positionally onto a selected path. Any other
+    count mismatch stays malformed.
+    """
+    raw_files = info.get("files")
+    links = info.get("links")
+    if not isinstance(raw_files, list) or not isinstance(links, list):
+        return False
+    selected = [f for f in raw_files if isinstance(f, dict) and f.get("selected")]
+    return len(selected) > 1 and len(links) == 1
+
+
+def _rd_packed_files(info: dict, info_hash: str, session, token: str) -> tuple:
+    """One synthetic file standing for the provider's packed archive.
+
+    Only the unrestrict metadata can name it: the torrent's own paths
+    describe the files *inside* the archive, and Cove neither opens nor
+    extracts it. The locked link is what gets persisted; the delivery URL
+    the unrestrict call returns is short-lived and deliberately dropped.
+    """
+    name = _torrent_root_name(info.get("filename"), info_hash, REAL_DEBRID)
+    link = _safe_download_url(info["links"][0], REAL_DEBRID)
+    unrestricted = real_debrid_unrestrict(link, token, session=session)
+    filename = _safe_filename(unrestricted.filename)
+    if not filename:
+        raise DebridError(
+            REAL_DEBRID, "packed_unsupported", _RD_PACKED_UNSUPPORTED, False, False,
+        )
+    return name, (CachedTorrentFile(
+        index=0, path=(filename,), size=unrestricted.filesize, locked_link=link,
+    ),)
+
+
 def _rd_cached_files(info: dict, info_hash: str) -> tuple:
     name = _torrent_root_name(info.get("filename"), info_hash, REAL_DEBRID)
     raw_files = info.get("files")
@@ -1718,11 +1762,16 @@ def real_debrid_cached_torrent(
                 # Provider would have to fetch it (or can't): not cached.
                 return None
             if status == "downloaded":
-                if (settle_deadline is not None and clock() < settle_deadline
-                        and _rd_links_incomplete(info)):
+                settling = settle_deadline is not None and clock() < settle_deadline
+                if settling and _rd_links_incomplete(info):
                     sleep(RD_TORRENT_POLL_INTERVAL)
                     continue
-                name, files = _rd_cached_files(info, info_hash)
+                if not settling and _rd_packed_response(info):
+                    # Only once the links have stopped arriving is a lone
+                    # link the provider's answer rather than a partial one.
+                    name, files = _rd_packed_files(info, info_hash, session, token)
+                else:
+                    name, files = _rd_cached_files(info, info_hash)
                 keep = True
                 return CachedTorrent(REAL_DEBRID, info_hash, name, files)
             if status == "waiting_files_selection":

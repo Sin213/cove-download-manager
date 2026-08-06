@@ -1444,6 +1444,26 @@ def _rd_info(status, files=None, links=None, filename="Season 1"):
     })
 
 
+def _rd_selected(count, prefix="ep"):
+    """`count` selected files, all at the torrent root."""
+    return [
+        {"id": i + 1, "path": f"/{prefix}{i + 1}.mkv", "bytes": 10, "selected": 1}
+        for i in range(count)
+    ]
+
+
+RD_PACKED_LINK = "https://real-debrid.com/d/PACKEDONE"
+RD_PACKED_DELIVERY = "https://sgp.download.real-debrid.com/d/PACKEDONE/Season+1.rar"
+
+
+def _rd_unrestricted(filename="Season 1.rar", filesize=1234):
+    return _Resp({
+        "download": RD_PACKED_DELIVERY,
+        "filename": filename,
+        "filesize": filesize,
+    })
+
+
 _RD_NO_CONTENT = _Resp(ValueError("no body"), status_code=204)
 
 
@@ -1588,9 +1608,13 @@ def test_real_debrid_selection_that_never_settles_is_uncached_and_cleaned_up():
 
 
 def test_real_debrid_links_that_never_settle_are_refused_and_cleaned_up():
+    # Three selected files with two links is a partial mismatch: it is neither
+    # a positional mapping nor the one-packed-link shape, so it stays refused.
     session = _rd_env(
-        [_rd_info("waiting_files_selection")]
-        + [_rd_info("downloaded", links=[RD_LOCKED_1])] * 40
+        [_rd_info("waiting_files_selection", files=_rd_selected(3))]
+        + [_rd_info(
+            "downloaded", files=_rd_selected(3), links=[RD_LOCKED_1, RD_LOCKED_2],
+        )] * 40
     )
     clock = FakeClock()
     with pytest.raises(DebridError) as excinfo:
@@ -1648,7 +1672,9 @@ def test_real_debrid_never_waits_for_a_cloud_download_to_finish():
 
 
 def test_real_debrid_link_count_mismatch_is_refused_and_cleaned_up():
-    session = _rd_env([_rd_info("downloaded", links=[RD_LOCKED_1])])
+    session = _rd_env([_rd_info(
+        "downloaded", files=_rd_selected(3), links=[RD_LOCKED_1, RD_LOCKED_2],
+    )])
     clock = FakeClock()
     with pytest.raises(DebridError):
         debrid.real_debrid_cached_torrent(
@@ -1717,6 +1743,235 @@ def test_real_debrid_torrent_file_uploads_raw_bytes():
     put = _rd_calls(session, "/torrents/addTorrent")[0]
     assert put[0] == "PUT"
     assert put[2]["data"] == raw
+
+
+# --- Real-Debrid packed multi-file torrents ---------------------------------
+#
+# Real-Debrid may compress a cached multi-file torrent into a single packed
+# link. The selected-file count then no longer matches the link count, and
+# the one link is the whole torrent rather than one of its files.
+
+_PACKED_MESSAGE = (
+    "Real-Debrid returned this torrent as a packed file, but Cove could not "
+    "determine a safe filename for it."
+)
+
+
+def test_real_debrid_packed_link_after_settling_becomes_one_file():
+    session = _rd_env(
+        [_rd_info("waiting_files_selection", files=_rd_selected(6))]
+        + [_rd_info(
+            "downloaded", files=_rd_selected(6), links=[RD_PACKED_LINK],
+        )] * 40,
+        **{"/unrestrict/link": _rd_unrestricted()},
+    )
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    # The full settling window is respected before the packed verdict.
+    assert sum(clock.slept) >= debrid.RD_SELECTION_SETTLE_WAIT
+    assert len(_rd_calls(session, "/torrents/selectFiles/rd-1")) == 1
+    assert len(_rd_calls(session, "/unrestrict/link")) == 1
+    assert len(cached.files) == 1
+    assert cached.files[0].index == 0
+    assert cached.files[0].path == ("Season 1.rar",)
+    assert cached.files[0].size == 1234
+    assert cached.files[0].locked_link == RD_PACKED_LINK
+    # The temporary delivery URL is never carried into the result.
+    assert RD_PACKED_DELIVERY not in repr(cached)
+    assert _rd_calls(session, "/torrents/delete/rd-1") == []
+
+
+def test_real_debrid_already_downloaded_packed_link_needs_no_settling():
+    session = _rd_env(
+        [_rd_info("downloaded", files=_rd_selected(50), links=[RD_PACKED_LINK])],
+        **{"/unrestrict/link": _rd_unrestricted()},
+    )
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    assert clock.slept == []
+    assert _rd_calls(session, "/torrents/selectFiles/rd-1") == []
+    assert len(_rd_calls(session, "/unrestrict/link")) == 1
+    assert len(cached.files) == 1
+    assert cached.files[0].locked_link == RD_PACKED_LINK
+    # One packed file is a flat destination, not a torrent wrapper folder.
+    assert cached.multi_file is False
+    assert cached.destination_parts(cached.files[0]) == ("Season 1.rar",)
+
+
+def test_real_debrid_packed_filename_is_sanitized():
+    session = _rd_env(
+        [_rd_info("downloaded", files=_rd_selected(6), links=[RD_PACKED_LINK])],
+        **{"/unrestrict/link": _rd_unrestricted(filename="../../evil/Season 1.rar")},
+    )
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached.files[0].path == ("Season 1.rar",)
+
+
+def test_real_debrid_packed_link_without_a_usable_filename_is_refused():
+    session = _rd_env(
+        [_rd_info("downloaded", files=_rd_selected(6), links=[RD_PACKED_LINK])],
+        **{"/unrestrict/link": _rd_unrestricted(filename="   ")},
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    err = excinfo.value
+    assert err.code == "packed_unsupported"
+    assert err.user_message == _PACKED_MESSAGE
+    assert err.fallback_allowed is False
+    assert RD_PACKED_LINK not in str(err)
+    assert RD_PACKED_DELIVERY not in str(err)
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_packed_unrestrict_error_stays_the_primary_failure():
+    session = _rd_env(
+        [_rd_info("downloaded", files=_rd_selected(6), links=[RD_PACKED_LINK])],
+        **{"/unrestrict/link": _Resp(
+            {"error": "infringing_file", "error_code": 35}, status_code=403
+        )},
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    err = excinfo.value
+    assert err.code == 35
+    assert err.user_message == "the file was refused as infringing."
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_partial_link_mismatch_is_not_treated_as_packed():
+    session = _rd_env(
+        [_rd_info("waiting_files_selection", files=_rd_selected(4))]
+        + [_rd_info(
+            "downloaded", files=_rd_selected(4), links=[RD_LOCKED_1, RD_LOCKED_2],
+        )] * 40
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert excinfo.value.code == "bad_response"
+    assert _rd_calls(session, "/unrestrict/link") == []
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_zero_links_is_not_treated_as_packed():
+    session = _rd_env(
+        [_rd_info("waiting_files_selection", files=_rd_selected(4))]
+        + [_rd_info("downloaded", files=_rd_selected(4), links=[])] * 40
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert excinfo.value.code == "bad_response"
+    assert _rd_calls(session, "/unrestrict/link") == []
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_excess_links_are_not_treated_as_packed():
+    session = _rd_env([_rd_info(
+        "downloaded", files=_rd_selected(1),
+        links=[RD_LOCKED_1, RD_LOCKED_2],
+    )])
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert excinfo.value.code == "bad_response"
+    assert _rd_calls(session, "/unrestrict/link") == []
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 1
+
+
+def test_real_debrid_matching_multi_file_response_is_unchanged():
+    session = _rd_env([_rd_info("downloaded")])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert [f.path for f in cached.files] == [("ep1.mkv",), ("extras", "ep2.mkv")]
+    assert [f.locked_link for f in cached.files] == [RD_LOCKED_1, RD_LOCKED_2]
+    assert _rd_calls(session, "/unrestrict/link") == []
+
+
+def test_real_debrid_single_file_response_is_never_packed():
+    session = _rd_env([_rd_info(
+        "downloaded", files=_rd_selected(1, prefix="movie"), links=[RD_LOCKED_1],
+    )])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert [f.path for f in cached.files] == [("movie1.mkv",)]
+    assert cached.files[0].size == 10
+    assert _rd_calls(session, "/unrestrict/link") == []
+
+
+def test_real_debrid_links_that_arrive_during_settling_stay_individual():
+    session = _rd_env([
+        _rd_info("waiting_files_selection"),
+        _rd_info("downloaded", links=[RD_PACKED_LINK]),
+        _rd_info("downloaded"),
+    ])
+    clock = FakeClock()
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert [f.locked_link for f in cached.files] == [RD_LOCKED_1, RD_LOCKED_2]
+    assert _rd_calls(session, "/unrestrict/link") == []
+
+
+def test_real_debrid_fresh_selection_waits_before_calling_a_link_packed():
+    session = _rd_env(
+        [_rd_info("waiting_files_selection", files=_rd_selected(6))]
+        + [_rd_info(
+            "downloaded", files=_rd_selected(6), links=[RD_PACKED_LINK],
+        )] * 40,
+        **{"/unrestrict/link": _rd_unrestricted()},
+    )
+    clock = FakeClock()
+    started = clock.now
+    cached = debrid.real_debrid_cached_torrent(
+        INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+    )
+    assert cached is not None
+    # Polled at the existing interval until the settling deadline, not before.
+    assert set(clock.slept) == {debrid.RD_TORRENT_POLL_INTERVAL}
+    assert clock.now - started >= debrid.RD_SELECTION_SETTLE_WAIT
+
+
+def test_real_debrid_packed_failure_survives_a_failing_cleanup():
+    session = _rd_env(
+        [_rd_info("downloaded", files=_rd_selected(6), links=[RD_PACKED_LINK])],
+        **{
+            "/unrestrict/link": _rd_unrestricted(filename=""),
+            "/torrents/delete/rd-1": RuntimeError("boom"),
+        },
+    )
+    clock = FakeClock()
+    with pytest.raises(DebridError) as excinfo:
+        debrid.real_debrid_cached_torrent(
+            INFO_HASH, TOKEN, session=session, sleep=clock.sleep, clock=clock.monotonic
+        )
+    assert excinfo.value.code == "packed_unsupported"
+    assert len(_rd_calls(session, "/torrents/delete/rd-1")) == 2
 
 
 # --- Shared torrent routing ------------------------------------------------
