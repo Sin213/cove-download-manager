@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizeGrip,
     QSizePolicy,
     QSpinBox,
@@ -100,6 +101,29 @@ COL_STATUS = 1
 COL_PROGRESS = 2
 COL_SIZE = 3
 COL_SPEED = 4
+
+
+def build_panel_scroll_area(content: QWidget) -> QScrollArea:
+    """Put the controls column in a scroller instead of a bare layout.
+
+    A QVBoxLayout that runs out of height shrinks its children below their
+    sensible size rather than overflowing, which renders as hint labels
+    sitting on top of the widgets above them. Scrolling keeps every section
+    at its own height and makes the overflow reachable. Horizontal scrolling
+    stays off: the column is width-driven by the two-column split.
+    """
+    area = QScrollArea()
+    area.setWidget(content)
+    area.setWidgetResizable(True)
+    area.setFrameShape(QScrollArea.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    # The sections draw their own surfaces; the viewport must not paint a
+    # second background over the window's.
+    area.setStyleSheet("QScrollArea { background: transparent; }")
+    area.viewport().setAutoFillBackground(False)
+    content.setAutoFillBackground(False)
+    return area
 
 
 def torrent_drop_paths(local_paths, enabled: bool) -> list[str]:
@@ -590,7 +614,9 @@ class MainWindow(QMainWindow):
         cols = QHBoxLayout()
         cols.setSpacing(16)
         cols.addLayout(self._build_stage(), 7)
-        cols.addLayout(self._build_panel(), 4)
+        panel_host = QWidget()
+        panel_host.setLayout(self._build_panel())
+        cols.addWidget(build_panel_scroll_area(panel_host), 4)
         body_lay.addLayout(cols, 1)
 
         # Bottom action bar
@@ -748,8 +774,8 @@ class MainWindow(QMainWindow):
         """
         self.extension_banner = Section("Browser extension")
         text = QLabel(
-            "Install the Cove browser extension to capture downloads from "
-            "your browser automatically."
+            "Install the Cove browser extension to capture downloads "
+            "automatically."
         )
         text.setProperty("role", "muted")
         text.setWordWrap(True)
@@ -805,10 +831,7 @@ class MainWindow(QMainWindow):
         section = Section("Browser extension")
         self.extension_pill = StatusPill()
         self._set_extension_state(False)
-        hint = QLabel(
-            "Cove captures browser downloads through the extension. This "
-            "reads 'connected' once it has talked to Cove."
-        )
+        hint = QLabel("Reads 'connected' once the extension has talked to Cove.")
         hint.setProperty("role", "muted")
         hint.setWordWrap(True)
         section.body().addWidget(self.extension_pill)
