@@ -2585,7 +2585,7 @@ class QueueManager(QObject):
         # sets — a pasted share link still lands in the branch below.
         share_reason = (
             "" if t.source_type == SOURCE_TORRENT_FILE
-            else debrid.share_link_reason(t.url)
+            else debrid.share_link_reason(t.url, self.settings)
         )
         if share_reason:
             facts = diagnostics.url_facts(t.url)
