@@ -7,7 +7,7 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v3.4.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v3.5.0-5eead4?style=flat-square)
 
 ![Cove Download Manager](docs/screenshot.png)
 
@@ -64,6 +64,10 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 - **Debrid accounts** - optional Real-Debrid, AllDebrid, and TorBox
   integration. Links on hosts your account supports are resolved
   automatically before downloading. See [Debrid services](#debrid-services).
+- **Diagnostics** - a **Logs** button opens a filterable view of what Cove
+  actually did, with **Copy diagnostics** for reporting a problem. Links,
+  file paths, tokens and cookies are stripped before anything is stored or
+  copied, and nothing is ever uploaded. See [Diagnostics](#diagnostics).
 - **Magnet links from your browser** - once Cove is registered as a magnet
   handler on Linux or Windows, clicking a magnet link opens Cove and adds it
   to the existing torrent / debrid pipeline. An already-running Cove picks
@@ -225,6 +229,57 @@ The command-line flags still work for scripted setups:
 A source checkout cannot register: the path it would record belongs to the
 Python interpreter, not to Cove. Settings explains this rather than failing
 silently.
+
+---
+
+## Diagnostics
+
+Cove keeps a sanitized record of what it did, so a problem can be reported
+with evidence instead of a description.
+
+Press **Logs** in the action bar to open the Diagnostics window. Filter by
+level, component, task or request id, or search the text. **Copy diagnostics**
+puts a support-ready report on the clipboard, **Save diagnostics** writes it to
+a text file, and **Open log folder** goes to the files themselves.
+
+Logs live beside the rest of Cove's data:
+
+| Install | Location |
+|---------|----------|
+| Linux | `~/.local/share/cove/logs/` |
+| Windows (installed) | the Cove data folder plus `logs` |
+| Windows (portable) | the portable data folder plus `logs` |
+
+The active log is capped at 2 MB with three rotating backups, and the native
+messaging host writes its own smaller `native-host.jsonl` beside it.
+
+### What is not recorded
+
+Redaction runs before anything is stored, displayed, copied or saved:
+
+- Links keep only their scheme, a sanitized host and a route shape, so a
+  Real-Debrid link is recorded as `https://real-debrid.com/d/<redacted>` and a
+  magnet as `magnet:<redacted>`. Query strings and fragments are dropped.
+- File paths keep only their shape. Your user folder becomes `%USERPROFILE%`
+  or `~`, and the random work-directory suffix becomes `.cove-work-<work-id>`.
+- API tokens, cookies, authorization headers and the aria2 RPC secret are
+  never recorded. Debrid accounts appear only as configured or not.
+- The browser extension never records a page address, a media address or a
+  tab title.
+
+There is no telemetry and no upload. Nothing leaves your machine unless you
+press Copy or Save and send it yourself.
+
+### Reporting a failed download
+
+1. Reproduce the problem once.
+2. Right-click the failed row and choose **View logs**, which opens the
+   Diagnostics window already filtered to that download.
+3. Press **Copy diagnostics** and paste the result into your report.
+
+If the problem is that a browser download never reached Cove at all, the app
+has nothing to log. Use **Copy diagnostics** in the extension popup instead,
+which works with Cove closed.
 
 ---
 
@@ -483,6 +538,7 @@ its interface is a routing decision, not a guarantee.
 | aria2 session / log | `~/.local/share/cove/aria2.{session,log}` | `%USERPROFILE%\.local\share\cove\aria2.{session,log}` |
 | Debrid host cache | `~/.local/share/cove/debrid_hosts.json` | `%USERPROFILE%\.local\share\cove\debrid_hosts.json` |
 | Torrent copies | `~/.local/share/cove/torrents/` | `%USERPROFILE%\.local\share\cove\torrents\` |
+| Diagnostics logs | `~/.local/share/cove/logs/` | `%USERPROFILE%\.local\share\cove\logs\` |
 
 Portable builds keep everything in a `cove-app-data` folder next to the
 executable instead.

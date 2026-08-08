@@ -342,25 +342,34 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.4.0
+          ## What's new in 3.5.0
 
-          This release makes the browser extension discoverable from inside the app, gives Cove Download Manager its own icon, and teaches Real-Debrid torrents to handle packed multi-file results.
+          This release is about being able to explain a failure after it happens. Cove could not do that before: the packaged Windows build is windowed, so its Python logging went nowhere, aria2 kept a log nothing surfaced, and the browser extension kept no record at all. A user hitting a broken download could describe it and little else.
 
           ### Added
 
-          - **Cove now offers the browser extension.** The app never mentioned that download interception and the in-page pill come from an extension; the setup instructions only existed in the README, which a running app never shows. A first-run banner above the download list links both store listings plus **Set up later**, and it is answered exactly once - dismissed, acted on, or made moot by an extension that connects. A permanent tray entry, **Get the browser extension**, keeps both links available afterwards, and the empty state mentions it too.
-          - **Extension connection status in the window.** The native host used to answer pings by itself, so a running Cove could not tell an installed extension from a missing one until a download actually arrived. The Browser extension panel now reports **Connected** or **Not detected**; any extension ping counts as proof, as does an accepted browser download.
-          - **Native-host setup problems are visible.** A failed native messaging registration is the usual reason an extension cannot connect, and it only ever reached the log file. The panel now shows a **Setup problem** row with a **Details** button explaining what failed. It stays independent of the connection indicator, because registration can fail for one browser while another talks to Cove fine.
-          - **Its own app icon.** Cove Download Manager used the shared Cove suite skull everywhere, so its window, taskbar, tray and launcher were indistinguishable from the other Cove apps. It now ships a distinct icon: the suite skull plus a teal download arrow with the brand keyline, sized so the distinction still reads at 16px. Every packaging path installs it - AppImage, deb, Inno Setup, the release workflow and both local Windows builders.
-          - **Real-Debrid packed multi-file torrents.** Real-Debrid sometimes compresses a cached multi-file torrent into a single packed archive and returns one link for the whole thing. Cove now recognises that answer and downloads it as one honest file, named and sized from the provider's own unrestrict metadata. No extraction, no pretending the individual files arrived separately: one queue row, one file, which is what the provider delivered. Any other link-count mismatch is still refused as malformed rather than guessed at.
+          - **Sanitized diagnostics, and a Logs button to read them.** A new Logs button opens a Diagnostics window over the queue, the app's own event log with filters for level, component, task or request id, and free text. Copy diagnostics puts a support-ready report on the clipboard, Save diagnostics writes it to a text file, and Open log folder goes straight to the files. Logs live under the normal data directory (`~/.local/share/cove/logs` on Linux, the portable data folder in portable mode), capped at 2 MB with three rotating backups, so they cannot grow without bound.
+          - **View logs on a failed download.** Right-click a failed row and choose View logs to open the Diagnostics window already filtered to that task. The row is not touched: it stays failed, and nothing is retried.
+          - **The extension can report a failure while Cove is closed.** This was the gap that made "the pill says Cove is not running" impossible to investigate: if the request never reached Cove, Cove's log has nothing to say about it. The extension now keeps its own bounded record in browser storage, and the popup has Copy diagnostics and Clear diagnostics buttons that work with Cove shut down, the native host unreachable, or native messaging failing outright.
+          - **The native messaging host keeps its own log.** It runs as a separate short-lived process, so it writes `native-host.jsonl` beside the app log and never shares a file with the running app. Its stdout stays reserved for the browser protocol. The Diagnostics window merges a tail of it into the same view, labelled `[host]`, so both sides of a browser handoff can be read together.
+          - **One request id across all three processes.** A download started from the in-page pill now carries an id from the content script through the background script, the native message, the local socket and into the queue. Filtering on it in the Diagnostics window shows the whole journey and where it stopped. It is optional throughout, so an older extension and a newer app, or the reverse, keep working exactly as before.
+          - **Temporary debug logging.** A checkbox in the Diagnostics window turns on extra detail until the app restarts. It is never persisted, and it never turns off redaction.
+
+          ### What the logs will not contain
+
+          Redaction happens before anything is stored, shown, copied or saved, and a redaction step that fails returns a placeholder rather than the original value. Links keep only their scheme, a sanitized host and a route shape, so a Real-Debrid link is recorded as `https://real-debrid.com/d/<redacted>` and a magnet as `magnet:<redacted>`. Query strings, fragments and login details in a URL are dropped outright. File paths keep only their shape: your Windows or Linux user folder becomes `%USERPROFILE%` or `~`, and the random work-directory suffix becomes `.cove-work-<work-id>`. API tokens, cookies, authorization headers and the aria2 RPC secret are never recorded, debrid accounts appear only as "configured: yes or no", and the extension never records a page address, a media address or a tab title.
+
+          There is no telemetry and no upload. Nothing leaves the machine unless you press Copy or Save and send it yourself.
 
           ### Fixed
 
-          - **Real-Debrid multi-file selection settling.** Real-Debrid populates its link array gradually after file selection, so Cove could read a partially filled response and reject a perfectly good cached torrent. Selection is now followed by a bounded settling window, and the response is only judged once the links have stopped arriving.
-          - **Right-click downloads on blob URLs.** The context menu now falls back to the extractor page URL when a media `srcUrl` is a `blob:`, so right-click downloads on YouTube work the same way the in-page pill already did.
-          - **In-page pill scrolling behaviour.** The pill used to clamp itself to the top of the viewport when its video scrolled away. It now hides while its anchor video is mostly out of view and comes back on scroll-in, and video selection and placement are visibility-aware across every activation path, so an off-screen video cannot take or suppress the pill.
-          - **Pill disappearing from feed previews.** Tearing down a feed preview now uses the existing 500ms grace period, so the pill stays reachable long enough to actually click.
-          - **Controls panel no longer squeezes itself.** The Browser extension section pushed the right-hand column past the window height, and a layout short of space shrinks its children rather than overflowing - so hint labels were drawn on top of the widgets above them. The panel now scrolls: sections keep their height and the overflow scrolls instead.
+          - **Startup errors no longer vanish.** Wiring the app's logger into diagnostics initially silenced the messages Python used to print to the terminal by itself, including the one that explains an unreadable settings file. The terminal output is restored explicitly.
+
+          ### Notes
+
+          - Diagnostics are observation only. Download routing, extractor validation, aria2 behaviour, debrid handling, connection wording and timeouts are all unchanged, and a logging failure can never fail a download or stop the app from starting.
+          - Three specific problems reported against 3.4.0 are now diagnosable, though this release deliberately does not change their outcome: the Windows extractor publication failure now records the exact rule that rejected the path, the popup saying Connected while the video pill says Cove is not running now records both sides of that check, and a Real-Debrid generated `/d/` link now records its route class without the account token.
+          - Browser extension: Firefox 1.4.5 and Chrome 1.3.5. Store submission is manual, so the store listings update separately from this release.
 
           ## Downloads
 
