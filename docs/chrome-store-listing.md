@@ -30,22 +30,35 @@ Cove Download Manager (browser extension) hands your downloads off to the Cove d
 When you start a download, the extension can intercept it and send the link to Cove, along with the page's cookies and referrer so logged-in and protected downloads still work. Cove then downloads the file using multiple connections and manages it in a real queue.
 
 Features:
-• Multi-connection downloads (up to 16 connections per file) for higher speeds
-• Real download queue with start/pause and per-item control
+
+• Multi-connection downloads with up to 16 connections per file for higher speeds
+
+• Real download queue with start, pause, and per-item controls
+
 • Daily schedule window and a global speed cap
+
 • Right-click any link or image and choose "Download with Cove"
-• Sends cookies, referrer, and user-agent so authenticated downloads work
-• Toggle interception on/off and set a minimum file size and excluded domains
 
-How it works:
-Cove takes over the file downloads your browser would otherwise handle on its own - installers, archives, documents, and other direct file links. You stay in control of what it touches: interception can be switched off with a keyboard shortcut, limited by minimum file size, restricted by file type, and disabled per domain. Nothing is downloaded without an action you took.
+• Sends cookies, referrer, and user-agent information so authenticated downloads work
 
-What's new in 1.3.6:
-• Removed in-page video handling from the Chrome version. Cove for Chrome now handles direct file downloads and right-click downloads on links and images.
+• Toggle interception on or off and set a minimum file size and excluded domains
 
-Requires the free Cove Download Manager desktop app, which provides the download engine. Install Cove, launch it once, then click "Test Connection to Cove" in the extension to link them.
+How interception works:
 
-Cove is open source: https://github.com/Sin213/cove-download-manager
+When you start a download, Cove can take it over instead of leaving it to the browser: installers, archives, documents, and other direct file links.
+
+You decide what it touches. Interception can be switched off with a keyboard shortcut, limited by a minimum file size, restricted to specific file types, and disabled entirely on domains you list.
+
+Nothing is downloaded without an action you took, and the extension never collects or transmits your browsing history.
+
+What's new in version 1.3.6:
+
+Cove for Chrome now focuses on file downloads: direct downloads it intercepts from the browser, and right-click downloads on links and images.
+
+The free Cove Download Manager desktop app is required because it provides the download engine. Install Cove, launch it once, and then click "Test Connection to Cove" in the extension to link them.
+
+Cove is open source:
+https://github.com/Sin213/cove-download-manager
 ```
 
 ## What changed from the 1.3.4 copy
