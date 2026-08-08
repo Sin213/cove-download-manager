@@ -94,7 +94,8 @@ function stubVideo({ top = 100, width = 640, height = 360 } = {}) {
   return video;
 }
 
-function loadMediaTab({ href = "https://example.test/watch", videos = [] } = {}) {
+function loadMediaTab({ href = "https://example.test/watch", videos = [],
+                       reply = { mediaPillEnabled: true } } = {}) {
   const timers = [];
   const documentElement = new StubNode("HTML");
   const body = new StubNode("BODY");
@@ -132,10 +133,20 @@ function loadMediaTab({ href = "https://example.test/watch", videos = [] } = {})
     },
   };
 
+  // Every message the content script sends, so the diagnostics it reports
+  // can be inspected exactly as the background would receive them.
+  const sent = [];
   const browser = {
     runtime: {
       id: "cove-test",
-      sendMessage: async () => ({ mediaPillEnabled: true }),
+      async sendMessage(message) {
+        sent.push(message);
+        if (typeof reply === "function") return reply(message);
+        if (message && message.type === "getSettings") {
+          return { mediaPillEnabled: true };
+        }
+        return reply;
+      },
       onMessage: { addListener() {} },
     },
     storage: { onChanged: { addListener() {} } },
@@ -193,7 +204,7 @@ function loadMediaTab({ href = "https://example.test/watch", videos = [] } = {})
     const pending = timers.splice(0, timers.length);
     for (const handle of pending) handle.fn();
   };
-  return { doc, win, body, pillHost, runTimers, timers };
+  return { doc, win, body, pillHost, runTimers, timers, sent };
 }
 
 // Brings a video up as the active pill target through the hover path.
@@ -438,4 +449,131 @@ test("hovering the pill itself cancels the pending hide", () => {
   harness.runTimers();
 
   assert.equal(host.style.display, "block");
+});
+
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+//
+// The content script cannot load extension/diagnostics.js (the manifest lists
+// one content script), so it reports events to the background instead. It must
+// never send a page address, a media address or a title along with them.
+// ---------------------------------------------------------------------------
+
+function diagMessages(harness) {
+  return harness.sent.filter((m) => m && m.type === "coveDiag");
+}
+
+async function clickPill(harness, video) {
+  const host = hover(harness, video);
+  const pill = host.shadowRoot.children.find(
+    (n) => n.className === "cove-pill"
+  );
+  assert.ok(pill, "expected the pill element inside the shadow root");
+  pill.dispatch("click", {});
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  return host;
+}
+
+test("a pill download records a request with a generated request id", async () => {
+  const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
+  const harness = loadMediaTab({ videos: [video], reply: { ok: true } });
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.match(download.requestId, /^[0-9a-f]{8}$/);
+
+  const requested = diagMessages(harness).find(
+    (m) => m.event === "video_download_requested"
+  );
+  assert.ok(requested, "the pill request must be recorded");
+  assert.equal(requested.component, "extension.content");
+  assert.equal(requested.requestId, download.requestId);
+});
+
+test("a pill result is recorded with the same request id", async () => {
+  const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
+  const harness = loadMediaTab({ videos: [video], reply: { ok: true } });
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  const result = diagMessages(harness).find((m) => m.event === "video_pill_result");
+  assert.equal(result.requestId, download.requestId);
+  assert.equal(result.fields.result, "sent");
+});
+
+test("an unavailable Cove is recorded as such by the pill", async () => {
+  const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
+  const harness = loadMediaTab({
+    videos: [video],
+    reply: { ok: false, reason: "unavailable" },
+  });
+  await clickPill(harness, video);
+
+  const result = diagMessages(harness).find((m) => m.event === "video_pill_result");
+  assert.equal(result.fields.result, "unavailable");
+});
+
+test("a background script that never answers is recorded as unavailable", async () => {
+  const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
+  const harness = loadMediaTab({
+    videos: [video],
+    reply: (message) => {
+      if (message.type === "downloadMedia") throw new Error("no background");
+      if (message.type === "getSettings") return { mediaPillEnabled: true };
+      return {};
+    },
+  });
+  await clickPill(harness, video);
+
+  const result = diagMessages(harness).find((m) => m.event === "video_pill_result");
+  assert.equal(result.fields.result, "unavailable");
+});
+
+test("no page url, media url or title is sent with a pill diagnostic", async () => {
+  const video = stubVideo({
+    top: 200,
+    src: "https://cdn.example.test/v/secret-movie.mp4",
+  });
+  const harness = loadMediaTab({
+    videos: [video],
+    href: "https://news.example.test/private-article",
+    reply: { ok: true },
+  });
+  await clickPill(harness, video);
+
+  const dumped = JSON.stringify(diagMessages(harness));
+  assert.ok(!dumped.includes("secret-movie"));
+  assert.ok(!dumped.includes("private-article"));
+  assert.ok(!dumped.includes("news.example.test"));
+  assert.ok(!dumped.includes("cdn.example.test"));
+});
+
+test("the pill wording is unchanged by diagnostics", async () => {
+  const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
+  const harness = loadMediaTab({
+    videos: [video],
+    reply: { ok: false, reason: "unavailable" },
+  });
+  const host = await clickPill(harness, video);
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  const label = pill.children[0];
+  assert.equal(label.textContent, "Cove is not running");
+});
+
+test("a diagnostics send failure never breaks a pill download", async () => {
+  const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
+  const harness = loadMediaTab({
+    videos: [video],
+    reply: (message) => {
+      if (message.type === "coveDiag") throw new Error("diagnostics exploded");
+      if (message.type === "getSettings") return { mediaPillEnabled: true };
+      return { ok: true };
+    },
+  });
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.ok(download, "the download must still be sent");
 });

@@ -347,3 +347,413 @@ def test_download_delivery_failure_is_reported_as_error(tmp_path, monkeypatch):
     )
     assert result["status"] == "error"
     assert list(tmp_path.rglob("*")) == []
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics for the native messaging host.
+#
+# The host runs as a separate short-lived process with no GUI, so it keeps its
+# own logger and its own file. stdout belongs to the native messaging protocol
+# and must stay free of diagnostic text.
+# ---------------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+import pytest  # noqa: E402
+
+from cove import diagnostics  # noqa: E402
+
+RD_SHARE = "https://real-debrid.com/d/A7QK3ZP9WVN2XLMDR4TJ6YB8C5FGH1SE"
+COOKIE = "session=eyJhbGciOiJIUzI1NiJ9.QWxhZGRpbjpvcGVuIHNlc2FtZQ"
+
+
+@pytest.fixture
+def host_log(tmp_path, monkeypatch):
+    log = diagnostics.init_native_host_logger(tmp_path)
+    monkeypatch.setattr(nm, "_LOG", log)
+    yield log
+    log.close()
+
+
+def _events(log, event=None):
+    return [r for r in log.records() if event is None or r["event"] == event]
+
+
+def test_native_messaging_module_imports_without_qt():
+    """PySide6 must stay out of the import path: the host is spawned by the
+    browser for every message, including plain pings."""
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys, cove.native_messaging; "
+         "print('PySide6' in sys.modules or 'PySide6.QtCore' in sys.modules)"],
+        capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == "False"
+
+
+def test_host_start_is_logged_with_versions(host_log):
+    nm.log_host_start()
+    start = _events(host_log, "host_start")
+    assert len(start) == 1
+    assert start[0]["component"] == "native_host"
+    assert start[0]["fields"]["app_version"]
+
+
+def test_host_logger_writes_to_its_own_file(tmp_path):
+    log = diagnostics.init_native_host_logger(tmp_path)
+    try:
+        log.emit("native_host", "host_start", "INFO")
+        assert (tmp_path / "logs" / diagnostics.NATIVE_LOG_NAME).exists()
+        assert not (tmp_path / "logs" / diagnostics.APP_LOG_NAME).exists()
+    finally:
+        log.close()
+
+
+def test_request_action_is_logged_without_the_payload(host_log, monkeypatch):
+    monkeypatch.setattr(nm, "deliver_to_primary", lambda req: True)
+    handle_message(
+        {"action": "download", "url": RD_SHARE, "cookies": COOKIE,
+         "filename": "video.mp4"},
+        None, None,
+    )
+    received = _events(host_log, "request_received")
+    assert len(received) == 1
+    assert received[0]["fields"]["action"] == "download"
+    dumped = json.dumps(host_log.records())
+    assert "A7QK3ZP9WVN2XLMDR4TJ6YB8C5FGH1SE" not in dumped
+    assert "eyJhbGciOiJIUzI1NiJ9" not in dumped
+    assert "real-debrid.com/d/" not in dumped
+    assert "video.mp4" not in dumped
+
+
+def test_optional_request_id_is_recorded(host_log, monkeypatch):
+    monkeypatch.setattr(nm, "deliver_to_primary", lambda req: True)
+    handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4",
+         "requestId": "51c2a711"},
+        None, None,
+    )
+    assert _events(host_log, "request_received")[0]["request"] == "51c2a711"
+
+
+def test_request_id_is_forwarded_to_the_primary(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(nm, "deliver_to_primary",
+                        lambda req: seen.update(req) or True)
+    handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4",
+         "requestId": "51c2a711"},
+        None, None,
+    )
+    assert seen["request_id"] == "51c2a711"
+
+
+def test_a_message_without_a_request_id_still_works(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(nm, "deliver_to_primary",
+                        lambda req: seen.update(req) or True)
+    result = handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+    )
+    assert result["status"] == "ok"
+    assert seen["request_id"] is None
+
+
+@pytest.mark.parametrize(
+    "value", ["bad id!", "x" * 200, 12345, "", None, "semi;colon"]
+)
+def test_invalid_request_ids_are_dropped_not_forwarded(value, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(nm, "deliver_to_primary",
+                        lambda req: seen.update(req) or True)
+    handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4",
+         "requestId": value},
+        None, None,
+    )
+    assert seen["request_id"] is None
+
+
+def test_ipc_attempt_and_result_are_logged(host_log, monkeypatch):
+    monkeypatch.setattr(nm, "_send_to_primary",
+                        lambda request, on_reason: (on_reason("ok"), True)[1])
+    handle_message({"action": "download", "url": "https://example.com/a.mp4"},
+                   None, None)
+    assert _events(host_log, "ipc_attempt")
+    result = _events(host_log, "ipc_result")
+    assert result[0]["fields"]["result"] == "ok"
+
+
+@pytest.mark.parametrize(
+    "reason", ["connect_timeout", "ack_timeout", "transport_error", "rejected"]
+)
+def test_ipc_failure_reasons_are_distinguished(reason, host_log, monkeypatch):
+    monkeypatch.setattr(nm, "_send_to_primary",
+                        lambda request, on_reason: (on_reason(reason), False)[1])
+    response = handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+    )
+    assert response["message"] == "Cove is not available"
+    assert _events(host_log, "ipc_result")[0]["fields"]["result"] == reason
+
+
+def test_gui_unavailable_is_recorded_when_the_socket_cannot_be_reached(
+    host_log, monkeypatch
+):
+    monkeypatch.setattr(
+        nm, "_send_to_primary",
+        lambda request, on_reason: (_ for _ in ()).throw(RuntimeError("no gui")),
+    )
+    response = handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+    )
+    assert response["status"] == "error"
+    assert _events(host_log, "ipc_result")[0]["fields"]["result"] == "app_unavailable"
+
+
+def test_broad_exception_handlers_are_no_longer_silent(host_log, monkeypatch):
+    monkeypatch.setattr(
+        nm, "notify_primary_extension_seen",
+        lambda: (_ for _ in ()).throw(RuntimeError("ping exploded")),
+    )
+    assert handle_message({"action": "ping"}, None, None)["status"] == "ok"
+    assert _events(host_log, "ping_notify_failed")
+
+
+def test_reply_status_is_logged(host_log, monkeypatch):
+    monkeypatch.setattr(nm, "deliver_to_primary", lambda req: False)
+    handle_message({"action": "download", "url": "https://example.com/a.mp4"},
+                   None, None)
+    reply = _events(host_log, "reply_sent")
+    assert reply[0]["fields"]["status"] == "error"
+
+
+def test_stdout_carries_only_protocol_frames(tmp_path, monkeypatch, capsys):
+    """Anything written to stdout that is not a length-prefixed frame breaks
+    the browser's parser, so diagnostics must never go there."""
+    log = diagnostics.init_native_host_logger(tmp_path)
+    monkeypatch.setattr(nm, "_LOG", log)
+    monkeypatch.setattr(nm, "deliver_to_primary", lambda req: True)
+
+    payload = encode_message({"action": "download", "url": "https://example.com/a.mp4"})
+    stdin = io.BytesIO(payload)
+    stdout = io.BytesIO()
+    monkeypatch.setattr(nm, "_binary_stdio", lambda: (stdin, stdout))
+    monkeypatch.setattr(nm.Settings, "load", staticmethod(lambda: None))
+    nm.main()
+
+    raw = stdout.getvalue()
+    length = struct.unpack("<I", raw[:4])[0]
+    assert json.loads(raw[4:4 + length])["status"] == "ok"
+    assert len(raw) == 4 + length, "no extra bytes on stdout"
+    assert capsys.readouterr().out == ""
+    log.close()
+
+
+def test_session_end_is_logged(tmp_path, monkeypatch):
+    log = diagnostics.init_native_host_logger(tmp_path)
+    monkeypatch.setattr(nm, "_LOG", log)
+    monkeypatch.setattr(nm, "_binary_stdio", lambda: (io.BytesIO(b""), io.BytesIO()))
+    monkeypatch.setattr(nm.Settings, "load", staticmethod(lambda: None))
+    nm.main()
+    assert [r["event"] for r in log.records()][-1] == "host_stop"
+    log.close()
+
+
+def test_host_diagnostics_failure_never_breaks_a_reply(monkeypatch):
+    monkeypatch.setattr(nm, "_LOG", None)
+    monkeypatch.setattr(nm, "deliver_to_primary", lambda req: True)
+    assert handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+    )["status"] == "ok"
+
+
+# ---- request-id propagation across the IPC boundary ------------------------
+
+from cove import single_instance as si  # noqa: E402
+
+
+def _browser_message(**extra):
+    message = {"version": si.PROTOCOL_VERSION, "action": si.BROWSER_DOWNLOAD_ACTION,
+               "url": "https://example.com/a.mp4"}
+    message.update(extra)
+    return message
+
+
+def test_validate_browser_download_accepts_an_optional_request_id():
+    request = si.validate_browser_download(_browser_message(request_id="51c2a711"))
+    assert request["request_id"] == "51c2a711"
+
+
+def test_validate_browser_download_without_a_request_id_still_validates():
+    request = si.validate_browser_download(_browser_message())
+    assert request["request_id"] is None
+    assert request["url"] == "https://example.com/a.mp4"
+
+
+@pytest.mark.parametrize("value", ["bad id!", "x" * 200, 5, ""])
+def test_validate_browser_download_drops_an_invalid_request_id(value):
+    request = si.validate_browser_download(_browser_message(request_id=value))
+    assert request["request_id"] is None
+
+
+def test_an_unknown_extra_key_does_not_reject_a_browser_download():
+    """Forward compatibility: a newer extension may add keys this build has
+    never heard of, and the download must still be accepted."""
+    request = si.validate_browser_download(_browser_message(somethingNew="x"))
+    assert request["url"] == "https://example.com/a.mp4"
+
+
+def test_browser_download_add_is_tagged_as_extension_intake(tmp_path):
+    from cove import app as cove_app
+
+    diagnostics.shutdown_logger()
+    log = diagnostics.init_app_logger(tmp_path)
+    try:
+        recorded = {}
+
+        class _Queue:
+            def add_url(self, url, **kw):
+                recorded.update(kw)
+                return 7
+
+        gate = cove_app.BrowserDownloadGate()
+        gate.queue = _Queue()
+        gate.ready = True
+        assert gate.accept(
+            {"url": "https://example.com/a.mp4", "request_id": "51c2a711"}
+        ) is True
+        assert recorded["intake"] == "extension"
+        results = [r for r in log.records() if r["event"] == "gui_result"]
+        assert results[0]["request"] == "51c2a711"
+        assert results[0]["component"] == "extension.native_bridge"
+        assert results[0]["task"] == 7
+    finally:
+        diagnostics.shutdown_logger()
+
+
+def test_browser_download_rejection_is_logged_without_the_url(tmp_path):
+    from cove import app as cove_app
+
+    diagnostics.shutdown_logger()
+    log = diagnostics.init_app_logger(tmp_path)
+    try:
+        gate = cove_app.BrowserDownloadGate()
+        gate.ready = False
+        assert gate.accept({"url": RD_SHARE, "request_id": "51c2a711"}) is False
+        results = [r for r in log.records() if r["event"] == "gui_result"]
+        assert results[0]["fields"]["result"] == "not_ready"
+        assert "A7QK3ZP9WVN2XLMDR4TJ6YB8C5FGH1SE" not in json.dumps(log.records())
+    finally:
+        diagnostics.shutdown_logger()
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: the request id survives every hop
+# ---------------------------------------------------------------------------
+
+
+def test_one_request_id_spans_extension_host_and_gui(tmp_path, monkeypatch):
+    """content script -> background -> native message -> host -> IPC -> queue.
+
+    The extension side of the chain is covered by the Node tests; this walks
+    the message the background produced through the host, the IPC validator
+    and the GUI gate, and proves the same id lands on the queue-side record.
+    """
+    from cove import app as cove_app
+
+    diagnostics.shutdown_logger()
+    app_log = diagnostics.init_app_logger(tmp_path / "gui")
+    host_log = diagnostics.init_native_host_logger(tmp_path / "host")
+    monkeypatch.setattr(nm, "_LOG", host_log)
+
+    forwarded = {}
+    monkeypatch.setattr(nm, "deliver_to_primary",
+                        lambda req: forwarded.update(req) or True)
+    try:
+        # The frame the background actually sends.
+        nm.handle_message(
+            {"action": "download", "url": "https://example.com/a.mp4",
+             "requestId": "51c2a711"},
+            None, None,
+        )
+        assert forwarded["request_id"] == "51c2a711"
+
+        # The IPC frame the host builds from it.
+        message = {"version": si.PROTOCOL_VERSION,
+                   "action": si.BROWSER_DOWNLOAD_ACTION,
+                   "url": forwarded["url"], "request_id": forwarded["request_id"]}
+        validated = si.validate_browser_download(message)
+        assert validated["request_id"] == "51c2a711"
+
+        # The GUI gate that finally adds it.
+        class _Queue:
+            def add_url(self, url, **kw):
+                return 11
+
+        gate = cove_app.BrowserDownloadGate()
+        gate.queue = _Queue()
+        gate.ready = True
+        assert gate.accept(validated) is True
+
+        assert [r["request"] for r in host_log.records()
+                if r["event"] == "request_received"] == ["51c2a711"]
+        gui = [r for r in app_log.records() if r["event"] == "gui_result"]
+        assert gui[0]["request"] == "51c2a711"
+        assert gui[0]["task"] == 11
+    finally:
+        host_log.close()
+        diagnostics.shutdown_logger()
+
+
+def test_an_old_extension_without_a_request_id_still_completes(tmp_path, monkeypatch):
+    from cove import app as cove_app
+
+    diagnostics.shutdown_logger()
+    app_log = diagnostics.init_app_logger(tmp_path / "gui")
+    host_log = diagnostics.init_native_host_logger(tmp_path / "host")
+    monkeypatch.setattr(nm, "_LOG", host_log)
+
+    forwarded = {}
+    monkeypatch.setattr(nm, "deliver_to_primary",
+                        lambda req: forwarded.update(req) or True)
+    try:
+        response = nm.handle_message(
+            {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+        )
+        assert response["status"] == "ok"
+        assert forwarded["request_id"] is None
+
+        validated = si.validate_browser_download({
+            "version": si.PROTOCOL_VERSION,
+            "action": si.BROWSER_DOWNLOAD_ACTION,
+            "url": forwarded["url"],
+        })
+
+        class _Queue:
+            def add_url(self, url, **kw):
+                return 12
+
+        gate = cove_app.BrowserDownloadGate()
+        gate.queue = _Queue()
+        gate.ready = True
+        assert gate.accept(validated) is True
+        gui = [r for r in app_log.records() if r["event"] == "gui_result"]
+        assert gui[0].get("request") is None
+    finally:
+        host_log.close()
+        diagnostics.shutdown_logger()
+
+
+def test_an_old_host_that_omits_the_request_id_is_still_accepted():
+    """Forward compatibility in the other direction: a primary running a newer
+    build must not require a key an older host never sends."""
+    validated = si.validate_browser_download({
+        "version": si.PROTOCOL_VERSION,
+        "action": si.BROWSER_DOWNLOAD_ACTION,
+        "url": "https://example.com/a.mp4",
+        "cookies": "a=b",
+    })
+    assert validated["url"] == "https://example.com/a.mp4"
+    assert validated["request_id"] is None

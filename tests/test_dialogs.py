@@ -1184,10 +1184,10 @@ class FakeQueue:
         self.batches = []
     def find_duplicate(self, url, **kw):
         return self.matches.get(dedup.canonical_url(url) or url)
-    def add_url(self, url, out_dir=None):
+    def add_url(self, url, out_dir=None, **kw):
         self.added.append(url)
         return len(self.added)
-    def add_urls(self, urls, out_dir=None):
+    def add_urls(self, urls, out_dir=None, **kw):
         self.batches.append(list(urls))
         return [self.add_url(u) for u in urls]
 

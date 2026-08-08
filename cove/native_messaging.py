@@ -16,11 +16,31 @@ import struct
 import sys
 from typing import Any
 
-from . import __version__
+from . import __version__, diagnostics
 from .aria2 import Aria2RPC, Aria2Error
 from .config import Settings
 
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
+
+# This host's own logger, initialised in main(). It writes to its own file:
+# the GUI is a different process and two writers must never share one file.
+# stdout is reserved for protocol frames, so nothing here may print.
+_LOG = None
+
+
+def _log(event: str, level: str = "INFO", request_id=None, exc=None, **fields) -> None:
+    log = _LOG
+    if log is None:
+        return
+    try:
+        log.emit("native_host", event, level, request_id=request_id, exc=exc, **fields)
+    except Exception:
+        pass
+
+
+def log_host_start() -> None:
+    _log("host_start", "INFO", app_version=__version__,
+         mode=diagnostics.install_mode())
 
 
 def _read_exact(stream: io.BufferedIOBase, n: int) -> bytes | None:
@@ -81,6 +101,27 @@ def validate_url(url: str) -> bool:
     return False
 
 
+def _send_to_primary(request: dict, on_reason) -> bool:
+    """Do the actual IPC round trip, reporting a safe failure class.
+
+    Split out from deliver_to_primary so the reason a handoff failed can be
+    recorded without changing what deliver_to_primary returns or when.
+    """
+    from PySide6.QtCore import QCoreApplication
+
+    from .config import DATA_DIR
+    from .single_instance import send_browser_download, server_name
+
+    # QLocalSocket needs a QCoreApplication for its event dispatcher. This
+    # host is a short-lived console process with no Qt app of its own, so
+    # create a minimal one; it is never exec()'d, and no GUI is possible
+    # (QCoreApplication, not QApplication) - the browser respawns this
+    # host freely, so accidentally opening a window here would loop.
+    if QCoreApplication.instance() is None:
+        QCoreApplication([])
+    return send_browser_download(server_name(DATA_DIR), request, on_reason=on_reason)
+
+
 def deliver_to_primary(request: dict) -> bool:
     """Hand one browser download to the Cove process running right now.
 
@@ -94,22 +135,21 @@ def deliver_to_primary(request: dict) -> bool:
     Imported lazily so the Qt local-socket machinery is only pulled in when a
     download is actually being forwarded (ping/status stay cheap).
     """
+    request_id = request.get("request_id")
+    reasons = []
+    _log("ipc_attempt", "INFO", request_id=request_id)
     try:
-        from PySide6.QtCore import QCoreApplication
-
-        from .config import DATA_DIR
-        from .single_instance import send_browser_download, server_name
-
-        # QLocalSocket needs a QCoreApplication for its event dispatcher. This
-        # host is a short-lived console process with no Qt app of its own, so
-        # create a minimal one; it is never exec()'d, and no GUI is possible
-        # (QCoreApplication, not QApplication) - the browser respawns this
-        # host freely, so accidentally opening a window here would loop.
-        if QCoreApplication.instance() is None:
-            QCoreApplication([])
-        return send_browser_download(server_name(DATA_DIR), request)
-    except Exception:
+        accepted = _send_to_primary(request, reasons.append)
+    except Exception as exc:
+        # Qt missing, no socket, no running GUI: all of these look the same
+        # from here, so report the class rather than guessing.
+        _log("ipc_result", "WARNING", request_id=request_id,
+             result="app_unavailable", exc=exc)
         return False
+    reason = reasons[-1] if reasons else ("ok" if accepted else "unknown")
+    _log("ipc_result", "INFO" if accepted else "WARNING", request_id=request_id,
+         result=reason, accepted=bool(accepted))
+    return accepted
 
 
 def notify_primary_extension_seen() -> bool:
@@ -139,15 +179,26 @@ def handle_message(
     settings: Settings | None,
 ) -> dict:
     action = msg.get("action", "")
+    # Optional, additive and backward compatible: an older extension simply
+    # omits it, and an older host ignores it.
+    request_id = diagnostics.normalize_request_id(msg.get("requestId"))
+    _log("request_received", "INFO", request_id=request_id,
+         action=action if isinstance(action, str) else "invalid")
+
+    def reply(response: dict) -> dict:
+        _log("reply_sent", "INFO", request_id=request_id,
+             action=action if isinstance(action, str) else "invalid",
+             status=response.get("status"))
+        return response
 
     if action == "ping":
         # The extension's own heartbeat doubles as the GUI's "extension is
         # installed and talking" signal. Failure here changes nothing.
         try:
             notify_primary_extension_seen()
-        except Exception:
-            pass
-        return {"status": "ok", "version": __version__}
+        except Exception as exc:
+            _log("ping_notify_failed", "WARNING", request_id=request_id, exc=exc)
+        return reply({"status": "ok", "version": __version__})
 
     if action == "download":
         url = msg.get("url", "")
@@ -159,7 +210,7 @@ def handle_message(
         if not validate_url(url):
             # Never echo the URL: the extension writes this message to the
             # browser console, and the URL may carry a session token.
-            return {"status": "error", "message": "Invalid or blocked URL"}
+            return reply({"status": "error", "message": "Invalid or blocked URL"})
 
         requested_dir = msg.get("directory")
         request = {
@@ -170,6 +221,8 @@ def handle_message(
             "referrer": _sanitize_header(msg.get("referrer", "")),
             "user_agent": _sanitize_header(msg.get("userAgent", "")),
             "file_size": msg.get("fileSize") if isinstance(msg.get("fileSize"), int) else 0,
+            # Additive and optional. Old primaries ignore an unknown key.
+            "request_id": request_id,
         }
 
         # Every download (plain, HLS, or extractor) is handed to the *running*
@@ -194,19 +247,20 @@ def handle_message(
         if not accepted:
             # Fixed sentence: never the URL, cookies or referrer, which the
             # extension logs to the browser console.
-            return {"status": "error", "message": "Cove is not available"}
-        return {"status": "ok", "message": "Download queued in Cove"}
+            return reply({"status": "error", "message": "Cove is not available"})
+        return reply({"status": "ok", "message": "Download queued in Cove"})
 
     if action == "status":
         if rpc is None:
-            return {"status": "error", "message": "Cove is not configured"}
+            return reply({"status": "error", "message": "Cove is not configured"})
         try:
             active = rpc.tell_active()
-            return {"status": "ok", "downloads": active}
+            return reply({"status": "ok", "downloads": active})
         except Aria2Error as e:
-            return {"status": "error", "message": str(e)}
+            _log("status_failed", "WARNING", request_id=request_id, exc=e)
+            return reply({"status": "error", "message": str(e)})
 
-    return {"status": "error", "message": f"Unknown action: {action!r}"}
+    return reply({"status": "error", "message": f"Unknown action: {action!r}"})
 
 
 def _binary_stdio() -> tuple[io.BufferedReader, io.BufferedWriter]:
@@ -248,10 +302,21 @@ def _binary_stdio() -> tuple[io.BufferedReader, io.BufferedWriter]:
 
 
 def main() -> None:
+    global _LOG
+    if _LOG is None:
+        try:
+            from .config import DATA_DIR
+
+            _LOG = diagnostics.init_native_host_logger(DATA_DIR)
+        except Exception:
+            _LOG = None
+    log_host_start()
+
     try:
         settings = Settings.load()
         rpc = Aria2RPC(settings)
     except Exception as e:
+        _log("settings_unavailable", "WARNING", exc=e)
         settings = None
         rpc = None
 
@@ -263,12 +328,15 @@ def main() -> None:
             break
         try:
             response = handle_message(msg, rpc, settings)
-        except Exception:
+        except Exception as exc:
             # A crash here kills the host and the browser respawns it,
             # silently dropping the message (and risking a crash loop).
+            _log("handler_crashed", "ERROR", exc=exc)
             response = {"status": "error", "message": "Internal error handling message"}
         stdout.write(encode_message(response))
         stdout.flush()
+
+    _log("host_stop", "INFO")
 
 
 if __name__ == "__main__":

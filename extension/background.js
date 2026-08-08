@@ -7,11 +7,129 @@ const browser = globalThis.browser || globalThis.chrome;
 
 const HOST_NAME = "cove_download_manager";
 
-function sendNativeMessage(msg) {
-  return browser.runtime.sendNativeMessage(HOST_NAME, msg).catch((err) => {
-    console.error("Cove native messaging error:", err);
-    // transport: the host could not be reached at all (not installed, or the
-    // browser refused to launch it), as opposed to a reply that says no.
+// ---- Diagnostics ----
+//
+// The background context owns the extension's diagnostic ring. It is the only
+// context that outlives a popup closing or a tab navigating, and it is still
+// running when Cove is not - which is exactly the failure the user needs to be
+// able to report. Content scripts and the popup send their events here rather
+// than keeping rings of their own.
+//
+// extension/diagnostics.js is loaded by the browser, not imported: the
+// manifest lists one background script, so this picks whichever loader the
+// current browser offers. Anything recorded before it lands is buffered.
+
+let coveDiag = null;
+let diagPendingAppVersion = null;
+// Resolves once diagnostics exist and their stored ring has been hydrated.
+// A report served before that would be missing the previous session.
+let resolveDiagReady = null;
+const diagReady = new Promise((resolve) => { resolveDiagReady = resolve; });
+const diagPending = [];
+const DIAG_PENDING_MAX = 100;
+let diagFlushTimer = null;
+
+function diagFlushSoon() {
+  if (diagFlushTimer || !coveDiag) return;
+  diagFlushTimer = setTimeout(() => {
+    diagFlushTimer = null;
+    try {
+      coveDiag.flush();
+    } catch (e) { /* diagnostics never break a download */ }
+  }, 1000);
+}
+
+function diagRecord(component, event, level, fields, requestId) {
+  try {
+    if (!coveDiag) {
+      diagPending.push([component, event, level, fields, requestId]);
+      if (diagPending.length > DIAG_PENDING_MAX) diagPending.shift();
+      return;
+    }
+    coveDiag.record(component, event, level, fields, requestId);
+    diagFlushSoon();
+  } catch (e) { /* diagnostics never break a download */ }
+}
+
+function diagSetAppVersion(version) {
+  try {
+    if (coveDiag) coveDiag.setEnvironment({ appVersion: version });
+    else diagPendingAppVersion = version;
+  } catch (e) { /* diagnostics never break a download */ }
+}
+
+function diagInit() {
+  if (coveDiag || typeof CoveDiag === "undefined") return;
+  try {
+    coveDiag = CoveDiag.createDiagnostics({
+      storage: browser.storage.local,
+      context: "background",
+      version: (browser.runtime.getManifest && browser.runtime.getManifest().version) ||
+        "unknown",
+      browser: CoveDiag.browserLabel(navigator && navigator.userAgent),
+    });
+    if (diagPendingAppVersion) {
+      coveDiag.setEnvironment({ appVersion: diagPendingAppVersion });
+      diagPendingAppVersion = null;
+    }
+    Promise.resolve(coveDiag.load()).then(() => {
+      const pending = diagPending.splice(0, diagPending.length);
+      for (const entry of pending) coveDiag.record(...entry);
+      diagFlushSoon();
+    }).catch(() => {}).then(() => resolveDiagReady());
+  } catch (e) {
+    coveDiag = null;
+    resolveDiagReady();
+  }
+}
+
+function diagLoadScript() {
+  try {
+    if (typeof CoveDiag !== "undefined") {
+      diagInit();
+      return;
+    }
+    if (typeof importScripts === "function") {
+      importScripts("diagnostics.js");
+      diagInit();
+      return;
+    }
+    if (typeof document !== "undefined" && document.head) {
+      const element = document.createElement("script");
+      element.src = browser.runtime.getURL("diagnostics.js");
+      element.onload = diagInit;
+      element.onerror = () => resolveDiagReady();
+      document.head.appendChild(element);
+      return;
+    }
+    // No loader at all: nothing will ever hydrate, so unblock the waiters.
+    resolveDiagReady();
+  } catch (e) {
+    // Diagnostics are optional, downloads are not.
+    resolveDiagReady();
+  }
+}
+
+diagLoadScript();
+
+function sendNativeMessage(msg, requestId) {
+  const action = msg && typeof msg.action === "string" ? msg.action : "unknown";
+  diagRecord("extension.background", "native_message_sent", "INFO",
+             { action }, requestId);
+  return browser.runtime.sendNativeMessage(HOST_NAME, msg).then((result) => {
+    diagRecord("extension.background", "native_message_result", "INFO", {
+      action,
+      status: (result && result.status) || "none",
+    }, requestId);
+    return result;
+  }).catch((err) => {
+    // The error text can carry a path or a host name, so only its shape is
+    // kept. transport: the host could not be reached at all (not installed,
+    // or the browser refused to launch it), as opposed to a reply that says no.
+    diagRecord("extension.background", "native_message_result", "WARNING", {
+      action,
+      status: "transport_error",
+    }, requestId);
     return { status: "error", message: err.message || String(err), transport: "error" };
   });
 }
@@ -435,6 +553,31 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     handleMediaTabDownload(msg, sender).then(sendResponse);
     return true;
   }
+  // Content scripts and the popup cannot load diagnostics.js themselves (the
+  // manifest lists one script per context), so they report through here.
+  if (msg.type === "coveDiag") {
+    diagRecord(msg.component, msg.event, msg.level, msg.fields, msg.requestId);
+    sendResponse({ ok: true });
+    return;
+  }
+  if (msg.type === "coveDiagReport") {
+    // Wait for hydration: a report is only useful if it has the whole ring.
+    diagReady.then(() => {
+      sendResponse({ ok: true, text: coveDiag ? coveDiag.report() : "" });
+    });
+    return true;
+  }
+  if (msg.type === "coveDiagClear") {
+    // Also gated, so a clear cannot be undone by a hydration still in flight.
+    diagReady.then(() => {
+      if (!coveDiag) {
+        sendResponse({ ok: false });
+        return;
+      }
+      Promise.resolve(coveDiag.clear()).then((ok) => sendResponse({ ok: !!ok }));
+    });
+    return true;
+  }
   if (msg.type === "downloadStream") {
     if (typeof msg.url !== "string" || !/^https?:\/\//i.test(msg.url)) {
       sendResponse({ ok: false, error: "Unsupported stream URL" });
@@ -511,9 +654,18 @@ function mediaFilename(tab, mediaUrl) {
 // Explicit user click on the in-page Cove pill. Routes through the same
 // native "download" action as interception and the context menu.
 async function handleMediaTabDownload(msg, sender) {
+  // Correlates this handoff with the pill click that started it and, further
+  // down, with the native host and Cove itself.
+  const requestId = (typeof CoveDiag !== "undefined" &&
+    CoveDiag.normalizeRequestId(msg.requestId)) || null;
+  diagRecord("extension.background", "request_received", "INFO",
+             { kind: "media" }, requestId);
+
   const url = extractorPageUrl(sender.tab && sender.tab.url) ||
     extractorPageUrl(msg.pageUrl) || msg.url || "";
   if (!/^https?:\/\//i.test(url)) {
+    diagRecord("extension.native_bridge", "request_failed", "WARNING",
+               { reason: "unsupported" }, requestId);
     return { ok: false, reason: "unsupported", error: "Unsupported URL" };
   }
 
@@ -538,7 +690,7 @@ async function handleMediaTabDownload(msg, sender) {
 
   const referrer = msg.pageUrl || (sender.tab && sender.tab.url) || "";
 
-  const result = await sendNativeMessage({
+  const nativeMessage = {
     action: "download",
     url: url,
     filename: filename,
@@ -546,7 +698,10 @@ async function handleMediaTabDownload(msg, sender) {
     cookies: cookieStr,
     fileSize: 0,
     userAgent: navigator.userAgent,
-  });
+  };
+  // Additive and optional: an older host ignores an unknown key.
+  if (requestId) nativeMessage.requestId = requestId;
+  const result = await sendNativeMessage(nativeMessage, requestId);
 
   if (result && result.status === "ok") {
     showNotification("Download sent to Cove", filename || url);
@@ -560,6 +715,11 @@ async function handleMediaTabDownload(msg, sender) {
   // folded into a generic failure that reads as a problem with the media.
   const unavailable = (result && result.transport === "error") ||
     (result && result.message === "Cove is not available");
+  diagRecord("extension.native_bridge", "request_failed", "WARNING", {
+    reason: result && result.transport === "error"
+      ? "transport_error"
+      : (unavailable ? "app_unavailable" : "gui_rejected"),
+  }, requestId);
   return {
     ok: false,
     reason: unavailable ? "unavailable" : "failed",
@@ -571,11 +731,20 @@ async function handleMediaTabDownload(msg, sender) {
 
 settingsReady.then(updateBadge);
 
-// Startup connectivity test
+// Startup connectivity test. The reply body is never logged raw: it is a
+// native-message payload, and those are exactly what must not be retained.
 sendNativeMessage({ action: "ping" }).then((r) => {
-  console.log("Cove startup ping:", JSON.stringify(r));
-}).catch((e) => {
-  console.error("Cove startup ping FAILED:", e);
+  diagRecord("extension.background", "native_ping_result", "INFO", {
+    status: (r && r.status) || "none",
+    appVersion: (r && r.version) || "unknown",
+  });
+  // Carry the version into the report header too: an event buried in a
+  // 300-line ring is not what a supporter reads first.
+  if (r && r.status === "ok" && r.version) diagSetAppVersion(r.version);
+}).catch(() => {
+  diagRecord("extension.background", "native_ping_result", "WARNING", {
+    status: "transport_error",
+  });
 });
 
 // ---- HLS/M3U8 stream detection ----

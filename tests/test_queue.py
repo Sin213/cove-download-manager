@@ -7,6 +7,7 @@ a persisted queued/active/paused task was restored on startup.
 
 import errno
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -5382,3 +5383,333 @@ def test_windows_rename_buffer_uses_complete_structure_header(monkeypatch):
 )
 def test_windows_win32_path_preserves_final_path_forms(final_path, expected):
     assert output_paths._WindowsPublicationApi._win32_path(final_path) == expected
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics: sanitized evidence for the three reported incidents.
+#
+# These tests assert on what is *recorded*. Every existing assertion about
+# what the queue *does* stays untouched: diagnostics may not change routing,
+# validation, error text or task outcomes.
+# ---------------------------------------------------------------------------
+
+from cove import diagnostics as diag_module  # noqa: E402
+from tests.test_diagnostics import assert_clean as _assert_clean  # noqa: E402
+
+
+@pytest.fixture
+def diag(tmp_path):
+    diag_module.shutdown_logger()
+    log = diag_module.init_app_logger(tmp_path / "diag")
+    yield log
+    diag_module.shutdown_logger()
+
+
+def _events(log, component=None, event=None):
+    out = []
+    for record in log.records():
+        if component is not None and record["component"] != component:
+            continue
+        if event is not None and record["event"] != event:
+            continue
+        out.append(record)
+    return out
+
+
+def _one(log, component, event):
+    found = _events(log, component, event)
+    assert len(found) == 1, "expected one {}/{}, got {}".format(
+        component, event, len(found)
+    )
+    return found[0]
+
+
+# ---- Incident A: extractor publication ------------------------------------
+
+
+def _reject_extractor_output(queue, fake_process, tmp_path):
+    """Report a final path inside the work directory that does not exist.
+
+    This is the shape of the Windows report: yt-dlp names a file under
+    .cove-work-*, validation resolves it strictly, and the missing file turns
+    into OutputPathError("Invalid engine output path") from FileNotFoundError.
+    """
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    private = _extractor_private_path(proc)
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+    return task
+
+
+def test_extractor_publication_logs_a_begin_event(queue_env, fake_process, tmp_path, diag):
+    queue, _rpc, _db = queue_env()
+    task = _reject_extractor_output(queue, fake_process, tmp_path)
+    begin = _one(diag, "extractor.publish", "publish_begin")
+    assert begin["task"] == task.id
+    assert begin["fields"]["engine"] == "yt-dlp"
+
+
+def test_engine_output_rejection_records_the_rule_that_rejected_it(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    _reject_extractor_output(queue, fake_process, tmp_path)
+    rejected = _one(diag, "extractor.publish", "engine_output_rejected")
+    assert rejected["level"] == "ERROR"
+    assert rejected["fields"]["rule"] == "invalid_engine_output_path"
+
+
+def test_engine_output_rejection_records_safe_path_facts(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    _reject_extractor_output(queue, fake_process, tmp_path)
+    fields = _one(diag, "extractor.publish", "engine_output_rejected")["fields"]
+    assert fields["absolute"] is True
+    assert fields["exists"] is False
+    assert fields["within_expected_root"] is True
+    assert fields["same_drive"] is True
+    assert fields["stage"] == "validate_engine_output"
+    assert "drive" in fields
+    assert "is_file" in fields
+
+
+def test_engine_output_rejection_hides_the_user_and_the_work_id(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    _reject_extractor_output(queue, fake_process, tmp_path)
+    dumped = json.dumps(diag.records())
+    assert ".cove-work-<work-id>" in dumped
+    assert ".cove-work-" + "abc" not in dumped
+    for record in diag.records():
+        path = (record.get("fields") or {}).get("path", "")
+        assert "cove-work-" not in path or "<work-id>" in path
+    _assert_clean(dumped)
+    assert str(tmp_path) not in dumped
+
+
+def test_engine_output_rejection_records_the_exception_chain(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    _reject_extractor_output(queue, fake_process, tmp_path)
+    rejected = _one(diag, "extractor.publish", "engine_output_rejected")
+    assert rejected["exc"]["type"] == "OutputPathError"
+    assert rejected["exc"]["cause"] == "FileNotFoundError"
+    assert rejected["exc"]["errno"] == errno.ENOENT
+    assert "winerror" in rejected["exc"]
+
+
+def test_work_directory_cleanup_result_is_recorded(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    _reject_extractor_output(queue, fake_process, tmp_path)
+    cleanup = _events(diag, "extractor.publish", "work_cleanup")
+    assert cleanup, "cleanup result must be observable"
+    assert cleanup[-1]["fields"]["result"] in {"success", "failure"}
+
+
+def test_publication_failure_emits_a_task_failed_event(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    task = _reject_extractor_output(queue, fake_process, tmp_path)
+    failed = _one(diag, "queue", "task_failed")
+    assert failed["task"] == task.id
+    assert failed["level"] == "ERROR"
+
+
+def test_publication_failure_outcome_is_unchanged_by_diagnostics(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    task = _reject_extractor_output(queue, fake_process, tmp_path)
+    assert task.status == "error"
+    assert task.error.startswith("Could not publish extractor output:")
+    assert task.finished_at is not None
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_successful_publication_logs_success_not_rejection(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    private = _extractor_private_path(proc)
+    private.write_bytes(b"extractor output")
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert _events(diag, "extractor.publish", "engine_output_rejected") == []
+    assert _one(diag, "extractor.publish", "publish_success")["task"] == task.id
+
+
+# ---- Incident C: Real-Debrid generated /d/ link ----------------------------
+
+
+def test_url_intake_is_classified_without_the_token(queue_env, diag):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(SHARE_URL, intake="manual")
+    added = _one(diag, "queue", "url_added")
+    assert added["task"] == tid
+    assert added["fields"]["intake"] == "manual"
+    assert added["fields"]["scheme"] == "https"
+    assert added["fields"]["host"] == "real-debrid.com"
+    assert added["fields"]["classification"] == "real_debrid_generated_link"
+    assert added["fields"]["backend"] == "aria2"
+    assert "ALJRILITCGUEW127" not in json.dumps(diag.records())
+
+
+def test_share_link_rejection_records_provider_and_resolver(
+    queue_env, monkeypatch, diag
+):
+    queue, _rpc, _db = queue_env(
+        real_debrid_enabled=True, real_debrid_api_token="rd-token-value"
+    )
+    tid = queue.add_url(SHARE_URL)
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    rejected = _one(diag, "debrid", "share_link_rejected")
+    fields = rejected["fields"]
+    assert fields["host"] == "real-debrid.com"
+    assert fields["route"] == "/d/<redacted>"
+    assert fields["provider"] == "real_debrid"
+    assert fields["resolver"] == "unsupported_share_link"
+    assert fields["rd_enabled"] is True
+    assert fields["rd_authenticated"] is True
+
+
+def test_share_link_rejection_records_credentials_as_booleans_only(
+    queue_env, monkeypatch, diag
+):
+    queue, _rpc, _db = queue_env(
+        real_debrid_enabled=True, real_debrid_api_token="rd-token-value"
+    )
+    tid = queue.add_url(SHARE_URL)
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    dumped = json.dumps(diag.records())
+    assert "rd-token-value" not in dumped
+    assert "ALJRILITCGUEW127" not in dumped
+    _assert_clean(dumped)
+
+
+def test_share_link_rejection_reports_unauthenticated_state(
+    queue_env, monkeypatch, diag
+):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(SHARE_URL)
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    fields = _one(diag, "debrid", "share_link_rejected")["fields"]
+    assert fields["rd_enabled"] is False
+    assert fields["rd_authenticated"] is False
+
+
+def test_share_link_rejection_emits_task_failed_and_keeps_the_error_text(
+    queue_env, monkeypatch, diag
+):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url(SHARE_URL)
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "Real-Debrid" in task.error
+    assert _one(diag, "queue", "task_failed")["task"] == tid
+
+
+def test_delivery_link_is_classified_separately_from_a_share_link(queue_env, diag):
+    queue, _rpc, _db = queue_env()
+    queue.add_url("https://sg5.download.real-debrid.com/d/TOKENTOKENTOKEN/video.mp4")
+    added = _one(diag, "queue", "url_added")
+    assert added["fields"]["classification"] == "debrid_delivery_link"
+    assert added["fields"]["host"] == "<redacted>.download.real-debrid.com"
+    assert "TOKENTOKENTOKEN" not in json.dumps(diag.records())
+
+
+# ---- aria2 ----------------------------------------------------------------
+
+
+def test_aria2_add_records_the_gid_and_no_url(queue_env, monkeypatch, diag):
+    queue, _rpc, _db = queue_env()
+    monkeypatch.setattr(
+        "requests.Session.head",
+        lambda self, url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
+    )
+    tid = queue.add_url("https://example.com/video.mp4")
+    queue._probe_and_add(queue.tasks[tid])
+
+    add = _one(diag, "aria2", "add")
+    assert add["task"] == tid
+    assert add["fields"]["gid"] == "gid-1"
+    dumped = json.dumps(diag.records())
+    assert "example.com/video.mp4" not in dumped
+
+
+def test_aria2_final_error_records_a_safe_code(queue_env, diag):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/video.mp4")
+    queue.tasks[tid].gid = "gid-1"
+    queue._apply_status(tid, {"status": "error", "errorCode": "3",
+                              "errorMessage": "Resource not found"})
+
+    result = _one(diag, "aria2", "final_error")
+    assert result["task"] == tid
+    assert result["fields"]["code"] == "3"
+    assert _one(diag, "queue", "task_failed")["task"] == tid
+
+
+def test_aria2_final_success_is_recorded_once(queue_env, diag):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/video.mp4")
+    queue.tasks[tid].gid = "gid-1"
+    queue._apply_status(tid, {"status": "complete"})
+    queue._apply_status(tid, {"status": "complete"})
+
+    assert len(_events(diag, "aria2", "final_success")) == 1
+    assert _one(diag, "queue", "task_completed")["task"] == tid
+
+
+def test_progress_polls_are_not_logged(queue_env, diag):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/video.mp4")
+    queue.tasks[tid].gid = "gid-1"
+    before = len(diag.records())
+    for _ in range(20):
+        queue._apply_status(tid, {"status": "active", "completedLength": "10",
+                                  "totalLength": "100", "downloadSpeed": "5"})
+    assert len(diag.records()) == before
+
+
+def test_task_launched_is_recorded_with_the_backend(queue_env, diag):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/video.mp4")
+    queue._launch(queue.tasks[tid])
+    launched = _one(diag, "queue", "task_launched")
+    assert launched["task"] == tid
+    assert launched["fields"]["backend"] == "aria2"
+
+
+def test_diagnostics_failures_never_fail_a_download(queue_env, monkeypatch, diag):
+    monkeypatch.setattr(
+        diag_module, "emit",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("diagnostics exploded")),
+    )
+    queue, rpc, _db = queue_env()
+    monkeypatch.setattr(
+        "requests.Session.head",
+        lambda self, url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
+    )
+    tid = queue.add_url("https://example.com/video.mp4")
+    assert tid is not None
+    queue._launch(queue.tasks[tid])
+    queue._probe_and_add(queue.tasks[tid])
+    assert rpc.added, "the download must still reach aria2"

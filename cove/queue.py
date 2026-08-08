@@ -18,7 +18,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
-from . import db, debrid, dedup, netiface, torrent
+from . import db, debrid, dedup, diagnostics, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
@@ -39,6 +39,9 @@ SOURCE_PLAIN = ""
 SOURCE_TORRENT = "torrent"
 SOURCE_TORRENT_FILE = "torrent_file"
 SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE)
+
+# Where a URL entered Cove. Diagnostics only - never affects routing.
+_INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "unknown")
 
 # Task failures on the local BitTorrent path. Every one of these is a fixed
 # sentence: a torrent carries tracker passkeys and peer addresses, and none
@@ -723,6 +726,7 @@ class QueueManager(QObject):
         torrent_name: str = "",
         torrent_path: str = "",
         debrid_route: str = "",
+        intake: str = "unknown",
     ) -> Optional[int]:
         """Add one URL to the queue.
 
@@ -836,17 +840,93 @@ class QueueManager(QObject):
             debrid_route=debrid_route,
         )
         self.tasks[tid] = t
+        self._diag_url_added(t, intake)
         self.task_added.emit(tid)
         self._maybe_start_next()
         return tid
 
+    # ---- diagnostics ---------------------------------------------------
+    #
+    # Observation only. Every helper below is best effort: it records what
+    # happened and never influences routing, validation or task state.
+
+    def _diag(self, component: str, event: str, level: str = "INFO", **kw) -> None:
+        try:
+            diagnostics.emit(component, event, level, **kw)
+        except Exception:
+            pass
+
+    def _diag_url_added(self, t: DownloadTask, intake: str) -> None:
+        facts = diagnostics.url_facts(t.url)
+        self._diag(
+            "queue", "url_added", "INFO", task_id=t.id,
+            intake=intake if intake in _INTAKE_SOURCES else "unknown",
+            scheme=facts["scheme"], host=facts["host"],
+            classification=facts["classification"], backend=t.backend,
+            source_type=t.source_type,
+        )
+
+    def _diag_task_failed(self, t: DownloadTask, reason: str) -> None:
+        self._diag("queue", "task_failed", "ERROR", task_id=t.id,
+                   backend=t.backend, reason=reason)
+
+    def _diag_engine_output_rejected(self, t, reported, work, exc) -> None:
+        """Record why a publication was refused, without echoing the path.
+
+        Everything here is derived from values the queue already holds. The
+        validation decision itself was made in cove/output_paths.py and is
+        not re-run, re-interpreted or influenced by this call.
+        """
+        try:
+            reported_text = str(reported or "")
+            work_root = str(getattr(work, "path", "") or "")
+            facts = diagnostics.path_facts(reported_text, expected_root=work_root)
+            exists = is_file = None
+            if reported_text:
+                try:
+                    exists = os.path.exists(reported_text)
+                    is_file = os.path.isfile(reported_text) if exists else None
+                except OSError:
+                    exists = is_file = None
+            self._diag(
+                "extractor.publish", "engine_output_rejected", "ERROR",
+                task_id=t.id, exc=exc,
+                engine="yt-dlp",
+                stage="validate_engine_output",
+                rule=diagnostics.classify_output_path_error(str(exc)),
+                path=diagnostics.sanitize_path(reported_text) if reported_text else None,
+                expected_root=diagnostics.sanitize_path(work_root) if work_root else None,
+                absolute=facts["absolute"],
+                drive=facts["drive"],
+                depth=facts["depth"],
+                ext=facts["ext"],
+                same_drive=facts["same_drive"],
+                within_expected_root=facts["within_expected_root"],
+                exists=exists,
+                is_file=is_file,
+            )
+        except Exception:
+            pass
+
+    def _debrid_credential_facts(self) -> dict:
+        """Configured-or-not, as booleans. Never the credential itself."""
+        try:
+            return {
+                "rd_enabled": bool(getattr(self.settings, "real_debrid_enabled", False)),
+                "rd_authenticated": bool(
+                    getattr(self.settings, "real_debrid_api_token", "")
+                ),
+            }
+        except Exception:
+            return {"rd_enabled": False, "rd_authenticated": False}
+
     def add_urls(
-        self, urls: list[str], out_dir: str | None = None
+        self, urls: list[str], out_dir: str | None = None, intake: str = "unknown"
     ) -> list[int]:
         return [
             tid
             for u in urls
-            if (tid := self.add_url(u, out_dir)) is not None
+            if (tid := self.add_url(u, out_dir, intake=intake)) is not None
         ]
 
     # ---- torrent input ------------------------------------------------
@@ -1453,13 +1533,20 @@ class QueueManager(QObject):
         self.task_changed.emit(tid)
         self._maybe_start_next()
 
-    def _cleanup_engine_work(self, work: WorkDirectory | None) -> None:
+    def _cleanup_engine_work(
+        self, work: WorkDirectory | None, task_id: int | None = None
+    ) -> None:
         if work is None:
             return
         try:
             cleanup_work_directory(work)
         except (OSError, OutputPathError) as exc:
+            self._diag("extractor.publish", "work_cleanup", "WARNING",
+                       task_id=task_id, result="failure", exc=exc)
             self.error.emit(f"Could not clean private output directory: {exc}")
+        else:
+            self._diag("extractor.publish", "work_cleanup", "INFO",
+                       task_id=task_id, result="success")
 
     def _stop_engine_process(
         self,
@@ -2213,15 +2300,20 @@ class QueueManager(QObject):
                 self._cleanup_engine_work(work)
                 return
             if exit_code == 0:
+                self._diag("extractor.publish", "publish_begin", "INFO",
+                           task_id=t.id, engine="yt-dlp",
+                           reported=bool(reported))
                 try:
                     if not reported:
                         raise OutputPathError("yt-dlp did not report a final output path")
                     published = publish_output(work, reported, requested)
                 except (OSError, OutputPathError) as exc:
-                    self._cleanup_engine_work(work)
+                    self._diag_engine_output_rejected(t, reported, work, exc)
+                    self._cleanup_engine_work(work, task_id=t.id)
                     t.status = "error"
                     t.error = f"Could not publish extractor output: {exc}"
                     t.finished_at = time.time()
+                    self._diag_task_failed(t, "extractor_publish_failed")
                 else:
                     t.filename = published.name
                     t.status = "completed"
@@ -2229,6 +2321,11 @@ class QueueManager(QObject):
                     t.total_bytes = max(t.total_bytes, 1000)
                     t.completed_bytes = t.total_bytes
                     t.error = None
+                    self._diag("extractor.publish", "publish_success", "INFO",
+                               task_id=t.id, engine="yt-dlp",
+                               ext=os.path.splitext(published.name)[1].lower() or None)
+                    self._diag("queue", "task_completed", "INFO", task_id=t.id,
+                               backend=t.backend)
             else:
                 self._cleanup_engine_work(work)
                 t.status = "error"
@@ -2278,6 +2375,8 @@ class QueueManager(QObject):
         t.clear_debrid()
         self._persist(t)
         self.task_changed.emit(t.id)
+        self._diag("queue", "task_launched", "INFO", task_id=t.id,
+                   backend=t.backend, source_type=t.source_type)
         if t.backend == "ffmpeg":
             self._launch_hls(t)
             return
@@ -2301,9 +2400,19 @@ class QueueManager(QObject):
             else debrid.share_link_reason(t.url)
         )
         if share_reason:
+            facts = diagnostics.url_facts(t.url)
+            self._diag(
+                "debrid", "share_link_rejected", "WARNING", task_id=t.id,
+                host=facts["host"], route=facts["route"],
+                provider=facts["provider"] or "unknown",
+                classification=facts["classification"],
+                resolver="unsupported_share_link",
+                **self._debrid_credential_facts(),
+            )
             t.status = "error"
             t.error = share_reason
             t.finished_at = time.time()
+            self._diag_task_failed(t, "share_link_rejected")
             self._persist(t)
             self.task_changed.emit(t.id)
             self._maybe_start_next()
@@ -2579,10 +2688,17 @@ class QueueManager(QObject):
         # status poll. Never overwrite a size the provider or user already set.
         if content_length > 0 and t.total_bytes <= 0:
             t.total_bytes = content_length
-        return self.rpc.add_uri(
+        gid = self.rpc.add_uri(
             [target], t.out_dir, segments,
             t.speed_limit_kbps, t.filename,
         )
+        # Runs on the probe worker thread; DiagLogger.emit is thread safe.
+        # Host class and segment count only - never the URL handed to aria2.
+        self._diag("aria2", "add", "INFO", task_id=t.id, gid=gid,
+                   segments=segments,
+                   target=diagnostics.url_facts(target)["classification"],
+                   provider=t.debrid_provider or None)
+        return gid
 
     def _on_unpause_failed(self, tid: int, msg: str) -> None:
         t = self.tasks.get(tid)
@@ -2668,6 +2784,9 @@ class QueueManager(QObject):
             t.status = "completed"
             t.finished_at = time.time()
             t.clear_debrid()
+            self._diag("aria2", "final_success", "INFO", task_id=tid, gid=t.gid)
+            self._diag("queue", "task_completed", "INFO", task_id=tid,
+                       backend=t.backend)
             self._persist(t)
             self.task_changed.emit(tid)
             self._maybe_start_next()
@@ -2680,6 +2799,11 @@ class QueueManager(QObject):
                 t.error = status.get("errorMessage") or f"aria2 error {status.get('errorCode')}"
             t.finished_at = time.time()
             t.clear_debrid()
+            # aria2's own error code and message: no URL, no command line.
+            self._diag("aria2", "final_error", "ERROR", task_id=tid, gid=t.gid,
+                       code=status.get("errorCode"),
+                       message=status.get("errorMessage"))
+            self._diag_task_failed(t, "aria2_error")
             self._persist(t)
             self.task_changed.emit(tid)
             self._maybe_start_next()

@@ -1,0 +1,14 @@
+# Synthetic fixtures for the diagnostics redaction tests.
+#
+# tests/test_diagnostics.py and tests/extension_diagnostics.test.js keep a bank
+# of realistic-looking secrets and assert that none of them survives into any
+# retained, displayed, copied or saved diagnostic. The fixtures have to look
+# like the real thing for those assertions to mean anything, which is exactly
+# why the scanner flags them.
+#
+# None is a real credential: the tokens were typed for the tests, and
+# eyJhbGciOiJIUzI1NiJ9 is the public example JWT header from RFC 7519
+# (base64 of {"alg":"HS256"}).
+tests/extension_diagnostics.test.js:generic-api-key:12
+tests/extension_diagnostics.test.js:generic-api-key:17
+tests/test_diagnostics.py:generic-api-key:17

@@ -368,11 +368,41 @@
     return "";
   }
 
+  // Diagnostics. A content script cannot load extension/diagnostics.js (the
+  // manifest lists exactly one content script), so events are reported to the
+  // background, which owns the ring. Only event names and outcomes travel:
+  // never the page address, the media address or the tab title.
+  function coveDiag(event, level, fields, requestId) {
+    try {
+      Promise.resolve(
+        browser.runtime.sendMessage({
+          type: "coveDiag",
+          component: "extension.content",
+          event: event,
+          level: level,
+          fields: fields || {},
+          requestId: requestId,
+        })
+      ).catch(() => {});
+    } catch (e) { /* a diagnostic must never break a download */ }
+  }
+
+  function newRequestId() {
+    let out = "";
+    while (out.length < 8) out += Math.floor(Math.random() * 16).toString(16);
+    return out.slice(0, 8);
+  }
+
   async function onPillClick() {
     if (!pillEnabled || downloadPending) return;
     downloadPending = true;
     cancelHide();
     setPillState("detecting");
+
+    // Generated at the origin of the request so the same id can be followed
+    // through the background, the native host and Cove itself.
+    const requestId = newRequestId();
+    coveDiag("video_download_requested", "INFO", { trigger: "pill" }, requestId);
 
     // Extractor-backed sites are downloaded from their page URL. Do not wait
     // for a transient media/blob URL: YouTube frequently replaces that media
@@ -385,6 +415,7 @@
       const last = sentUrls.get(url);
       if (last && Date.now() - last < SENT_RESET_MS) {
         setPillState("sent");
+        coveDiag("video_pill_result", "INFO", { result: "already_sent" }, requestId);
         return;
       }
 
@@ -393,18 +424,23 @@
           type: "downloadMedia",
           url,
           pageUrl,
+          requestId,
         })
       );
       if (!resp || resp.ok !== true) {
         sentUrls.delete(url);
         // No reply at all means the background script never answered, which
         // is the same practical outcome as an unreachable Cove.
-        setPillState("error", resp ? resp.reason : "unavailable");
+        const reason = resp ? resp.reason : "unavailable";
+        coveDiag("video_pill_result", "WARNING",
+                 { result: reason || "failed", replied: !!resp }, requestId);
+        setPillState("error", reason);
         return;
       }
 
       sentUrls.set(url, Date.now());
       setPillState("sent");
+      coveDiag("video_pill_result", "INFO", { result: "sent" }, requestId);
       if (resetTimer) clearTimeout(resetTimer);
       resetTimer = setTimeout(() => {
         if (currentUrl === url) setPillState("ready");
@@ -413,6 +449,8 @@
       sentUrls.delete(url);
       // sendMessage itself threw: the background script is gone, so Cove
       // could not have been reached either.
+      coveDiag("video_pill_result", "WARNING",
+               { result: "unavailable", replied: false }, requestId);
       setPillState("error", "unavailable");
     } finally {
       downloadPending = false;

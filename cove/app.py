@@ -18,7 +18,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from . import APP_NAME, __version__, theme
+from . import APP_NAME, __version__, diagnostics, theme
 from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC
 from .api_server import LocalApiServer
 from .config import CONFIG_FILE, Settings
@@ -93,7 +93,19 @@ class BrowserDownloadGate:
         self.shutting_down = False
 
     def accept(self, request: dict) -> bool:
+        # Correlates this add with the extension request that produced it.
+        # Never used for a decision, only for the diagnostics trail.
+        request_id = request.get("request_id")
+
+        def result(name, task_id=None, exc=None):
+            diagnostics.emit(
+                "extension.native_bridge", "gui_result",
+                "INFO" if name == "accepted" else "WARNING",
+                task_id=task_id, request_id=request_id, exc=exc, result=name,
+            )
+
         if self.shutting_down or not self.ready or self.queue is None:
+            result("shutting_down" if self.shutting_down else "not_ready")
             return False
         try:
             task_id = self.queue.add_url(
@@ -103,12 +115,15 @@ class BrowserDownloadGate:
                 cookies=request.get("cookies") or "",
                 referrer=request.get("referrer") or "",
                 user_agent=request.get("user_agent") or "",
+                intake="extension",
             )
-        except Exception:
+        except Exception as exc:
             # Fixed event name only - the request carries a URL, cookies and
             # a referrer, none of which may reach the log.
             logging.getLogger("cove").warning("browser_download_add_failed")
+            result("add_failed", exc=exc)
             return False
+        result("accepted" if task_id is not None else "add_rejected", task_id=task_id)
         return task_id is not None
 
 
@@ -176,6 +191,71 @@ def apply_theme(app: QApplication, name: str) -> None:
         w.update()
 
 
+_DIAG_HANDLER = None
+_DIAG_STDERR_HANDLER = None
+
+
+def _keep_stderr_fallback() -> None:
+    """Preserve the stderr output the cove logger had before diagnostics.
+
+    Python's logging falls back to ``lastResort`` (stderr, WARNING and above)
+    only while a logger has no handlers anywhere in its chain. Attaching the
+    diagnostics handler silences that fallback, which would swallow startup
+    failures like settings_unreadable, so restore it explicitly.
+    """
+    global _DIAG_STDERR_HANDLER
+    if _DIAG_STDERR_HANDLER is not None:
+        return
+    logger = logging.getLogger(diagnostics.COVE_LOGGER_NAME)
+    if any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+        return
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.WARNING)
+    logger.addHandler(handler)
+    _DIAG_STDERR_HANDLER = handler
+
+
+def init_diagnostics(data_dir=None):
+    """Start sanitized diagnostics for this process.
+
+    Explicit, never an import-time side effect, and never fatal: a Cove that
+    cannot write a log file still has to start and still has to download.
+    """
+    global _DIAG_HANDLER
+    try:
+        if data_dir is None:
+            from .config import DATA_DIR as data_dir  # noqa: N813
+        log = diagnostics.init_app_logger(data_dir)
+        if _DIAG_HANDLER is None:
+            # Only the "cove" logger. Attaching to the root logger would pull
+            # in requests/urllib3 traffic, which carries URLs and headers.
+            _DIAG_HANDLER = diagnostics.attach_python_logging(log)
+            _keep_stderr_fallback()
+        log.emit("app", "app_start", "INFO", **diagnostics.environment_facts())
+        return log
+    except Exception:
+        return None
+
+
+def shutdown_diagnostics() -> None:
+    global _DIAG_HANDLER, _DIAG_STDERR_HANDLER
+    try:
+        log = diagnostics.get_logger()
+        if log is not None:
+            log.emit("app", "app_stop", "INFO")
+        if _DIAG_HANDLER is not None:
+            diagnostics.detach_python_logging(_DIAG_HANDLER)
+            _DIAG_HANDLER = None
+        if _DIAG_STDERR_HANDLER is not None:
+            logging.getLogger(diagnostics.COVE_LOGGER_NAME).removeHandler(
+                _DIAG_STDERR_HANDLER
+            )
+            _DIAG_STDERR_HANDLER = None
+        diagnostics.shutdown_logger()
+    except Exception:
+        pass
+
+
 def run() -> int:
     # Safety net: never open the GUI when launched as a native messaging
     # host. A browser respawns the host on failure, so a GUI here loops into
@@ -212,6 +292,10 @@ def run() -> int:
             )
             return 1
         return 0
+
+    # Primary. Start diagnostics before any service so a failure during
+    # construction below is recorded rather than lost.
+    init_diagnostics(DATA_DIR)
 
     # We are primary and already listening, but nothing pumps the Qt event
     # loop until app.exec() at the very end of this function - a secondary
@@ -462,6 +546,7 @@ def run() -> int:
             pass
         daemon.stop()
         instance_server.shutdown()
+        shutdown_diagnostics()
 
     app.aboutToQuit.connect(_cleanup)
     return app.exec()

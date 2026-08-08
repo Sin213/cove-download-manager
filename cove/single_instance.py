@@ -25,6 +25,7 @@ from typing import Iterable
 from PySide6.QtCore import QCoreApplication, QLockFile, QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
+from . import diagnostics
 from .torrent import MAX_MAGNET_LENGTH, is_magnet
 
 logger = logging.getLogger("cove.single_instance")
@@ -258,6 +259,10 @@ def validate_browser_download(obj: dict) -> dict:
             MAX_BROWSER_USER_AGENT_LENGTH,
         ),
         "file_size": file_size,
+        # Diagnostics correlation only. Optional, opaque and charset-bounded:
+        # an extension or host that predates it simply omits the key, and an
+        # unusable value is dropped rather than rejecting the download.
+        "request_id": diagnostics.normalize_request_id(obj.get("request_id")),
     }
 
 
@@ -641,6 +646,7 @@ def send_browser_download(
     request: dict,
     connect_timeout_ms: int = _DEFAULT_CONNECT_TIMEOUT_MS,
     ack_timeout_ms: int = _DEFAULT_ACK_TIMEOUT_MS,
+    on_reason=None,
 ) -> bool:
     """Ask the running primary to take one browser download. Never raises.
 
@@ -663,13 +669,19 @@ def send_browser_download(
     ):
         if request.get(key) not in (None, ""):
             message[key] = request[key]
-    return _request(name, message, connect_timeout_ms, ack_timeout_ms)
+    request_id = request.get("request_id")
+    if request_id:
+        # Additive and optional. A primary that predates request ids simply
+        # ignores the extra key; nothing about the handshake depends on it.
+        message["request_id"] = request_id
+    return _request(name, message, connect_timeout_ms, ack_timeout_ms, on_reason)
 
 
 def send_extension_ping(
     name: str,
     connect_timeout_ms: int = _DEFAULT_CONNECT_TIMEOUT_MS,
     ack_timeout_ms: int = _DEFAULT_ACK_TIMEOUT_MS,
+    on_reason=None,
 ) -> bool:
     """Tell the running primary that the extension is alive. Never raises.
 
@@ -681,6 +693,7 @@ def send_extension_ping(
         {"version": PROTOCOL_VERSION, "action": EXTENSION_PING_ACTION},
         connect_timeout_ms,
         ack_timeout_ms,
+        on_reason,
     )
 
 
@@ -689,21 +702,36 @@ def _request(
     message_obj: dict,
     connect_timeout_ms: int,
     ack_timeout_ms: int,
+    on_reason=None,
 ) -> bool:
     """One bounded request/response round trip against `name`. Never raises.
 
     Shared by every client-side action so framing, the read deadline, and the
     "only an explicit ok=True counts as success" rule cannot drift apart
     between the magnet path and the browser path.
+
+    ``on_reason`` is a diagnostics-only observer. It is told which of the
+    outcomes below occurred and can neither change the result nor the
+    timings; it defaults to a no-op and any exception it raises is dropped.
     """
+    def reason(value: str) -> None:
+        if on_reason is None:
+            return
+        try:
+            on_reason(value)
+        except Exception:
+            pass
+
     sock = QLocalSocket()
     try:
         sock.connectToServer(name)
         if not sock.waitForConnected(connect_timeout_ms):
+            reason("connect_timeout")
             return False
         try:
             message = encode_message(message_obj)
         except MessageError:
+            reason("encode_error")
             return False
         sock.write(message)
         sock.flush()
@@ -713,23 +741,30 @@ def _request(
         while len(buf) < LENGTH_PREFIX_SIZE:
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0 or not sock.waitForReadyRead(remaining_ms):
+                reason("ack_timeout")
                 return False
             buf.extend(bytes(sock.readAll()))
         (length,) = struct.unpack(">I", bytes(buf[:LENGTH_PREFIX_SIZE]))
         if length > MAX_MESSAGE_BYTES:
+            reason("oversize_reply")
             return False
         del buf[:LENGTH_PREFIX_SIZE]
         while len(buf) < length:
             remaining_ms = int((deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0 or not sock.waitForReadyRead(remaining_ms):
+                reason("ack_timeout")
                 return False
             buf.extend(bytes(sock.readAll()))
         try:
             resp = json.loads(bytes(buf[:length]).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
+            reason("malformed_reply")
             return False
-        return isinstance(resp, dict) and resp.get("ok") is True
+        accepted = isinstance(resp, dict) and resp.get("ok") is True
+        reason("ok" if accepted else "gui_rejected")
+        return accepted
     except OSError:
+        reason("transport_error")
         return False
     finally:
         sock.abort()

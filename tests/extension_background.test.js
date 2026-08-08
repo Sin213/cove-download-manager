@@ -11,7 +11,9 @@ function event() {
   };
 }
 
-function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
+function loadBackground({ nativeResult = { status: "ok" }, settings,
+                         breakStorage = false, slowStorage = false,
+                         storedDiag = null } = {}) {
   const calls = { native: [], cancel: [], erase: [] };
   const events = {
     downloadCreated: event(),
@@ -21,12 +23,24 @@ function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
   };
   const browserDownloads = [];
   const quietEvent = () => event();
+  // A real key/value store, so the diagnostics ring can be inspected the way
+  // the popup would read it back.
   const store = {
+    data: {},
     async get(key) {
       if (key === "settings") return settings ? { settings } : {};
-      return {};
+      if (slowStorage && key === "coveDiag") {
+        // Hydration that lands well after the background has started
+        // recording, which is the ordering the real storage API produces.
+        for (let i = 0; i < 8; i += 1) await Promise.resolve();
+      }
+      return key in store.data ? { [key]: store.data[key] } : {};
     },
-    async set() {},
+    async set(obj) {
+      if (breakStorage) throw new Error("QuotaExceededError");
+      Object.assign(store.data, obj);
+    },
+    async remove(key) { delete store.data[key]; },
   };
   const browser = {
     action: {
@@ -46,6 +60,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
     notifications: { async create() {} },
     runtime: {
       lastError: null,
+      getManifest: () => ({ version: "1.4.4" }),
       onInstalled: quietEvent(),
       onMessage: events.message,
       async sendNativeMessage(_host, message) {
@@ -70,14 +85,25 @@ function loadBackground({ nativeResult = { status: "ok" }, settings } = {}) {
   const context = vm.createContext({
     browser,
     console: { log() {}, error() {} },
-    navigator: { userAgent: "test" },
+    navigator: {
+      userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+    },
     URL,
     setTimeout,
     clearTimeout,
   });
+  // The browser loads extension/diagnostics.js into the background context
+  // before background.js runs (importScripts on Chrome, a script element on
+  // the Firefox background page). Mirror that ordering here.
+  vm.runInContext(
+    fs.readFileSync("extension/diagnostics.js", "utf8"),
+    context,
+    { filename: "extension/diagnostics.js" },
+  );
+  if (storedDiag) store.data.coveDiag = storedDiag;
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
-  return { calls, events, browserDownloads };
+  return { calls, events, browserDownloads, store, context };
 }
 
 async function settle() {
@@ -448,4 +474,275 @@ test("the pill never labels a failure as a problem with the video", () => {
   // real debugging session chasing a video that was fine all along.
   assert.equal(source.includes("Video unavailable"), false);
   assert.equal(source.includes("Cove is not running"), true);
+});
+
+// ---------------------------------------------------------------------------
+// Diagnostics
+//
+// The background context owns the extension's diagnostic ring: it is the one
+// context that survives a popup closing and a tab navigating, and it is still
+// alive when Cove is not. Content scripts and the popup report into it by
+// message, because the manifest cannot load a second script into them.
+//
+// Assertions run against the report the popup would copy, which is the actual
+// support surface and does not depend on the storage flush debounce.
+// ---------------------------------------------------------------------------
+
+// The listeners answer through sendResponse, not through their return value
+// (which is the "reply asynchronously" flag), so capture the callback.
+async function sendToBackground(events, msg, sender = {}) {
+  let captured;
+  events.message.emit(msg, sender, (reply) => { captured = reply; });
+  await settle();
+  return captured;
+}
+
+async function diagReport(events) {
+  const reply = await sendToBackground(events, { type: "coveDiagReport" });
+  return reply && reply.text ? reply.text : "";
+}
+
+async function requestMedia(events, msg = {}) {
+  return sendToBackground(
+    events,
+    { type: "downloadMedia", url: "https://cdn.example.test/v/movie.mp4", ...msg },
+    { tab: { id: 4, url: "https://news.example.test/x" } },
+  );
+}
+
+test("the background records a media download request and its result", async () => {
+  const { events, calls } = loadBackground({ nativeResult: { status: "ok" } });
+  await settle();
+  calls.native.length = 0;
+
+  await requestMedia(events, { requestId: "51c2a711" });
+  const report = await diagReport(events);
+
+  assert.ok(report.includes("request_received"));
+  assert.ok(report.includes("native_message_sent"));
+  assert.ok(report.includes("native_message_result"));
+  assert.ok(report.includes("request=51c2a711"));
+});
+
+test("no page url, media url or filename reaches the extension log", async () => {
+  const { events } = loadBackground({ nativeResult: { status: "ok" } });
+  await settle();
+
+  await requestMedia(events, {
+    url: "https://cdn.example.test/v/secret-movie.mp4",
+    pageUrl: "https://news.example.test/private-article",
+  });
+  const report = await diagReport(events);
+
+  assert.ok(!report.includes("secret-movie"));
+  assert.ok(!report.includes("private-article"));
+  assert.ok(!report.includes("news.example.test"));
+});
+
+test("a request id from the content script reaches the native message", async () => {
+  const { calls, events } = loadBackground({ nativeResult: { status: "ok" } });
+  await settle();
+  calls.native.length = 0;
+
+  await requestMedia(events, { requestId: "51c2a711" });
+
+  const download = calls.native.find((m) => m.action === "download");
+  assert.equal(download.requestId, "51c2a711");
+});
+
+test("a media download without a request id still works", async () => {
+  const { calls, events } = loadBackground({ nativeResult: { status: "ok" } });
+  await settle();
+  calls.native.length = 0;
+
+  const result = await requestMedia(events);
+
+  assert.equal(result.ok, true);
+  const download = calls.native.find((m) => m.action === "download");
+  assert.equal(download.requestId, undefined);
+});
+
+test("an unreachable Cove is recorded with a reason the user can act on", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "error", message: "Cove is not available" },
+  });
+  await settle();
+
+  await requestMedia(events, { requestId: "51c2a711" });
+  const report = await diagReport(events);
+
+  assert.ok(report.includes("request_failed"));
+  assert.ok(report.includes("reason=app_unavailable"));
+  assert.ok(report.includes("request=51c2a711"));
+});
+
+test("a transport failure is distinguished from a rejection", async () => {
+  const { events } = loadBackground({
+    nativeResult: () => { throw new Error("no host"); },
+  });
+  await settle();
+
+  await requestMedia(events);
+  const report = await diagReport(events);
+
+  assert.ok(report.includes("reason=transport_error"));
+  assert.ok(!report.includes("reason=app_unavailable"));
+});
+
+test("a rejection by a running Cove is not reported as unavailable", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "error", message: "Invalid or blocked URL" },
+  });
+  await settle();
+
+  await requestMedia(events);
+  const report = await diagReport(events);
+
+  assert.ok(report.includes("reason=gui_rejected"));
+});
+
+test("the startup ping result is recorded instead of logged raw", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "ok", version: "3.4.0" },
+  });
+  await settle();
+
+  const report = await diagReport(events);
+  assert.ok(report.includes("native_ping_result"));
+  assert.ok(report.includes("appVersion=3.4.0"));
+});
+
+test("a content script can record through the background", async () => {
+  const { events } = loadBackground();
+  await settle();
+
+  await sendToBackground(
+    events,
+    { type: "coveDiag", component: "extension.content",
+      event: "video_download_requested", level: "INFO", requestId: "51c2a711",
+      fields: { trigger: "pill" } },
+    { tab: { id: 4, url: "https://news.example.test/x" } },
+  );
+
+  const report = await diagReport(events);
+  assert.ok(report.includes("extension.content/video_download_requested"));
+  assert.ok(report.includes("request=51c2a711"));
+  assert.ok(report.includes("trigger=pill"));
+});
+
+test("a forbidden field sent by a content script is still dropped", async () => {
+  const { events } = loadBackground();
+  await settle();
+
+  await sendToBackground(
+    events,
+    { type: "coveDiag", component: "extension.content", event: "video_pill_result",
+      fields: { pageUrl: "https://news.example.test/private", result: "ok" } },
+    { tab: { id: 4 } },
+  );
+
+  const report = await diagReport(events);
+  assert.ok(!report.includes("private"));
+  assert.ok(report.includes("result=ok"));
+});
+
+test("the popup can clear the ring", async () => {
+  const { events } = loadBackground();
+  await settle();
+
+  await sendToBackground(events, {
+    type: "coveDiag", component: "extension.popup",
+    event: "connection_status_rendered", fields: { state: "connected" },
+  });
+  assert.ok((await diagReport(events)).includes("connection_status_rendered"));
+
+  await sendToBackground(events, { type: "coveDiagClear" });
+  assert.ok(!(await diagReport(events)).includes("connection_status_rendered"));
+});
+
+test("the ring is persisted for a report after a background restart", async () => {
+  const { events, store } = loadBackground();
+  await settle();
+  await sendToBackground(events, {
+    type: "coveDiag", component: "extension.popup",
+    event: "connection_status_rendered", fields: { state: "connected" },
+  });
+  // The flush is debounced, so drive it the way the timer would.
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+  assert.ok(store.data.coveDiag && store.data.coveDiag.length > 0);
+});
+
+test("diagnostics failure never breaks a media download", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "ok" },
+    breakStorage: true,
+  });
+  await settle();
+
+  const result = await requestMedia(events);
+  assert.equal(result.ok, true);
+});
+
+test("the report header names the extension, the browser and Cove", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "ok", version: "3.4.0" },
+  });
+  await settle();
+
+  const report = await diagReport(events);
+  assert.ok(report.includes("extension version: 1.4.4"));
+  assert.ok(report.includes("last seen Cove version: 3.4.0"));
+  assert.ok(report.includes("browser: Firefox 140"));
+});
+
+test("an unreachable Cove leaves the version unknown rather than wrong", async () => {
+  const { events } = loadBackground({
+    nativeResult: () => { throw new Error("no host"); },
+  });
+  await settle();
+
+  const report = await diagReport(events);
+  assert.ok(report.includes("last seen Cove version: unknown"));
+});
+
+test("startup events survive a slow storage hydration", async () => {
+  const { events } = loadBackground({
+    nativeResult: { status: "ok", version: "3.4.0" },
+    slowStorage: true,
+    storedDiag: [{
+      ts: "2026-08-01T00:00:00.000Z", level: "INFO",
+      component: "extension.background", event: "event_from_last_run",
+      session: "aaaabbbb", context: "background", fields: {},
+    }],
+  });
+  await settle();
+  await settle();
+
+  const report = await diagReport(events);
+  // The event recorded while hydration was in flight must not be discarded,
+  // and the persisted history must not be lost either.
+  assert.ok(report.includes("native_ping_result"), "startup event was dropped");
+  assert.ok(report.includes("event_from_last_run"), "persisted history was lost");
+});
+
+test("a report requested during hydration still includes stored history", async () => {
+  const { events } = loadBackground({
+    slowStorage: true,
+    storedDiag: [{
+      ts: "2026-08-01T00:00:00.000Z", level: "INFO",
+      component: "extension.background", event: "event_from_last_run",
+      session: "aaaabbbb", context: "background", fields: {},
+    }],
+  });
+
+  // No settle first: ask while the storage read is still outstanding.
+  const report = await diagReport(events);
+  assert.ok(report.includes("event_from_last_run"));
+});
+
+test("a clear that storage refuses is reported as a failure", async () => {
+  const { events } = loadBackground({ breakStorage: true });
+  await settle();
+  const reply = await sendToBackground(events, { type: "coveDiagClear" });
+  assert.equal(reply.ok, false);
 });

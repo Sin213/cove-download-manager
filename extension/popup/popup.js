@@ -19,14 +19,107 @@ function formatSpeed(bytesPerSec) {
   return formatBytes(bytesPerSec) + "/s";
 }
 
+// ---- Diagnostics ----
+//
+// The ring itself lives in the background context (the manifest cannot load
+// diagnostics.js into two places at once), so the popup reports events there
+// and asks for the report back. When the background cannot answer, it falls
+// back to reading storage.local directly - being able to copy a report with
+// nothing running is the entire point of this surface.
+
+// Remembered from the last ping so the disconnected fallback report can still
+// name the Cove the popup was talking to a moment ago.
+let lastSeenAppVersion = null;
+
+function coveDiag(event, level, fields) {
+  try {
+    Promise.resolve(browser.runtime.sendMessage({
+      type: "coveDiag",
+      component: "extension.popup",
+      event: event,
+      level: level,
+      fields: fields || {},
+    })).catch(() => {});
+  } catch (e) { /* a diagnostic must never break the popup */ }
+}
+
+async function diagnosticsReport() {
+  try {
+    const reply = await browser.runtime.sendMessage({ type: "coveDiagReport" });
+    if (reply && reply.text) return reply.text;
+  } catch (e) { /* fall through to the stored copy */ }
+  try {
+    const fallback = CoveDiag.createDiagnostics({
+      storage: browser.storage.local,
+      context: "popup",
+      version: (browser.runtime.getManifest && browser.runtime.getManifest().version) ||
+        "unknown",
+      browser: CoveDiag.browserLabel(navigator && navigator.userAgent),
+    });
+    if (lastSeenAppVersion) fallback.setEnvironment({ appVersion: lastSeenAppVersion });
+    await fallback.load();
+    return fallback.report();
+  } catch (e) {
+    return CoveDiag.SANITIZATION_NOTICE + "\n";
+  }
+}
+
 async function checkConnection() {
-  const result = await browser.runtime.sendMessage({ type: "ping" });
+  let result = null;
+  try {
+    result = await browser.runtime.sendMessage({ type: "ping" });
+  } catch (e) {
+    result = null;
+  }
+  // The status shown here is a point-in-time sample of one ping, which is
+  // exactly why it can disagree with a video pill a moment later. Record what
+  // was actually rendered, so the two can be compared afterwards.
   if (result && result.status === "ok") {
     connectionStatus.textContent = "Connected - Cove v" + result.version;
     statusBar.className = "status-bar connected";
+    lastSeenAppVersion = result.version || null;
+    coveDiag("connection_status_rendered", "INFO",
+             { state: "connected", appVersion: result.version || "unknown" });
   } else {
     connectionStatus.textContent = "Not connected to Cove";
     statusBar.className = "status-bar error";
+    coveDiag("connection_status_rendered", "WARNING", {
+      state: "not_connected",
+      replied: !!result,
+    });
+  }
+}
+
+function wireDiagnosticsButtons() {
+  const copyBtn = document.getElementById("copy-diagnostics");
+  if (copyBtn) {
+    copyBtn.addEventListener("click", async () => {
+      const original = copyBtn.textContent;
+      try {
+        const text = await diagnosticsReport();
+        await navigator.clipboard.writeText(text);
+        copyBtn.textContent = "Copied";
+      } catch (e) {
+        copyBtn.textContent = "Copy failed";
+      }
+      setTimeout(() => { copyBtn.textContent = original; }, 2000);
+    });
+  }
+  const clearBtn = document.getElementById("clear-diagnostics");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", async () => {
+      const original = clearBtn.textContent;
+      try {
+        // Only the background knows whether persistent storage actually gave
+        // the records up. Claiming success on a refused write would tell the
+        // user their diagnostics are gone when they are still on disk.
+        const reply = await browser.runtime.sendMessage({ type: "coveDiagClear" });
+        clearBtn.textContent = reply && reply.ok ? "Cleared" : "Clear failed";
+      } catch (e) {
+        clearBtn.textContent = "Clear failed";
+      }
+      setTimeout(() => { clearBtn.textContent = original; }, 2000);
+    });
   }
 }
 
@@ -166,6 +259,7 @@ async function refreshStreams() {
   } catch {}
 }
 
+wireDiagnosticsButtons();
 checkConnection();
 loadSettings();
 refreshDownloads();

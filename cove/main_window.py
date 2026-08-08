@@ -913,6 +913,11 @@ class MainWindow(QMainWindow):
         self.clear_btn.clicked.connect(lambda: self._clear_completed(False))
         row.addWidget(self.clear_btn)
 
+        self.logs_btn = QPushButton("Logs")
+        self.logs_btn.setToolTip("Open sanitized diagnostics for support")
+        self.logs_btn.clicked.connect(lambda: self._open_diagnostics())
+        row.addWidget(self.logs_btn)
+
         row.addStretch(1)
 
         self.queue_btn = QPushButton("Pause queue")
@@ -1069,7 +1074,7 @@ class MainWindow(QMainWindow):
         return []
 
     def add_urls_checked(
-        self, urls: list[str], out_dir: str | None = None
+        self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
     ) -> list[int]:
         """Add URLs interactively, warning about anything already present."""
         cands = [self._candidate(u) for u in urls if (u or "").strip()]
@@ -1096,15 +1101,17 @@ class MainWindow(QMainWindow):
                     seen[ident] = cand
             checked.append((cand, match))
         if all(m is None for _, m in checked):
-            return self.queue.add_urls([c.url for c, _ in checked], out_dir)
+            return self.queue.add_urls(
+                [c.url for c, _ in checked], out_dir, intake=intake
+            )
         if len(checked) == 1:
             cand, match = checked[0]
             if not self._confirm_duplicate(match, dedup.safe_label(cand)):
                 return []
-            tid = self.queue.add_url(cand.url, out_dir)
+            tid = self.queue.add_url(cand.url, out_dir, intake=intake)
             return [] if tid is None else [tid]
         chosen = self._confirm_duplicate_batch(checked)
-        return self.queue.add_urls(chosen, out_dir) if chosen else []
+        return self.queue.add_urls(chosen, out_dir, intake=intake) if chosen else []
 
     def add_url_interactive(self, url: str) -> None:
         """Entry point for command-line and second-instance magnets."""
@@ -1219,7 +1226,7 @@ class MainWindow(QMainWindow):
             chosen = dlg.selected()
             if chosen:
                 selected_dir = dlg.get_dir()
-                self.add_urls_checked(chosen, selected_dir)
+                self.add_urls_checked(chosen, selected_dir, intake="clipboard")
 
     def _paste_urls(self) -> None:
         text = QGuiApplication.clipboard().text() or ""
@@ -1371,6 +1378,20 @@ class MainWindow(QMainWindow):
         for tid in tids:
             self.queue.remove(tid, delete_file=False)
 
+    def _open_diagnostics(self, task_id: int | None = None) -> None:
+        """Open the single Diagnostics window, optionally pre-filtered.
+
+        Never changes task state: a failed row stays failed, this only shows
+        what was already recorded about it.
+        """
+        try:
+            from .diagnostics_window import show_diagnostics
+
+            return show_diagnostics(parent=None, task_id=task_id)
+        except Exception:
+            logging.getLogger("cove").warning("diagnostics_window_failed")
+            return None
+
     def _add_source_action(self, menu, task) -> None:
         """Add "View source" for `task`. Available in every status: the
         origin of a download is just as worth checking when it failed."""
@@ -1430,6 +1451,10 @@ class MainWindow(QMainWindow):
                     retry_a = menu.addAction("Retry")
                     retry_a.triggered.connect(
                         lambda: [self.queue.resume(t) for t in selected]
+                    )
+                    logs_a = menu.addAction("View logs")
+                    logs_a.triggered.connect(
+                        lambda _=False, i=tid: self._open_diagnostics(task_id=i)
                     )
                 menu.addSeparator()
                 self._add_source_action(menu, task)
