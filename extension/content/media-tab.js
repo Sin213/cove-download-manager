@@ -346,7 +346,7 @@
     if (extractorUrl) return extractorUrl;
     try {
       const response = await Promise.resolve(
-        browser.runtime.sendMessage({ type: "getExtractorPageUrl" })
+        browser.runtime.sendMessage({ type: "getMediaPageUrl" })
       );
       if (response && isHttpUrl(response.url)) return response.url;
     } catch {}

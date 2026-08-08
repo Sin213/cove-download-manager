@@ -30,7 +30,7 @@
   ],
 
   "background": {
-    "scripts": ["background.js"],
+    "scripts": ["media.js", "background.js"],
     "persistent": true
   },
 

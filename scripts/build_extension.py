@@ -26,11 +26,19 @@ DIST = ROOT / "dist"
 # Files/dirs in extension/ that must never ship in a bundle.
 _EXCLUDE = {"manifest.chrome.json", "chrome-key.pem"}
 
+# Video handling, excluded from the Chrome bundle. The Chrome Web Store
+# rejected 1.3.5 under "Malicious and Prohibited Products" for facilitating
+# downloads of copyrighted media, naming YouTube, so the Chrome build ships
+# no in-page video pill, no HLS detection, and no page-extractor code.
+# background.js degrades to links and images when media.js is absent.
+# Firefox keeps all of it. Guarded by tests/test_extension_bundle.py.
+_CHROME_EXCLUDE = {"media.js", "content"}
 
-def _copy_shared(dest: Path) -> None:
+
+def _copy_shared(dest: Path, exclude: set[str] = frozenset()) -> None:
     dest.mkdir(parents=True, exist_ok=True)
     for item in SRC.iterdir():
-        if item.name in _EXCLUDE:
+        if item.name in _EXCLUDE or item.name in exclude:
             continue
         target = dest / item.name
         if item.is_dir():
@@ -51,7 +59,8 @@ def _zip_dir(src_dir: Path, zip_path: Path, manifest_override: str | None = None
                 zf.write(path, rel)
 
 
-def build() -> None:
+def build(dist: Path | None = None) -> None:
+    DIST = Path(dist) if dist is not None else globals()["DIST"]
     if DIST.exists():
         shutil.rmtree(DIST)
 
@@ -61,9 +70,9 @@ def build() -> None:
     ff_version = json.loads((firefox / "manifest.json").read_text())["version"]
     _zip_dir(firefox, DIST / f"cove-firefox-{ff_version}.zip")
 
-    # Chrome: swap in the MV3 manifest as manifest.json.
+    # Chrome: swap in the MV3 manifest as manifest.json, minus video handling.
     chrome = DIST / "chrome"
-    _copy_shared(chrome)
+    _copy_shared(chrome, exclude=_CHROME_EXCLUDE)
     mv3 = json.loads((SRC / "manifest.chrome.json").read_text())
     # Unpacked dir keeps `key` so the dev extension id is stable and matches
     # the native host whitelist when loaded unpacked for local testing.

@@ -13,8 +13,8 @@ function event() {
 
 function loadBackground({ nativeResult = { status: "ok" }, settings,
                          breakStorage = false, slowStorage = false,
-                         storedDiag = null } = {}) {
-  const calls = { native: [], cancel: [], erase: [] };
+                         storedDiag = null, media = true } = {}) {
+  const calls = { native: [], cancel: [], erase: [], menus: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
@@ -48,7 +48,10 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       async setBadgeBackgroundColor() {},
     },
     commands: { onCommand: quietEvent() },
-    contextMenus: { create() {}, onClicked: events.contextMenuClicked },
+    contextMenus: {
+      create(props) { calls.menus.push(props); },
+      onClicked: events.contextMenuClicked,
+    },
     cookies: { async getAll() { return []; } },
     downloads: {
       onCreated: events.downloadCreated,
@@ -101,6 +104,16 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     { filename: "extension/diagnostics.js" },
   );
   if (storedDiag) store.data.coveDiag = storedDiag;
+  // media.js ships in the Firefox bundle only and the MV2 manifest lists it
+  // ahead of background.js. `media: false` reproduces the Chrome bundle,
+  // which omits it entirely (scripts/build_extension.py).
+  if (media) {
+    vm.runInContext(
+      fs.readFileSync("extension/media.js", "utf8"),
+      context,
+      { filename: "extension/media.js" },
+    );
+  }
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
   return { calls, events, browserDownloads, store, context };
@@ -387,6 +400,96 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
 
   assert.equal(calls.native.filter((m) => m.action === "download").length, 0);
   assert.equal(browserDownloads.length, 0);
+});
+
+// ---- Chrome bundle: background.js without media.js ----
+//
+// The Chrome Web Store rejected 1.3.5 for facilitating downloads of
+// copyrighted media, so that bundle omits media.js and the pill content
+// script. background.js must degrade rather than throw on the references it
+// keeps. tests/test_extension_bundle.py asserts the exclusion itself; these
+// assert the behaviour that is left.
+
+test("without media.js the context menu offers links and images only", async () => {
+  const { calls } = loadBackground({ media: false });
+  await settle();
+
+  const menu = calls.menus.find((m) => m.id === "download-with-cove");
+  assert.deepEqual(Array.from(menu.contexts), ["link", "image"]);
+});
+
+test("with media.js the context menu still offers video and audio", async () => {
+  const { calls } = loadBackground();
+  await settle();
+
+  const menu = calls.menus.find((m) => m.id === "download-with-cove");
+  assert.deepEqual(Array.from(menu.contexts), ["link", "image", "video", "audio"]);
+});
+
+test("without media.js a blob player src is ignored, not guessed at", async () => {
+  const { calls, events } = loadBackground({ media: false });
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      {
+        menuItemId: "download-with-cove",
+        srcUrl: "blob:https://example.com/2b0f8c1e-0000-4000-8000-000000000000",
+        pageUrl: "https://example.com/watch?v=abc123",
+      },
+      { url: "https://example.com/watch?v=abc123", title: "Clip" }
+    )
+  );
+  await settle();
+
+  assert.deepEqual(calls.native.filter((m) => m.action === "download"), []);
+});
+
+test("without media.js a plain file link still downloads", async () => {
+  const { calls, events } = loadBackground({ media: false });
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(
+    events.contextMenuClicked.emit(
+      {
+        menuItemId: "download-with-cove",
+        linkUrl: "https://example.com/files/setup.zip",
+        pageUrl: "https://example.com/downloads",
+      },
+      { url: "https://example.com/downloads", title: "Downloads" }
+    )
+  );
+  await settle();
+
+  const sent = calls.native.filter((m) => m.action === "download");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, "https://example.com/files/setup.zip");
+  assert.equal(sent[0].filename, "setup.zip");
+});
+
+test("without media.js the popup's stream request is answered, not dropped", async () => {
+  const { events } = loadBackground({ media: false });
+  await settle();
+
+  let reply = "never called";
+  events.message.emit({ type: "getDetectedStreams" }, {}, (r) => { reply = r; });
+  await settle();
+
+  assert.deepEqual(Array.from(reply), []);
+});
+
+test("without media.js a media download request is refused cleanly", async () => {
+  const { calls, events } = loadBackground({ media: false });
+  await settle();
+  calls.native.length = 0;
+
+  const reply = await pillDownload(events, { url: "https://example.com/clip.mp4" });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+  assert.deepEqual(calls.native.filter((m) => m.action === "download"), []);
 });
 
 // ---- Media pill failure reporting ----

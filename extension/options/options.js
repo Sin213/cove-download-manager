@@ -23,8 +23,25 @@ const resetExtensionsBtn = document.getElementById("reset-extensions");
 const testConnectionBtn = document.getElementById("test-connection");
 const testResult = document.getElementById("test-result");
 
+// The Chrome bundle ships no pill content script, so the setting that turns
+// it on would control nothing. Detect that from the manifest rather than the
+// browser name: it is the bundle, not Chromium, that lacks the feature.
+function mediaPillAvailable() {
+  try {
+    const manifest = browser.runtime.getManifest();
+    return Array.isArray(manifest.content_scripts) && manifest.content_scripts.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 async function loadSettings() {
   const s = await browser.runtime.sendMessage({ type: "getSettings" });
+
+  if (!mediaPillAvailable()) {
+    const section = document.getElementById("media-pill-section");
+    if (section) section.hidden = true;
+  }
 
   enabledCheckbox.checked = s.enabled;
   mediaPillEnabledCheckbox.checked = s.mediaPillEnabled !== false;
