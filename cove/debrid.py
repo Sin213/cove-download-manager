@@ -758,26 +758,38 @@ def torbox_unrestrict(
             True, True,
         )
     item_id = _torbox_create_web_download(link, token, session=session)
-    deadline = clock() + TORBOX_READY_MAX_WAIT
-    while True:
-        entry = _torbox_mylist_entry(item_id, token, session=session)
-        if entry is None:
-            raise _bad_response(TORBOX)
-        if entry.get("download_present") is True or entry.get("download_finished") is True:
-            break
-        if clock() >= deadline:
+    # Once the job exists it is ours to clean up on every unsuccessful exit,
+    # not just the poll timeout: a malformed response, an unusable file list
+    # or a transport error would otherwise leave it behind, consuming the
+    # user's TorBox quota and cluttering their account. Mirrors the torrent
+    # path's own keep/finally handling.
+    keep = False
+    try:
+        deadline = clock() + TORBOX_READY_MAX_WAIT
+        while True:
+            entry = _torbox_mylist_entry(item_id, token, session=session)
+            if entry is None:
+                raise _bad_response(TORBOX)
+            if entry.get("download_present") is True or entry.get("download_finished") is True:
+                break
+            if clock() >= deadline:
+                raise DebridError(
+                    TORBOX, "not_ready",
+                    "could not confirm this download was ready in time.", True, True,
+                )
+            sleep(TORBOX_READY_POLL_INTERVAL)
+        file_id, filename, filesize = _torbox_pick_file(entry.get("files"))
+        download = _torbox_request_dl("webdl", item_id, file_id, token, session=session)
+        # Ownership transfers to the caller with the successful result: the
+        # job backs a live download and must outlive this function.
+        keep = True
+        return Unrestricted(
+            download=download, filename=filename, filesize=filesize,
+            provider=TORBOX, item_id=item_id,
+        )
+    finally:
+        if not keep:
             _torbox_delete_web_download(item_id, token, session=session)
-            raise DebridError(
-                TORBOX, "not_ready",
-                "could not confirm this download was ready in time.", True, True,
-            )
-        sleep(TORBOX_READY_POLL_INTERVAL)
-    file_id, filename, filesize = _torbox_pick_file(entry.get("files"))
-    download = _torbox_request_dl("webdl", item_id, file_id, token, session=session)
-    return Unrestricted(
-        download=download, filename=filename, filesize=filesize,
-        provider=TORBOX, item_id=item_id,
-    )
 
 
 def torbox_refresh_web_download(

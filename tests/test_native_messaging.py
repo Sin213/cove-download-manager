@@ -896,3 +896,36 @@ def test_ping_is_unaffected_by_the_rejection_categories(host_log, monkeypatch):
     response = handle_message({"action": "ping"}, None, None)
     assert response["status"] == "ok"
     assert "category" not in response
+
+
+# --- URL authority validation ----------------------------------------------
+
+
+@pytest.mark.parametrize("url", [
+    "https:///file",
+    "http:///",
+    "ftp:///path",
+    "https://",
+    "http://:8080/x",
+    "https://host:notaport/x",
+    "https://ho\x00st/x",
+])
+def test_network_urls_without_a_usable_authority_are_rejected(url):
+    """Scheme-prefix matching let malformed URLs through the trust boundary.
+
+    These reach queue and network handling as untrusted strings and produce
+    confusing download failures rather than a clean rejection at the edge.
+    """
+    assert nm.validate_url(url) is False
+
+
+@pytest.mark.parametrize("url", [
+    "https://example.com/file.zip",
+    "http://example.com:8080/file.zip",
+    "ftp://files.example.com/pub/x",
+    "https://user:pass@example.com/f",
+    "https://192.168.1.10/f",
+    "https://[2001:db8::1]:443/f",
+])
+def test_ordinary_network_urls_are_still_accepted(url):
+    assert nm.validate_url(url) is True

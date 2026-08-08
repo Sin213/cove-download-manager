@@ -26,6 +26,7 @@ import base64
 import hashlib
 import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl
 
@@ -534,6 +535,22 @@ def is_managed_torrent_path(path) -> bool:
     return parent == base
 
 
+def _write_all(fd: int, payload: bytes) -> None:
+    """Write every byte of `payload`, or raise.
+
+    `os.write` may accept fewer bytes than it is given - the API allows it and
+    it does happen under fault injection and on unusual filesystems. A single
+    unchecked call would let a truncated file be renamed over a good one and
+    only fail much later, when the torrent no longer parses.
+    """
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while storing torrent metadata")
+        view = view[written:]
+
+
 def store_managed_torrent(meta: TorrentMetadata) -> str:
     """Copy validated `.torrent` bytes into Cove's store; return the path.
 
@@ -560,27 +577,44 @@ def store_managed_torrent(meta: TorrentMetadata) -> str:
         except TorrentError:
             pass  # Junk under our own name; replaced below.
 
-    tmp = target + ".tmp"
+    # A unique scratch name per writer, in the destination directory so the
+    # rename stays atomic. The old fixed `<target>.tmp` was derived only from
+    # the info hash, so two concurrent saves of the same torrent opened the
+    # same file with O_TRUNC and one replace could unlink it before the
+    # other's - producing a truncated file or ENOENT.
+    tmp = None
     try:
-        if os.path.islink(tmp):
-            raise TorrentError(_MANAGED_UNSAFE)
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        # Inside the try: a failure creating the scratch file is a storage
+        # failure like any other here and must surface as TorrentError, not as
+        # a raw OSError escaping this function's contract.
+        fd, tmp = tempfile.mkstemp(
+            prefix=f"{meta.info_hash}.", suffix=".tmp", dir=directory,
+        )
         try:
-            os.write(fd, meta.raw_bytes)
+            # Both under the same finally: a failure setting the mode would
+            # otherwise leave the descriptor open for the life of the process.
+            #
+            # mkstemp already creates the file owner-only, so this is
+            # belt-and-braces against an unusual umask. `os.fchmod` does not
+            # exist on Windows, and an AttributeError is not an OSError - it
+            # would escape the handler below entirely, breaking torrent
+            # persistence there and stranding the scratch file.
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            # os.write is permitted to write fewer bytes than requested, so a
+            # single call could rename a truncated file over a good one.
+            _write_all(fd, meta.raw_bytes)
         finally:
             os.close(fd)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
         os.replace(tmp, target)
     except TorrentError:
         raise
     except OSError:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise TorrentError(_MANAGED_UNSAFE) from None
     return target
 

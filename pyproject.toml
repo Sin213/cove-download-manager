@@ -7,7 +7,7 @@ name = "cove"
 version = "3.5.1"
 description = "Cove - a coastal-themed download manager built on aria2"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Cove" }]
 dependencies = [

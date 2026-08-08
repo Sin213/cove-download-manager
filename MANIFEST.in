@@ -1,0 +1,9 @@
+# The canonical branded icons live at the repository root, where build.sh,
+# scripts/build-deb.sh, the PyInstaller spec and the Windows release workflow
+# all read them. setup.py's build_py hook copies them into the cove package so
+# the wheel carries the package data pyproject declares - but that hook can
+# only copy what the tree it builds from actually contains, and an sdist
+# includes no root-level data files by default. Without these lines a wheel
+# built from an sdist ships no icons at all.
+include cove_dm_icon.png
+include cove_icon.png

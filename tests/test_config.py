@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pytest
 
+from cove import config
+
 
 def _load_close_to_tray(tmp_path, raw: dict):
     script = r'''
@@ -324,3 +326,153 @@ def test_unreadable_settings_never_regenerates_secrets(tmp_path, monkeypatch):
     assert reloaded.rpc_secret == seeded.rpc_secret
     assert reloaded.api_token == seeded.api_token
     assert reloaded.download_dir == seeded.download_dir
+
+
+# --- persisted value types --------------------------------------------------
+#
+# The loader accepted any JSON value for a recognised key. Consumers then did
+# arithmetic on it, compared it, or tested it for truth - so a hand-edited,
+# partially migrated or corrupted settings file could crash a feature or, worse,
+# silently invert one (a non-empty string like "false" is truthy).
+
+
+def _write(tmp_path, monkeypatch, payload):
+    import json
+
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(config, "CONFIG_FILE", path)
+    monkeypatch.setattr(config, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    return path
+
+
+@pytest.mark.parametrize("value", ["false", "16", None, [], {}, 3.5])
+def test_a_non_boolean_setting_falls_back_to_its_default(tmp_path, monkeypatch, value):
+    _write(tmp_path, monkeypatch, {"speed_limiter_enabled": value})
+
+    loaded = config.Settings.load()
+
+    assert loaded.speed_limiter_enabled is False
+
+
+@pytest.mark.parametrize("value", ["8", None, [], {}, True, 2.5])
+def test_a_non_integer_setting_falls_back_to_its_default(tmp_path, monkeypatch, value):
+    _write(tmp_path, monkeypatch, {"max_concurrent": value})
+
+    loaded = config.Settings.load()
+
+    assert loaded.max_concurrent == config.Settings().max_concurrent
+
+
+@pytest.mark.parametrize("value", [17, None, {}, True])
+def test_a_non_string_setting_falls_back_to_its_default(tmp_path, monkeypatch, value):
+    _write(tmp_path, monkeypatch, {"proxy_host": value})
+
+    loaded = config.Settings.load()
+
+    assert loaded.proxy_host == ""
+
+
+def test_well_typed_settings_are_preserved(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {
+        "max_concurrent": 5,
+        "speed_limiter_enabled": True,
+        "proxy_host": "127.0.0.1",
+        "theme": "light",
+    })
+
+    loaded = config.Settings.load()
+
+    assert loaded.max_concurrent == 5
+    assert loaded.speed_limiter_enabled is True
+    assert loaded.proxy_host == "127.0.0.1"
+    assert loaded.theme == "light"
+
+
+@pytest.mark.parametrize("value", [17, None, [], {}, True])
+def test_a_nested_category_dir_of_the_wrong_type_falls_back(tmp_path, monkeypatch, value):
+    """Nested settings are as reachable by a hand-edited file as top-level ones."""
+    _write(tmp_path, monkeypatch, {"category_dirs": {"Videos": value}})
+
+    loaded = config.Settings.load()
+
+    assert loaded.category_dirs.Videos == config.CategoryDirs().Videos
+
+
+@pytest.mark.parametrize("value", ["2", None, [], 2.5])
+def test_a_nested_schedule_field_of_the_wrong_type_falls_back(
+    tmp_path, monkeypatch, value
+):
+    _write(tmp_path, monkeypatch, {"schedule": {"enabled": True, "start_hour": value}})
+
+    loaded = config.Settings.load()
+
+    assert loaded.schedule.start_hour == config.ScheduleWindow().start_hour
+
+
+def test_well_typed_nested_settings_are_preserved(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {
+        "category_dirs": {"Videos": "/srv/video"},
+        "schedule": {"enabled": True, "start_hour": 3, "end_hour": 5},
+    })
+
+    loaded = config.Settings.load()
+
+    assert loaded.category_dirs.Videos == "/srv/video"
+    assert loaded.schedule.start_hour == 3
+    assert loaded.schedule.enabled is True
+
+
+def test_saved_schedule_days_survive_loading(tmp_path, monkeypatch):
+    """A day selection is a user setting, not a derived value.
+
+    The type validator recognised only scalars, so `days: List[int]` was
+    dropped on load and every schedule silently reverted to all seven days.
+    """
+    _write(tmp_path, monkeypatch, {
+        "schedule": {"enabled": True, "start_hour": 1, "end_hour": 5,
+                     "days": [1, 3, 5]},
+    })
+
+    loaded = config.Settings.load()
+
+    assert loaded.schedule.days == [1, 3, 5]
+    assert loaded.schedule.enabled is True
+
+
+@pytest.mark.parametrize("days", [["1"], [9], [None], [True]])
+def test_a_schedule_with_invalid_days_resets_to_defaults(tmp_path, monkeypatch, days):
+    """Element checking stays with _schedule_valid, which resets the window."""
+    _write(tmp_path, monkeypatch, {
+        "schedule": {"enabled": True, "start_hour": 1, "days": days},
+    })
+
+    loaded = config.Settings.load()
+
+    assert loaded.schedule.days == config.ScheduleWindow().days
+    assert loaded.schedule.enabled is config.ScheduleWindow().enabled
+
+
+def test_a_non_list_days_value_falls_back(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {"schedule": {"days": "everyday"}})
+
+    loaded = config.Settings.load()
+
+    assert loaded.schedule.days == config.ScheduleWindow().days
+
+
+def test_every_persisted_field_is_one_the_validator_can_check():
+    """Guards the class of bug, not just this instance.
+
+    A field the validator does not understand is dropped on load, silently
+    discarding whatever the user had saved. Adding one must fail here rather
+    than be discovered by a user whose settings reverted.
+    """
+    for klass in (config.Settings, config.ScheduleWindow, config.CategoryDirs):
+        for name, annotation in klass.__annotations__.items():
+            # The two nested dataclasses are removed from the payload before
+            # validation runs and are constructed separately.
+            if klass is config.Settings and name in ("category_dirs", "schedule"):
+                continue
+            assert config.understands(annotation), f"{klass.__name__}.{name}"

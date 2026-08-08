@@ -485,6 +485,17 @@ def new_id(length=8):
     return secrets.token_hex(max(1, length // 2))[:length]
 
 
+def _encoded_length(line: str) -> int:
+    """How many bytes `line` occupies once written.
+
+    `max_bytes` is a byte budget and the log is UTF-8, so counting characters
+    undercounts every multibyte one - and localised messages, filenames and
+    URLs are full of them. A file capped at 1 MB could reach several times
+    that before rotating.
+    """
+    return len(line.encode("utf-8", errors="replace"))
+
+
 class DiagLogger:
     """Process-local sanitized event log.
 
@@ -546,7 +557,7 @@ class DiagLogger:
     def _write_line(self, line):
         with open(self._path, "a", encoding="utf-8") as fh:
             fh.write(line)
-        self._size += len(line)
+        self._size += _encoded_length(line)
 
     def _rotate(self):
         """Shift backups down by one. Truncate if the shift is impossible."""
@@ -623,7 +634,7 @@ class DiagLogger:
             self.skipped_writes += 1
             return
         try:
-            if self._size + len(line) > self.max_bytes:
+            if self._size + _encoded_length(line) > self.max_bytes:
                 self._rotate()
             if not self.memory_only:
                 self._write_line(line)

@@ -433,8 +433,6 @@ def test_active_log_stays_under_the_size_limit(tmp_path):
     finally:
         log.close()
     assert (tmp_path / "logs" / "cove.jsonl").stat().st_size <= 1000 * 2
-
-
 def test_default_limits_match_the_spec():
     assert diagnostics.MAX_BYTES == 2 * 1024 * 1024
     assert diagnostics.BACKUPS == 3
@@ -924,3 +922,23 @@ def test_install_mode_still_reports_frozen_builds(monkeypatch):
     assert diagnostics.install_mode() == "portable"
     monkeypatch.setattr("cove.portable.is_portable", lambda: False)
     assert diagnostics.install_mode() == "installed"
+
+
+def test_rotation_counts_bytes_not_characters(tmp_path):
+    """max_bytes is a byte budget, and the log is written as UTF-8.
+
+    Counting str characters undercounts every multibyte one, so a log full of
+    localised text, filenames or URLs blew straight past its configured cap.
+    """
+    log = diagnostics.DiagLogger(log_dir=tmp_path / "logs", max_bytes=1000, backups=2)
+    try:
+        for i in range(300):
+            # Four bytes per character in UTF-8: the widest undercount there is.
+            log.emit("app", "tick", "INFO", i=i, pad="𝄞" * 40)
+    finally:
+        log.close()
+
+    # The cap is enforced before each write, so the active file never exceeds
+    # it. Counting characters let it reach roughly 1.5x here, and worse for
+    # logs that are mostly non-ASCII.
+    assert (tmp_path / "logs" / "cove.jsonl").stat().st_size <= 1000

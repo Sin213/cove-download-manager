@@ -96,6 +96,31 @@ _KNOWN_FLATPAK_IDS = {
     "com.opera.Opera",
 }
 
+# Where each Flatpak browser looks for manifests *inside its own sandbox home*
+# (~/.var/app/<id>/). A Flatpak-only install has no ~/.mozilla or
+# ~/.config/<browser> on the host, so the override mechanism has nothing to
+# grant access to and the manifest has to be written here directly.
+#
+# Firefox-family: the same hardcoded ~/.mozilla path, relative to the sandbox
+# home. Chromium-family: config/<browser dir>/NativeMessagingHosts, because
+# the sandbox maps its XDG_CONFIG_HOME to ~/.var/app/<id>/config.
+_FLATPAK_FIREFOX_IDS = {
+    "org.mozilla.firefox",
+    "app.zen_browser.zen",
+    "io.github.nicoth.zen",
+    "io.gitlab.librewolf-community",
+    "net.waterfox.waterfox",
+    "one.nicothin.nicothin",
+}
+_FLATPAK_CHROMIUM_CONFIG_DIRS = {
+    "com.google.Chrome": "google-chrome",
+    "org.chromium.Chromium": "chromium",
+    "com.microsoft.Edge": "microsoft-edge",
+    "com.brave.Browser": "BraveSoftware/Brave-Browser",
+    "com.vivaldi.Vivaldi": "vivaldi",
+    "com.opera.Opera": "opera",
+}
+
 
 def _host_command_parts() -> list[str]:
     appimage = os.environ.get("APPIMAGE")
@@ -201,6 +226,44 @@ def _chromium_browser_dirs() -> list[Path]:
     return dirs
 
 
+def _installed_flatpak_ids() -> list[str]:
+    """Recognised browser app ids that actually have a Flatpak data directory.
+
+    ~/.var/app holds a directory per installed Flatpak app, so this is checked
+    against the known-browser set - Cove must never write into an unrelated
+    application's private home.
+    """
+    root = Path.home() / ".var" / "app"
+    if not root.is_dir():
+        return []
+    try:
+        entries = sorted(p.name for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    return [name for name in entries if name in _KNOWN_FLATPAK_IDS]
+
+
+def _flatpak_browser_dirs() -> tuple[list[Path], list[Path]]:
+    """(Firefox-family, Chromium-family) manifest dirs inside Flatpak homes.
+
+    Discovered independently of the conventional ~/.mozilla and ~/.config
+    locations: a Flatpak-only browser has neither, and depending on them meant
+    such a user got no manifest at all.
+    """
+    root = Path.home() / ".var" / "app"
+    firefox: list[Path] = []
+    chromium: list[Path] = []
+    for app_id in _installed_flatpak_ids():
+        if app_id in _FLATPAK_FIREFOX_IDS:
+            firefox.append(root / app_id / ".mozilla" / "native-messaging-hosts")
+        config_dir = _FLATPAK_CHROMIUM_CONFIG_DIRS.get(app_id)
+        if config_dir:
+            chromium.append(
+                root / app_id / "config" / config_dir / "NativeMessagingHosts"
+            )
+    return firefox, chromium
+
+
 def _apply_flatpak_overrides(manifest_dir: str) -> None:
     if not shutil.which("flatpak"):
         return
@@ -240,19 +303,29 @@ def _install_posix() -> list[str]:
     wrapper = _wrapper_script(parts)
     installed: list[str] = []
 
+    # Flatpak targets are enumerated independently of the conventional ones:
+    # a Flatpak-only browser has no ~/.mozilla or ~/.config/<browser>, and
+    # deriving its manifest location from those left it with nothing.
+    flatpak_firefox, flatpak_chromium = _flatpak_browser_dirs()
+
     # Firefox-based browsers (allowed_extensions). _browser_dirs() already
     # filters to installed browsers.
-    for hosts_dir in _browser_dirs():
+    for hosts_dir in [*_browser_dirs(), *flatpak_firefox]:
         _write_manifest(hosts_dir, wrapper)
         installed.append(str(hosts_dir))
 
     # Chromium-based browsers (allowed_origins). Same wrapper, different
     # manifest shape and location.
-    for hosts_dir in _chromium_browser_dirs():
+    for hosts_dir in [*_chromium_browser_dirs(), *flatpak_chromium]:
         _write_manifest(hosts_dir, wrapper, _chrome_manifest)
         installed.append(str(hosts_dir))
 
+    # Overrides only matter for manifests on the host side; one written inside
+    # a sandbox home is already visible to that browser.
+    host_side = {str(p) for p in [*flatpak_firefox, *flatpak_chromium]}
     for manifest_dir in installed:
+        if manifest_dir in host_side:
+            continue
         try:
             _apply_flatpak_overrides(manifest_dir)
         except Exception:

@@ -3003,3 +3003,64 @@ def test_torbox_refresh_torrent_file_transport_failure_never_carries_the_token()
         debrid.torbox_refresh_torrent_file(str(TB_TORRENT_ID), "1", TORBOX_TOKEN, session=session)
     assert TORBOX_TOKEN not in str(exc.value)
     assert TORBOX_TOKEN not in repr(exc.value)
+
+
+# ---- TorBox web-download job cleanup ---------------------------------------
+
+
+def _tb_deletes(session):
+    return [c for c in session.calls if "controlwebdownload" in c[1]]
+
+
+def test_torbox_web_download_is_deleted_when_the_entry_is_malformed():
+    """Every unsuccessful exit after the create must release the remote job.
+
+    Only the poll timeout used to clean up, so a malformed response left the
+    job on the account - consuming quota with nothing pointing at it.
+    """
+    h = _tb_hash()
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 7}),
+        "/webdl/mylist": _tb_env(None),          # no entry: bad response
+        "/webdl/controlwebdownload": _tb_env(None),
+    })
+
+    with pytest.raises(DebridError):
+        debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+
+    assert len(_tb_deletes(session)) == 1
+
+
+def test_torbox_web_download_is_deleted_when_no_file_can_be_picked():
+    h = _tb_hash()
+    entry = _tb_entry()
+    entry["files"] = []                          # nothing selectable
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 7}),
+        "/webdl/mylist": _tb_env(entry),
+        "/webdl/controlwebdownload": _tb_env(None),
+    })
+
+    with pytest.raises(DebridError):
+        debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+
+    assert len(_tb_deletes(session)) == 1
+
+
+def test_torbox_web_download_is_kept_when_the_unlock_succeeds():
+    """The job backs a live download, so success must not clean it up."""
+    h = _tb_hash()
+    session = FakeSession({
+        "/webdl/checkcached": _tb_env({h: True}),
+        "/webdl/createwebdownload": _tb_env({"webdownload_id": 7}),
+        "/webdl/mylist": _tb_env(_tb_entry()),
+        "/webdl/requestdl": _tb_env("https://cdn.torbox.app/f"),
+        "/webdl/controlwebdownload": _tb_env(None),
+    })
+
+    result = debrid.torbox_unrestrict(TORBOX_LINK, TORBOX_TOKEN, session=session)
+
+    assert result.item_id == "7"
+    assert _tb_deletes(session) == []

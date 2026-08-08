@@ -15,6 +15,7 @@ import os
 import struct
 import sys
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import __version__, diagnostics
 from .aria2 import Aria2RPC, Aria2Error
@@ -131,12 +132,36 @@ def max_browser_cookies_length() -> int:
 
 
 def validate_url(url: str) -> bool:
+    """Whether a handed-over URL may cross into the queue.
+
+    A scheme-prefix match was not enough: `https:///file` and `ftp:///path`
+    passed it while naming no host at all, so a malformed value from an
+    extension or any other client reached queue and network handling as an
+    untrusted string. Network schemes must carry a usable authority.
+    """
     if not url or not isinstance(url, str):
         return False
-    lower = url.lower().strip()
-    if lower.startswith(("http://", "https://", "ftp://")):
-        return True
-    return False
+    candidate = url.strip()
+    if not _is_control_free(candidate):
+        return False
+    if not candidate.lower().startswith(("http://", "https://", "ftp://")):
+        return False
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        return False
+    try:
+        # Rejects an invalid or out-of-range port; `hostname` lowercases and
+        # strips the IPv6 brackets and any userinfo for us.
+        if parts.port is not None and not (0 < parts.port < 65536):
+            return False
+    except ValueError:
+        return False
+    return bool(parts.hostname)
+
+
+def _is_control_free(value: str) -> bool:
+    return all(ord(ch) >= 32 and ch != "\x7f" for ch in value)
 
 
 def _send_to_primary(request: dict, on_reason) -> bool:

@@ -5,6 +5,7 @@ import secrets
 import tempfile
 import threading
 import time
+import typing
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List
@@ -189,6 +190,91 @@ def _new_distinct_api_token(rpc_secret: str) -> str:
     return token
 
 
+_SCALAR_ANNOTATIONS = {"str": str, "int": int, "bool": bool, "float": float}
+
+
+def _is_list_annotation(annotation) -> bool:
+    """Whether an annotation names a list (`List[int]`, `list[int]`, `list`)."""
+    if isinstance(annotation, str):
+        return annotation.replace(" ", "").lower().startswith("list")
+    return annotation is list or typing.get_origin(annotation) is list
+
+
+def _field_kind(annotation):
+    """How `_well_typed_fields` handles this annotation, or None if it cannot.
+
+    The single source of truth for both the validator and `understands`, so the
+    two cannot drift apart and leave the guard test passing over a field that
+    is in fact being dropped.
+    """
+    scalar = _scalar_annotation(annotation)
+    if scalar is not None:
+        return ("scalar", scalar)
+    if _is_list_annotation(annotation):
+        return ("list", list)
+    return None
+
+
+def understands(annotation) -> bool:
+    """Whether _well_typed_fields can type-check this annotation.
+
+    Anything it cannot check is dropped, which silently discards the user's
+    stored value - so a new field of an unhandled kind must be caught by a test
+    rather than by someone noticing their settings reverted.
+    """
+    return _field_kind(annotation) is not None
+
+
+def _scalar_annotation(annotation):
+    """The scalar type an annotation names, or None if it is not one.
+
+    Accepts both forms: dataclass annotations are real type objects here, but
+    become strings under `from __future__ import annotations`, and this must
+    not quietly start accepting everything if that import is ever added.
+    """
+    if isinstance(annotation, str):
+        return _SCALAR_ANNOTATIONS.get(annotation)
+    if annotation in (str, int, bool, float):
+        return annotation
+    return None
+
+
+def _well_typed_fields(klass, raw: dict) -> dict:
+    """Keyword args for `klass`, dropping keys whose value is the wrong type.
+
+    Recognising a key was never enough. Consumers do arithmetic on the numbers,
+    compare the strings and test the booleans for truth, so a hand-edited,
+    partially migrated or corrupted file could crash a feature outright - or,
+    worse, silently invert one, because a non-empty string like "false" is
+    truthy. A rejected value simply leaves the dataclass default in place.
+
+    bool is checked before int deliberately: in Python `True` is an int, and a
+    boolean where a count belongs is a mistake, not a 1.
+    """
+    out = {}
+    for key, value in raw.items():
+        kind = _field_kind(klass.__annotations__.get(key))
+        if kind is None:
+            continue  # unknown key, or a nested dataclass handled separately
+        label, expected = kind
+        if label == "list":
+            # Element-level checking belongs to the owner: ScheduleWindow.days
+            # is range-checked by _schedule_valid, which resets the whole
+            # window if any day is wrong. Dropping the list here instead threw
+            # the user's saved day selection away.
+            if isinstance(value, list):
+                out[key] = value
+        elif expected is bool:
+            if isinstance(value, bool):
+                out[key] = value
+        elif expected is int:
+            if isinstance(value, int) and not isinstance(value, bool):
+                out[key] = value
+        elif isinstance(value, expected):
+            out[key] = value
+    return out
+
+
 @dataclass
 class Settings:
     download_dir: str = str(DEFAULT_DOWNLOAD_DIR)
@@ -302,17 +388,22 @@ class Settings:
 
         def _sub_fields(data, klass):
             """Keyword args for a nested dataclass, dropping unknown keys
-            and tolerating a non-dict value from a hand-edited file."""
+            and tolerating a non-dict value from a hand-edited file.
+
+            Typed on the same terms as the top-level fields: a nested setting
+            is no less reachable by a hand-edited file, and its consumers are
+            no better at surviving a string where a path or a count belongs.
+            """
             if not isinstance(data, dict):
                 return {}
-            return {k: v for k, v in data.items() if k in klass.__annotations__}
+            return _well_typed_fields(klass, data)
 
         sched = ScheduleWindow(**_sub_fields(raw.pop("schedule", None), ScheduleWindow))
         sched_reset = not _schedule_valid(sched)
         if sched_reset:
             sched = ScheduleWindow()
         cat = CategoryDirs(**_sub_fields(raw.pop("category_dirs", None), CategoryDirs))
-        s = cls(**{k: v for k, v in raw.items() if k in cls.__annotations__})
+        s = cls(**_well_typed_fields(cls, raw))
         s.schedule = sched
         s.category_dirs = cat
         if s.theme not in ("dark", "light"):

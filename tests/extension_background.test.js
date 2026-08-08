@@ -11,14 +11,25 @@ function event() {
   };
 }
 
+// Top-level const/let in a vm script land in the context's global lexical
+// scope, which is shared between scripts but is not reachable as a property of
+// the context object. Reading them back needs an evaluation in that scope.
+function evalIn(context, source) {
+  return vm.runInContext(source, context);
+}
+
 function loadBackground({ nativeResult = { status: "ok" }, settings,
                          breakStorage = false, slowStorage = false,
-                         storedDiag = null, media = true, cookies = [] } = {}) {
+                         storedDiag = null, media = true, cookies = [],
+                         tabs = [], downloadSearch = () => [],
+                         storedIntercepted = null, eraseThrows = false,
+                         slowInterceptedIds = false } = {}) {
   const calls = { native: [], cancel: [], erase: [], menus: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
     contextMenuClicked: event(),
+    downloadErased: event(),
     message: event(),
   };
   const browserDownloads = [];
@@ -29,6 +40,9 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     data: {},
     async get(key) {
       if (key === "settings") return settings ? { settings } : {};
+      if (slowInterceptedIds && key === "_interceptedIds") {
+        for (let i = 0; i < 8; i += 1) await Promise.resolve();
+      }
       if (slowStorage && key === "coveDiag") {
         // Hydration that lands well after the background has started
         // recording, which is the ordering the real storage API produces.
@@ -42,10 +56,11 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     },
     async remove(key) { delete store.data[key]; },
   };
+  const badge = { text: [], colors: [] };
   const browser = {
     action: {
-      async setBadgeText() {},
-      async setBadgeBackgroundColor() {},
+      async setBadgeText({ text }) { badge.text.push(text); },
+      async setBadgeBackgroundColor({ color }) { badge.colors.push(color); },
     },
     commands: { onCommand: quietEvent() },
     contextMenus: {
@@ -56,8 +71,13 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     downloads: {
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
+      onErased: events.downloadErased,
       async cancel(id) { calls.cancel.push(id); },
-      async erase(query) { calls.erase.push(query); },
+      async erase(query) {
+        if (eraseThrows) throw new Error("erase failed");
+        calls.erase.push(query);
+      },
+      async search(query) { return downloadSearch(query); },
       async download(options) { browserDownloads.push(options); },
     },
     notifications: { async create() {} },
@@ -77,7 +97,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onChanged: quietEvent(),
     },
     tabs: {
-      async query() { return []; },
+      async query() { return tabs; },
       async sendMessage() {},
       onRemoved: quietEvent(),
       onUpdated: quietEvent(),
@@ -104,6 +124,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     { filename: "extension/diagnostics.js" },
   );
   if (storedDiag) store.data.coveDiag = storedDiag;
+  if (storedIntercepted) store.data._interceptedIds = storedIntercepted;
   // media.js ships in the Firefox bundle only and the MV2 manifest lists it
   // ahead of background.js. `media: false` reproduces the Chrome bundle,
   // which omits it entirely (scripts/build_extension.py).
@@ -116,7 +137,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   }
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
-  return { calls, events, browserDownloads, store, context };
+  return { calls, events, browserDownloads, store, context, badge };
 }
 
 async function settle() {
@@ -939,4 +960,135 @@ test("no cookie value ever reaches the extension diagnostics ring", async () => 
   await settle();
 
   assert.ok(!JSON.stringify(store.data).includes("dummysecretcookie"));
+});
+
+// --- badge precedence and interception bookkeeping -------------------------
+
+test("a media count never overwrites the disabled OFF badge", async () => {
+  // Interception is off, so the toolbar must keep saying so. Media detection
+  // published its own count unconditionally, which made a disabled extension
+  // look active.
+  const { context, badge } = loadBackground({
+    settings: { enabled: false },
+    tabs: [{ id: 7 }],
+  });
+  await settle();
+
+  assert.equal(badge.text.at(-1), "OFF");
+
+  evalIn(context, 'detectedStreams.set(7, [{ url: "https://x/a.m3u8" }]); updateStreamBadge(7)');
+  await settle();
+
+  assert.equal(badge.text.at(-1), "OFF");
+});
+
+test("a media count still shows while interception is enabled", async () => {
+  const { context, badge } = loadBackground({
+    settings: { enabled: true },
+    tabs: [{ id: 7 }],
+  });
+  await settle();
+
+  evalIn(context, 'detectedStreams.set(7, [{ url: "https://x/a.m3u8" }, { url: "https://x/b.m3u8" }]); updateStreamBadge(7)');
+  await settle();
+
+  assert.equal(badge.text.at(-1), "2");
+});
+
+test("an erased download stops being tracked as intercepted", async () => {
+  const { events, context } = loadBackground({ settings: { enabled: true } });
+  await settle();
+  evalIn(context, 'interceptedIds.add(42)');
+
+  events.downloadErased.emit(42);
+  await settle();
+
+  assert.equal(evalIn(context, 'interceptedIds.has(42)'), false);
+});
+
+test("stored intercepted ids are pruned when they are no longer downloading", async () => {
+  // The set is persisted, so ids left behind by a missed terminal event or an
+  // extension suspension came back on every wake and could suppress events for
+  // a reused id.
+  const { context, store } = loadBackground({
+    settings: { enabled: true },
+    storedIntercepted: [1, 2, 3],
+    downloadSearch: ({ id }) => (id === 2 ? [{ id: 2, state: "in_progress" }] : []),
+  });
+  await settle();
+
+  // Arrays built inside the vm realm are not reference-equal to host ones.
+  assert.deepEqual(Array.from(evalIn(context, '[...interceptedIds]')), [2]);
+  assert.deepEqual(Array.from(store.data._interceptedIds), [2]);
+});
+
+test("pruning erases a terminal download instead of just forgetting it", async () => {
+  // The persisted set exists to recover cleanup that a missed terminal event
+  // or a suspended worker skipped. Dropping the id without erasing would
+  // strand the cancelled download in the browser's history for good.
+  const { context, calls, store } = loadBackground({
+    settings: { enabled: true },
+    storedIntercepted: [5],
+    downloadSearch: ({ id }) => [{ id, state: "interrupted" }],
+  });
+  await settle();
+
+  // Objects built inside the vm realm are not reference-equal to host ones.
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.erase)), [{ id: 5 }]);
+  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), []);
+  assert.deepEqual(Array.from(store.data._interceptedIds), []);
+});
+
+test("an id the browser no longer knows about is dropped without erasing", async () => {
+  const { context, calls } = loadBackground({
+    settings: { enabled: true },
+    storedIntercepted: [6],
+    downloadSearch: () => [],
+  });
+  await settle();
+
+  assert.deepEqual(calls.erase, []);
+  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), []);
+});
+
+test("an id is kept when its erase fails, for the next startup to retry", async () => {
+  const { context } = loadBackground({
+    settings: { enabled: true },
+    storedIntercepted: [7],
+    downloadSearch: ({ id }) => [{ id, state: "complete" }],
+    eraseThrows: true,
+  });
+  await settle();
+
+  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), [7]);
+});
+
+test("an erase during hydration is not lost", async () => {
+  // The stored set arrives asynchronously. An erase handled before it lands
+  // would operate on an empty Set, and the id would come back on the next
+  // startup as though it had never been cleaned up.
+  const { events, context, store } = loadBackground({
+    settings: { enabled: true },
+    storedIntercepted: [11, 12],
+    downloadSearch: ({ id }) => [{ id, state: "in_progress" }],
+    slowInterceptedIds: true,
+  });
+
+  events.downloadErased.emit(11);   // fires before hydration completes
+  await settle();
+
+  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), [12]);
+  assert.deepEqual(Array.from(store.data._interceptedIds), [12]);
+});
+
+test("overlapping persists leave the newest state stored", async () => {
+  const { context, store } = loadBackground({ settings: { enabled: true } });
+  await settle();
+
+  // Two mutations back to back: the stored value must reflect the second.
+  evalIn(context, "interceptedIds.add(1); persistInterceptedIds();");
+  evalIn(context, "interceptedIds.add(2); persistInterceptedIds();");
+  await settle();
+
+  assert.deepEqual(Array.from(store.data._interceptedIds), [1, 2]);
 });

@@ -139,3 +139,61 @@ def test_install_dispatch_posix(monkeypatch):
         assert nhi.install_native_hosts() == ["POSIX"]
     posix.assert_called_once()
     win.assert_not_called()
+
+
+# --- Flatpak-only browsers --------------------------------------------------
+
+
+def test_flatpak_only_firefox_gets_a_manifest_inside_its_sandbox_home(
+    tmp_path, monkeypatch
+):
+    """A Flatpak browser with no conventional config dir was skipped entirely.
+
+    Flatpak targets were only ever reached through the override step, which
+    runs over directories discovered from ~/.mozilla and ~/.config. With
+    neither present there was nothing to override and no manifest anywhere, so
+    browser integration silently could not be installed.
+    """
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(nhi.shutil, "which", lambda _n: None)
+    (tmp_path / ".var" / "app" / "org.mozilla.firefox").mkdir(parents=True)
+
+    installed = nhi._install_posix()
+
+    hosts = (
+        tmp_path / ".var" / "app" / "org.mozilla.firefox"
+        / ".mozilla" / "native-messaging-hosts"
+    )
+    manifest = hosts / "cove_download_manager.json"
+    assert manifest.is_file()
+    assert "allowed_extensions" in json.loads(manifest.read_text())
+    assert str(hosts) in installed
+
+
+def test_flatpak_only_chromium_gets_the_chrome_shaped_manifest(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(nhi.shutil, "which", lambda _n: None)
+    (tmp_path / ".var" / "app" / "com.brave.Browser").mkdir(parents=True)
+
+    installed = nhi._install_posix()
+
+    hosts = (
+        tmp_path / ".var" / "app" / "com.brave.Browser" / "config"
+        / "BraveSoftware" / "Brave-Browser" / "NativeMessagingHosts"
+    )
+    manifest = hosts / "cove_download_manager.json"
+    assert manifest.is_file()
+    assert "allowed_origins" in json.loads(manifest.read_text())
+    assert str(hosts) in installed
+
+
+def test_an_unknown_flatpak_app_is_never_written_to(tmp_path, monkeypatch):
+    """Only browsers Cove recognises; ~/.var/app holds every Flatpak app."""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(nhi.shutil, "which", lambda _n: None)
+    (tmp_path / ".var" / "app" / "org.libreoffice.LibreOffice").mkdir(parents=True)
+
+    installed = nhi._install_posix()
+
+    assert installed == []
+    assert list((tmp_path / ".var" / "app" / "org.libreoffice.LibreOffice").iterdir()) == []

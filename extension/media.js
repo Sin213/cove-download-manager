@@ -199,10 +199,12 @@ function updateStreamBadge(tabId) {
   browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
     if (tabs[0] && tabs[0].id === tabId) {
       const streams = detectedStreams.get(tabId) || [];
-      const count = streams.length;
-      const api = browser.browserAction || browser.action;
-      api.setBadgeText({ text: count > 0 ? String(count) : "" });
-      api.setBadgeBackgroundColor({ color: "#50e6cf" });
+      // Never paint the badge directly. Disabled state has priority over a
+      // media count, and only background.js knows whether interception is on;
+      // writing here unconditionally replaced its "OFF" and made a disabled
+      // extension look active. renderBadge is defined by background.js, which
+      // always loads after this script.
+      renderBadge({ mediaCount: streams.length });
     }
   });
 }

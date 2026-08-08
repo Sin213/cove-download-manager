@@ -287,14 +287,74 @@ async function loadInterceptedIds() {
       for (const id of data._interceptedIds) interceptedIds.add(id);
     }
   } catch {}
+  await pruneInterceptedIds();
 }
 
+// Drop ids the browser no longer has an in-progress download for. Cleanup used
+// to depend entirely on catching a terminal onChanged, which is missed when it
+// races the insertion below or fires while the extension is suspended - so an
+// id could persist for the whole session and suppress or misclassify later
+// events for a reused id.
+async function pruneInterceptedIds() {
+  if (interceptedIds.size === 0) return;
+  for (const id of [...interceptedIds]) {
+    let items;
+    try {
+      items = await browser.downloads.search({ id });
+    } catch {
+      continue;  // Cannot tell; leave it alone rather than guess.
+    }
+    const item = items && items[0];
+    if (!item) {
+      interceptedIds.delete(id);   // Already gone from the browser's list.
+      continue;
+    }
+    if (item.state === "in_progress") continue;
+    // Terminal, and still listed: this is exactly the missed cleanup the
+    // persisted set exists to recover. Dropping the id without erasing would
+    // strand the cancelled download in the browser's history permanently.
+    try {
+      await browser.downloads.erase({ id });
+      interceptedIds.delete(id);
+    } catch {
+      // Keep it for the next startup rather than lose track of it.
+    }
+  }
+  persistInterceptedIds();
+}
+
+// Writes are chained rather than fired off independently: two overlapping
+// store.set() calls can complete out of order, which would let an older
+// snapshot overwrite a newer one and resurrect ids that had just been cleared.
+// The snapshot is taken synchronously at call time, so the last caller's state
+// is what the last write in the chain carries.
+let persistChain = Promise.resolve();
+
+function persistInterceptedIds() {
+  const snapshot = [...interceptedIds];
+  persistChain = persistChain.then(async () => {
+    try {
+      const store = browser.storage.session || browser.storage.local;
+      await store.set({ _interceptedIds: snapshot });
+    } catch {}
+  });
+  return persistChain;
+}
+
+// The pruning that runs *during* hydration must not wait on itself, so only
+// the event-driven mutators below await readiness.
 async function saveInterceptedIds() {
   await interceptedIdsReady;
-  try {
-    const store = browser.storage.session || browser.storage.local;
-    store.set({ _interceptedIds: [...interceptedIds] }).catch(() => {});
-  } catch {}
+  return persistInterceptedIds();
+}
+
+async function forgetIntercepted(id) {
+  // Without this, an erase arriving while the stored set is still hydrating
+  // operates on an empty Set and is lost - and the id comes back on the next
+  // startup as though it were never cleaned up.
+  await interceptedIdsReady;
+  if (!interceptedIds.delete(id)) return;
+  return persistInterceptedIds();
 }
 
 const interceptedIdsReady = loadInterceptedIds();
@@ -305,9 +365,14 @@ browser.downloads.onChanged.addListener(async (delta) => {
   const state = delta.state && delta.state.current;
   if (state === "interrupted" || state === "complete") {
     browser.downloads.erase({ id: delta.id }).catch(() => {});
-    interceptedIds.delete(delta.id);
-    saveInterceptedIds();
+    await forgetIntercepted(delta.id);
   }
+});
+
+// Terminal in every ordering, including ones onChanged never reports: the item
+// is gone from the browser's list, so there is nothing left to erase.
+browser.downloads.onErased.addListener(async (id) => {
+  await forgetIntercepted(id);
 });
 
 // Cove's native handoff bounds the cookie header (single_instance.py,
@@ -524,13 +589,29 @@ browser.commands.onCommand.addListener(async (command) => {
 // MV3 renamed browserAction -> action; fall back for MV2 Firefox.
 const browserAction = browser.action || browser.browserAction;
 
-function updateBadge() {
+// The single place the badge is painted. Everything that wants to change it
+// goes through here, so precedence is decided once: a disabled extension says
+// OFF no matter what else is happening. media.js used to write the badge
+// itself, which erased that.
+let badgeMediaCount = 0;
+
+function renderBadge({ mediaCount } = {}) {
+  if (mediaCount !== undefined) badgeMediaCount = mediaCount;
   if (!settings.enabled) {
     browserAction.setBadgeText({ text: "OFF" });
     browserAction.setBadgeBackgroundColor({ color: "#6b6b80" });
-  } else {
-    browserAction.setBadgeText({ text: "" });
+    return;
   }
+  if (badgeMediaCount > 0) {
+    browserAction.setBadgeText({ text: String(badgeMediaCount) });
+    browserAction.setBadgeBackgroundColor({ color: "#50e6cf" });
+    return;
+  }
+  browserAction.setBadgeText({ text: "" });
+}
+
+function updateBadge() {
+  renderBadge();
 }
 
 // ---- Notifications ----

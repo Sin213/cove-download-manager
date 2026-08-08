@@ -8,6 +8,10 @@ shape gets its own test.
 """
 
 import hashlib
+import os
+import threading
+import unittest.mock
+from pathlib import Path
 
 import pytest
 
@@ -664,3 +668,136 @@ def test_is_managed_torrent_path(managed, tmp_path):
     assert torrent.is_managed_torrent_path(path) is True
     assert torrent.is_managed_torrent_path(str(tmp_path / "x.torrent")) is False
     assert torrent.is_managed_torrent_path("") is False
+
+
+# --- concurrent and partial writes -----------------------------------------
+
+
+def test_store_managed_torrent_survives_a_concurrent_save_of_the_same_hash(managed):
+    """Two saves for one info hash must not share a temporary file.
+
+    The temp path was `<target>.tmp` - derived only from the hash, so both
+    writers opened it with O_TRUNC and one replace could unlink it before the
+    other's. The loser saw ENOENT or, worse, published a truncated file.
+    """
+    import threading
+
+    meta = _meta()
+    at_the_boundary = threading.Barrier(2, timeout=5)
+    real_replace = os.replace
+
+    def racing_replace(src, dst):
+        # Line both writers up with their temp files written but not yet
+        # renamed - the exact window the shared name made unsafe.
+        try:
+            at_the_boundary.wait()
+        except threading.BrokenBarrierError:
+            pass
+        return real_replace(src, dst)
+
+    results = []
+
+    def save():
+        try:
+            results.append(torrent.store_managed_torrent(meta))
+        except Exception as exc:  # noqa: BLE001 - recorded, asserted below
+            results.append(exc)
+
+    with unittest.mock.patch("os.replace", racing_replace):
+        threads = [threading.Thread(target=save) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+
+    assert all(isinstance(r, str) for r in results), results
+    target = managed / f"{meta.info_hash}.torrent"
+    assert target.read_bytes() == meta.raw_bytes
+    # Neither writer may leave its scratch file behind.
+    assert sorted(p.suffix for p in managed.iterdir()) == [".torrent"]
+
+
+def test_store_managed_torrent_writes_every_byte_when_os_write_is_partial(
+    managed, monkeypatch
+):
+    """os.write may write fewer bytes than asked; the API permits it.
+
+    A single unchecked call could therefore rename a truncated file over a
+    good one, and the result parses as a corrupt torrent later.
+    """
+    meta = _meta()
+    real_write = os.write
+
+    def stingy_write(fd, data):
+        return real_write(fd, data[:16])
+
+    monkeypatch.setattr(os, "write", stingy_write)
+
+    path = torrent.store_managed_torrent(meta)
+
+    assert Path(path).read_bytes() == meta.raw_bytes
+
+
+def test_store_managed_torrent_closes_its_descriptor_when_chmod_fails(
+    managed, monkeypatch
+):
+    """Every failure after mkstemp must release the descriptor.
+
+    fchmod ran outside the block that closes the fd, so a permission or
+    filesystem error there leaked it for the life of the process.
+    """
+    opened = []
+    real_open = os.open
+    real_close = os.close
+
+    def tracking_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    closed = []
+    monkeypatch.setattr(os, "close", lambda fd: (closed.append(fd), real_close(fd))[1])
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "fchmod", lambda *a: (_ for _ in ()).throw(OSError("nope")))
+
+    with pytest.raises(TorrentError):
+        torrent.store_managed_torrent(_meta())
+
+    assert opened, "the scratch file was never created"
+    assert set(opened) <= set(closed), "a descriptor was leaked"
+    # And the scratch file must not be left behind either.
+    assert list(managed.iterdir()) == []
+
+
+def test_store_managed_torrent_reports_a_failed_scratch_file_as_torrent_error(
+    managed, monkeypatch
+):
+    """Every storage failure here must honour the TorrentError contract.
+
+    Creating the scratch file sat outside the error-normalising block, so a
+    full or read-only directory escaped as a raw OSError into callers that
+    only handle TorrentError.
+    """
+    def refuse(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(torrent.tempfile, "mkstemp", refuse)
+
+    with pytest.raises(TorrentError):
+        torrent.store_managed_torrent(_meta())
+
+
+def test_store_managed_torrent_works_without_fchmod(managed, monkeypatch):
+    """Windows has no os.fchmod, and AttributeError is not OSError.
+
+    Calling it unconditionally raised straight past the handler that turns
+    storage failures into TorrentError, so torrent persistence failed outright
+    on Windows and left the scratch file behind.
+    """
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    meta = _meta()
+
+    path = torrent.store_managed_torrent(meta)
+
+    assert Path(path).read_bytes() == meta.raw_bytes
+    assert sorted(p.suffix for p in managed.iterdir()) == [".torrent"]
