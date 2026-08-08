@@ -486,15 +486,22 @@ def test_ipc_attempt_and_result_are_logged(host_log, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "reason", ["connect_timeout", "ack_timeout", "transport_error", "rejected"]
+    "reason, message",
+    [
+        ("connect_timeout", "Cove is not available"),
+        ("ack_timeout", "Cove is not available"),
+        ("transport_error", "Cove is not available"),
+        # Cove answered and said no; claiming it is not available would be a lie.
+        ("rejected", "Cove refused this download."),
+    ],
 )
-def test_ipc_failure_reasons_are_distinguished(reason, host_log, monkeypatch):
+def test_ipc_failure_reasons_are_distinguished(reason, message, host_log, monkeypatch):
     monkeypatch.setattr(nm, "_send_to_primary",
                         lambda request, on_reason: (on_reason(reason), False)[1])
     response = handle_message(
         {"action": "download", "url": "https://example.com/a.mp4"}, None, None
     )
-    assert response["message"] == "Cove is not available"
+    assert response["message"] == message
     assert _events(host_log, "ipc_result")[0]["fields"]["result"] == reason
 
 
@@ -757,3 +764,135 @@ def test_an_old_host_that_omits_the_request_id_is_still_accepted():
     })
     assert validated["url"] == "https://example.com/a.mp4"
     assert validated["request_id"] is None
+
+
+# ---- Oversized cookie jars -------------------------------------------------
+#
+# An older installed extension joins the whole browser cookie jar into one
+# header. The GUI bounds that field, so the *entire* download was rejected for
+# it. Dropping the header keeps an otherwise valid download; the host mirrors
+# the rule so an extension that has not updated yet still works.
+
+
+def _cookie_limit() -> int:
+    from cove.single_instance import MAX_BROWSER_COOKIES_LENGTH
+
+    return MAX_BROWSER_COOKIES_LENGTH
+
+
+def test_the_host_drops_a_cookie_header_the_gui_would_reject(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+
+    result = handle_message(
+        {
+            "action": "download",
+            "url": "https://example.invalid/file.zip",
+            "cookies": "c" * (_cookie_limit() + 1),
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+
+    assert result["status"] == "ok"
+    assert delivery.calls[0]["cookies"] == ""
+    assert delivery.calls[0]["url"] == "https://example.invalid/file.zip"
+
+
+def test_the_host_never_truncates_a_cookie_header(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+
+    handle_message(
+        {
+            "action": "download",
+            "url": "https://example.invalid/file.zip",
+            "cookies": "sid=dummysecretcookie" + "c" * _cookie_limit(),
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+
+    assert delivery.calls[0]["cookies"] == ""
+
+
+def test_a_cookie_header_within_the_limit_is_forwarded_unchanged(tmp_path, monkeypatch):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    delivery = _Delivery(accept=True)
+    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
+    cookies = "c" * _cookie_limit()
+
+    handle_message(
+        {
+            "action": "download",
+            "url": "https://example.invalid/file.zip",
+            "cookies": cookies,
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+
+    assert delivery.calls[0]["cookies"] == cookies
+
+
+def test_the_host_cookie_bound_is_the_gui_cookie_bound():
+    assert nm.max_browser_cookies_length() == _cookie_limit()
+
+
+def test_dropping_cookies_is_logged_without_any_cookie_content(
+    host_log, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr(nm, "deliver_to_primary", _Delivery(accept=True))
+
+    handle_message(
+        {
+            "action": "download",
+            "url": "https://example.invalid/dummysecretpath.zip",
+            "cookies": "sid=dummysecretcookie" + "c" * _cookie_limit(),
+        },
+        rpc=MagicMock(),
+        settings=MagicMock(),
+    )
+
+    dropped = _events(host_log, "cookies_dropped")
+    assert dropped
+    dumped = json.dumps(host_log.records())
+    assert "dummysecretcookie" not in dumped
+    assert "dummysecretpath" not in dumped
+
+
+def test_an_explicit_gui_rejection_is_not_reported_as_cove_missing(
+    host_log, monkeypatch
+):
+    monkeypatch.setattr(
+        nm, "_send_to_primary",
+        lambda request, on_reason: (on_reason("oversized_message"), False)[1],
+    )
+    response = handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+    )
+    assert response["status"] == "error"
+    assert response["message"] != "Cove is not available"
+    assert _events(host_log, "ipc_result")[0]["fields"]["result"] == "oversized_message"
+    assert "https://example.com/a.mp4" not in json.dumps(host_log.records())
+
+
+def test_a_transport_failure_still_reports_cove_as_unavailable(host_log, monkeypatch):
+    monkeypatch.setattr(
+        nm, "_send_to_primary",
+        lambda request, on_reason: (on_reason("connect_timeout"), False)[1],
+    )
+    response = handle_message(
+        {"action": "download", "url": "https://example.com/a.mp4"}, None, None
+    )
+    assert response["message"] == "Cove is not available"
+
+
+def test_ping_is_unaffected_by_the_rejection_categories(host_log, monkeypatch):
+    monkeypatch.setattr(nm, "notify_primary_extension_seen", lambda: False)
+    response = handle_message({"action": "ping"}, None, None)
+    assert response["status"] == "ok"
+    assert "category" not in response

@@ -3858,12 +3858,31 @@ def test_fake_extractor_rejects_symlink_escape(
     _assert_no_work_dirs(tmp_path)
 
 
-def test_fake_extractor_missing_result_does_not_complete(
+def test_fake_extractor_unreported_result_publishes_the_only_candidate(
+    queue_env, fake_process, tmp_path
+):
+    # A run that never printed the marker is the same recoverable situation as
+    # one whose reported name is stale: exactly one finished file is present.
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    _extractor_private_path(proc).write_bytes(b"unreported")
+
+    proc.emit_output("Download complete\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert (tmp_path / "movie.mp4").read_bytes() == b"unreported"
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_fake_extractor_unreported_ambiguous_result_does_not_complete(
     queue_env, fake_process, tmp_path
 ):
     queue, _rpc, _db_path = queue_env()
     task, proc = _start_extractor(queue, fake_process, tmp_path)
-    _extractor_private_path(proc).write_bytes(b"unreported")
+    work_path = _extractor_private_path(proc).parent
+    (work_path / "a.mp4").write_bytes(b"one")
+    (work_path / "b.mkv").write_bytes(b"two")
 
     proc.emit_output("Download complete\n")
     proc.finish(0)
@@ -5456,7 +5475,9 @@ def test_engine_output_rejection_records_the_rule_that_rejected_it(
     _reject_extractor_output(queue, fake_process, tmp_path)
     rejected = _one(diag, "extractor.publish", "engine_output_rejected")
     assert rejected["level"] == "ERROR"
-    assert rejected["fields"]["rule"] == "invalid_engine_output_path"
+    # A file that is simply absent is not the same failure as a path we refuse
+    # to touch; support needs to tell those two apart.
+    assert rejected["fields"]["rule"] == "engine_output_missing"
 
 
 def test_engine_output_rejection_records_safe_path_facts(
@@ -5495,7 +5516,7 @@ def test_engine_output_rejection_records_the_exception_chain(
     queue, _rpc, _db = queue_env()
     _reject_extractor_output(queue, fake_process, tmp_path)
     rejected = _one(diag, "extractor.publish", "engine_output_rejected")
-    assert rejected["exc"]["type"] == "OutputPathError"
+    assert rejected["exc"]["type"] == "MissingEngineOutputError"
     assert rejected["exc"]["cause"] == "FileNotFoundError"
     assert rejected["exc"]["errno"] == errno.ENOENT
     assert "winerror" in rejected["exc"]
@@ -5545,6 +5566,219 @@ def test_successful_publication_logs_success_not_rejection(
     assert task.status == "completed"
     assert _events(diag, "extractor.publish", "engine_output_rejected") == []
     assert _one(diag, "extractor.publish", "publish_success")["task"] == task.id
+
+
+# ---- Windows publication fallback -----------------------------------------
+#
+# yt-dlp exits 0 and prints a final path inside Cove's own work directory, but
+# on Windows that exact file is sometimes not the one left on disk. When the
+# work directory holds exactly one legitimate finished file, publish that
+# instead of failing an otherwise complete download.
+
+
+def _finish_extractor_with_missing_report(queue, fake_process, tmp_path, filename="movie.mp4"):
+    task, proc = _start_extractor(queue, fake_process, tmp_path, filename)
+    private = _extractor_private_path(proc)
+    work_path = private.parent
+    return task, proc, private, work_path
+
+
+def test_extractor_publishes_the_single_legitimate_output_when_the_report_is_missing(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    actual = work_path / "movie.mkv"
+    actual.write_bytes(b"merged output")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "movie.mkv"
+    assert (tmp_path / "movie.mkv").read_bytes() == b"merged output"
+    assert not (tmp_path / "movie.mp4").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_extractor_fallback_ignores_yt_dlp_intermediate_artifacts(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    (work_path / "movie.mkv").write_bytes(b"merged output")
+    (work_path / "movie.f137.mp4.part").write_bytes(b"video fragment")
+    (work_path / "movie.f251.webm").write_bytes(b"audio fragment")
+    (work_path / "movie.ytdl").write_bytes(b"resume state")
+    (work_path / "movie.temp").write_bytes(b"remux scratch")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "movie.mkv"
+    assert (tmp_path / "movie.mkv").read_bytes() == b"merged output"
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_extractor_fallback_fails_closed_when_two_outputs_are_plausible(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    (work_path / "a.mp4").write_bytes(b"one")
+    (work_path / "b.mkv").write_bytes(b"two")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert task.error.startswith("Could not publish extractor output:")
+    assert list(tmp_path.glob("*.mp4")) == []
+    assert list(tmp_path.glob("*.mkv")) == []
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_extractor_fallback_fails_closed_when_the_work_directory_is_empty(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, _work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_extractor_fallback_does_not_run_for_a_path_outside_the_work_directory(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, _private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    (work_path / "movie.mkv").write_bytes(b"merged output")
+    outside = tmp_path / "outside.mkv"
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{outside}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert not (tmp_path / "movie.mkv").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink semantics")
+def test_extractor_fallback_rejects_a_symlinked_candidate(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    real = tmp_path / "real.mkv"
+    real.write_bytes(b"outside payload")
+    (work_path / "movie.mkv").symlink_to(real)
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert real.read_bytes() == b"outside payload"
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_extractor_fallback_accepts_a_marker_split_across_output_chunks(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    (work_path / "movie.mkv").write_bytes(b"merged output")
+    reported = f"{FINAL_PATH_MARKER}{private}\r\n"
+    half = len(reported) // 2
+
+    proc.emit_output(reported[:half])
+    proc.emit_output(reported[half:])
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "movie.mkv"
+
+
+def test_extractor_fallback_handles_spaces_brackets_and_unicode_names(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    requested = "Ocean Waves [1080p] 海.mp4"
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, requested
+    )
+    (work_path / "Ocean Waves [1080p] 海.mkv").write_bytes(b"merged output")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "Ocean Waves [1080p] 海.mkv"
+    assert (tmp_path / "Ocean Waves [1080p] 海.mkv").exists()
+
+
+def test_an_unsafe_engine_output_path_keeps_its_own_classification(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, _private, _work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{tmp_path / 'outside.mp4'}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    rejected = _one(diag, "extractor.publish", "engine_output_rejected")
+    assert rejected["fields"]["rule"] == "outside_private_directory"
+
+
+def test_work_directory_shape_is_recorded_without_private_names(
+    queue_env, fake_process, tmp_path, diag
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    (work_path / "a.mp4").write_bytes(b"one")
+    (work_path / "b.mkv").write_bytes(b"two")
+    (work_path / "movie.ytdl").write_bytes(b"resume state")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    shape = _one(diag, "extractor.publish", "work_shape")
+    fields = shape["fields"]
+    assert shape["task"] == task.id
+    assert fields["entries"] == 3
+    assert fields["candidates"] == 2
+    assert fields["reported_exists"] is False
+    assert fields["single_candidate"] is False
+    assert sorted(fields["exts"]) == [".mkv", ".mp4", ".ytdl"]
+    # Shape only: no name from inside the private directory, no user path.
+    dumped = json.dumps(shape)
+    assert "movie" not in dumped
+    assert "a.mp4" not in dumped
+    assert "b.mkv" not in dumped
+    assert str(tmp_path) not in dumped
 
 
 # ---- Incident C: Real-Debrid generated /d/ link ----------------------------
@@ -5713,3 +5947,659 @@ def test_diagnostics_failures_never_fail_a_download(queue_env, monkeypatch, diag
     queue._launch(queue.tasks[tid])
     queue._probe_and_add(queue.tasks[tid])
     assert rpc.added, "the download must still reach aria2"
+
+
+# ---- Removing an unfinished aria2 download ---------------------------------
+#
+# Removing an unfinished download used to drop the row and leave the partial
+# file and its .aria2 resume data on disk forever - unresumable, because the
+# only thing that knew about them was the row just deleted. Explicit removal
+# now means "abandon this download and clean up after it". Pause, errors and
+# shutdown still keep everything, and a finished file is never touched without
+# an explicit delete.
+
+
+def _aria2_task(queue_env, tmp_path, filename="Show.S01E01.mkv"):
+    queue, rpc, db_path = queue_env()
+    _sync_spawn(queue)
+    _running(queue)
+    tid = queue.add_url(
+        "https://example.invalid/" + filename,
+        out_dir=str(tmp_path),
+        filename=filename,
+    )
+    queue._launch(queue.tasks[tid])
+    payload = tmp_path / filename
+    control = tmp_path / (filename + ".aria2")
+    payload.write_bytes(b"partial payload")
+    control.write_bytes(b"aria2 resume state")
+    return queue, rpc, db_path, tid, payload, control
+
+
+def test_removing_an_active_aria2_download_cleans_its_partial_data(
+    queue_env, tmp_path
+):
+    queue, rpc, db_path, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+
+    queue.remove(tid)
+
+    assert rpc.removed == ["gid-1"]
+    assert not payload.exists()
+    assert not control.exists()
+    assert _rows(db_path) == []
+
+
+def test_removing_a_queued_aria2_download_that_never_started_is_safe(
+    queue_env, tmp_path
+):
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(
+        "https://example.invalid/never.bin",
+        out_dir=str(tmp_path),
+        filename="never.bin",
+    )
+
+    queue.remove(tid)
+
+    assert _rows(db_path) == []
+    assert tid not in queue.tasks
+
+
+def test_aria2_partial_data_is_unlinked_only_after_aria2_forgets_the_gid(
+    queue_env, tmp_path
+):
+    queue, rpc, db_path, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    order = []
+    deferred = []
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        if getattr(fn, "__name__", "") == "remove":
+            deferred.append((fn, args, on_done))
+            return
+        result = fn(*args, **kwargs)
+        if on_done is not None:
+            on_done(result)
+
+    queue._spawn = spawn
+    queue.remove(tid)
+
+    # aria2 has not answered yet, so nothing may be unlinked.
+    assert payload.exists()
+    assert control.exists()
+    fn, args, on_done = deferred[0]
+    order.append("rpc_remove")
+    on_done(fn(*args))
+    order.append("unlinked")
+
+    assert order == ["rpc_remove", "unlinked"]
+    assert not payload.exists()
+    assert not control.exists()
+
+
+def test_pausing_an_aria2_download_keeps_its_partial_data(queue_env, tmp_path):
+    queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+
+    queue.pause(tid)
+
+    assert payload.exists()
+    assert control.exists()
+
+    queue.remove(tid)
+
+    assert not payload.exists()
+    assert not control.exists()
+
+
+def test_an_errored_aria2_download_keeps_its_data_until_removed(queue_env, tmp_path):
+    queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue._apply_status(tid, {"status": "error", "errorCode": "1"})
+
+    assert payload.exists()
+    assert control.exists()
+
+    queue.remove(tid)
+
+    assert not payload.exists()
+    assert not control.exists()
+
+
+def test_stopping_the_queue_keeps_partial_aria2_data(queue_env, tmp_path):
+    queue, rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    rpc.pause_all = lambda: None
+
+    queue.stop_queue()
+
+    assert payload.exists()
+    assert control.exists()
+
+
+def test_removing_a_completed_aria2_download_keeps_the_finished_file(
+    queue_env, tmp_path
+):
+    queue, _rpc, db_path, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue._apply_status(tid, {"status": "complete", "totalLength": "10",
+                              "completedLength": "10"})
+    assert queue.tasks[tid].status == "completed"
+
+    queue.remove(tid)
+
+    assert payload.exists()
+    # A stray sidecar next to a finished file is not this command's business.
+    assert control.exists()
+    assert _rows(db_path) == []
+
+
+def test_removing_a_completed_aria2_download_with_delete_still_deletes(
+    queue_env, tmp_path
+):
+    queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue._apply_status(tid, {"status": "complete", "totalLength": "10",
+                              "completedLength": "10"})
+
+    queue.remove(tid, delete_file=True)
+
+    assert not payload.exists()
+    assert not control.exists()
+
+
+def test_removing_an_aria2_download_mid_add_cleans_up_once_the_gid_lands(
+    queue_env, tmp_path
+):
+    queue, rpc, db_path = queue_env()
+    _running(queue)
+    pending = []
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        if getattr(fn, "__name__", "") in ("add_uri", "_probe_and_add"):
+            pending.append((fn, args, on_done))
+            return
+        result = fn(*args, **kwargs)
+        if on_done is not None:
+            on_done(result)
+
+    queue._spawn = spawn
+    tid = queue.add_url(
+        "https://example.invalid/late.bin",
+        out_dir=str(tmp_path),
+        filename="late.bin",
+    )
+    queue._launch(queue.tasks[tid])
+    queue.tasks[tid].status = "active"
+    assert pending
+
+    payload = tmp_path / "late.bin"
+    control = tmp_path / "late.bin.aria2"
+    payload.write_bytes(b"partial")
+    control.write_bytes(b"ctrl")
+
+    queue.remove(tid)
+    fn, args, on_done = pending[0]
+    on_done(fn(*args))
+
+    assert rpc.removed == ["gid-1"]
+    assert not payload.exists()
+    assert not control.exists()
+    assert _rows(db_path) == []
+
+
+def test_an_unknown_filename_is_never_guessed_at_removal(queue_env, tmp_path):
+    queue, _rpc, db_path = queue_env()
+    _sync_spawn(queue)
+    _running(queue)
+    tid = queue.add_url("https://example.invalid/x", out_dir=str(tmp_path))
+    queue._launch(queue.tasks[tid])
+    queue.tasks[tid].status = "active"
+    queue.tasks[tid].filename = ""
+    neighbour = tmp_path / "someone-elses.bin"
+    neighbour.write_bytes(b"keep")
+    (tmp_path / "someone-elses.bin.aria2").write_bytes(b"keep")
+
+    queue.remove(tid)
+
+    assert neighbour.exists()
+    assert (tmp_path / "someone-elses.bin.aria2").exists()
+    assert _rows(db_path) == []
+
+
+def test_removal_touches_only_the_selected_tasks_own_files(queue_env, tmp_path):
+    queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    other = tmp_path / "Show.S01E02.mkv"
+    other.write_bytes(b"other partial")
+    (tmp_path / "Show.S01E02.mkv.aria2").write_bytes(b"other ctrl")
+
+    queue.remove(tid)
+
+    assert not payload.exists()
+    assert other.exists()
+    assert (tmp_path / "Show.S01E02.mkv.aria2").exists()
+
+
+def test_clear_all_keeps_files_on_disk_as_its_prompt_promises(queue_env, tmp_path):
+    queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+
+    # The Clear all prompt says "Files on disk are kept"; that is a promise,
+    # not a default.
+    queue.remove(tid, keep_incomplete=True)
+
+    assert payload.exists()
+    assert control.exists()
+    assert tid not in queue.tasks
+
+
+def test_clear_completed_never_deletes_incomplete_data(queue_env, tmp_path):
+    queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+
+    queue.clear_completed()
+
+    assert payload.exists()
+    assert control.exists()
+    assert tid in queue.tasks
+
+
+def test_an_adopted_external_aria2_download_is_cleaned_on_removal(
+    queue_env, tmp_path
+):
+    # A row Cove deliberately adopted from aria2 is a Cove-managed row: it
+    # carries the authoritative path aria2 itself reported.
+    queue, rpc, db_path = queue_env()
+    _sync_spawn(queue)
+    payload = tmp_path / "stranger.bin"
+    control = tmp_path / "stranger.bin.aria2"
+    payload.write_bytes(b"partial payload")
+    control.write_bytes(b"aria2 resume state")
+    rpc.tell_external_snapshot = lambda: [
+        {
+            "gid": "gid-external",
+            "status": "active",
+            "totalLength": "100",
+            "completedLength": "10",
+            "files": [{"path": str(payload),
+                       "uris": [{"uri": "https://example.invalid/stranger.bin"}]}],
+        }
+    ]
+
+    queue._check_external()
+    tid = next(t.id for t in queue.tasks.values() if t.gid == "gid-external")
+    assert queue.tasks[tid].status == "active"
+
+    queue.remove(tid)
+
+    assert rpc.removed == ["gid-external"]
+    assert not payload.exists()
+    assert not control.exists()
+
+
+def test_removing_an_extractor_task_keeps_its_existing_behaviour(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path)
+    task.status = "active"
+    bystander = tmp_path / "movie.mp4"
+    bystander.write_bytes(b"unrelated file with the same name")
+
+    queue.remove(task.id)
+
+    assert bystander.exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_removing_an_hls_task_keeps_its_existing_behaviour(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+    task.status = "active"
+    bystander = tmp_path / "movie.mp4"
+    bystander.write_bytes(b"unrelated file with the same name")
+
+    queue.remove(task.id)
+
+    assert bystander.exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_removing_an_incomplete_torrent_keeps_its_dedicated_path(
+    queue_env, monkeypatch, tmp_path
+):
+    """The incomplete-aria2 cleanup default must not reach a torrent.
+
+    A torrent is a tree, not a single file, and its deletion is bounded by the
+    paths aria2 itself reports. Routing it through the generic single-file
+    cleanup would either miss most of the tree or delete by a reconstructed
+    name, so a torrent keeps its own removal path unchanged.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "active", "followedBy": ["gid-child"],
+                              "totalLength": "100", "completedLength": "10"})
+    root = tmp_path / "Season 1"
+    root.mkdir(parents=True)
+    partial = root / "ep1.mkv"
+    partial.write_bytes(b"partial")
+    control = root / "ep1.mkv.aria2"
+    control.write_bytes(b"ctrl")
+    rpc.files_result = [{"path": str(partial)}]
+    assert queue.tasks[tid].source_type == SOURCE_TORRENT
+    assert queue.tasks[tid].status != "completed"
+
+    queue.remove(tid)
+
+    assert rpc.removed == ["gid-child"]
+    assert partial.exists()
+    assert control.exists()
+    assert _rows(db_path) == []
+
+
+def test_removing_an_incomplete_torrent_with_delete_still_deletes(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "active", "followedBy": ["gid-child"],
+                              "totalLength": "100", "completedLength": "10"})
+    root = tmp_path / "Season 1"
+    root.mkdir(parents=True)
+    partial = root / "ep1.mkv"
+    partial.write_bytes(b"partial")
+    (root / "ep1.mkv.aria2").write_bytes(b"ctrl")
+    rpc.files_result = [{"path": str(partial)}]
+
+    queue.remove(tid, delete_file=True)
+
+    assert not partial.exists()
+    assert not (root / "ep1.mkv.aria2").exists()
+
+
+def test_extractor_fallback_ignores_yt_dlp_fragment_part_files(
+    queue_env, fake_process, tmp_path
+):
+    """yt-dlp writes fragmented downloads as "<target>.part-Frag<n>".
+
+    Those carry a compound suffix rather than a plain ".part", so a naive
+    suffix match lets one through - and publishing a fragment as the finished
+    file would present a broken download as a successful one.
+    """
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    # Exactly one, so ambiguity cannot be what saves us here.
+    (work_path / "movie.mp4.part-Frag1").write_bytes(b"fragment one")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert list(tmp_path.glob("movie*")) == []
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_extractor_fallback_picks_the_finished_file_beside_fragments(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path
+    )
+    (work_path / "movie.mkv").write_bytes(b"merged output")
+    (work_path / "movie.mp4.part-Frag1").write_bytes(b"fragment one")
+    (work_path / "movie.f137.mp4.ytdl").write_bytes(b"resume state")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "movie.mkv"
+    assert (tmp_path / "movie.mkv").read_bytes() == b"merged output"
+
+
+def test_an_f_number_name_is_never_a_safe_fallback_candidate(
+    queue_env, fake_process, tmp_path
+):
+    """An f###-shaped name is treated as ambiguous, on purpose.
+
+    yt-dlp writes per-format streams as "<stem>.f137.<ext>", so inside a work
+    directory that shape is not unambiguously the finished output. A user could
+    in theory choose that basename themselves and would hit this rule too; that
+    is the accepted trade. Failing closed costs a failed task and leaves the
+    file where it is. Publishing it would present an unmerged stream as a
+    completed download.
+    """
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    # The only file present, so ambiguity of count cannot be what rejects it.
+    lone = work_path / "video.f137.mp4"
+    lone.write_bytes(b"one per-format stream")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert task.error.startswith("Could not publish extractor output:")
+    assert not (tmp_path / "video.f137.mp4").exists()
+    assert not (tmp_path / "video.mp4").exists()
+    assert list(tmp_path.glob("video*")) == []
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_an_f_number_name_does_not_shadow_a_real_final_output(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    (work_path / "video.mkv").write_bytes(b"merged output")
+    (work_path / "video.f137.mp4").write_bytes(b"per-format stream")
+    (work_path / "video.f251.webm").write_bytes(b"per-format stream")
+    (work_path / "video.mp4.part-Frag1").write_bytes(b"fragment")
+    (work_path / "video.ytdl").write_bytes(b"resume state")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    # Exactly one legitimate final file among the intermediates: publish it.
+    assert task.status == "completed"
+    assert task.filename == "video.mkv"
+    assert (tmp_path / "video.mkv").read_bytes() == b"merged output"
+    assert not (tmp_path / "video.f137.mp4").exists()
+    assert not (tmp_path / "video.mp4.part-Frag1").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_the_f_number_rule_does_not_change_outside_work_root_handling(
+    queue_env, fake_process, tmp_path, diag
+):
+    """Excluding f### names is a candidate rule, not a containment rule."""
+    queue, _rpc, _db = queue_env()
+    task, proc, _private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    (work_path / "video.f137.mp4").write_bytes(b"per-format stream")
+    outside = tmp_path / "video.f137.mp4"
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{outside}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    # Still rejected by containment, exactly as before, not by the shape rule.
+    rejected = _one(diag, "extractor.publish", "engine_output_rejected")
+    assert rejected["fields"]["rule"] == "outside_private_directory"
+    assert not outside.exists()
+
+
+def test_yt_dlp_reporting_no_final_marker_is_recoverable_by_design(
+    queue_env, fake_process, tmp_path
+):
+    """No marker plus exactly one validated final file is a publish, not a bug.
+
+    yt-dlp does not always print after_move:%(filepath)s, and the run is still
+    complete. The candidate goes through the same validation as any reported
+    path, so this widens nothing: it only stops discarding a finished download
+    because the engine stayed quiet.
+    """
+    queue, _rpc, _db = queue_env()
+    task, proc = _start_extractor(queue, fake_process, tmp_path, "video.mp4")
+    work_path = _extractor_private_path(proc).parent
+    (work_path / "video.mkv").write_bytes(b"merged output")
+
+    proc.emit_output("[download] 100% of 10.00MiB\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "video.mkv"
+    assert (tmp_path / "video.mkv").read_bytes() == b"merged output"
+    _assert_no_work_dirs(tmp_path)
+
+
+# ---- Sidecars are never a finished media output ----------------------------
+#
+# A user's own yt-dlp config can add --write-thumbnail or --write-info-json,
+# which lands a sidecar in the private work directory. If the media output is
+# the thing that went missing, that sidecar would be the lone candidate - and
+# publishing a .webp as the completed download is a silent data loss.
+
+
+def _publish_lone_candidate(queue, fake_process, tmp_path, name, requested="video.mp4"):
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, requested
+    )
+    (work_path / name).write_bytes(b"sidecar payload")
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+    return task
+
+
+@pytest.mark.parametrize(
+    "sidecar",
+    [
+        "video.info.json",
+        "video.live_chat.json",
+        "video.description",
+        "video.webp",
+        "video.jpg",
+        "video.jpeg",
+        "video.png",
+        "video.en.vtt",
+        "video.en.srt",
+        "video.en.ass",
+        "video.en.ssa",
+        "video.en.lrc",
+        "video.en.ttml",
+        "video.en.srv1",
+        "video.en.srv3",
+        "video.en.json3",
+    ],
+)
+def test_a_lone_sidecar_is_never_published_as_the_finished_download(
+    queue_env, fake_process, tmp_path, sidecar
+):
+    queue, _rpc, _db = queue_env()
+
+    task = _publish_lone_candidate(queue, fake_process, tmp_path, sidecar)
+
+    assert task.status == "error"
+    assert task.error.startswith("Could not publish extractor output:")
+    assert list(tmp_path.glob("video*")) == []
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_sidecars_do_not_shadow_the_real_media_output(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    (work_path / "video.mkv").write_bytes(b"merged output")
+    (work_path / "video.info.json").write_bytes(b"{}")
+    (work_path / "video.webp").write_bytes(b"thumbnail")
+    (work_path / "video.en.vtt").write_bytes(b"captions")
+    (work_path / "video.description").write_bytes(b"description")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "video.mkv"
+    assert (tmp_path / "video.mkv").read_bytes() == b"merged output"
+    assert not (tmp_path / "video.webp").exists()
+    assert not (tmp_path / "video.info.json").exists()
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_every_excluded_shape_together_still_yields_the_media_output(
+    queue_env, fake_process, tmp_path
+):
+    """Sidecars, fragments, f### streams and control files in one directory."""
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    (work_path / "video.mkv").write_bytes(b"merged output")
+    for noise in (
+        "video.info.json",
+        "video.webp",
+        "video.en.vtt",
+        "video.f137.mp4",
+        "video.f251.webm",
+        "video.mp4.part-Frag1",
+        "video.ytdl",
+        "video.temp",
+        "video.mkv.aria2",
+    ):
+        (work_path / noise).write_bytes(b"not the finished file")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "video.mkv"
+    assert (tmp_path / "video.mkv").read_bytes() == b"merged output"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["cove.db", "video.mkv"]
+
+
+def test_a_webm_output_stays_an_eligible_media_candidate(
+    queue_env, fake_process, tmp_path
+):
+    """.webm is real media; only the thumbnail's .webp is a sidecar."""
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    (work_path / "video.webm").write_bytes(b"merged output")
+    (work_path / "video.webp").write_bytes(b"thumbnail")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "completed"
+    assert task.filename == "video.webm"
+    assert (tmp_path / "video.webm").read_bytes() == b"merged output"
+
+
+def test_two_media_candidates_beside_sidecars_still_fail_closed(
+    queue_env, fake_process, tmp_path
+):
+    queue, _rpc, _db = queue_env()
+    task, proc, private, work_path = _finish_extractor_with_missing_report(
+        queue, fake_process, tmp_path, "video.mp4"
+    )
+    (work_path / "video.mkv").write_bytes(b"one")
+    (work_path / "video.webm").write_bytes(b"two")
+    (work_path / "video.info.json").write_bytes(b"{}")
+
+    proc.emit_output(f"{FINAL_PATH_MARKER}{private}\n")
+    proc.finish(0)
+
+    assert task.status == "error"
+    assert list(tmp_path.glob("video*")) == []
+    _assert_no_work_dirs(tmp_path)

@@ -13,7 +13,7 @@ function event() {
 
 function loadBackground({ nativeResult = { status: "ok" }, settings,
                          breakStorage = false, slowStorage = false,
-                         storedDiag = null, media = true } = {}) {
+                         storedDiag = null, media = true, cookies = [] } = {}) {
   const calls = { native: [], cancel: [], erase: [], menus: [] };
   const events = {
     downloadCreated: event(),
@@ -52,7 +52,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       create(props) { calls.menus.push(props); },
       onClicked: events.contextMenuClicked,
     },
-    cookies: { async getAll() { return []; } },
+    cookies: { async getAll() { return cookies; } },
     downloads: {
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
@@ -848,4 +848,95 @@ test("a clear that storage refuses is reported as a failure", async () => {
   await settle();
   const reply = await sendToBackground(events, { type: "coveDiagClear" });
   assert.equal(reply.ok, false);
+});
+
+// ---- Oversized cookie jars -------------------------------------------------
+//
+// The whole cookie jar for one origin can exceed Cove's native handoff bound,
+// and Cove refused the entire request for it. Sending the download without
+// cookies is strictly better than not sending it at all.
+
+const COOKIE_LIMIT = 32 * 1024;
+
+function jarOfSize(total) {
+  return [{ name: "sid", value: "c".repeat(Math.max(0, total - 4)) }];
+}
+
+function freshItem(overrides = {}) {
+  return {
+    id: 90,
+    url: "https://example.test/big.zip",
+    filename: "big.zip",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 2_000_000,
+    ...overrides,
+  };
+}
+
+test("a cookie jar within the handoff limit is sent unchanged", async () => {
+  const jar = jarOfSize(100);
+  const { calls, events } = loadBackground({ cookies: jar });
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(freshItem());
+  await settle();
+
+  const sent = calls.native.find((m) => m.action === "download");
+  assert.equal(sent.cookies, `${jar[0].name}=${jar[0].value}`);
+  assert.equal(sent.cookies.length, 100);
+});
+
+test("an oversized cookie jar is dropped rather than sent or truncated", async () => {
+  const { calls, events } = loadBackground({ cookies: jarOfSize(COOKIE_LIMIT + 1) });
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(freshItem());
+  await settle();
+
+  const sent = calls.native.find((m) => m.action === "download");
+  assert.ok(sent, "the download must still be handed to Cove");
+  assert.equal(sent.cookies, "");
+  assert.equal(sent.url, "https://example.test/big.zip");
+});
+
+test("an oversized cookie jar still lets Cove take the download", async () => {
+  const { calls, events } = loadBackground({
+    cookies: jarOfSize(COOKIE_LIMIT + 1),
+    nativeResult: { status: "ok" },
+  });
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(freshItem({ id: 91 }));
+  await settle();
+
+  assert.deepEqual(calls.cancel, [91]);
+});
+
+test("a host rejection still leaves the browser download alone", async () => {
+  const { calls, events } = loadBackground({
+    cookies: jarOfSize(COOKIE_LIMIT + 1),
+    nativeResult: { status: "error", message: "Cove refused this download." },
+  });
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(freshItem({ id: 92 }));
+  await settle();
+
+  assert.deepEqual(calls.cancel, []);
+});
+
+test("no cookie value ever reaches the extension diagnostics ring", async () => {
+  const jar = [{ name: "sid", value: "dummysecretcookie".repeat(4000) }];
+  const { events, store } = loadBackground({ cookies: jar });
+  await settle();
+
+  events.downloadCreated.emit(freshItem({ id: 93 }));
+  await settle();
+
+  assert.ok(!JSON.stringify(store.data).includes("dummysecretcookie"));
 });

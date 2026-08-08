@@ -421,8 +421,8 @@ def test_bridge_cancel_never_deletes_and_hides_inflight_task_immediately():
             }
             self.remove_call = None
 
-        def remove(self, task_id, delete_file=False):
-            self.remove_call = (task_id, delete_file)
+        def remove(self, task_id, delete_file=False, keep_incomplete=False):
+            self.remove_call = (task_id, delete_file, keep_incomplete)
             # QueueManager deliberately retains an add-in-flight task until
             # its gid arrives; the API must still hide it immediately.
 
@@ -430,7 +430,9 @@ def test_bridge_cancel_never_deletes_and_hides_inflight_task_immediately():
     bridge = QueueApiBridge(queue)
     removed = bridge.invoke("cancel", {"task_id": 9})
     assert removed["status"] == "removed"
-    assert queue.remove_call == (9, False)
+    # keep_incomplete pins the API contract: cancel never touches disk, even
+    # for an unfinished aria2 download that the GUI's own Remove would clean.
+    assert queue.remove_call == (9, False, True)
     assert bridge.invoke("list") == []
     with pytest.raises(ApiProblem) as caught:
         bridge.invoke("status", {"task_id": 9})

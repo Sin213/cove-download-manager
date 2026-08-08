@@ -23,6 +23,7 @@ from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
 from .output_paths import (
+    MissingEngineOutputError,
     OutputPathError,
     WorkDirectory,
     cleanup_work_directory,
@@ -33,6 +34,97 @@ from .output_paths import (
 from .torrent import TorrentError
 
 URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+", re.IGNORECASE)
+
+# Suffixes yt-dlp leaves behind mid-run. None of these is ever the finished
+# file, so they can never be the single legitimate publication candidate.
+# Matched with a trailing word boundary rather than by equality because a
+# fragmented download is written as "<target>.part-Frag3", which a plain
+# ".part" comparison would let through - and publishing one fragment would
+# present a broken download as a finished one. ".partial" and similar real
+# extensions are left alone: the boundary only allows a non-word character
+# after the known name.
+_ENGINE_INTERMEDIATE_SUFFIX_RE = re.compile(r"^\.(?:part|ytdl|temp|aria2)\b", re.IGNORECASE)
+# yt-dlp names per-format streams "<stem>.f137.<ext>" before merging them.
+#
+# This is deliberately a shape rule, not a proof: a user could in theory pick
+# the basename "video.f137.mp4" themselves, and that file would be excluded
+# too. That trade is intentional. Inside a yt-dlp work directory an f###-shaped
+# name is not unambiguously the finished output, and the fallback exists only
+# to recover ONE unambiguously legitimate final file. A false negative costs a
+# failed task and leaves the file untouched - exactly what happened before this
+# fallback existed. A false positive publishes an unmerged stream as the
+# finished download and marks it completed. Prefer the false negative.
+#
+# Do not add special cases trying to tell a "real" video.f137.mp4 from an
+# intermediate, and do not correlate against yt-dlp's format selection: both
+# turn a cheap invariant into a guess.
+_ENGINE_FRAGMENT_STEM_RE = re.compile(r"\.f\d+$")
+
+# Sidecars yt-dlp writes alongside the media file. Cove never asks for these,
+# but a user's own yt-dlp config can (--write-thumbnail, --write-info-json,
+# --write-subs), and they land in the same private work directory. If the media
+# output is what went missing, a lone sidecar would otherwise be the single
+# "legitimate" candidate - and publishing a thumbnail as the completed download
+# loses the download silently.
+#
+# Bounded to shapes yt-dlp actually produces, checked against the installed
+# yt-dlp: .info.json/.live_chat.json/.description metadata, webp/jpg/png
+# thumbnails, and the subtitle formats it writes or converts to (srt, vtt, ass,
+# lrc, plus YouTube's native ttml/srv1-3/json3). Deliberately NOT a media
+# allowlist: an unknown container must stay publishable. Note .webm is media
+# and stays eligible - only the thumbnail's .webp is a sidecar.
+_ENGINE_SIDECAR_SUFFIXES = frozenset({
+    ".json", ".description",
+    ".webp", ".jpg", ".jpeg", ".png",
+    ".vtt", ".srt", ".ass", ".ssa", ".lrc",
+    ".ttml", ".srv1", ".srv2", ".srv3", ".json3",
+})
+
+
+def _engine_work_files(work: WorkDirectory) -> list[str]:
+    """Names of the top-level regular files in an owned private work directory.
+
+    One directory level, no symlinks, and never anything outside the directory
+    Cove created for this run.
+    """
+    root = str(getattr(work, "path", "") or "")
+    if not root:
+        return []
+    names = []
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        names.append(entry.name)
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    return names
+
+
+def _engine_output_candidates(work: WorkDirectory) -> list[str]:
+    """Plausible finished media files in an owned private work directory.
+
+    Everything yt-dlp writes that is not the finished media file is excluded:
+    partials, resume state, remux scratch files, unmerged per-format streams,
+    and the metadata/thumbnail/subtitle sidecars a user's own yt-dlp config may
+    have asked for. What remains is either the finished file or nothing.
+    """
+    root = str(getattr(work, "path", "") or "")
+    candidates = []
+    for name in _engine_work_files(work):
+        stem, suffix = os.path.splitext(name)
+        suffix = suffix.lower()
+        if _ENGINE_INTERMEDIATE_SUFFIX_RE.match(suffix):
+            continue
+        if suffix in _ENGINE_SIDECAR_SUFFIXES:
+            continue
+        if _ENGINE_FRAGMENT_STEM_RE.search(stem):
+            continue
+        candidates.append(os.path.join(root, name))
+    return candidates
 
 # Approved `source_type` values (see the v6 migration in cove/db.py).
 SOURCE_PLAIN = ""
@@ -908,6 +1000,59 @@ class QueueManager(QObject):
         except Exception:
             pass
 
+    def _diag_engine_work_shape(self, t, work, reported) -> None:
+        """Record the shape of the private work directory before it is cleaned.
+
+        Counts and extensions only. The names inside that directory come from
+        the page title, so they never reach the log.
+        """
+        try:
+            names = _engine_work_files(work)
+            candidates = _engine_output_candidates(work)
+            reported_exists = None
+            if reported:
+                try:
+                    reported_exists = os.path.exists(str(reported))
+                except OSError:
+                    reported_exists = None
+            self._diag(
+                "extractor.publish", "work_shape", "INFO",
+                task_id=t.id, engine="yt-dlp",
+                entries=len(names),
+                candidates=len(candidates),
+                exts=sorted({os.path.splitext(name)[1].lower() for name in names}),
+                reported_exists=reported_exists,
+                single_candidate=len(candidates) == 1,
+            )
+        except Exception:
+            pass
+
+    def _publish_extractor_output(
+        self, work: WorkDirectory, reported: str, requested: str
+    ):
+        """Publish the run's finished file, tolerating a stale reported name.
+
+        yt-dlp exits 0 and prints the path it believes it produced. On Windows
+        that name is sometimes not the file actually left behind, which failed
+        an otherwise complete download. When the run's own work directory holds
+        exactly one legitimate finished file, publish that instead; ambiguity
+        and emptiness both still fail closed, and the fallback candidate goes
+        through the same validation as any reported path.
+        """
+        if reported:
+            try:
+                return publish_output(work, reported, requested)
+            except MissingEngineOutputError as missing:
+                rejection = missing
+        else:
+            rejection = OutputPathError("yt-dlp did not report a final output path")
+        candidates = _engine_output_candidates(work)
+        if len(candidates) != 1:
+            raise rejection
+        published_suffix = os.path.splitext(candidates[0])[1]
+        fallback = os.path.splitext(requested)[0] + published_suffix
+        return publish_output(work, candidates[0], validate_public_filename(fallback))
+
     def _debrid_credential_facts(self) -> dict:
         """Configured-or-not, as booleans. Never the credential itself."""
         try:
@@ -1720,7 +1865,34 @@ class QueueManager(QObject):
             return
         self._launch(t)
 
-    def remove(self, tid: int, delete_file: bool = False) -> None:
+    def _cleans_incomplete_data(
+        self,
+        t: DownloadTask,
+        delete_file: bool,
+        keep_incomplete: bool,
+        private_run: bool,
+    ) -> bool:
+        """Whether removing `t` should also clean what it left on disk.
+
+        Explicitly removing an unfinished aria2 download means "abandon this
+        download", so its partial payload and matching .aria2 resume file go
+        with the row - otherwise the only thing that knew about those files is
+        deleted and they stay behind forever, unresumable.
+
+        A finished file is never touched without an explicit delete, private
+        engine runs (yt-dlp/ffmpeg) keep their own work-directory cleanup, and
+        callers that promise on-disk files are kept - Clear all, Clear
+        completed, the API - opt out with `keep_incomplete`.
+        """
+        if delete_file:
+            return True
+        if keep_incomplete or private_run:
+            return False
+        return t.backend == "aria2" and t.status != "completed"
+
+    def remove(
+        self, tid: int, delete_file: bool = False, keep_incomplete: bool = False
+    ) -> None:
         t = self.tasks.get(tid)
         if not t:
             return
@@ -1740,8 +1912,16 @@ class QueueManager(QObject):
         # active ffmpeg/yt-dlp tasks never get a gid and must instead go
         # through the normal path that terminates their process.
         if t.status == "active" and not t.gid and t.backend == "aria2":
+            # Resolve the cleanup decision now, while the task is still here to
+            # ask; on_done only sees the tombstone. A task in this state has no
+            # private engine run by definition.
             self._pending_launch.setdefault(tid, {}).update(
-                {"remove": True, "delete_file": bool(delete_file)}
+                {
+                    "remove": True,
+                    "delete_file": self._cleans_incomplete_data(
+                        t, delete_file, keep_incomplete, private_run=False
+                    ),
+                }
             )
             with db.connect() as conn:
                 conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
@@ -1763,7 +1943,14 @@ class QueueManager(QObject):
         with db.connect() as conn:
             conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
 
-        unlink = self._make_unlinker(path) if delete_file else None
+        # Ordering below is unchanged and load-bearing: aria2 must forget the
+        # gid before the payload and control file are unlinked, or it recreates
+        # them.
+        unlink = (
+            self._make_unlinker(path)
+            if self._cleans_incomplete_data(t, delete_file, keep_incomplete, private_run)
+            else None
+        )
         if gid:
             def _after_remove(*_args):
                 if unlink:
@@ -1950,8 +2137,10 @@ class QueueManager(QObject):
             self._maybe_start_next()
 
     def clear_completed(self, delete_files: bool = False) -> None:
+        # Completed rows only, and explicitly never the incomplete-data
+        # cleanup: this is a list operation, not an abandon-download one.
         for tid in [t.id for t in self.tasks.values() if t.status == "completed"]:
-            self.remove(tid, delete_file=delete_files)
+            self.remove(tid, delete_file=delete_files, keep_incomplete=True)
 
     def start_queue(self) -> None:
         if self._running:
@@ -2304,10 +2493,9 @@ class QueueManager(QObject):
                            task_id=t.id, engine="yt-dlp",
                            reported=bool(reported))
                 try:
-                    if not reported:
-                        raise OutputPathError("yt-dlp did not report a final output path")
-                    published = publish_output(work, reported, requested)
+                    published = self._publish_extractor_output(work, reported, requested)
                 except (OSError, OutputPathError) as exc:
+                    self._diag_engine_work_shape(t, work, reported)
                     self._diag_engine_output_rejected(t, reported, work, exc)
                     self._cleanup_engine_work(work, task_id=t.id)
                     t.status = "error"

@@ -303,6 +303,20 @@ def _error_sentence(category: str) -> str:
     return _ERROR_SENTENCES.get(category, _DEFAULT_ERROR)
 
 
+def reply_category(resp) -> str:
+    """The fixed rejection category a negative reply carries, if any.
+
+    Only labels this build already defines are honoured, so a reply can never
+    put arbitrary text into a diagnostics log. A primary that predates the
+    field - or sends anything unrecognised - keeps the old generic label.
+    """
+    if isinstance(resp, dict):
+        value = resp.get("category")
+        if isinstance(value, str) and value in _ERROR_SENTENCES:
+            return value
+    return "gui_rejected"
+
+
 class _PendingConnection(QObject):
     """Bounded-read state machine for one accepted server-side connection.
 
@@ -444,8 +458,16 @@ class _PendingConnection(QObject):
 
     def _respond_error(self, category: str) -> None:
         self._done = True
+        # `category` is always one of the fixed labels above - never an
+        # exception string and never anything derived from the request - so it
+        # is safe both on the wire and in the caller's log.
         self._write(
-            {"version": PROTOCOL_VERSION, "ok": False, "error": _error_sentence(category)}
+            {
+                "version": PROTOCOL_VERSION,
+                "ok": False,
+                "error": _error_sentence(category),
+                "category": category,
+            }
         )
 
     def _write(self, obj: dict) -> None:
@@ -761,7 +783,7 @@ def _request(
             reason("malformed_reply")
             return False
         accepted = isinstance(resp, dict) and resp.get("ok") is True
-        reason("ok" if accepted else "gui_rejected")
+        reason("ok" if accepted else reply_category(resp))
         return accepted
     except OSError:
         reason("transport_error")

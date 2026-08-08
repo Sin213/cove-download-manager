@@ -1063,3 +1063,117 @@ def test_browser_download_action_is_rejected_by_the_magnet_validator():
         validate_message(
             {"version": 1, "action": "browser_download", "urls": []}
         )
+
+
+# ---- Fixed rejection categories on the wire --------------------------------
+#
+# "gui_rejected" told support nothing: a rejected browser download looked
+# identical whether the URL was unsupported, the cookie header was too big, or
+# the queue simply declined. The reply now carries the fixed category the
+# server already computed.
+
+
+@pytest.mark.parametrize(
+    "message, category",
+    [
+        (
+            {"version": 1, "action": "browser_download", "url": BROWSER_URL,
+             "cookies": "c" * (MAX_BROWSER_COOKIES_LENGTH + 1)},
+            "oversized_message",
+        ),
+        (
+            {"version": 1, "action": "browser_download", "url": "file:///etc/passwd"},
+            "invalid_url",
+        ),
+        (
+            {"version": 1, "action": "browser_download", "url": BROWSER_URL,
+             "file_size": "big"},
+            "invalid_schema",
+        ),
+        (
+            {"version": 99, "action": "browser_download", "url": BROWSER_URL},
+            "unsupported_version",
+        ),
+        (
+            {"version": 1, "action": "nonsense", "urls": []},
+            "unknown_action",
+        ),
+    ],
+)
+def test_rejection_replies_carry_their_fixed_category(message, category):
+    name = _unique_name()
+    server = SingleInstanceServer()
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: True
+        resp = _raw_ipc_roundtrip(name, message)
+        assert resp["ok"] is False
+        assert resp["category"] == category
+    finally:
+        server.shutdown()
+
+
+def test_a_declining_handler_reports_the_generic_rejected_category():
+    name = _unique_name()
+    server = SingleInstanceServer()
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: False
+        resp = _raw_ipc_roundtrip(
+            name, {"version": 1, "action": "browser_download", "url": BROWSER_URL}
+        )
+        assert resp["ok"] is False
+        assert resp["category"] == "rejected"
+    finally:
+        server.shutdown()
+
+
+def test_a_rejection_reply_never_echoes_the_request():
+    name = _unique_name()
+    server = SingleInstanceServer()
+    try:
+        assert server.try_become_primary(name) is True
+        server.browser_download_handler = lambda req: False
+        resp = _raw_ipc_roundtrip(
+            name,
+            {
+                "version": 1,
+                "action": "browser_download",
+                "url": BROWSER_URL + "?token=dummysecrettoken",
+                "filename": "dummysecretname.bin",
+                "cookies": "sid=dummysecretcookie",
+                "referrer": "https://example.invalid/dummysecretreferrer",
+                "user_agent": "dummysecretagent/1.0",
+            },
+        )
+        dumped = json.dumps(resp)
+        assert set(resp) == {"version", "ok", "error", "category"}
+        for needle in (
+            "dummysecrettoken",
+            "dummysecretname",
+            "dummysecretcookie",
+            "dummysecretreferrer",
+            "dummysecretagent",
+        ):
+            assert needle not in dumped
+    finally:
+        server.shutdown()
+
+
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        ({"version": 1, "ok": False, "error": "x", "category": "oversized_message"},
+         "oversized_message"),
+        # A primary that predates the field keeps the old generic label.
+        ({"version": 1, "ok": False, "error": "x"}, "gui_rejected"),
+        # Never let a reply put arbitrary text into diagnostics.
+        ({"version": 1, "ok": False, "error": "x", "category": "made up"},
+         "gui_rejected"),
+        ({"version": 1, "ok": False, "error": "x", "category": 7}, "gui_rejected"),
+    ],
+)
+def test_client_reports_only_fixed_reply_categories(reply, expected):
+    from cove.single_instance import reply_category
+
+    assert reply_category(reply) == expected

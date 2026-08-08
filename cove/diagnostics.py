@@ -889,10 +889,23 @@ SANITIZATION_NOTICE = (
 
 
 def install_mode():
-    """source, installed or portable - the three shapes Cove ships in."""
+    """source, appimage, installed or portable - the shapes Cove ships in.
+
+    An AppImage runs Cove from source inside its mounted AppDir, so without
+    the AppImage check it reported "source" and a support log could not tell
+    the two apart. Labelling only: nothing about DATA_DIR, the IPC endpoint
+    name or the native-host manifest is derived from this.
+    """
     try:
         import sys
 
+        try:
+            from .magnet_identity import APPIMAGE, build_identity
+
+            if build_identity() == APPIMAGE:
+                return "appimage"
+        except Exception:
+            pass
         if not getattr(sys, "frozen", False):
             return "source"
         try:
@@ -1086,6 +1099,7 @@ def url_facts(value):
 # Message prefix -> stable rule name. The messages come from
 # cove/output_paths.py; matching on them keeps validation itself untouched.
 _OUTPUT_PATH_RULES = (
+    ("Engine output file does not exist", "engine_output_missing"),
     ("Invalid engine output path", "invalid_engine_output_path"),
     ("Engine output is outside its private directory", "outside_private_directory"),
     ("Engine output is the private directory", "output_is_private_directory"),

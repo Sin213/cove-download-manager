@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Cove Download Manager",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "description": "Intercept downloads and send them to Cove Download Manager.",
   "author": "Sin",
 

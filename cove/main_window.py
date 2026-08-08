@@ -1376,7 +1376,10 @@ class MainWindow(QMainWindow):
         if ans != QMessageBox.Yes:
             return
         for tid in tids:
-            self.queue.remove(tid, delete_file=False)
+            # The prompt above promises files on disk are kept, so this must
+            # not fall into the abandon-and-clean default that explicit
+            # per-task removal uses.
+            self.queue.remove(tid, delete_file=False, keep_incomplete=True)
 
     def _open_diagnostics(self, task_id: int | None = None) -> None:
         """Open the single Diagnostics window, optionally pre-filtered.

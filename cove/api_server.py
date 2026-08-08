@@ -300,7 +300,9 @@ class QueueApiBridge(QObject):
             return task_snapshot(self._task(task_id))
         if action == "cancel":
             snapshot = task_snapshot(task)
-            self.queue.remove(task_id, delete_file=False)
+            # keep_incomplete pins the API's existing contract: cancelling a
+            # task through the API removes the row and never touches disk.
+            self.queue.remove(task_id, delete_file=False, keep_incomplete=True)
             # Keep only IDs the queue still tracks (the in-flight add_uri
             # remove case); anything else 404s on its own, so pruning here
             # stops the set from growing for the life of the session.

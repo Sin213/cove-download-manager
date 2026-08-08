@@ -6,6 +6,7 @@ representative secrets and asserts their absence from whatever surface is
 under test.
 """
 import json
+import sys
 
 import pytest
 
@@ -651,7 +652,7 @@ def test_environment_facts_are_safe_and_complete():
     facts = diagnostics.environment_facts()
     for key in ("app_version", "os", "os_version", "arch", "mode"):
         assert key in facts
-    assert facts["mode"] in ("source", "installed", "portable")
+    assert facts["mode"] in ("source", "appimage", "installed", "portable")
     assert_clean(json.dumps(facts))
 
 
@@ -884,3 +885,42 @@ def test_scrubbing_still_redacts_a_bare_absolute_path():
 def test_scrubbing_a_url_inside_a_sentence_keeps_the_sentence():
     out = diagnostics.scrub_text("could not fetch {} for task 7".format(RD_SHARE_URL))
     assert out == "could not fetch https://real-debrid.com/d/<redacted> for task 7"
+
+
+# ---- AppImage install mode -------------------------------------------------
+#
+# An AppImage runs Cove from source inside its mounted AppDir, so the support
+# log called it a plain "source" run - the one shape most likely to be behind a
+# Linux extension report. Labelling only; nothing about DATA_DIR, the IPC
+# endpoint name or the native-host manifest depends on it.
+
+
+def test_install_mode_reports_an_appimage_run(tmp_path, monkeypatch):
+    image = tmp_path / "Cove-x86_64.AppImage"
+    image.write_bytes(b"appimage")
+    monkeypatch.setenv("APPIMAGE", str(image))
+
+    assert diagnostics.install_mode() == "appimage"
+
+
+def test_install_mode_reports_an_ordinary_source_run(monkeypatch):
+    monkeypatch.delenv("APPIMAGE", raising=False)
+
+    assert diagnostics.install_mode() == "source"
+
+
+def test_install_mode_ignores_an_appimage_variable_pointing_nowhere(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("APPIMAGE", str(tmp_path / "missing.AppImage"))
+
+    assert diagnostics.install_mode() == "source"
+
+
+def test_install_mode_still_reports_frozen_builds(monkeypatch):
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr("cove.portable.is_portable", lambda: True)
+    assert diagnostics.install_mode() == "portable"
+    monkeypatch.setattr("cove.portable.is_portable", lambda: False)
+    assert diagnostics.install_mode() == "installed"

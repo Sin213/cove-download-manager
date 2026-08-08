@@ -25,6 +25,15 @@ class OutputPathError(RuntimeError):
     """Raised when an engine output cannot be handled safely."""
 
 
+class MissingEngineOutputError(OutputPathError):
+    """The engine named a safe path inside its work directory, but no file is there.
+
+    Kept apart from a generic invalid path so callers - and support logs - can
+    tell "the file is not where the engine said" from "we refuse to touch that
+    path". Only the former is recoverable.
+    """
+
+
 class _WindowsApiError(OSError):
     """An error returned by the small Windows publication boundary."""
 
@@ -712,6 +721,11 @@ def validate_engine_output(work: WorkDirectory, reported: str | os.PathLike[str]
         info = resolved.stat()
     except OutputPathError:
         raise
+    except FileNotFoundError as exc:
+        # The path itself passed every containment rule above; it simply is not
+        # on disk. Callers may recover from this, so it must not be flattened
+        # into the generic invalid-path failure.
+        raise MissingEngineOutputError(f"Engine output file does not exist: {reported}") from exc
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise OutputPathError(f"Invalid engine output path: {reported}") from exc
     if not stat.S_ISREG(info.st_mode):

@@ -22,6 +22,29 @@ from .config import Settings
 
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
 
+# Reply sentences for a handoff the running Cove refused outright. Most
+# failures really are "no Cove answered", which is what the default says; a
+# request Cove explicitly rejected must not be reported as Cove being closed.
+_HANDOFF_UNAVAILABLE = "Cove is not available"
+_HANDOFF_SENTENCES = {
+    "oversized_message": "Cove refused this request: it is too large.",
+    "truncated_message": "Cove refused this request: it was incomplete.",
+    "malformed_json": "Cove refused this request: it could not be read.",
+    "invalid_schema": "Cove refused this request: unexpected format.",
+    "invalid_url": "Cove refused this request: unsupported link.",
+    "too_many_urls": "Cove refused this request: too many links.",
+    "unknown_action": "Cove refused this request: unsupported action.",
+    "unsupported_version": "Cove refused this request: please update Cove.",
+    "rejected": "Cove refused this download.",
+    "gui_rejected": "Cove refused this download.",
+}
+
+# The reason the last handoff attempt ended, as a fixed category. The host
+# loop handles exactly one message at a time, so a plain module attribute is
+# enough - and it keeps deliver_to_primary's single-argument contract, which
+# both the tests and any external caller already rely on.
+_LAST_HANDOFF_REASON = None
+
 # This host's own logger, initialised in main(). It writes to its own file:
 # the GUI is a different process and two writers must never share one file.
 # stdout is reserved for protocol frames, so nothing here may print.
@@ -92,6 +115,21 @@ def _sanitize_header(value: Any) -> str:
     return value.replace("\r", "").replace("\n", "")
 
 
+def max_browser_cookies_length() -> int:
+    """The GUI's own cookie bound, read from the one place that defines it.
+
+    Imported lazily because single_instance pulls in Qt networking and a ping
+    must stay cheap. If that import fails the handoff cannot happen at all, so
+    the safe answer is to drop cookies rather than invent a second bound here.
+    """
+    try:
+        from .single_instance import MAX_BROWSER_COOKIES_LENGTH
+
+        return MAX_BROWSER_COOKIES_LENGTH
+    except Exception:
+        return 0
+
+
 def validate_url(url: str) -> bool:
     if not url or not isinstance(url, str):
         return False
@@ -135,6 +173,8 @@ def deliver_to_primary(request: dict) -> bool:
     Imported lazily so the Qt local-socket machinery is only pulled in when a
     download is actually being forwarded (ping/status stay cheap).
     """
+    global _LAST_HANDOFF_REASON
+
     request_id = request.get("request_id")
     reasons = []
     _log("ipc_attempt", "INFO", request_id=request_id)
@@ -143,10 +183,12 @@ def deliver_to_primary(request: dict) -> bool:
     except Exception as exc:
         # Qt missing, no socket, no running GUI: all of these look the same
         # from here, so report the class rather than guessing.
+        _LAST_HANDOFF_REASON = "app_unavailable"
         _log("ipc_result", "WARNING", request_id=request_id,
              result="app_unavailable", exc=exc)
         return False
     reason = reasons[-1] if reasons else ("ok" if accepted else "unknown")
+    _LAST_HANDOFF_REASON = reason
     _log("ipc_result", "INFO" if accepted else "WARNING", request_id=request_id,
          result=reason, accepted=bool(accepted))
     return accepted
@@ -213,11 +255,21 @@ def handle_message(
             return reply({"status": "error", "message": "Invalid or blocked URL"})
 
         requested_dir = msg.get("directory")
+        cookies = _sanitize_header(msg.get("cookies", ""))
+        if len(cookies) > max_browser_cookies_length():
+            # An extension older than this host still joins the browser's whole
+            # cookie jar into one header. The GUI bounds that field and would
+            # refuse the entire request for it, so drop the header instead and
+            # let the download through. Never truncated: a partial cookie
+            # header authenticates nothing and would fail downstream anyway.
+            _log("cookies_dropped", "INFO", request_id=request_id,
+                 reason="over_gui_limit")
+            cookies = ""
         request = {
             "url": url,
             "filename": msg.get("filename") or None,
             "directory": requested_dir if isinstance(requested_dir, str) else None,
-            "cookies": _sanitize_header(msg.get("cookies", "")),
+            "cookies": cookies,
             "referrer": _sanitize_header(msg.get("referrer", "")),
             "user_agent": _sanitize_header(msg.get("userAgent", "")),
             "file_size": msg.get("fileSize") if isinstance(msg.get("fileSize"), int) else 0,
@@ -240,14 +292,22 @@ def handle_message(
         # or not any Cove process existed; the file was then consumed at the
         # next launch, which is what made a download intercepted while Cove
         # was closed reappear later.
+        global _LAST_HANDOFF_REASON
+        _LAST_HANDOFF_REASON = None
         try:
             accepted = deliver_to_primary(request)
         except Exception:
             accepted = False
         if not accepted:
-            # Fixed sentence: never the URL, cookies or referrer, which the
-            # extension logs to the browser console.
-            return reply({"status": "error", "message": "Cove is not available"})
+            # Fixed sentences only, chosen by the fixed category the primary
+            # reported: never the URL, cookies or referrer, which the extension
+            # logs to the browser console.
+            return reply({
+                "status": "error",
+                "message": _HANDOFF_SENTENCES.get(
+                    _LAST_HANDOFF_REASON, _HANDOFF_UNAVAILABLE
+                ),
+            })
         return reply({"status": "ok", "message": "Download queued in Cove"})
 
     if action == "status":
