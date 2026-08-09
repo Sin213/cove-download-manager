@@ -408,7 +408,20 @@
     // for a transient media/blob URL: YouTube frequently replaces that media
     // element while its controls are being used.
     const pageUrl = extractorPageUrl() || location.href;
-    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo) || pageUrl;
+    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo);
+    if (!url) {
+      // Nothing resolvable: an MSE player whose src is a blob:, on a site that
+      // is not extractor-backed, before any stream has been seen on the wire.
+      // The page address used to stand in here, which could only ever fire for
+      // a site the extractor does not handle - an extractor-backed page is
+      // already the first term above. So the fallback never served its stated
+      // purpose and instead handed an ordinary HTML page to the downloader,
+      // which fetches a web page, or on a site that refuses unfamiliar clients
+      // fails with a bare 403 nobody can act on. Say so on the pill instead.
+      coveDiag("video_pill_result", "INFO", { result: "unsupported" }, requestId);
+      setPillState("error", "unsupported");
+      return;
+    }
     currentUrl = url;
 
     try {

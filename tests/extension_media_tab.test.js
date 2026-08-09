@@ -577,3 +577,71 @@ test("a diagnostics send failure never breaks a pill download", async () => {
   const download = harness.sent.find((m) => m.type === "downloadMedia");
   assert.ok(download, "the download must still be sent");
 });
+
+// ---------------------------------------------------------------------------
+// Unresolvable media
+//
+// A page can show a video whose address the content script cannot work out:
+// an MSE player whose src is a blob:, on a site that is not extractor-backed,
+// before any stream has been seen on the wire. The Reddit front page is the
+// case that surfaced this. There is nothing to download, and the page address
+// is not a substitute - handing an HTML page to aria2 downloads a web page or,
+// on a site that refuses unfamiliar clients, fails with a bare 403.
+// ---------------------------------------------------------------------------
+
+function blobVideo(options = {}) {
+  const video = stubVideo(options);
+  video.currentSrc = "blob:https://www.reddit.com/9c3f2f1e-0d4a-4c1e-8d2b";
+  video.src = "";
+  return video;
+}
+
+test("a video with no resolvable address does not fall back to the page", async () => {
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(
+    download, undefined,
+    "the page address must never be sent as if it were the media"
+  );
+});
+
+test("an unresolvable video reports why instead of failing at the backend", async () => {
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  const host = await clickPill(harness, video);
+
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  const label = pill.children[0];
+  assert.equal(label.textContent, "No video found");
+});
+
+test("an extractor-backed page still downloads from its page address", async () => {
+  // The fallback's stated purpose. YouTube replaces the media element while
+  // its controls are used, so the page address is the stable target - and it
+  // is reached through extractorPageUrl, not through the removed fallback.
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.ok(download, "a YouTube page must still be handed over");
+  assert.equal(download.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+});
