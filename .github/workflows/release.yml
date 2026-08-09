@@ -344,10 +344,11 @@ jobs:
           cat > "$NOTES_FILE" <<'NOTESEOF'
           ## What's new in 3.5.2
 
-          A correctness release. An audit of the codebase turned up twenty-one confirmed defects, and this fixes all of them. Nothing here is a new feature; several are problems you could hit without ever knowing why, which is the reason for shipping them on their own rather than folding them into the next feature release.
+          A correctness release. An audit of the codebase turned up twenty-one confirmed defects, and this fixes all of them, along with a contributed fix for Real-Debrid share links. Nothing here is a new feature; several are problems you could hit without ever knowing why, which is the reason for shipping them on their own rather than folding them into the next feature release.
 
           ### Fixed
 
+          - **Real-Debrid `/d/` links now download instead of being refused.** These are the standard unrestricted-link format Real-Debrid's own API hands back, and the API will unlock them again for the account that owns them - the same call Cove already makes for ordinary hoster links. Cove was turning them away with the message meant for account-bound share links. With a Real-Debrid account configured they now resolve and download; without one the refusal is unchanged, and AllDebrid `/f/` links still always refuse, because no API unlock exists for those. Direct delivery links are unaffected. Thanks to @kraibse.
           - **A removed download can no longer come back.** Cancelling an unfinished download asks aria2 to let go of it first, and only then clears the row - so a cancellation aria2 refuses leaves the download intact instead of losing track of a transfer that is still running. Quitting or crashing inside that window used to restore the download on the next launch and start it again; the row now records that it is on its way out, and startup finishes the job.
           - **Pause and resume no longer drift out of step with aria2.** Cove sends one pause or resume per download at a time and waits for the answer before sending another. Two commands issued together could be applied by aria2 in the opposite order to the one they were sent in, leaving a download running while Cove showed it paused, or paused while Cove showed it running, with nothing to correct it. Cove now compares what you asked for against what aria2 last reported and re-sends the difference.
           - **A download you paused stays paused across a restart.** Startup restored paused downloads as queued, so they resumed on their own.
