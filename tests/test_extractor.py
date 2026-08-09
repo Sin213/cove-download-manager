@@ -3,6 +3,7 @@ from cove.extractor import (
     is_extractor_url,
     parse_ytdlp_final_path,
     parse_ytdlp_progress,
+    write_cookie_jar,
     ytdlp_command,
 )
 
@@ -186,3 +187,65 @@ def test_a_direct_url_still_carries_its_cookies():
         cookies="session=abc",
     )
     assert "Cookie: session=abc" in cmd
+
+
+def test_a_cookie_jar_is_written_in_netscape_form(tmp_path):
+    """Reddit's extractor reads yt-dlp's jar, not the request headers.
+
+    `_is_logged_in` asks the cookiejar for `reddit_session`, so a header
+    passed with --add-header is invisible to it however correct the header is.
+    Only --cookies with a real jar file satisfies the check.
+    """
+    jar = tmp_path / "cookies.txt"
+    written = write_cookie_jar("reddit_session=abc123; token_v2=def456", jar)
+
+    assert written is True
+    lines = [l for l in jar.read_text().splitlines() if l and not l.startswith("#")]
+    assert len(lines) == 2
+    for line in lines:
+        fields = line.split("\t")
+        assert len(fields) == 7, fields
+        assert fields[0] == ".reddit.com"
+        assert fields[1] == "TRUE"      # include subdomains
+        assert fields[2] == "/"
+        assert fields[3] == "TRUE"      # https only
+    assert any(f.endswith("\treddit_session\tabc123") for f in lines)
+    assert any(f.endswith("\ttoken_v2\tdef456") for f in lines)
+
+
+def test_the_cookie_jar_is_not_readable_by_anyone_else(tmp_path):
+    """It holds live session cookies, so it must not be world readable."""
+    jar = tmp_path / "cookies.txt"
+    write_cookie_jar("reddit_session=abc123", jar)
+    assert oct(jar.stat().st_mode & 0o777) == "0o600"
+
+
+def test_an_empty_or_malformed_cookie_string_writes_nothing(tmp_path):
+    jar = tmp_path / "cookies.txt"
+    assert write_cookie_jar("", jar) is False
+    assert not jar.exists()
+    assert write_cookie_jar("novalue; ", jar) is False
+    assert not jar.exists()
+
+
+def test_a_cookie_value_containing_equals_survives(tmp_path):
+    # Base64 payloads end in "=" and must not be split on it.
+    jar = tmp_path / "cookies.txt"
+    write_cookie_jar("token=YWJjZGVm==", jar)
+    line = [l for l in jar.read_text().splitlines() if not l.startswith("#")][0]
+    assert line.endswith("\ttoken\tYWJjZGVm==")
+
+
+def test_the_jar_is_used_instead_of_a_cookie_header(tmp_path):
+    jar = tmp_path / "cookies.txt"
+    cmd = ytdlp_command(
+        "https://old.reddit.com/r/sub/comments/abc123/a_title/",
+        "/out/%(title)s.%(ext)s",
+        executable="/usr/bin/yt-dlp",
+        cookies="reddit_session=abc",
+        cookie_file=str(jar),
+    )
+    assert "--cookies" in cmd
+    assert cmd[cmd.index("--cookies") + 1] == str(jar)
+    # Sending both is pointless and re-triggers yt-dlp's deprecation warning.
+    assert not any("Cookie:" in part for part in cmd)

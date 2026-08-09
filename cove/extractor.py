@@ -16,6 +16,11 @@ _REDDIT_HOSTS = frozenset({
     "sh.reddit.com", "np.reddit.com",
 })
 _REDDIT_POST = re.compile(r"^/r/[^/]+/comments/[^/]+")
+# Cookie jars need an expiry per entry. The browser's own lifetimes are not
+# carried over the handoff, and the jar is deleted with the run's work
+# directory anyway, so a far-future stamp keeps yt-dlp from discarding a
+# session cookie as already expired.
+_COOKIE_EXPIRY = 2147483647
 _PROGRESS = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _SPEED = re.compile(r"\bat\s+(\d+(?:\.\d+)?)\s*([KMG]iB)/s", re.IGNORECASE)
 FINAL_PATH_MARKER = "__COVE_FINAL_FILE__:"
@@ -67,6 +72,46 @@ def resolve_ytdlp() -> str | None:
     return shutil.which("yt-dlp")
 
 
+def write_cookie_jar(cookies: str, path: Path) -> bool:
+    """Write a `name=value; ...` string as a yt-dlp cookie jar.
+
+    Reddit's extractor decides whether it is logged in by asking yt-dlp's
+    cookiejar for `reddit_session`, and a header passed with --add-header
+    never reaches that jar - so however correct the header is, the extractor
+    reports "Account authentication is required" and downloads nothing. Only
+    --cookies with a real file satisfies it.
+
+    Returns False when there was nothing usable to write, leaving no file
+    behind. The caller then runs without cookies rather than pointing yt-dlp
+    at an empty jar.
+
+    The file holds live session cookies, so it is created 0600 and belongs in
+    the task's private work directory, which is removed when the run ends.
+    """
+    if not cookies:
+        return False
+    lines = []
+    for pair in cookies.split(";"):
+        name, sep, value = pair.strip().partition("=")
+        if not sep or not name:
+            continue
+        lines.append(f".reddit.com\tTRUE\t/\tTRUE\t{_COOKIE_EXPIRY}\t{name}\t{value}")
+    if not lines:
+        return False
+    body = "# Netscape HTTP Cookie File\n" + "\n".join(lines) + "\n"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return False
+    return True
+
+
 def ytdlp_command(
     url: str,
     output_template: str,
@@ -75,6 +120,7 @@ def ytdlp_command(
     cookies: str = "",
     referrer: str = "",
     user_agent: str = "",
+    cookie_file: str = "",
 ) -> list[str]:
     cmd = [
         executable or resolve_ytdlp() or "yt-dlp",
@@ -99,7 +145,11 @@ def ytdlp_command(
     # callers outright, so yt-dlp reports "Account authentication is required"
     # and downloads nothing. Testing every extractor URL here swept Reddit into
     # a workaround written for one site's quirk.
-    if cookies and not is_youtube_url(url):
+    if cookie_file:
+        # A jar and a header are not interchangeable - see write_cookie_jar -
+        # and sending both only re-triggers yt-dlp's deprecation warning.
+        cmd += ["--cookies", cookie_file]
+    elif cookies and not is_youtube_url(url):
         cmd += ["--add-header", f"Cookie: {cookies}"]
     if referrer:
         cmd += ["--referer", referrer]
