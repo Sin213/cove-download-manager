@@ -645,3 +645,44 @@ test("an extractor-backed page still downloads from its page address", async () 
   assert.ok(download, "a YouTube page must still be handed over");
   assert.equal(download.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
 });
+
+test("an unresolvable video leaves the pill able to hide again", async () => {
+  // The early return that reports "No video found" must still clear the
+  // in-flight flag. deactivateVideo() refuses to run while a download is
+  // pending, so a flag left set pins the pill over the feed until the page is
+  // reloaded - and blocks every later click on it too.
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  const host = await clickPill(harness, video);
+
+  video.paused = true;
+  video.dispatch("pause", { target: video });
+  harness.runTimers();
+
+  assert.equal(host.style.display, "none", "the pill must be able to go away");
+});
+
+test("an unresolvable video does not wedge the pill against later clicks", async () => {
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  // The stream arrives on the wire after the first click, as it does when the
+  // player starts fetching. A second click must be able to act on it.
+  video.currentSrc = "https://v.redd.it/abc123/DASH_720.mp4";
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.ok(download, "the second click must be allowed through");
+  assert.equal(download.url, "https://v.redd.it/abc123/DASH_720.mp4");
+});

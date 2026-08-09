@@ -395,20 +395,24 @@
 
   async function onPillClick() {
     if (!pillEnabled || downloadPending) return;
-    downloadPending = true;
-    cancelHide();
-    setPillState("detecting");
+
+    // Extractor-backed sites are downloaded from their page URL. Do not wait
+    // for a transient media/blob URL: YouTube frequently replaces that media
+    // element while its controls are being used.
+    //
+    // Resolved before anything is claimed or displayed. Nothing is in flight
+    // yet, so the unresolvable case below can simply return: taking the
+    // in-flight flag first would mean every exit from here had to remember to
+    // release it, and deactivateVideo() refuses to run while that flag is set,
+    // so forgetting once pins the pill over the page until a reload.
+    const pageUrl = extractorPageUrl() || location.href;
+    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo);
 
     // Generated at the origin of the request so the same id can be followed
     // through the background, the native host and Cove itself.
     const requestId = newRequestId();
     coveDiag("video_download_requested", "INFO", { trigger: "pill" }, requestId);
 
-    // Extractor-backed sites are downloaded from their page URL. Do not wait
-    // for a transient media/blob URL: YouTube frequently replaces that media
-    // element while its controls are being used.
-    const pageUrl = extractorPageUrl() || location.href;
-    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo);
     if (!url) {
       // Nothing resolvable: an MSE player whose src is a blob:, on a site that
       // is not extractor-backed, before any stream has been seen on the wire.
@@ -422,6 +426,10 @@
       setPillState("error", "unsupported");
       return;
     }
+
+    downloadPending = true;
+    cancelHide();
+    setPillState("detecting");
     currentUrl = url;
 
     try {
