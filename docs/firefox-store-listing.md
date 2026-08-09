@@ -1,9 +1,9 @@
-# AMO listing - Cove Download Manager (Firefox) 1.4.6
+# AMO listing - Cove Download Manager (Firefox) 1.4.7
 
 Lives in `docs/` rather than `dist/`, which `scripts/build_extension.py`
 deletes on every build.
 
-Upload `dist/cove-firefox-1.4.6.zip` at
+Upload `dist/cove-firefox-1.4.7.zip` at
 <https://addons.mozilla.org/developers/>.
 
 The three blocks below map to the three AMO fields. They are plain text, not
@@ -48,9 +48,11 @@ You decide what it touches. Interception can be switched off with a keyboard sho
 
 Nothing is downloaded without an action you took, and the extension never collects or transmits your browsing history.
 
-What's new in version 1.4.6:
+What's new in version 1.4.7:
 
-Downloads on sites with very large cookie jars no longer fail. Cove's handoff puts a limit on the cookie header it accepts, and a big site's full set of cookies could exceed it, which made Cove refuse the whole download. The extension now sends the download without cookies rather than sending an oversized header, so the download still reaches Cove instead of failing outright. Cookies are never truncated, because half a cookie header authenticates nothing.
+The download button on videos is more accurate about what it can do. On a page where the video's address cannot be worked out, it now says "No video found" instead of quietly sending the page itself to Cove, which produced a download that failed for no visible reason. The button also stops getting stuck after that happens, and a video on a page with several players can no longer be sent using a different player's stream.
+
+Interception also cleans up after itself more reliably. A download the browser finished or cancelled while the extension was asleep used to stay on the tracking list for the rest of the session, which could misclassify a later download that reused the same id. And the toolbar badge now shows OFF whenever interception is disabled, instead of being overwritten by a count of videos found on the page.
 
 The free Cove Download Manager desktop app is required because it provides the download engine. Install Cove, launch it once, and then click "Test Connection to Cove" in the extension to link them.
 
@@ -61,16 +63,22 @@ https://github.com/Sin213/cove-download-manager
 ## Version -> Release Notes
 
 Shown on the add-on's detail page under this version. Keep it to what changed
-in 1.4.6 only.
+in 1.4.7 only.
 
 ```text
-Fixed: downloads on sites with very large cookie jars no longer fail.
+Fixed: the video download button no longer sends the page instead of the video.
 
-Cove's native handoff bounds the size of the cookie header it will accept. A large site's full cookie jar could exceed that bound, and Cove then refused the entire download rather than just the cookies. The extension now drops an oversized cookie header and sends the download without it, so the download still reaches Cove.
+On a page where the video's address cannot be determined - a player that streams through the browser rather than from a plain file address - the button used to fall back to sending the page's own address. Cove then tried to download a web page as if it were a video, which failed with an unhelpful error or, on sites that refuse unfamiliar clients, no explanation at all. The button now reports "No video found", which is the honest answer.
 
-The header is never truncated - half a cookie header authenticates nothing, so sending a partial one would fail in a more confusing way. Cookie handling is unchanged for every site under the limit, which is almost all of them.
+Fixed: the button no longer sticks on the page after that happens. It could previously stay pinned over the page until a reload, and ignore every later click.
 
-Requires the Cove desktop app 3.5.1 or later for the matching fix on the app side. Older app versions still work; they just keep rejecting the oversized case.
+Fixed: on a page with several video players, a player with no stream of its own can no longer be sent using the first player's stream. That produced a download that appeared to succeed and fetched the wrong video.
+
+Fixed: intercepted downloads are cleaned up even when the browser's completion event is missed, which can happen while the extension is suspended. A leftover entry used to persist for the whole session and could suppress or misclassify a later download that reused the same id.
+
+Fixed: the toolbar badge shows OFF while interception is disabled, rather than being replaced by a count of videos detected on the page.
+
+No permission changes in this version.
 ```
 
 ## Version -> Notes to Reviewer
@@ -84,24 +92,35 @@ The packaging step is a file copy and a zip, nothing more. scripts/build_extensi
 
 Every one of the 17 files in the uploaded XPI is byte-for-byte identical to its counterpart in the extension/ directory of the public repository. You can verify this by diffing the XPI contents against that directory.
 
-To reproduce the uploaded file exactly:
+To reproduce the uploaded file:
 
   git clone https://github.com/Sin213/cove-download-manager
   cd cove-download-manager
-  git checkout v3.5.1
   python scripts/build_extension.py
 
-This writes dist/cove-firefox-1.4.6.zip. Requires Python 3.9 or later, no other tooling. Only two files differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3) and the exclusion of video handling from the Chrome build.
+This writes dist/cove-firefox-1.4.7.zip. Requires Python 3.9 or later, no other tooling. Only two things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3) and the exclusion of video handling from the Chrome build.
 
 Public source: https://github.com/Sin213/cove-download-manager
 
-What changed in 1.4.6
+What changed in 1.4.7
 
-One change only, in extension/background.js: cookie collection was moved into a collectCookies() helper that returns an empty string when the assembled cookie header exceeds 32 KiB, instead of sending it.
+Five fixes, in two files. No new permissions, no new APIs, no new hosts.
 
-The reason is a bug report, not a feature. The companion desktop app bounds the cookie header it accepts over its local IPC socket (MAX_BROWSER_COOKIES_LENGTH in cove/single_instance.py, also 32 KiB) and rejected the whole download request when the header was larger. Users on cookie-heavy sites saw the download simply fail. The extension now declines to send an oversized header so the download proceeds without cookies rather than not at all. The header is never truncated, deliberately: a partial cookie header authenticates nothing.
+extension/content/media-tab.js - the in-page video button:
 
-No permissions were added or changed in this version.
+1. It no longer falls back to sending the page's own address when it cannot determine the video's address. On a player that streams through the browser (a blob: source with no separate stream visible on the page), there is genuinely nothing to download, and sending the page address made the desktop app fetch an HTML page as if it were a video. It now reports "No video found" and sends nothing.
+
+2. The in-flight flag is released when there is no video to send. It was previously set before the address was resolved and cleared only on a path that this case returned before reaching, so the button pinned itself over the page until a reload and rejected every later click.
+
+3. The lookup for a player's embedded stream address is now scoped to that player's own ancestors. It previously fell back to the first matching element anywhere in the document, so on a page with several players every one of them resolved to the first player's stream - a download that looked successful and fetched the wrong video.
+
+extension/background.js and extension/media.js - interception bookkeeping:
+
+4. Intercepted download ids are pruned against the browser's own download list. Cleanup previously depended entirely on catching a terminal onChanged event, which is missed when it races the insertion or fires while the extension is suspended. A leftover id persisted for the whole session and could suppress or misclassify a later event for a reused id. Writes to the persisted set are chained rather than fired independently, because two overlapping writes could complete out of order and resurrect ids that had just been cleared.
+
+5. The toolbar badge is rendered through a single function so the disabled OFF state takes priority over a media count. media.js previously painted the badge directly, which overwrote OFF and made a disabled extension look active.
+
+These are covered by tests/extension_background.test.js and tests/extension_media_tab.test.js in the repository, which run under node --test with no dependencies.
 
 How the add-on works
 
@@ -146,21 +165,31 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 | in-page pill ships on Firefox | `content/media-tab.js` and `.css` present in the bundle and registered in `content_scripts`, asserted by `tests/test_extension_bundle.py` |
 | extractor and HLS ship on Firefox | `media.js` present in the bundle, `manifest.background.scripts` loads it |
 | Alt+Shift+D toggle | `extension/manifest.json` `commands.toggle-intercept` |
-| 32 KiB cookie bound, both sides | `extension/background.js:317`, `cove/single_instance.py:51` |
-| cookie header dropped, never truncated | `extension/background.js` `collectCookies`, asserted by `tests/extension_background.test.js` |
+| "No video found" instead of the page address | `content/media-tab.js` `onPillClick`, guarded by `tests/extension_media_tab.test.js` |
+| the pill can hide again after that | `downloadPending` set only once an address resolves, guarded by the same file |
+| stream lookup is ancestor-scoped | `content/media-tab.js` `embeddedStreamUrl` uses `closest()` only |
+| intercepted ids pruned against the browser | `extension/background.js` `pruneInterceptedIds`, `tests/extension_background.test.js` |
+| badge OFF outranks a media count | `extension/media.js` calls `renderBadge` rather than painting directly |
 | diagnostics record no URLs or cookies | `tests/extension_diagnostics.test.js` |
-| bundle is a verbatim copy of `extension/` | `scripts/build_extension.py` `_copy_shared`; all 17 files verified sha256-identical |
+| bundle is a verbatim copy of `extension/` | `scripts/build_extension.py` `_copy_shared`; all 17 files verified sha256-identical for 1.4.7 |
+| no permission changes | `git diff af4afbc..HEAD -- extension/manifest.json` shows only the version line |
 
 ## Before submitting
 
-- Only `extension/background.js` changed since 1.4.5, so the feature bullets in
-  the description carry over unchanged. Only the "What's new" paragraph and the
-  release notes are new copy.
-- Screenshots do not need replacing. Unlike Chrome, this build still ships the
-  video pill, so existing pill screenshots remain accurate.
+- The feature bullets in the description carry over from 1.4.6 unchanged. Only
+  the "What's new" paragraph, the release notes, and the reviewer notes are new
+  copy for 1.4.7.
+- Screenshots do not need replacing. This build still ships the video pill, so
+  existing pill screenshots remain accurate.
 - `nativeMessaging`, `cookies`, `webRequest`, and `<all_urls>` are still
   requested and still need their justifications - they are reproduced in the
   reviewer notes above.
-- The reviewer notes claim the XPI matches `extension/` byte for byte. That
-  holds only for a bundle built from a clean checkout at the tagged commit.
-  Rebuild before uploading if the working tree has drifted.
+- **Not yet done: the manual load check.** Load `dist/firefox/` as a temporary
+  add-on and confirm two things by hand before uploading - right-clicking a
+  video offers "Download with Cove", and the in-page pill appears on hover.
+  This has been outstanding since `0be8c3e` changed the script load order and
+  no browser has executed the new layout yet. See the note in
+  `project-firefox-release-check`.
+- 1.4.7 carries extension fixes from `c445cb1` that were written before the
+  1.4.6 upload but never given a version bump, so the published 1.4.6 and the
+  repository's 1.4.6 source were not the same code. That is corrected here.
