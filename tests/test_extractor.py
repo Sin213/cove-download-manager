@@ -123,3 +123,26 @@ def test_command_omits_header_flags_when_absent():
 def test_parses_download_progress():
     result = parse_ytdlp_progress("[download]  42.5% of 10MiB at 2.00MiB/s ETA 00:03")
     assert result == {"percent": 42.5, "speed_bps": 2 * 1024**2}
+
+
+def test_reddit_post_urls_go_to_the_extractor():
+    assert is_extractor_url("https://www.reddit.com/r/aww/comments/abc123/a_title/")
+    assert is_extractor_url("https://reddit.com/r/aww/comments/abc123/a_title/")
+    assert is_extractor_url("https://old.reddit.com/r/aww/comments/abc123/a_title/")
+    assert is_extractor_url("https://new.reddit.com/r/aww/comments/abc123/a_title/")
+    assert is_extractor_url("https://sh.reddit.com/r/aww/comments/abc123/a_title/")
+    assert is_extractor_url("https://np.reddit.com/r/aww/comments/abc123/a_title/")
+    assert is_extractor_url("https://www.reddit.com/r/aww/comments/abc123")
+
+
+def test_non_post_reddit_urls_are_left_alone():
+    # The feed, a subreddit and a user page are pages, not videos.
+    assert not is_extractor_url("https://www.reddit.com/")
+    assert not is_extractor_url("https://www.reddit.com/r/aww/")
+    assert not is_extractor_url("https://www.reddit.com/r/aww")
+    assert not is_extractor_url("https://www.reddit.com/user/someone/")
+    # A direct media link is what the user asked for: download it as-is.
+    assert not is_extractor_url("https://v.redd.it/abc123/DASH_720.mp4")
+    assert not is_extractor_url("https://preview.redd.it/abc123.jpg")
+    # Not Reddit at all.
+    assert not is_extractor_url("https://reddit.com.evil.test/r/aww/comments/x/y/")

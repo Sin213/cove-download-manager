@@ -9,6 +9,13 @@ from urllib.parse import parse_qs, urlparse
 
 
 _YOUTUBE_PATH = re.compile(r"^/(?:shorts|live|embed)/[^/]+")
+# Reddit keeps DASH audio in a separate file from video, so a direct media
+# link downloads silent. yt-dlp resolves the post and muxes the two.
+_REDDIT_HOSTS = frozenset({
+    "reddit.com", "old.reddit.com", "new.reddit.com",
+    "sh.reddit.com", "np.reddit.com",
+})
+_REDDIT_POST = re.compile(r"^/r/[^/]+/comments/[^/]+")
 _PROGRESS = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
 _SPEED = re.compile(r"\bat\s+(\d+(?:\.\d+)?)\s*([KMG]iB)/s", re.IGNORECASE)
 FINAL_PATH_MARKER = "__COVE_FINAL_FILE__:"
@@ -20,6 +27,8 @@ def is_extractor_url(url: str) -> bool:
         host = (parsed.hostname or "").lower().removeprefix("www.")
         if host == "youtu.be":
             return bool(parsed.path.strip("/"))
+        if host in _REDDIT_HOSTS:
+            return bool(_REDDIT_POST.match(parsed.path))
         if host not in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
             return False
         if parsed.path == "/watch":
