@@ -825,3 +825,37 @@ test("a thread page sends the playlist and never the permalink", async () => {
   const download = harness.sent.find((m) => m.type === "downloadMedia");
   assert.equal(download.url, "https://v.redd.it/abc123/HLSPlaylist.m3u8");
 });
+
+test("a player does not borrow another player's stream", async () => {
+  // The fallback used to be document-wide, so on a page with several players
+  // every one of them resolved to the first player's stream - a download that
+  // looks like it worked and fetches the wrong video.
+  const owner = new StubNode("DIV");
+  owner["data-hls-url"] = "https://v.redd.it/first/HLSPlaylist.m3u8";
+  const ownerVideo = blobVideo({ top: -600 });
+  const bare = new StubNode("DIV");
+  const bareVideo = blobVideo({ top: 200 });
+
+  const harness = loadMediaTab({
+    href: "https://example.test/feed",
+    videos: [ownerVideo, bareVideo],
+  });
+  harness.body.appendChild(owner);
+  owner.appendChild(ownerVideo);
+  harness.body.appendChild(bare);
+  bare.appendChild(bareVideo);
+  // A real document finds the first matching element anywhere on the page,
+  // which is the whole hazard. The stub returns null by default, so without
+  // this the document-wide branch is never exercised at all.
+  harness.doc.querySelector = (selector) =>
+    selector === "[data-hls-url]" ? owner : null;
+
+  const host = await clickPill(harness, bareVideo);
+
+  assert.equal(
+    harness.sent.find((m) => m.type === "downloadMedia"), undefined,
+    "a player with no stream of its own must not claim one"
+  );
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  assert.equal(pill.children[0].textContent, "No video found");
+});

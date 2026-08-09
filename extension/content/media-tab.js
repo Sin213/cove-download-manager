@@ -66,8 +66,11 @@
     // Reddit's embed exposes both DASH and HLS URLs in the player container,
     // but normally requests only DASH. Prefer HLS because Cove can download
     // and merge that stream directly.
-    const player =
-      video.closest("[data-hls-url]") || document.querySelector("[data-hls-url]");
+    //
+    // Ancestor-scoped on purpose. A document-wide lookup returns the first
+    // player on the page, so on a feed every video resolved to the first
+    // post's stream and downloaded the wrong video with no sign of error.
+    const player = video.closest("[data-hls-url]");
     const hlsUrl = player ? player.getAttribute("data-hls-url") : "";
     return isHttpUrl(hlsUrl) ? hlsUrl : "";
   }
