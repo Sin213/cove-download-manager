@@ -16,6 +16,8 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import stat
 import struct
 import tempfile
 import time
@@ -94,15 +96,114 @@ def server_name(data_dir: "str | Path") -> str:
     return f"cove-{digest[:16]}"
 
 
+class ElectionUnavailable(RuntimeError):
+    """Election could not be decided, and not because a peer holds the lock.
+
+    Raised when the lock file cannot be opened at all - wrong owner, wrong
+    permissions, or not a regular file. Kept distinct from ordinary contention
+    because the two demand opposite responses: contention means "forward to the
+    running Cove", while this means "something is wrong with the lock itself",
+    and treating it as contention lets anyone who can plant that file stop Cove
+    from starting.
+    """
+
+
+def _election_dir() -> Path:
+    """A private, per-user directory for election state.
+
+    `XDG_RUNTIME_DIR` is the right home for this - it is already per-user and
+    mode 0700 - with a per-uid subdirectory of the temp dir as the fallback for
+    platforms and sessions that do not set it. Never the shared temp directory
+    itself: a predictable path there is one any local user can pre-create.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime:
+        base = Path(runtime) / "cove"
+    else:
+        try:
+            uid = os.getuid()
+        except AttributeError:  # Windows: the temp dir is already per-user
+            uid = os.environ.get("USERNAME", "user")
+        base = Path(tempfile.gettempdir()) / f"cove-{uid}"
+    _ensure_private_dir(base)
+    return base
+
+
+def _ensure_private_dir(base: Path) -> None:
+    """Create `base` as a private directory, refusing anything pre-planted.
+
+    The temp-dir fallback is a predictable path inside a world-writable
+    directory, so it may already exist as a symlink another local user planted.
+    Both `mkdir(exist_ok=True)` and `chmod` follow symlinks: the first would
+    silently accept the redirection, and the second would change the mode of
+    whatever target the attacker chose. So the directory is validated with
+    `lstat` before either is trusted.
+    """
+    try:
+        os.mkdir(base, 0o700)
+        return
+    except FileExistsError:
+        pass
+    except OSError as exc:
+        raise ElectionUnavailable(f"cannot create {base}") from exc
+
+    try:
+        info = os.lstat(base)
+    except OSError as exc:
+        raise ElectionUnavailable(f"cannot inspect {base}") from exc
+    if not stat.S_ISDIR(info.st_mode):
+        # Covers a symlink, a regular file, a fifo - anything but a directory.
+        raise ElectionUnavailable(f"{base} is not a directory")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ElectionUnavailable(f"{base} belongs to another user")
+    if os.name == "posix" and stat.S_IMODE(info.st_mode) != 0o700:
+        # Safe now: verified to be a real directory that we own, which another
+        # user cannot swap for a symlink.
+        try:
+            os.chmod(base, 0o700)
+        except OSError as exc:
+            raise ElectionUnavailable(f"cannot secure {base}") from exc
+
+
 def _election_lock_path(name: str) -> Path:
     """Path for the short-lived mutex serializing election for `name`.
 
     Deliberately separate from the socket path itself (and from any
     per-install data directory, which may not exist yet this early in
-    startup) - a plain OS temp-dir file keyed by the already-bounded,
-    already-hashed `name`.
+    startup) - a file keyed by the already-bounded, already-hashed `name`,
+    inside this user's private election directory.
     """
-    return Path(tempfile.gettempdir()) / f"{name}.election.lock"
+    return _election_dir() / f"{name}.election.lock"
+
+
+def _election_lock_is_unusable(path: Path) -> bool:
+    """Whether a failed tryLock means the file itself is unusable.
+
+    QLockFile reports `LockFailedError` for every failure - a live holder, a
+    permission denial, a directory in the way - so its own error code cannot
+    tell contention from a planted file. The path has to be inspected instead.
+
+    Contention is the expected case and must stay cheap and non-destructive:
+    opening O_RDWR neither truncates nor writes, and a lock a peer legitimately
+    holds is still openable.
+    """
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        # Nothing is in the way, so the failure was not about this file. If we
+        # cannot even create it here, the directory is the problem.
+        return not os.access(path.parent, os.W_OK | os.X_OK)
+    except OSError:
+        return True
+    if not stat.S_ISREG(info.st_mode):
+        return True                      # symlink, directory, fifo, socket
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        return True                      # someone else's file under our name
+    try:
+        os.close(os.open(path, os.O_RDWR))
+    except OSError:
+        return True
+    return False
 
 
 def _is_control_free(value: str) -> bool:
@@ -549,9 +650,16 @@ class SingleInstanceServer(QObject):
         later probe correctly finds it alive.
         """
         self._name = name
-        election_lock = QLockFile(str(_election_lock_path(name)))
+        lock_path = _election_lock_path(name)
+        election_lock = QLockFile(str(lock_path))
         election_lock.setStaleLockTime(_ELECTION_LOCK_STALE_MS)
         if not election_lock.tryLock(_ELECTION_LOCK_TIMEOUT_MS):
+            if _election_lock_is_unusable(lock_path):
+                # Not contention: reporting a running peer here would send the
+                # user's launch to an instance that does not exist.
+                raise ElectionUnavailable(
+                    f"the election lock at {lock_path} could not be opened"
+                )
             return False  # another launch is mid-election for this name right now
 
         try:

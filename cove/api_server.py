@@ -227,14 +227,34 @@ class QueueApiBridge(QObject):
         if QThread.currentThread() is self.thread():
             self._execute(request)
         else:
+            # One deadline for the whole request. The second phase used to be
+            # an unbounded wait, so a GUI handler that started but never
+            # finished - a blocked GUI, a stalled modal, a hung callback -
+            # pinned this worker and its client connection forever.
+            deadline = time.monotonic() + self.timeout
             self._dispatch.emit(request)
             if not request.event.wait(self.timeout):
                 # A timed-out request must never mutate the queue afterwards:
                 # abandon it so _execute() skips it. If execution already
-                # started, wait for the outcome so the response stays truthful.
+                # started, give it the rest of the deadline to produce a
+                # truthful answer, then stop waiting either way.
                 if request.abandon():
                     raise _problem(503, "bridge_timeout", "Cove's main thread did not answer in time.")
-                request.event.wait()
+                remaining = max(0.0, deadline - time.monotonic())
+                if not request.event.wait(remaining):
+                    # Started but unfinished. A Qt slot on the GUI thread cannot
+                    # be cancelled mid-flight, so an add/pause/resume/cancel may
+                    # still commit after this returns. Reporting a plain timeout
+                    # would invite a retry that duplicates it, so this is a
+                    # deliberately distinct code: the request was not refused,
+                    # its outcome is unknown, and the caller must re-read state
+                    # rather than repeat the call.
+                    raise _problem(
+                        503, "bridge_outcome_unknown",
+                        "Cove's main thread is still busy with this request. It "
+                        "may still complete - check the download list before "
+                        "retrying.",
+                    )
         if request.error is not None:
             raise request.error
         return request.result
@@ -250,8 +270,23 @@ class QueueApiBridge(QObject):
         finally:
             request.event.set()
 
+    def _is_removed(self, task_id: int) -> bool:
+        """Whether the API should still pretend a cancelled task is gone.
+
+        Cancellation is only final once aria2 confirms it. If aria2 refuses,
+        the queue puts the task back and it is live again - so the id has to
+        stop being masked here too, or the task would stay 404 to the API for
+        the rest of the session while the window shows it downloading.
+        """
+        if task_id not in self._removed_task_ids:
+            return False
+        if task_id not in self.queue.tasks or self.queue.is_pending_removal(task_id):
+            return True
+        self._removed_task_ids.discard(task_id)
+        return False
+
     def _task(self, task_id: int) -> DownloadTask:
-        if task_id in self._removed_task_ids:
+        if self._is_removed(task_id):
             raise _problem(404, "task_not_found", f"No Cove task has ID {task_id}.")
         task = self.queue.tasks.get(task_id)
         if task is None:
@@ -283,7 +318,8 @@ class QueueApiBridge(QObject):
             return task_snapshot(self._task(task_id))
         if action == "list":
             tasks = sorted(
-                (task for task in self.queue.tasks.values() if task.id not in self._removed_task_ids),
+                (task for task in self.queue.tasks.values()
+                 if not self._is_removed(task.id)),
                 key=lambda task: (task.created_at, task.id),
             )
             return [task_snapshot(task) for task in tasks]

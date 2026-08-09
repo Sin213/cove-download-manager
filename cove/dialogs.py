@@ -103,6 +103,50 @@ class _AccountTest(QRunnable):
         self.signals.finished.emit()
 
 
+class _MagnetProbe(QRunnable):
+    """Run one magnet-handler call off the GUI thread.
+
+    `status()`, `enable()` and `disable()` all shell out to xdg-mime and the
+    desktop-database tools, each bounded at several seconds. Called directly
+    from the GUI thread - which is where the Settings dialog and its buttons
+    live - that is several seconds of a window that does not repaint or accept
+    input. Same shape as _AccountTest above, including autoDelete(False) so the
+    signal carrier outlives any queued cross-thread call.
+    """
+
+    class _Sig(QObject):
+        done = Signal(object)
+        finished = Signal()
+
+    def __init__(self, fn):
+        super().__init__()
+        self.setAutoDelete(False)
+        self.signals = self._Sig()
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn()
+        except Exception:
+            # Best-effort by design: a magnet association is never worth
+            # surfacing a traceback into Settings.
+            result = None
+        self.signals.done.emit(result)
+        self.signals.finished.emit()
+
+
+# Pins in-flight probes for the same reason _INFLIGHT_ACCOUNT_TESTS does.
+_INFLIGHT_MAGNET_PROBES = set()
+
+
+def _run_magnet_probe(fn, on_done) -> None:
+    call = _MagnetProbe(fn)
+    _INFLIGHT_MAGNET_PROBES.add(call)
+    call.signals.done.connect(on_done)
+    call.signals.finished.connect(lambda c=call: _INFLIGHT_MAGNET_PROBES.discard(c))
+    QThreadPool.globalInstance().start(call)
+
+
 def _make_buttons(parent: QDialog, ok_text: str = "Save") -> QDialogButtonBox:
     bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     ok = bb.button(QDialogButtonBox.Ok)
@@ -631,15 +675,24 @@ class SettingsDialog(QDialog):
         # checkbox: on Windows a checkbox would stay ticked after the user
         # closed Settings without choosing Cove, stating something false.
         from . import magnet_handler
+        from . import magnet_identity
         from .magnet_identity import WINDOWS_PORTABLE, WINDOWS_SETUP
 
         self._magnet_handler = magnet_handler
-        magnet_state = magnet_handler.status()
-        self.magnet_status_label = QLabel(self._magnet_status_text(magnet_state))
+        # Serialises the magnet operations and identifies which one owns the
+        # controls; a callback carrying a stale token is dropped.
+        self._magnet_op = 0
+        # Probed off the GUI thread: status() shells out with a five-second
+        # timeout, which is five seconds of a frozen Settings window if it runs
+        # here. The controls stay disabled until the answer lands, so nothing
+        # can be acted on before its state is known.
+        self.magnet_status_label = QLabel("Status: checking\u2026")
         self.magnet_status_label.setProperty("role", "muted")
         self.magnet_status_label.setWordWrap(True)
 
-        is_windows = magnet_state.identity in (WINDOWS_SETUP, WINDOWS_PORTABLE)
+        # build_identity() only inspects the environment and the executable
+        # path - no subprocess - so the button label needs no probe.
+        is_windows = magnet_identity.build_identity() in (WINDOWS_SETUP, WINDOWS_PORTABLE)
         self.magnet_action_btn = QPushButton(
             "Choose Cove as default" if is_windows else "Make Cove default"
         )
@@ -662,14 +715,13 @@ class SettingsDialog(QDialog):
         magnet_box.addWidget(self.magnet_repair_check)
         form.addRow("Magnet links", magnet_box)
 
-        if not magnet_state.supported:
-            self.magnet_action_btn.setEnabled(False)
-            self.magnet_remove_btn.setEnabled(False)
-            self.magnet_repair_check.setEnabled(False)
-            self.magnet_repair_check.setChecked(False)
+        self.magnet_action_btn.setEnabled(False)
+        self.magnet_remove_btn.setEnabled(False)
+        self.magnet_repair_check.setEnabled(False)
 
         self.magnet_action_btn.clicked.connect(self._on_magnet_enable)
         self.magnet_remove_btn.clicked.connect(self._on_magnet_disable)
+        self._refresh_magnet_status()
 
         self.smart_segments = QCheckBox("Auto-tune connections based on server support")
         self.smart_segments.setChecked(settings.intelligent_segments)
@@ -1076,14 +1128,68 @@ class SettingsDialog(QDialog):
             return "Status: Registered, but not currently selected as default"
         return "Status: Not registered"
 
-    def _refresh_magnet_status(self) -> None:
-        self.magnet_status_label.setText(
-            self._magnet_status_text(self._magnet_handler.status())
+    def _begin_magnet_op(self) -> int:
+        """Claim the magnet controls for one operation, returning its token.
+
+        Registration and removal both rewrite the same association, so they
+        must never overlap - and a control left disabled by a failed probe
+        would strand the user with no way to retry. Every path back out goes
+        through _on_magnet_status, which restores the controls.
+        """
+        self._magnet_op += 1
+        self.magnet_action_btn.setEnabled(False)
+        self.magnet_remove_btn.setEnabled(False)
+        self.magnet_repair_check.setEnabled(False)
+        return self._magnet_op
+
+    def _refresh_magnet_status(self, token: int | None = None) -> None:
+        if token is None:
+            token = self._begin_magnet_op()
+        _run_magnet_probe(
+            self._magnet_handler.status,
+            lambda state, t=token: self._on_magnet_status(t, state),
         )
 
+    def _on_magnet_status(self, token: int, state) -> None:
+        """Apply a probe result. Never called on the worker thread.
+
+        A result from a superseded operation is dropped: the newer one owns
+        the controls and will report its own outcome.
+        """
+        if token != self._magnet_op:
+            return
+        if state is None:
+            # The probe failed, so the real state is unknown. Re-enable the
+            # controls rather than leaving the user unable to try again.
+            self.magnet_status_label.setText("Status: could not be determined")
+            self.magnet_action_btn.setEnabled(True)
+            self.magnet_remove_btn.setEnabled(True)
+            self.magnet_repair_check.setEnabled(True)
+            return
+        self.magnet_status_label.setText(self._magnet_status_text(state))
+        self.magnet_action_btn.setEnabled(state.supported)
+        self.magnet_remove_btn.setEnabled(state.supported)
+        self.magnet_repair_check.setEnabled(state.supported)
+        if not state.supported:
+            self.magnet_repair_check.setChecked(False)
+
     def _on_magnet_enable(self) -> None:
-        result = self._magnet_handler.enable()
-        self._refresh_magnet_status()
+        # enable() runs xdg-mime too, so it goes off-thread for the same reason
+        # the status probe does. All the magnet controls are disabled meanwhile,
+        # so a removal cannot race a registration over the same association.
+        token = self._begin_magnet_op()
+        _run_magnet_probe(
+            self._magnet_handler.enable,
+            lambda result, t=token: self._on_magnet_enabled(t, result),
+        )
+
+    def _on_magnet_enabled(self, token: int, result) -> None:
+        if token != self._magnet_op:
+            return
+        # Re-probe under the same token so the controls come back exactly once.
+        self._refresh_magnet_status(token)
+        if result is None:
+            return
         if not result.ok:
             if result.message:
                 QMessageBox.information(self, "Magnet links", result.message)
@@ -1095,8 +1201,18 @@ class SettingsDialog(QDialog):
             QDesktopServices.openUrl(QUrl(url))
 
     def _on_magnet_disable(self) -> None:
-        result = self._magnet_handler.disable()
-        self._refresh_magnet_status()
+        token = self._begin_magnet_op()
+        _run_magnet_probe(
+            self._magnet_handler.disable,
+            lambda result, t=token: self._on_magnet_disabled(t, result),
+        )
+
+    def _on_magnet_disabled(self, token: int, result) -> None:
+        if token != self._magnet_op:
+            return
+        self._refresh_magnet_status(token)
+        if result is None:
+            return
         if not result.ok and result.message:
             QMessageBox.information(self, "Magnet links", result.message)
             return

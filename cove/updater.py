@@ -23,9 +23,11 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import threading
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -262,34 +264,147 @@ class UpdateCheckWorker(QObject):
 
 
 class DownloadWorker(QObject):
+    """Fetches the release manifest, then the asset, on one worker thread.
+
+    The manifest used to be fetched synchronously from the GUI thread, which
+    froze the whole interface for the length of its timeout and - because it
+    took a different code path from the asset download - ignored the user's
+    configured network interface. Both requests now go through this one
+    interface-aware worker, so they cannot diverge.
+    """
+
     progress = Signal(int)
     finished = Signal(str)
     failed = Signal(str)
+    # The release does not ship a usable digest: "unreachable" (the manifest
+    # could not be fetched) or "no_digest" (it holds none for our asset).
+    # Reported separately from `failed` because neither is a download error and
+    # each has its own user-facing outcome.
+    manifestFailed = Signal(str)
+    digestResolved = Signal(str)
 
-    def __init__(self, url: str, dest: Path, repo: str, iface: str = ""):
+    def __init__(
+        self,
+        url: str,
+        dest: Path,
+        repo: str,
+        iface: str = "",
+        checksum_url: str = "",
+        asset_name: str = "",
+    ):
         super().__init__()
         self._url = url
         self._dest = dest
         self._repo = repo
         self._iface = iface
-        self._cancelled = False
+        self._checksum_url = checksum_url
+        self._asset_name = asset_name
+        # Shared state, not a queued slot call: this worker's thread is busy
+        # inside run() for the whole transfer, so anything delivered through
+        # its event queue could not be seen until the transfer had finished -
+        # which is precisely when cancelling stops being useful.
+        self._cancel = threading.Event()
+        # The response currently being read, so cancel() can close it. Setting
+        # the event alone only takes effect between reads; a worker blocked
+        # inside one - waiting on a stalled manifest or a dead connection -
+        # would otherwise ignore Cancel for the whole socket timeout.
+        self._active_response = None
+        self._response_lock = threading.Lock()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
 
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancel.set()
+        self._interrupt_active_response()
+
+    def _interrupt_active_response(self) -> None:
+        """Break the worker out of a blocked read, from the GUI thread.
+
+        `close()` cannot do this job here. It takes the buffered reader's lock,
+        which the worker holds for the whole of a read - so calling it from the
+        GUI thread freezes the interface until that read returns or the socket
+        times out, which is 8 or 20 seconds of exactly the hang Cancel exists
+        to avoid. `shutdown()` takes no lock and is what actually makes the
+        blocked read return.
+
+        The private attribute walk is deliberate: urllib exposes no supported
+        route to the socket, and every step is guarded so a stack that does not
+        match simply falls through to the close below.
+        """
+        with self._response_lock:
+            response, self._active_response = self._active_response, None
+        if response is None:
+            return
+        try:
+            raw = getattr(getattr(response, "fp", None), "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        # The close can still block behind the read the shutdown just broke,
+        # so it never runs on the caller's thread.
+        threading.Thread(
+            target=self._quietly_close, args=(response,), daemon=True
+        ).start()
+
+    @staticmethod
+    def _quietly_close(response) -> None:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+    def _close_active_response(self) -> None:
+        """Release the response from the worker thread, where blocking is fine."""
+        with self._response_lock:
+            response, self._active_response = self._active_response, None
+        if response is not None:
+            self._quietly_close(response)
+
+    def _open(self, url: str, timeout: float):
+        """Open a request, refusing to start one that is already cancelled.
+
+        Note the residual gap: once `bound_urlopen` is entered, a cancel
+        arriving during DNS, connect or TLS cannot interrupt it - there is no
+        socket to close yet - so it takes effect when the socket timeout
+        expires. Closing that gap means replacing urllib with a stack that
+        exposes the socket during establishment, which is more machinery than
+        a Cancel button warrants. Every phase is bounded by `timeout`.
+        """
+        if self._cancel.is_set():
+            raise RuntimeError("cancelled")
+        req = urllib.request.Request(
+            url, headers={"User-Agent": f"{self._repo.split('/')[-1]}-updater"},
+        )
+        return self._track(
+            netiface.bound_urlopen(req, name=self._iface, timeout=timeout)
+        )
+
+    def _track(self, response):
+        """Register a response so cancel() can interrupt a read on it."""
+        with self._response_lock:
+            if self._cancel.is_set():
+                response.close()
+                raise RuntimeError("cancelled")
+            self._active_response = response
+        return response
 
     def run(self) -> None:
+        if self._checksum_url and not self._resolve_digest():
+            return
         try:
-            req = urllib.request.Request(
-                self._url,
-                headers={"User-Agent": f"{self._repo.split('/')[-1]}-updater"},
-            )
-            with netiface.bound_urlopen(req, name=self._iface, timeout=20) as resp:
+            if self._cancel.is_set():
+                raise RuntimeError("cancelled")
+            with self._open(self._url, 20) as resp:
                 total = int(resp.headers.get("Content-Length") or 0)
                 written = 0
                 self._dest.parent.mkdir(parents=True, exist_ok=True)
                 with open(self._dest, "wb") as f:
                     while True:
-                        if self._cancelled:
+                        if self._cancel.is_set():
                             raise RuntimeError("cancelled")
                         chunk = resp.read(262144)
                         if not chunk:
@@ -298,6 +413,12 @@ class DownloadWorker(QObject):
                         written += len(chunk)
                         if total > 0:
                             self.progress.emit(int(written * 100 / total))
+            if self._cancel.is_set():
+                # A Cancel that lands during the final read finds the loop
+                # already leaving through its normal exit, with nothing left to
+                # interrupt. Without this the worker reports success and the
+                # controller installs the update the user just called off.
+                raise RuntimeError("cancelled")
             self.finished.emit(str(self._dest))
         except Exception as exc:
             try:
@@ -305,6 +426,46 @@ class DownloadWorker(QObject):
             except Exception:
                 pass
             self.failed.emit(str(exc))
+        finally:
+            self._close_active_response()
+
+    def _fetch_manifest(self) -> str | None:
+        """The checksum manifest, read so that Cancel can interrupt it.
+
+        Deliberately not `fetch_text()`: that owns its response, so a Cancel
+        arriving mid-request could not be acted on until the socket timeout
+        expired. Same interface binding and headers, just a response this
+        worker can close from the GUI thread.
+        """
+        response = self._open(self._checksum_url, 8.0)
+        try:
+            return response.read().decode("utf-8", errors="replace")
+        finally:
+            self._close_active_response()
+
+    def _resolve_digest(self) -> bool:
+        """Recover this asset's expected SHA-256 before transferring anything.
+
+        Returns False when the release cannot be verified, having reported why.
+        Nothing is downloaded in that case: an unverifiable binary is one Cove
+        would refuse to install anyway.
+        """
+        try:
+            manifest = self._fetch_manifest()
+        except Exception:
+            manifest = None
+        if self._cancel.is_set():
+            self.failed.emit("cancelled")
+            return False
+        if manifest is None:
+            self.manifestFailed.emit("unreachable")
+            return False
+        digest = parse_sha256_manifest(manifest, self._asset_name)
+        if not digest:
+            self.manifestFailed.emit("no_digest")
+            return False
+        self.digestResolved.emit(digest)
+        return True
 
 
 def swap_in_appimage(new_path: Path) -> Path:
@@ -467,27 +628,11 @@ class UpdateController(QObject):
         dest = cache / info.asset_name
         self._pending_info = info
 
-        # Fetch + parse the manifest first; if we can't recover the digest
-        # for our asset, bail before transferring the binary.
-        manifest = fetch_text(info.checksum_url, self._repo)
-        if manifest is None:
-            QMessageBox.warning(
-                self._parent,
-                "Update aborted",
-                "Couldn't download the checksum manifest. Try again later.",
-            )
-            return
-        expected = parse_sha256_manifest(manifest, info.asset_name)
-        if not expected:
-            QMessageBox.warning(
-                self._parent,
-                "Update aborted",
-                f"The release manifest doesn't contain a digest for "
-                f"{info.asset_name}. Cove won't install unverified binaries.",
-            )
-            _open_url(info.release_url)
-            return
-        self._expected_digest = expected
+        # The manifest is fetched by the worker, not here: doing it on this
+        # thread froze the window for the length of its timeout and bypassed
+        # the configured network interface. The digest arrives via
+        # digestResolved before any bytes of the asset are written.
+        self._expected_digest = None
 
         self._progress = QProgressDialog(
             f"Downloading {info.asset_name}…", "Cancel", 0, 100, self._parent,
@@ -499,12 +644,22 @@ class UpdateController(QObject):
         self._progress.setValue(0)
 
         thread = QThread(self)
-        worker = DownloadWorker(info.asset_url, dest, self._repo, iface=self._iface)
+        worker = DownloadWorker(
+            info.asset_url, dest, self._repo, iface=self._iface,
+            checksum_url=info.checksum_url, asset_name=info.asset_name,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
-        self._progress.canceled.connect(worker.cancel)
+        worker.manifestFailed.connect(thread.quit)
+        # Direct, deliberately: the worker owns `thread`, whose event loop is
+        # occupied by run() for the whole transfer. A queued call would sit
+        # behind the very download it is meant to interrupt. cancel() only
+        # sets a threading.Event, which is safe to touch from this thread.
+        self._progress.canceled.connect(worker.cancel, Qt.DirectConnection)
+        worker.digestResolved.connect(self._on_digest_resolved, Qt.QueuedConnection)
+        worker.manifestFailed.connect(self._on_manifest_failed, Qt.QueuedConnection)
         worker.progress.connect(self._progress.setValue, Qt.QueuedConnection)
         worker.finished.connect(self._on_downloaded, Qt.QueuedConnection)
         worker.failed.connect(self._on_download_failed, Qt.QueuedConnection)
@@ -513,10 +668,47 @@ class UpdateController(QObject):
         self._download_worker = worker
         thread.start()
 
+    def _on_digest_resolved(self, digest: str) -> None:
+        self._expected_digest = digest
+
+    def _on_manifest_failed(self, reason: str) -> None:
+        """The release cannot be verified, so nothing was downloaded."""
+        if self._progress is not None:
+            self._progress.close()
+        info = self._pending_info
+        if reason == "no_digest":
+            QMessageBox.warning(
+                self._parent,
+                "Update aborted",
+                f"The release manifest doesn't contain a digest for "
+                f"{info.asset_name if info else 'this release'}. Cove won't "
+                f"install unverified binaries.",
+            )
+            if info is not None:
+                _open_url(info.release_url)
+            return
+        QMessageBox.warning(
+            self._parent,
+            "Update aborted",
+            "Couldn't download the checksum manifest. Try again later.",
+        )
+
     def _on_downloaded(self, path: str) -> None:
         if self._progress is not None:
             self._progress.close()
         downloaded = Path(path)
+
+        # Second gate on cancellation, at the boundary that matters: past here
+        # the executable is replaced and Cove relaunches. The worker checks
+        # too, but this signal is queued, so a Cancel can arrive after it was
+        # emitted and before it is delivered.
+        worker = self._download_worker
+        if worker is not None and worker.cancelled:
+            try:
+                downloaded.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
 
         # Integrity gate. The asset must hash to the digest we recovered
         # from the release's SHA256SUMS manifest, or we delete it and bail.
@@ -570,7 +762,7 @@ class UpdateController(QObject):
         if self._progress is not None:
             self._progress.close()
         worker = self._download_worker
-        if worker is not None and worker._cancelled:
+        if worker is not None and worker.cancelled:
             # User-initiated cancel is not a failure; no error dialog.
             return
         QMessageBox.warning(

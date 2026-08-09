@@ -8,9 +8,12 @@ calls only service that socket's own descriptor, so a same-thread client
 would starve the server's newConnection/readyRead notifications.
 """
 import json
+import os
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +21,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QCoreApplication
 
+from cove import single_instance
 from cove.single_instance import (
     MAX_BROWSER_COOKIES_LENGTH,
     MAX_MESSAGE_BYTES,
@@ -1177,3 +1181,103 @@ def test_client_reports_only_fixed_reply_categories(reply, expected):
     from cove.single_instance import reply_category
 
     assert reply_category(reply) == expected
+
+
+# --- election lock location and failure classes ----------------------------
+
+
+def test_election_lock_lives_in_a_private_per_user_directory(tmp_path, monkeypatch):
+    """The lock must not sit at a predictable path in the shared temp dir.
+
+    Another local user could pre-create it with ownership or permissions that
+    stop Cove opening it, and a failed open was read as "another instance is
+    running" - so an unprivileged user could keep someone else out of Cove.
+    """
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    (tmp_path / "run").mkdir()
+
+    path = single_instance._election_lock_path("cove-abc123")
+
+    assert path.parent != Path(tempfile.gettempdir())
+    assert path.parent.is_dir()
+    if os.name == "posix":
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+def test_election_lock_directory_is_per_user_when_there_is_no_runtime_dir(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    path = single_instance._election_lock_path("cove-abc123")
+
+    assert path.parent != tmp_path, "must not be the shared temp dir itself"
+    assert tmp_path in path.parents
+    if os.name == "posix":
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership semantics")
+def test_an_unopenable_election_lock_is_not_reported_as_a_running_instance(
+    tmp_path, monkeypatch
+):
+    """Permission denied is a configuration fault, not a live peer.
+
+    Treating it as a peer makes Cove forward to nothing and exit, which is the
+    denial-of-startup this distinction exists to prevent.
+    """
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))
+    (tmp_path / "run").mkdir()
+    lock_path = single_instance._election_lock_path("cove-abc123")
+    lock_path.write_text("")
+    os.chmod(lock_path, 0o000)
+
+    if os.access(lock_path, os.W_OK):
+        pytest.skip("running as a user that ignores mode bits (root?)")
+
+    server = single_instance.SingleInstanceServer()
+    with pytest.raises(single_instance.ElectionUnavailable):
+        server.try_become_primary("cove-abc123")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlink semantics")
+def test_a_symlinked_election_directory_is_refused(tmp_path, monkeypatch):
+    """The fallback path is predictable and sits somewhere world-writable.
+
+    mkdir(exist_ok=True) and chmod both follow symlinks, so a pre-planted link
+    would redirect the lock and hand an attacker a chmod on a target of their
+    choosing.
+    """
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    target = tmp_path / "attacker"
+    target.mkdir(mode=0o755)
+    (tmp_path / f"cove-{os.getuid()}").symlink_to(target)
+
+    with pytest.raises(single_instance.ElectionUnavailable):
+        single_instance._election_lock_path("cove-abc123")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755, "chmod followed the link"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ownership semantics")
+def test_a_non_directory_at_the_election_path_is_refused(tmp_path, monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    (tmp_path / f"cove-{os.getuid()}").write_text("not a directory")
+
+    with pytest.raises(single_instance.ElectionUnavailable):
+        single_instance._election_lock_path("cove-abc123")
+
+
+def test_an_existing_private_directory_is_reused(tmp_path, monkeypatch):
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    first = single_instance._election_lock_path("cove-abc123")
+    second = single_instance._election_lock_path("cove-abc123")
+
+    assert first == second
+    if os.name == "posix":
+        assert stat.S_IMODE(first.parent.stat().st_mode) == 0o700

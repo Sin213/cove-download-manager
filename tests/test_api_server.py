@@ -420,11 +420,15 @@ def test_bridge_cancel_never_deletes_and_hides_inflight_task_immediately():
                 )
             }
             self.remove_call = None
+            self.pending_removal = True
 
         def remove(self, task_id, delete_file=False, keep_incomplete=False):
             self.remove_call = (task_id, delete_file, keep_incomplete)
             # QueueManager deliberately retains an add-in-flight task until
             # its gid arrives; the API must still hide it immediately.
+
+        def is_pending_removal(self, task_id):
+            return self.pending_removal
 
     queue = FakeQueue()
     bridge = QueueApiBridge(queue)
@@ -437,6 +441,43 @@ def test_bridge_cancel_never_deletes_and_hides_inflight_task_immediately():
     with pytest.raises(ApiProblem) as caught:
         bridge.invoke("status", {"task_id": 9})
     assert caught.value.code == "task_not_found"
+
+
+def test_bridge_cancel_unhides_a_task_aria2_refused_to_cancel():
+    """A cancellation is only final once the backend confirms it.
+
+    The queue keeps the task while aria2 decides and puts it back if aria2
+    refuses. The API masked the id the moment cancel was called, so it has to
+    stop masking it once the task is live again - otherwise the window shows a
+    download the API insists does not exist.
+    """
+    QCoreApplication.instance() or QCoreApplication([])
+
+    class FakeQueue(QObject):
+        def __init__(self):
+            super().__init__()
+            self.settings = SimpleNamespace()
+            self.tasks = {
+                9: DownloadTask(id=9, url="https://example.com/a",
+                                out_dir="C:\\Downloads", status="active")
+            }
+            self.pending_removal = True
+
+        def remove(self, task_id, delete_file=False, keep_incomplete=False):
+            pass
+
+        def is_pending_removal(self, task_id):
+            return self.pending_removal
+
+    queue = FakeQueue()
+    bridge = QueueApiBridge(queue)
+    bridge.invoke("cancel", {"task_id": 9})
+    assert bridge.invoke("list") == []
+
+    queue.pending_removal = False   # aria2 refused; the queue restored it
+
+    assert [task["task_id"] for task in bridge.invoke("list")] == [9]
+    assert bridge.invoke("status", {"task_id": 9})["task_id"] == 9
 
 
 def test_http_add_enters_real_queue_sqlite_and_ui_signal_immediately(tmp_path, monkeypatch):
@@ -641,3 +682,87 @@ def test_torbox_settings_do_not_broaden_the_add_payload_schema(api_server):
     )
     assert status == 400
     assert payload["error"]["code"] == "unknown_fields"
+
+
+def test_bridge_bounds_the_total_wait_even_after_work_starts():
+    """BUG-010: the second wait phase had no deadline at all.
+
+    Once the GUI handler was marked started, the bridge waited forever for it
+    to finish. A blocked GUI, a stalled modal or a hung callback therefore
+    pinned an HTTP worker and its client connection for the life of the
+    process, and enough repeats exhausted the pool.
+    """
+    QCoreApplication.instance() or QCoreApplication([])
+
+    class FakeQueue(QObject):
+        def __init__(self):
+            super().__init__()
+            self.settings = SimpleNamespace()
+            self.tasks = {}
+
+    queue = FakeQueue()
+    bridge = QueueApiBridge(queue, timeout=0.3)
+    release = threading.Event()
+    entered = threading.Event()
+
+    def blocking_handle(action, payload):
+        # The handler has started, so abandon() can no longer succeed - this
+        # is the state the unbounded wait was reached from.
+        entered.set()
+        release.wait(10)
+        return []
+
+    bridge._handle = blocking_handle
+
+    # Give the bridge a thread with a running event loop, so the queued
+    # dispatch actually executes somewhere other than this thread. The bridge
+    # is parented to the queue, and a child cannot be moved on its own - the
+    # whole tree goes across together.
+    thread = QThread()
+    queue.moveToThread(thread)
+    thread.start()
+    try:
+        began = time.monotonic()
+        with pytest.raises(ApiProblem) as caught:
+            bridge.invoke("list")
+        elapsed = time.monotonic() - began
+
+        assert entered.is_set(), "the handler never started; wrong phase tested"
+        # Deliberately not "bridge_timeout": that means the request was refused
+        # before it ran. This one started and may still commit, so a client
+        # must not treat it as a clean failure and retry.
+        assert caught.value.code == "bridge_outcome_unknown"
+        assert elapsed < 5, f"the wait was not bounded ({elapsed:.1f}s)"
+    finally:
+        release.set()
+        thread.quit()
+        thread.wait(5000)
+        queue.moveToThread(QCoreApplication.instance().thread())
+
+
+def test_a_request_refused_before_it_ran_is_a_plain_timeout():
+    """The two timeout paths must stay distinguishable.
+
+    Nothing executed here, so the caller can safely retry - which is exactly
+    what it must not do when the handler had already started.
+    """
+    QCoreApplication.instance() or QCoreApplication([])
+
+    class FakeQueue(QObject):
+        def __init__(self):
+            super().__init__()
+            self.settings = SimpleNamespace()
+            self.tasks = {}
+
+    queue = FakeQueue()
+    bridge = QueueApiBridge(queue, timeout=0.2)
+
+    # No event loop anywhere, so the queued _execute never runs at all.
+    thread = QThread()
+    queue.moveToThread(thread)
+    try:
+        with pytest.raises(ApiProblem) as caught:
+            bridge.invoke("list")
+        assert caught.value.code == "bridge_timeout"
+    finally:
+        queue.moveToThread(QCoreApplication.instance().thread())

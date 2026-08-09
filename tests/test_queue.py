@@ -224,7 +224,8 @@ class _FakeRpc:
     def __getattr__(self, name):
         # Torrent state lives in lazily created lists so the plain HTTP
         # tests above keep their tiny stub.
-        if name in ("magnets", "torrents", "removed", "unpaused", "version_calls"):
+        if name in ("magnets", "torrents", "removed", "unpaused", "version_calls",
+                    "paused_all", "status_calls"):
             value = []
             setattr(self, name, value)
             return value
@@ -254,6 +255,14 @@ class _FakeRpc:
     def unpause(self, gid):
         self.unpaused.append(gid)
         return gid
+
+    def pause_all(self):
+        self.paused_all.append(True)
+        return "OK"
+
+    def tell_status(self, gid):
+        self.status_calls.append(gid)
+        return dict(getattr(self, "status_result", {}))
 
 
 @pytest.fixture
@@ -6603,3 +6612,871 @@ def test_two_media_candidates_beside_sidecars_still_fail_closed(
     assert task.status == "error"
     assert list(tmp_path.glob("video*")) == []
     _assert_no_work_dirs(tmp_path)
+
+
+# --- stale callbacks and unconfirmed removal -------------------------------
+#
+# Four independent races between Cove and aria2, all of the same shape: an
+# asynchronous RPC result is applied without checking that the decision it was
+# issued under still holds. Each test below delays one RPC, changes the world
+# underneath it, then releases it.
+
+
+class _DeferredSpawn:
+    """Captures worker calls so a test can release them out of order."""
+
+    def __init__(self, queue):
+        self.calls = []
+        queue._spawn = self._spawn
+
+    def _spawn(self, fn, *args, on_done=None, on_fail=None, **kwargs):
+        self.calls.append(SimpleNamespace(
+            fn=fn, args=args, kwargs=kwargs, on_done=on_done, on_fail=on_fail,
+        ))
+
+    def names(self):
+        return [getattr(c.fn, "__name__", "?") for c in self.calls]
+
+    def take(self, name):
+        """Pop the oldest pending call to rpc.<name>."""
+        for index, call in enumerate(self.calls):
+            if getattr(call.fn, "__name__", "") == name:
+                return self.calls.pop(index)
+        raise AssertionError(f"no pending {name}; have {self.names()}")
+
+    def run(self, call):
+        """Execute a captured call and deliver its result, as the pool would."""
+        try:
+            result = call.fn(*call.args, **call.kwargs)
+        except Exception as exc:  # noqa: BLE001 - mirrors _RpcCall's own catch
+            if call.on_fail is not None:
+                call.on_fail(str(exc))
+        else:
+            if call.on_done is not None:
+                call.on_done(result)
+
+    def fail(self, call, msg="aria2 rpc failed"):
+        if call.on_fail is not None:
+            call.on_fail(msg)
+
+    def drain(self, limit=10):
+        """Run everything still pending, including work those calls queue.
+
+        Bounded on purpose: a compensating command that re-triggered itself
+        would be an infinite loop in production, so it fails here instead.
+        """
+        for _ in range(limit):
+            if not self.calls:
+                return
+            pending, self.calls = self.calls, []
+            for call in pending:
+                self.run(call)
+        raise AssertionError(f"compensating commands did not settle: {self.names()}")
+
+
+def test_remove_keeps_the_task_until_aria2_confirms(queue_env, tmp_path):
+    """BUG-001: the row and the payload outlive an unconfirmed cancellation."""
+    queue, _rpc, db_path, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid, delete_file=True)
+
+    # In flight: nothing may be gone yet.
+    assert tid in queue.tasks
+    assert [row["id"] for row in _rows(db_path)] == [tid]
+    assert payload.exists()
+    # A task Cove has not actually let go of still occupies a slot.
+    assert queue._active_count() == 1
+
+    spawn.fail(spawn.take("remove"))
+
+    # aria2 refused, so the download is still real: keep showing it.
+    assert tid in queue.tasks
+    assert queue.tasks[tid].status == "active"
+    assert [row["id"] for row in _rows(db_path)] == [tid]
+    assert payload.exists()
+    assert control.exists()
+
+
+def test_remove_completes_once_aria2_confirms(queue_env, tmp_path):
+    """The success path still removes the row and cleans the partial data."""
+    queue, rpc, db_path, tid, payload, control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid, delete_file=True)
+    spawn.run(spawn.take("remove"))
+
+    assert rpc.removed == ["gid-1"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+    assert not payload.exists()
+    assert not control.exists()
+
+
+def test_status_arriving_during_removal_cannot_complete_the_task(
+    queue_env, tmp_path
+):
+    """A poll result must not resurrect a task that is being cancelled."""
+    queue, _rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid)
+    queue._apply_status(tid, {"status": "complete", "totalLength": "10",
+                              "completedLength": "10"})
+
+    assert queue.tasks[tid].status == "active"
+    spawn.run(spawn.take("remove"))
+    assert tid not in queue.tasks
+
+
+def test_a_late_pause_all_cannot_pause_a_restarted_queue(queue_env, tmp_path):
+    """BUG-003: Stop -> Start, then the old pause_all result finally lands."""
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")   # held in flight
+    queue.start_queue()
+
+    # The pause never landed, so the task never left "active" locally and the
+    # restart has nothing to resume. The UI shows a running queue.
+    assert queue.tasks[tid].status == "active"
+
+    spawn.run(pause_all)                  # the superseded result arrives
+    spawn.drain()                         # ...and whatever it compensates with
+
+    assert queue.tasks[tid].status == "active"
+    # aria2 did receive the pause_all, so the backend has to be pulled back to
+    # the state Cove is showing rather than silently disagreeing with it.
+    assert rpc.unpaused == ["gid-1"]
+
+
+def test_a_pause_that_wins_locally_also_wins_at_aria2(queue_env, tmp_path):
+    """BUG-004: a pause raised while an unpause is in flight still wins.
+
+    The two used to be issued together and race, with aria2 free to apply them
+    in either order and reconciliation to clean up afterwards. Only one command
+    per transfer is outstanding now, so the pause waits for the unpause to
+    resolve and is then the only thing aria2 is told - there is no race left to
+    lose and nothing to compensate for.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "paused"
+    spawn = _DeferredSpawn(queue)
+
+    queue.resume(tid)
+    unpause = spawn.take("unpause")       # in flight
+    queue.pause(tid)
+
+    assert spawn.names() == [], "the pause waits rather than racing"
+
+    spawn.run(unpause)
+    spawn.drain()
+
+    assert queue.tasks[tid].status == "paused"
+    assert rpc.unpaused == ["gid-1"]
+    assert rpc.paused == ["gid-1"], "sent once, after the unpause resolved"
+
+
+def test_status_for_a_replaced_gid_is_discarded(queue_env, tmp_path):
+    """BUG-005: a tellStatus answer for the old gid outlives a retry."""
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    task.completed_bytes = 10
+    spawn = _DeferredSpawn(queue)
+
+    rpc.status_result = {"status": "complete", "totalLength": "999",
+                         "completedLength": "999"}
+    queue._poll_active()
+    poll = spawn.take("tell_status")
+
+    # The task is retried in the meantime and gets a replacement transfer.
+    task.gid = "gid-2"
+    task.completed_bytes = 0
+
+    spawn.run(poll)
+
+    assert task.status == "active"
+    assert task.completed_bytes == 0
+    assert task.total_bytes != 999
+
+
+def test_a_stale_pause_result_cannot_repaint_a_resumed_task(queue_env, tmp_path):
+    """A pause that lost the race must not persist itself over the resume.
+
+    Reconciling aria2 is only half the job: if the superseded callback still
+    marks the task paused locally, Cove ends up showing and persisting the
+    exact disagreement the generation check exists to prevent.
+    """
+    queue, rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.pause(tid)
+    pause = spawn.take("pause")            # held in flight; still "active"
+    # Stop marks it paused, and the restart resumes it - so by the time the
+    # original pause result lands, the newest intent is "running". The resume
+    # waits behind the pause rather than racing it.
+    queue.stop_queue()
+    spawn.run(spawn.take("pause_all"))
+    assert queue.tasks[tid].status == "paused"
+    queue.start_queue()
+
+    assert queue.tasks[tid].status == "active", "the resume flips it optimistically"
+
+    spawn.run(pause)                       # the superseded result arrives
+    spawn.drain()                          # ...releasing the resume behind it
+
+    assert queue.tasks[tid].status == "active", "the pause must not repaint it"
+    assert _persisted_row(db_path, tid)["status"] == "active"
+    assert rpc.unpaused == ["gid-1"]
+
+
+def test_a_stale_unpause_failure_cannot_requeue_a_paused_task(queue_env, tmp_path):
+    """Relaunch-on-failed-unpause is destructive, so it must be generation checked.
+
+    A late failure for a superseded unpause would drop the gid and requeue a
+    task the user has since paused - detaching it from aria2 and restarting a
+    download nobody asked to restart.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "paused"
+    spawn = _DeferredSpawn(queue)
+
+    queue.resume(tid)
+    unpause = spawn.take("unpause")        # held in flight
+    queue.pause(tid)                       # the user changes their mind
+
+    spawn.fail(unpause)                    # the superseded command fails
+    spawn.drain()                          # ...releasing the pause behind it
+
+    assert task.status == "paused"
+    assert task.gid == "gid-1"             # not detached
+    assert rpc.removed == []               # not dropped from aria2
+    assert rpc.paused == ["gid-1"], "the wish it stepped aside for still runs"
+
+
+def test_queue_wide_compensation_yields_to_a_newer_per_task_pause(queue_env, tmp_path):
+    """Stop -> Start compensation must not resume a task the user just paused.
+
+    A task whose own pause is still in flight is locally "active", so the
+    queue-wide reconciliation would happily unpause it and throw away the more
+    specific, more recent intent.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")   # held in flight
+    queue.start_queue()
+    queue.pause(tid)                      # the user pauses this one task
+    pause = spawn.take("pause")           # also still in flight
+
+    spawn.run(pause_all)                  # the superseded queue-wide result
+
+    assert rpc.unpaused == [], "the newer per-task pause must win"
+
+    spawn.run(pause)
+    spawn.drain()
+
+    assert queue.tasks[tid].status == "paused"
+    assert rpc.unpaused == []
+
+
+def test_a_failed_pause_stops_deferring_queue_wide_compensation(queue_env, tmp_path):
+    """A pause aria2 refused is not a pause still pending.
+
+    Compensation defers to a newer per-task pause, so an intent left set by a
+    failure would make it defer forever - and a stale pause_all would then
+    leave aria2 paused behind a task Cove shows as active.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")   # held in flight
+    queue.start_queue()
+    queue.pause(tid)
+    spawn.fail(spawn.take("pause"))       # aria2 refuses the pause
+
+    # The task never paused, so it is still active and still needs the stale
+    # queue-wide pause compensated for.
+    assert queue.tasks[tid].status == "active"
+
+    spawn.run(pause_all)
+    spawn.drain()
+
+    assert rpc.unpaused == ["gid-1"]
+    assert queue.tasks[tid].status == "active"
+
+
+def test_a_retry_does_not_inherit_the_old_transfers_pause_intent(queue_env, tmp_path):
+    """Pause intent belongs to a gid, not to a task id.
+
+    A retry abandons the gid and relaunches under a new one. An intent left
+    over from the old transfer describes a download that no longer exists, and
+    would keep suppressing reconciliation for its replacement.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.pause(tid)
+    spawn.take("pause")                   # never lands; intent recorded
+    task.gid = "gid-2"                    # the retry's replacement transfer
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")
+    queue.start_queue()
+    spawn.run(pause_all)
+    spawn.drain()
+
+    # The stale intent belonged to gid-1, so it must not shield gid-2.
+    assert rpc.unpaused == ["gid-2"]
+
+
+def test_a_failed_compensation_is_reported_and_not_recorded_as_success(
+    queue_env, tmp_path
+):
+    """Discarding a stale result is not enough if the repair also fails."""
+    queue, _rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    errors = []
+    queue.error.connect(errors.append)
+    spawn = _DeferredSpawn(queue)
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")
+    queue.start_queue()
+    spawn.run(pause_all)
+
+    spawn.fail(spawn.take("unpause"), "rpc unreachable")
+
+    assert errors == ["rpc unreachable"], "a failed repair must not be swallowed"
+    # Cove no longer claims to know what aria2 holds for this gid, so the
+    # stale belief cannot suppress the next reconciliation.
+    assert queue._desired_for(tid, "gid-1") is None
+
+
+def test_a_refused_removal_reasserts_the_tasks_intent_to_aria2(queue_env, tmp_path):
+    """Reconciliation is suppressed during removal, so it must be replayed.
+
+    A refused removal leaves the transfer live. Any pause or unpause that
+    completed inside the removal window was never checked against the current
+    intent, so aria2 can hold the opposite of what the restored task shows.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.pause(tid)
+    pause = spawn.take("pause")            # held in flight
+    queue.remove(tid)                      # user removes while it is pending
+    spawn.run(pause)                       # lands during removal: not reconciled
+
+    spawn.fail(spawn.take("remove"))       # aria2 refuses the removal
+    spawn.drain()
+
+    assert tid in queue.tasks
+    # The recorded intent was "paused", so aria2 is told again now that the
+    # task is live and reconciliation is no longer suppressed.
+    assert rpc.paused == ["gid-1", "gid-1"]
+
+
+def test_a_removing_task_is_not_recorded_as_paused_by_a_queue_wide_pause(
+    queue_env, tmp_path
+):
+    """It was excluded from the pause_all, so it must not be marked by it."""
+    queue, _rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid)                     # cancellation in flight
+    queue.stop_queue()
+    spawn.run(spawn.take("pause_all"))
+
+    assert queue.tasks[tid].status == "active"
+
+
+def test_a_refused_removal_asserts_state_even_without_a_per_task_intent(
+    queue_env, tmp_path
+):
+    """Removal excluded the task from queue-wide reconciliation too.
+
+    With no per-task command to replay, aria2's state for this gid is simply
+    unknown once the removal is refused - so what the queue wants for it now
+    has to be asserted rather than assumed to already hold.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid)
+    queue.stop_queue()
+    spawn.run(spawn.take("pause_all"))    # aria2 paused everything, incl. this
+    queue.start_queue()
+
+    spawn.fail(spawn.take("remove"))      # aria2 refuses the removal
+    spawn.drain()
+
+    assert tid in queue.tasks
+    assert queue.tasks[tid].status == "active"
+    assert rpc.unpaused == ["gid-1"], "the restored task must be resumed at aria2"
+
+
+# --- restoration and stream parsing ----------------------------------------
+
+
+def test_a_user_paused_task_comes_back_paused(queue_env, tmp_path):
+    """BUG-015: explicit pause intent must survive a restart.
+
+    Restoration normalised every persisted row to "queued", so startup queue
+    processing treated a deliberately paused download as eligible and started
+    it - on metered or restricted connections, exactly what the user stopped.
+    """
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url("https://example.invalid/a.bin", out_dir=str(tmp_path))
+    task = queue.tasks[tid]
+    task.status = "paused"
+    queue._persist(task)
+
+    revived, _rpc2, _db2 = queue_env()
+    revived.tasks.clear()
+    revived._load_persisted()
+
+    assert revived.tasks[tid].status == "paused"
+
+
+def test_an_interrupted_active_task_comes_back_queued(queue_env, tmp_path):
+    """Only states that represent interrupted work are normalised."""
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url("https://example.invalid/b.bin", out_dir=str(tmp_path))
+    task = queue.tasks[tid]
+    task.status = "active"
+    queue._persist(task)
+
+    revived, _rpc2, _db2 = queue_env()
+    revived.tasks.clear()
+    revived._load_persisted()
+
+    assert revived.tasks[tid].status == "queued"
+
+
+def test_a_restored_user_paused_task_is_not_started_by_the_queue(queue_env, tmp_path):
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.invalid/c.bin", out_dir=str(tmp_path))
+    task = queue.tasks[tid]
+    task.status = "paused"
+    queue._persist(task)
+
+    revived, _rpc2, _db2 = queue_env()
+    revived.tasks.clear()
+    revived._load_persisted()
+    launched = []
+    revived._launch = launched.append
+    _running(revived)
+    revived._maybe_start_next()
+
+    assert launched == []
+
+
+def test_an_ffmpeg_progress_record_split_across_reads_still_updates(
+    queue_env, fake_process, tmp_path
+):
+    """BUG-025: QProcess may deliver one line in two readyRead events.
+
+    Each chunk was decoded and split on its own, so a record straddling the
+    boundary was parsed as two fragments and dropped - producing stalled or
+    jumpy progress for HLS downloads.
+    """
+    queue, _rpc, _db = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+
+    proc.emit_output("  Duration: 00:00:20.00, start: 0.0\n")
+    line = "frame=250 size=1024kB time=00:00:10.00 bitrate=838.9kbits/s speed=1.5x\n"
+    proc.emit_output(line[:30])           # split mid-record
+    proc.emit_output(line[30:])
+
+    assert task.completed_bytes == 10
+
+
+def test_every_split_of_one_ffmpeg_record_produces_the_same_update(
+    queue_env, fake_process, tmp_path
+):
+    """Chunk boundaries are arbitrary, so no single split may be special."""
+    line = "frame=175 size=512kB time=00:00:07.00 bitrate=838.9kbits/s speed=1.5x\n"
+    for cut in range(1, len(line)):
+        queue, _rpc, _db = queue_env()
+        task, proc = _start_hls(queue, fake_process, tmp_path)
+        proc.emit_output("  Duration: 00:00:20.00, start: 0.0\n")
+
+        proc.emit_output(line[:cut])
+        proc.emit_output(line[cut:])
+
+        assert task.completed_bytes == 7, f"split after {cut} chars"
+
+
+def test_a_stale_compensation_failure_leaves_a_newer_command_alone(queue_env, tmp_path):
+    """Failure callbacks need the same guard as successful ones.
+
+    Clearing the wish recorded by a newer command would suppress exactly the
+    reconciliation that wish exists to drive. The guard is on the wish rather
+    than the generation, because a wish held behind an in-flight command has no
+    generation of its own yet.
+    """
+    queue, _rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    errors = []
+    queue.error.connect(errors.append)
+    spawn = _DeferredSpawn(queue)
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")
+    queue.start_queue()
+    spawn.run(pause_all)
+    compensation = spawn.take("unpause")   # held in flight
+
+    queue.pause(tid)                       # a newer wish supersedes it
+
+    spawn.fail(compensation)
+
+    assert errors == [], "a superseded failure is not the user's problem"
+    assert queue._desired_for(tid, "gid-1") is True, "the newer wish survives"
+
+
+def test_only_one_command_per_transfer_is_ever_in_flight(queue_env, tmp_path):
+    """Concurrency against one gid is the bug, not a case to be handled.
+
+    Two commands for the same transfer are independent requests on independent
+    worker threads. aria2 can apply them in one order and deliver their
+    callbacks in the other, and nothing downstream can then say which one the
+    backend actually ended up applying - so the record of what aria2 holds
+    would be a guess. A newer wish waits for the outstanding command instead,
+    which is what makes that record trustworthy.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "paused"
+    spawn = _DeferredSpawn(queue)
+
+    queue.resume(tid)
+    unpause = spawn.take("unpause")
+    queue.pause(tid)
+
+    assert spawn.names() == [], "nothing may go out alongside the unpause"
+
+    spawn.run(unpause)
+    spawn.drain()                          # raises if the commands never settle
+
+    assert task.status == "paused"
+    assert rpc.unpaused == ["gid-1"]
+    assert rpc.paused == ["gid-1"], "one command each, in order"
+
+
+def test_repeated_wishes_while_a_command_is_in_flight_send_one_command(
+    queue_env, tmp_path,
+):
+    """Only the latest wish is worth issuing, so the held slot holds one.
+
+    A task stays locally active until its pause callback lands, so an impatient
+    user can raise the same wish several times over. Each of those used to
+    become its own RPC, and the duplicates are what every ordering defect in
+    this area was built on.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "paused"
+    spawn = _DeferredSpawn(queue)
+
+    queue.resume(tid)
+    unpause = spawn.take("unpause")
+    queue.pause(tid)
+    queue.pause(tid)
+    queue.pause(tid)
+
+    assert spawn.names() == []
+
+    spawn.run(unpause)
+    spawn.drain()
+
+    assert task.status == "paused"
+    assert rpc.paused == ["gid-1"], "three clicks, one pause"
+
+
+def test_a_failed_command_still_releases_the_wish_held_behind_it(
+    queue_env, tmp_path,
+):
+    """A command that will never land must not hold a wish forever.
+
+    Convergence waits for the outstanding command before sending anything else.
+    If a failure did not end that command's flight, the wish raised while it
+    was in flight would sit unsent and Cove would never act on it.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "paused"
+    errors = []
+    queue.error.connect(errors.append)
+    spawn = _DeferredSpawn(queue)
+
+    queue.resume(tid)
+    unpause = spawn.take("unpause")
+    queue.pause(tid)                       # held behind it
+
+    spawn.fail(unpause, "unpause rejected")
+    spawn.drain()
+
+    assert task.status == "paused"
+    assert rpc.paused == ["gid-1"], "the held wish went out after the failure"
+    assert task.gid == "gid-1", "and the failure did not relaunch the transfer"
+
+
+def test_a_crash_during_removal_does_not_resurrect_the_download(queue_env, tmp_path):
+    """Two-phase removal must not make removal itself less durable.
+
+    The row used to be deleted before the RPC was issued, so exiting mid-removal
+    could never bring a download back. Holding the row until aria2 confirms is
+    what keeps a refused removal recoverable - but it also means a crash inside
+    that window would restore a task the user had already removed, and restart
+    it downloading.
+    """
+    queue, _rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    _DeferredSpawn(queue)                  # aria2 never answers
+
+    queue.remove(tid, delete_file=True)
+
+    # Still live in memory - a refusal has to be able to bring it back.
+    assert tid in queue.tasks
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    queue2, _rpc2, _db2 = queue_env()      # the next launch
+
+    assert tid not in queue2.tasks, "a removed download must not come back"
+    assert _persisted_row(db_path, tid) is None, "the row is finished off"
+
+
+def test_a_refused_removal_clears_the_durable_removal_marker(queue_env, tmp_path):
+    """A restored task must survive the next launch too.
+
+    The marker outliving the refusal it was written for would delete a live
+    download from the database at startup.
+    """
+    queue, _rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    queue.tasks[tid].status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid, delete_file=True)
+    spawn.fail(spawn.take("remove"))       # aria2 refuses
+
+    assert _persisted_row(db_path, tid)["status"] == "active"
+
+    queue2, _rpc2, _db2 = queue_env()
+
+    assert tid in queue2.tasks, "the transfer is still running"
+
+
+def test_a_failed_pause_sends_the_unpause_that_deferred_to_it(queue_env, tmp_path):
+    """A skipped queue-wide compensation still has to happen if the pause fails.
+
+    Stale `pause_all` compensation steps aside for a pending per-task pause on
+    the assumption that pause will land. When it fails instead, nothing else
+    holds the unpause it withheld: aria2 keeps the task paused from the
+    `pause_all` while Cove shows it running, with no command left to converge
+    them.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    errors = []
+    queue.error.connect(errors.append)
+    spawn = _DeferredSpawn(queue)
+
+    queue.stop_queue()
+    pause_all = spawn.take("pause_all")    # reaches aria2, result held
+    queue.start_queue()
+    queue.pause(tid)                       # the user pauses this one task
+    pause = spawn.take("pause")
+
+    spawn.run(pause_all)                   # superseded; skips this task
+    assert rpc.unpaused == [], "the pending per-task pause still outranks it"
+
+    spawn.fail(pause, "pause rejected")    # but that pause never lands
+    spawn.drain()
+
+    assert errors == ["pause rejected"]
+    assert task.status == "active"
+    assert rpc.unpaused == ["gid-1"], "aria2 must be told the task is running"
+
+
+def test_a_removal_refused_while_stopped_still_restarts_with_the_queue(
+    queue_env, tmp_path,
+):
+    """A task restored into a stopped queue has to rejoin the Start that follows.
+
+    `_mark_all_active_paused` skips a task being removed, so it stays locally
+    active across the Stop. The refusal then pauses it in aria2 to match the
+    stopped queue - and if that is not recorded locally, Start skips it, since
+    it only resumes members of `_auto_paused` that are locally paused. The
+    download would sit paused in aria2 forever behind a running queue.
+    """
+    queue, rpc, _db, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.remove(tid)
+    remove = spawn.take("remove")          # held in flight
+    queue.stop_queue()
+    spawn.run(spawn.take("pause_all"))
+
+    assert task.status == "active", "the removal excluded it from the Stop"
+
+    spawn.fail(remove)                     # aria2 refuses; the task is back
+    spawn.drain()
+
+    # Restored into a stopped queue: paused, and marked as the queue's doing.
+    assert task.status == "paused"
+    assert rpc.paused == ["gid-1"]
+
+    queue.start_queue()
+    spawn.drain()
+
+    assert task.status == "active"
+    assert rpc.unpaused == ["gid-1"], "Start must pick the restored task back up"
+
+
+def test_hls_progress_survives_carriage_return_terminated_records(
+    queue_env, fake_process, tmp_path
+):
+    """ffmpeg ends each status line with a bare CR, not a newline.
+
+    Buffering a partial record must not stop treating a carriage return as the
+    end of one. Splitting on "\\n" alone holds every update in the buffer until
+    an unrelated log line arrives, and the progress regexes search rather than
+    match, so the eventual parse reports the oldest record in the blob.
+    """
+    queue, _rpc, _db = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+
+    proc.emit_output("  Duration: 00:00:20.00, start: 0.0\r\n")
+    proc.emit_output("frame=125 time=00:00:05.00 bitrate=838.9kbits/s speed=1.5x\r")
+    proc.emit_output("frame=275 time=00:00:11.00 bitrate=838.9kbits/s speed=1.5x\r")
+
+    assert task.total_bytes == 20
+    assert task.completed_bytes == 11, "the newest record wins, not the oldest"
+
+    # A CR-terminated record split across two reads is still stitched together.
+    proc.emit_output("frame=425 time=00:00:1")
+    assert task.completed_bytes == 11
+    proc.emit_output("7.00 bitrate=838.9kbits/s speed=1.5x\r")
+    assert task.completed_bytes == 17
+
+
+def test_activity_during_a_pending_removal_cannot_clear_the_marker(
+    queue_env, tmp_path,
+):
+    """A task awaiting confirmation stays visible, so it stays interactive.
+
+    Pause, resume and a pause callback landing inside the removal window all
+    persist the task. Any of them writing the live status back over the durable
+    marker restores the crash that two-phase removal introduced - and a row
+    left as `active` comes back as queued and downloads again.
+    """
+    queue, _rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.pause(tid)
+    pause = spawn.take("pause")            # in flight when the removal starts
+    queue.remove(tid, delete_file=True)
+    spawn.take("remove")                   # aria2 never answers
+
+    spawn.run(pause)                       # lands inside the removal window
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    queue.resume(tid)                      # the row is still on screen
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    queue.pause(tid)
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    queue2, _rpc2, _db2 = queue_env()
+
+    assert tid not in queue2.tasks, "the removal still wins after a crash"
+
+
+def test_a_pause_the_user_repeats_is_still_only_paused_once(queue_env, tmp_path):
+    """The impatient-click case, which serialisation now prevents outright.
+
+    Findings 19, 21 and 23 were all built on two pauses for one transfer being
+    in flight together: the first succeeding and the second failing, the second
+    failing before the first landed, and a newer resolution being read as the
+    all-clear while the older was still out. None of those states is reachable
+    with one command outstanding at a time, so what is guarded here is the
+    property that replaced them.
+    """
+    queue, rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    errors = []
+    queue.error.connect(errors.append)
+    spawn = _DeferredSpawn(queue)
+
+    queue.pause(tid)
+    first = spawn.take("pause")
+    queue.pause(tid)                       # still shows active, so still allowed
+
+    assert spawn.names() == [], "the repeat is held, not raced against the first"
+
+    spawn.run(first)
+    spawn.drain()
+
+    assert errors == []
+    assert task.status == "paused"
+    assert _persisted_row(db_path, tid)["status"] == "paused"
+    assert rpc.paused == ["gid-1"], "and the held repeat adds nothing"
+
+
+def test_a_wish_dropped_as_redundant_still_settles_local_state(
+    queue_env, tmp_path,
+):
+    """Granting a wish without an RPC is still granting it.
+
+    A held pause is dropped when aria2 already holds a pause - there is nothing
+    to send. The wish was still granted, though, so the local effect its
+    callback would have applied has to happen anyway. Skipping it leaves the
+    row, the UI and the concurrency accounting describing a running download
+    while the transfer is paused.
+    """
+    queue, rpc, db_path, tid, _payload, _control = _aria2_task(queue_env, tmp_path)
+    task = queue.tasks[tid]
+    task.status = "active"
+    spawn = _DeferredSpawn(queue)
+
+    queue.pause(tid)
+    spawn.run(spawn.take("pause"))         # aria2 is now observably paused
+    assert task.status == "paused"
+
+    queue.resume(tid)
+    unpause = spawn.take("unpause")        # optimistically active again
+    queue.pause(tid)                       # held behind the resume
+
+    spawn.fail(unpause, "unpause rejected")
+    spawn.drain()
+
+    # aria2 never left the paused state, so the held pause needs no RPC.
+    assert rpc.paused == ["gid-1"], "no second pause was necessary"
+    assert task.status == "paused", "but the task is paused, and says so"
+    assert _persisted_row(db_path, tid)["status"] == "paused"

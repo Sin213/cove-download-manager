@@ -27,6 +27,7 @@ from .queue import QueueManager
 from .scheduler import Scheduler
 from .single_instance import (
     MAX_URLS_PER_MESSAGE,
+    ElectionUnavailable,
     SingleInstanceServer,
     is_valid_launch_url,
     send_to_primary,
@@ -279,7 +280,16 @@ def run() -> int:
 
     instance_name = server_name(DATA_DIR)
     instance_server = SingleInstanceServer()
-    if not instance_server.try_become_primary(instance_name):
+    try:
+        is_primary = instance_server.try_become_primary(instance_name)
+    except ElectionUnavailable as exc:
+        # The lock itself is unusable - wrong owner, wrong permissions, or not
+        # a regular file. That is a local configuration or security problem,
+        # not a running Cove, so forwarding to a peer would send this launch
+        # nowhere. Say so instead of exiting silently.
+        logging.getLogger("cove").error("single_instance_election_unavailable: %s", exc)
+        return 1
+    if not is_primary:
         # Not primary. Forward and exit before touching Settings, aria2, the
         # queue, or the window - a second aria2 daemon fights the first one
         # for the same RPC port.

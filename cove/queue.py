@@ -232,7 +232,12 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         speed_limit_kbps=row["speed_limit_kbps"],
         filename=row["filename"],
         gid=None,
-        status="queued",
+        # "paused" is a decision the user made and must outlive the process;
+        # everything else restored here represents work a shutdown interrupted,
+        # which is what "queued" means. Normalising the two together silently
+        # resumed downloads someone had deliberately stopped - on a metered or
+        # restricted connection, the exact thing they were avoiding.
+        status="paused" if _row_get(row, "status", "") == "paused" else "queued",
         total_bytes=row["total_bytes"],
         completed_bytes=row["completed_bytes"],
         created_at=row["created_at"],
@@ -403,6 +408,50 @@ class QueueManager(QObject):
         # and dropped from the DB; we keep it in self.tasks so the on_done
         # callback can still find the gid and dispatch a clean shutdown.
         self._pending_launch: dict[int, dict] = {}
+        # Tasks whose cancellation aria2 has not confirmed yet. Maps tid ->
+        # the removal intent captured when the user asked:
+        #   {"gid": str, "path": str|None, "clean": bool, "private_run": bool}
+        # The task stays in self.tasks and in the database for the whole of
+        # this window, because until aria2 answers, the download is still
+        # running and Cove is the only thing that knows about it.
+        self._removing: dict[int, dict] = {}
+        # Per-task command generation for pause/unpause. Two RPCs issued back
+        # to back run on independent pool threads and can reach aria2 in the
+        # opposite order, which would leave aria2 downloading a task Cove
+        # shows and persists as paused. Every command captures the generation
+        # it was issued under; a result whose generation has been superseded
+        # means an older command won at the backend, so the current intent is
+        # re-sent as a compensating command.
+        self._cmd_gen: dict[int, int] = {}
+        # tid -> (gid, paused). Scoped to the gid so an intent recorded for a
+        # transfer a retry has since abandoned can never describe its
+        # replacement.
+        self._desired_paused: dict[int, tuple[str, bool]] = {}
+        # tid -> (gid, paused): what aria2 was last observed to hold. Written
+        # wherever that becomes known - a per-task command landing, or a
+        # queue-wide pause_all, which pauses every gid at once. Reconciliation
+        # compares this against `_desired_paused` rather than reasoning about
+        # which command superseded which; see _converge.
+        self._backend_state: dict[int, tuple[str, bool]] = {}
+        # tid -> {generation: gid} for every command still in flight. A high-
+        # water mark of the newest generation to resolve will not do: commands
+        # complete out of order, so a newer one finishing says nothing about
+        # whether older ones are still on their way. A failure removes an entry
+        # just as surely as success - a command that will never land must stop
+        # counting as pending. The gid is kept because serialisation is per
+        # transfer: a command still outstanding against a gid a retry has
+        # abandoned says nothing about its replacement and must not block it.
+        self._cmd_pending: dict[int, dict[int, str]] = {}
+        # tid -> (gid, paused, send) for an intent raised while a command was
+        # already in flight. One slot: only the latest intent is worth issuing,
+        # so a newer one replaces it. Released by _converge once the task has
+        # nothing outstanding.
+        self._cmd_queued: dict[int, tuple[str, bool, object, object]] = {}
+        # The same idea one level up, for queue-wide transitions. Stop, Start
+        # and each scheduler boundary bump this; a pause_all result carrying a
+        # superseded epoch is discarded rather than applied to whatever is
+        # running now.
+        self._queue_epoch = 0
         # Every gid Cove has ever launched or adopted this session. External
         # downloads (browser extension) are discovered by polling aria2; this
         # guards against re-adopting one the user already cleared from the
@@ -421,6 +470,7 @@ class QueueManager(QObject):
         self._hls_duration: dict[int, float] = {}
         self._hls_stderr: dict[int, str] = {}
         self._hls_work: dict[int, WorkDirectory] = {}
+        self._hls_line_buffer: dict[int, str] = {}
         self._extractor_procs: dict[int, QProcess] = {}
         self._extractor_output: dict[int, str] = {}
         self._extractor_work: dict[int, WorkDirectory] = {}
@@ -453,6 +503,11 @@ class QueueManager(QObject):
                 "finished_at=? WHERE status='converting'",
                 (time.time(),),
             )
+            # A removal the previous run never saw confirmed. The user asked
+            # for it and the row is only still here because Cove exited inside
+            # the aria2 round trip, so finish the job rather than restoring a
+            # download that was already on its way out.
+            conn.execute("DELETE FROM downloads WHERE status='removing'")
             rows = conn.execute(
                 "SELECT * FROM downloads WHERE status IN ('queued','active','paused')"
             ).fetchall()
@@ -602,6 +657,14 @@ class QueueManager(QObject):
         )
 
     def _persist(self, t: DownloadTask) -> None:
+        # A task waiting on aria2 to confirm its removal stays visible and
+        # interactive, so pause/resume and a pause callback landing inside that
+        # window all reach this method. None of them may overwrite the durable
+        # removal marker: the row has to keep saying "on its way out" until
+        # aria2 answers, or a crash in between restores a download the user
+        # already removed. Everything else about the row still persists, and
+        # _restore_removal clears _removing before it rewrites the true status.
+        status = "removing" if t.id in self._removing else t.status
         with db.connect() as conn:
             conn.execute(
                 """
@@ -613,7 +676,7 @@ class QueueManager(QObject):
                 """,
                 (
                     t.filename,
-                    t.status,
+                    status,
                     t.gid,
                     t.total_bytes,
                     t.completed_bytes,
@@ -1752,6 +1815,7 @@ class QueueManager(QObject):
         proc = self._hls_procs.pop(tid, None)
         self._hls_duration.pop(tid, None)
         self._hls_stderr.pop(tid, None)
+        self._hls_line_buffer.pop(tid, None)
         work = self._hls_work.pop(tid, None)
         self._stop_engine_process(proc, work)
 
@@ -1781,6 +1845,7 @@ class QueueManager(QObject):
             proc = self._hls_procs.pop(tid, None)
             self._hls_duration.pop(tid, None)
             self._hls_stderr.pop(tid, None)
+            self._hls_line_buffer.pop(tid, None)
             work = self._hls_work.pop(tid, None)
         elif tid in self._extractor_procs or tid in self._extractor_work:
             proc = self._extractor_procs.pop(tid, None)
@@ -1816,9 +1881,272 @@ class QueueManager(QObject):
             self._mark_paused(tid)
             return
         if t.gid and t.status == "active":
-            self._spawn(self.rpc.pause, t.gid, on_done=lambda _: self._mark_paused(tid))
+            def _send(gen, gid=t.gid):
+                def _paused(_result):
+                    # Local state follows the intent, not the generation. A
+                    # pause landing after the user has resumed must not persist
+                    # "paused" over that newer wish - and the newer wish may be
+                    # held rather than issued, in which case it has no
+                    # generation of its own to compare against yet.
+                    if self._desired_for(tid, gid) is True:
+                        self._mark_paused(tid)
+                    self._on_cmd_landed(tid, gen, gid, True)
+
+                self._spawn(
+                    self.rpc.pause, gid,
+                    on_done=_paused,
+                    on_fail=lambda msg: self._on_pause_failed(tid, gen, gid, msg),
+                )
+
+            self._issue_state(
+                tid, t.gid, True, _send,
+                settle=lambda: self._mark_paused(tid),
+            )
         else:
             self._mark_paused(tid)
+
+    # ---- pause/unpause command ordering --------------------------------
+
+    def _issue_state(self, tid: int, gid: str, paused: bool, send, settle=None) -> None:
+        """Put one state-changing command per task in flight, and only one.
+
+        Two commands running against the same gid are independent HTTP requests
+        on independent worker threads: aria2 can apply them in one order and
+        their callbacks can arrive in the other. Nothing downstream can then
+        say which command the backend actually ended up applying, and
+        `_note_backend_state` would record the wrong answer - after which
+        `_converge` sees false agreement and never corrects it.
+
+        Serialising removes the ambiguity at the source. While a command is
+        outstanding the newer intent is recorded and its send is held; it
+        replaces any previously held send, because only the latest intent is
+        worth issuing. `_converge` releases it once the outstanding command
+        resolves.
+
+        `send(gen)` spawns the RPC with its own callbacks, so each caller keeps
+        its own success and failure handling. `settle` carries whatever local
+        state that command would have applied on success, for the case where
+        the wish is later dropped as redundant: aria2 needs no command then,
+        but Cove still has to agree with it.
+        """
+        self._desired_paused[tid] = (gid, paused)
+        if self._in_flight(tid, gid):
+            self._cmd_queued[tid] = (gid, paused, send, settle)
+            return
+        send(self._next_cmd_gen(tid, gid, paused=paused))
+
+    def _state_sender(self, tid: int, gid: str, paused: bool):
+        """A send for a command Cove issued itself rather than the user.
+
+        Failures are repairs that did not take: reported, and the belief about
+        aria2 dropped rather than kept as if it had worked.
+        """
+        def _send(gen):
+            fn = self.rpc.pause if paused else self.rpc.unpause
+            self._spawn(
+                fn, gid,
+                on_done=lambda _: self._on_cmd_landed(tid, gen, gid, paused),
+                on_fail=lambda msg: self._on_compensation_failed(
+                    tid, gen, gid, paused, msg
+                ),
+            )
+
+        return _send
+
+    def _release_queued(self, tid: int, gid: str) -> bool:
+        """Send the wish held back while a command was in flight.
+
+        Held for the same transfer only, and only when aria2 is not already in
+        the state it asks for. A user who clicks pause twice raises the same
+        wish twice; once the first command has landed, the second describes
+        what the backend already holds and sending it would be the duplicate
+        this whole mechanism exists to avoid.
+        """
+        entry = self._cmd_queued.get(tid)
+        if entry is None or entry[0] != gid:
+            return False
+        self._cmd_queued.pop(tid, None)
+        _gid, paused, send, settle = entry
+        t = self.tasks.get(tid)
+        if t is None or t.gid != gid or tid in self._removing:
+            return False
+        if self._backend_for(tid, gid) == paused:
+            # No RPC needed, but the wish was still granted: aria2 is already
+            # in the state it asked for. Its local effect has to happen anyway,
+            # or the UI and the persisted row keep describing the state the
+            # user moved away from.
+            self._desired_paused[tid] = (gid, paused)
+            if settle is not None:
+                settle()
+            return False
+        send(self._next_cmd_gen(tid, gid, paused=paused))
+        return True
+
+    def _next_cmd_gen(self, tid: int, gid: str, paused: bool) -> int:
+        """Record the newest pause/unpause intent and return its generation.
+
+        The intent is scoped to the gid it was issued for. A retry abandons a
+        gid and relaunches under a new one, and an intent left over from the
+        old transfer says nothing about the new one - carrying it forward would
+        both suppress reconciliation and describe a download that no longer
+        exists.
+        """
+        gen = self._cmd_gen.get(tid, 0) + 1
+        self._cmd_gen[tid] = gen
+        self._desired_paused[tid] = (gid, paused)
+        # Every caller spawns the command immediately, so issuing it and
+        # putting it in flight are the same moment.
+        self._cmd_pending.setdefault(tid, {})[gen] = gid
+        return gen
+
+    def _desired_for(self, tid: int, gid: str):
+        """The recorded intent for `gid`, or None if there is none for it."""
+        record = self._desired_paused.get(tid)
+        if not record or record[0] != gid:
+            return None
+        return record[1]
+
+    def _backend_for(self, tid: int, gid: str):
+        """What aria2 is known to hold for `gid`, or None if unobserved."""
+        record = self._backend_state.get(tid)
+        if not record or record[0] != gid:
+            return None
+        return record[1]
+
+    def _note_backend_state(self, tid: int, gid: str, paused: bool) -> None:
+        """Record what a command that just reached aria2 left behind.
+
+        Callback order is the only evidence of the order commands landed in, so
+        the most recent callback describes the backend. No generation check
+        belongs here: an older command whose result arrives last is precisely
+        the one aria2 applied last.
+        """
+        self._backend_state[tid] = (gid, paused)
+
+    def _note_resolved(self, tid: int, gen: int) -> None:
+        """Mark a command as no longer in flight, whether it landed or failed.
+
+        Failures count. A command that will never land must stop being treated
+        as pending, or convergence waits forever for a result that is not
+        coming.
+        """
+        pending = self._cmd_pending.get(tid)
+        if pending is None:
+            return
+        pending.pop(gen, None)
+        if not pending:
+            self._cmd_pending.pop(tid, None)
+
+    def _in_flight(self, tid: int, gid: str) -> bool:
+        """Whether a command is outstanding against this exact transfer."""
+        return gid in self._cmd_pending.get(tid, {}).values()
+
+    def _on_cmd_landed(self, tid: int, gen: int, gid: str, paused: bool) -> None:
+        """A pause/unpause reached aria2."""
+        self._note_resolved(tid, gen)
+        self._note_backend_state(tid, gid, paused)
+        self._converge(tid, gid)
+
+    def _converge(self, tid: int, gid: str) -> None:
+        """Send the current intent if aria2 is known to hold something else.
+
+        This is the whole reconciliation rule. Rather than reasoning about
+        which command superseded which, it compares two facts: the state the
+        user asked for (`_desired_paused`) and the state aria2 was last
+        observed in (`_backend_state`). If they disagree and no command is
+        still in flight to close the gap, the intent is sent again.
+
+        Waiting for in-flight commands is what keeps this from racing itself: a
+        command already on its way to aria2 targets the current intent, so
+        compensating before it lands would just issue a duplicate. Once every
+        command has resolved, one of two things is true - either the backend
+        matches the intent and there is nothing to do, or it does not and
+        exactly one corrective command is issued. That command's own landing
+        re-runs this check, which then finds agreement and stops.
+
+        This is also where a command held back by `_issue_state` is released,
+        since that is the same moment: the task now has nothing outstanding.
+        """
+        if tid in self._removing:
+            return
+        t = self.tasks.get(tid)
+        if t is None or t.gid != gid:
+            return
+        if self._in_flight(tid, gid):
+            return
+        if self._release_queued(tid, gid):
+            # The intent held during the last command is now on its way, and it
+            # is by definition the current one. Its own landing runs this again.
+            return
+        desired = self._desired_for(tid, gid)
+        if desired is None:
+            return
+        known = self._backend_for(tid, gid)
+        if known is None or known == desired:
+            # Unobserved is not the same as wrong. Asserting a state over a
+            # backend nothing has reported on would be a guess, and the next
+            # explicit command or queue transition will settle it anyway.
+            return
+        self._state_sender(tid, gid, desired)(
+            self._next_cmd_gen(tid, gid, paused=desired)
+        )
+
+    def _on_compensation_failed(
+        self, tid: int, gen: int, gid: str, paused: bool, msg: str
+    ) -> None:
+        """A corrective pause/unpause did not reach aria2.
+
+        Discarding a stale result is not enough if the command meant to repair
+        it also fails, so this must not be swallowed. The error is surfaced and
+        the recorded intent for this gid is dropped: Cove no longer claims to
+        know what aria2 holds, which stops that stale belief from suppressing
+        the next reconciliation. Convergence then comes from the next explicit
+        pause/resume or queue transition - nothing here pretends it succeeded.
+
+        A repair the user has already overtaken is not their problem, so it is
+        neither reported nor allowed to clear the newer intent. The test is
+        against the intent rather than the generation, because the newer wish
+        may be held rather than issued and so have no generation yet.
+        """
+        self._note_resolved(tid, gen)
+        if self._desired_for(tid, gid) != paused:
+            self._converge(tid, gid)
+            return
+        self.error.emit(msg)
+        if self._desired_paused.get(tid, (None,))[0] == gid:
+            self._desired_paused.pop(tid, None)
+        # Still release anything held behind this command, or a wish raised
+        # while it was in flight would never be sent.
+        self._converge(tid, gid)
+
+    def _on_pause_failed(self, tid: int, gen: int, gid: str, msg: str) -> None:
+        """Retract a pause intent aria2 refused to act on.
+
+        `_desired_paused` records the state aria2 is believed to be converging
+        on. A failed pause never reached it, so leaving the intent set would
+        claim a pause is still pending forever - and anything that defers to a
+        pending pause (queue-wide reconciliation in particular) would keep
+        skipping this task while it is in fact still downloading.
+
+        Retracting is only half of it. Something else may already have put
+        aria2 into the paused state this command failed to reach - a queue-wide
+        pause, or an earlier pause of this same task that did succeed. The
+        retraction is therefore followed by a convergence check, which sends
+        the unpause if aria2 is known to be holding a pause nobody wants now.
+        """
+        self.error.emit(msg)
+        self._note_resolved(tid, gen)
+        if self._desired_for(tid, gid) is not True or tid in self._cmd_queued:
+            # Something newer wants a different state, or a wish is held behind
+            # this command and is about to be sent. Either way a pause is not
+            # what is outstanding any more, so there is nothing to retract -
+            # and retracting would overwrite the newer wish. Neither has a
+            # generation to compare against yet, which is why the test is on
+            # the intent rather than the generation.
+            self._converge(tid, gid)
+            return
+        self._desired_paused[tid] = (gid, False)
+        self._converge(tid, gid)
 
     def resume(self, tid: int) -> None:
         t = self.tasks.get(tid)
@@ -1831,11 +2159,14 @@ class QueueManager(QObject):
             t.error = None
             self._persist(t)
             self.task_changed.emit(tid)
-            self._spawn(
-                self.rpc.unpause,
-                t.gid,
-                on_fail=lambda msg, tid=tid: self._on_unpause_failed(tid, msg),
-            )
+            def _send(gen, gid=t.gid):
+                self._spawn(
+                    self.rpc.unpause, gid,
+                    on_done=lambda _: self._on_cmd_landed(tid, gen, gid, False),
+                    on_fail=lambda msg: self._on_unpause_failed(tid, msg, gen, gid),
+                )
+
+            self._issue_state(tid, t.gid, False, _send)
         elif not t.gid and tid in self._pending_launch:
             # The add RPC is still in flight, so there is nothing to unpause
             # and nothing to relaunch — a relaunch would add it to aria2
@@ -1928,8 +2259,14 @@ class QueueManager(QObject):
             self.task_removed.emit(tid)
             return
 
-        # Normal path: drop from local state, ask aria2 to forget the gid
-        # if it had one, optionally unlink the file on disk.
+        # A second click while aria2 is still deciding must not start a
+        # second teardown for the same task.
+        if tid in self._removing:
+            return
+
+        # Normal path: stop any private engine run, then ask aria2 to forget
+        # the gid. Local state, the database row and anything on disk are
+        # only touched once aria2 has confirmed - see _finish_removal.
         private_run = False
         if tid in self._hls_procs or tid in self._hls_work:
             private_run = True
@@ -1937,42 +2274,121 @@ class QueueManager(QObject):
         if tid in self._extractor_procs or tid in self._extractor_work:
             private_run = True
             self._retire_extractor_run(tid)
-        self.tasks.pop(tid, None)
         gid = t.gid
         path = None if private_run else self._task_path(t)
+        clean = self._cleans_incomplete_data(t, delete_file, keep_incomplete, private_run)
+
+        if not gid:
+            # Nothing to cancel: there is no backend transfer to outlive us.
+            self._finish_removal(tid, path if clean else None)
+            return
+
+        # A gid means aria2 may still be writing. Until it answers, the task
+        # is still real: it stays visible, keeps its gid mapping and keeps
+        # occupying a concurrency slot. Deleting files here would race aria2
+        # into recreating them.
+        self._removing[tid] = {"gid": gid, "path": path, "clean": clean}
+        # The row does have to record that it is on its way out, though. Before
+        # this was two-phase the delete was synchronous, so a crash could never
+        # resurrect a removed download; leaving the row untouched until aria2
+        # answers would restore an active task on the next launch and start it
+        # downloading again. The marker is durable and deliberately not applied
+        # to `t.status`, which the UI and _restore_removal still need - being
+        # in `_removing` is what makes _persist write it.
+        self._persist(t)
+        self.task_changed.emit(tid)
+
+        def _confirmed(*_args):
+            # Ordering below is load-bearing: aria2 has forgotten the gid, so
+            # the payload and control file can no longer be recreated.
+            self._finish_removal(tid, path if clean else None)
+
+        def _refused(*args):
+            self.error.emit(*args)
+            self._restore_removal(tid)
+
+        self._spawn(self.rpc.remove, gid, on_done=_confirmed, on_fail=_refused)
+
+    def is_pending_removal(self, tid: int) -> bool:
+        """Whether `tid` is still tracked only so its cancellation can finish.
+
+        True both while aria2 has yet to confirm a removal and while a task
+        removed before its add_uri returned is waiting for the gid. Callers
+        that hide removed tasks need this to tell "on its way out" from "the
+        backend refused, so it is live again".
+        """
+        if tid in self._removing:
+            return True
+        return bool(self._pending_launch.get(tid, {}).get("remove"))
+
+    def _finish_removal(self, tid: int, unlink_path: str | None) -> None:
+        """Let go of a task aria2 has confirmed it no longer owns."""
+        self._removing.pop(tid, None)
+        self.tasks.pop(tid, None)
+        self._cmd_gen.pop(tid, None)
+        self._desired_paused.pop(tid, None)
+        self._backend_state.pop(tid, None)
+        self._cmd_pending.pop(tid, None)
+        self._cmd_queued.pop(tid, None)
         with db.connect() as conn:
             conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
-
-        # Ordering below is unchanged and load-bearing: aria2 must forget the
-        # gid before the payload and control file are unlinked, or it recreates
-        # them.
-        unlink = (
-            self._make_unlinker(path)
-            if self._cleans_incomplete_data(t, delete_file, keep_incomplete, private_run)
-            else None
-        )
-        if gid:
-            def _after_remove(*_args):
-                if unlink:
-                    unlink()
-                self._maybe_start_next()
-
-            def _after_remove_fail(*args):
-                self.error.emit(*args)
-                _after_remove()
-
-            self._spawn(
-                self.rpc.remove,
-                gid,
-                on_done=_after_remove,
-                on_fail=_after_remove_fail,
-            )
-        else:
-            if unlink:
-                unlink()
-            self._maybe_start_next()
-
+        if unlink_path:
+            self._make_unlinker(unlink_path)()
         self.task_removed.emit(tid)
+        self._maybe_start_next()
+
+    def _restore_removal(self, tid: int) -> None:
+        """Put a task back after aria2 refused to cancel it.
+
+        The transfer is still running and Cove is still the only thing that
+        knows about it, so nothing was deleted and the row never left the
+        database. All that is needed is to stop treating it as doomed - and to
+        clear the durable removal marker, or the next launch would drop a task
+        aria2 is still running.
+        """
+        self._removing.pop(tid, None)
+        t = self.tasks.get(tid)
+        if t is None:
+            return
+        self._persist(t)
+        self.task_changed.emit(tid)
+        self._reassert_intent(t)
+
+    def _reassert_intent(self, t: DownloadTask) -> None:
+        """Re-send this task's pause/unpause intent to aria2.
+
+        Reconciliation is deliberately suppressed while a removal is in flight,
+        so a pause or unpause that completed during that window was never
+        checked against the current intent. A refused removal leaves the
+        transfer live, which means aria2 may now hold the opposite of what Cove
+        shows - so the intent is asserted again rather than assumed.
+        """
+        gid = t.gid
+        if not gid:
+            return
+        desired = self._desired_for(t.id, gid)
+        if desired is None:
+            # No per-task command to replay, but the task was also excluded
+            # from any queue-wide pause that ran during the removal window, so
+            # aria2's state for it is simply unknown. Assert what the queue
+            # wants for it now rather than assuming the two agree.
+            desired = (
+                t.status == "paused"
+                or not (self._running and self._scheduler_allows)
+            )
+            if desired and t.status == "active":
+                # Only the stopped-queue branch reaches here, and this is the
+                # auto-pause the task missed by being mid-removal when
+                # _mark_all_active_paused ran. Recording it is what makes Start
+                # resume the task: start_queue only resumes members of
+                # _auto_paused that are locally paused, so leaving the status
+                # at "active" would strand the download paused in aria2 behind
+                # a queue the UI shows as running.
+                t.status = "paused"
+                self._persist(t)
+                self._auto_paused.add(t.id)
+                self.task_changed.emit(t.id)
+        self._issue_state(t.id, gid, desired, self._state_sender(t.id, gid, desired))
 
     # ---- torrent removal ----------------------------------------------
 
@@ -2146,6 +2562,9 @@ class QueueManager(QObject):
         if self._running:
             return
         self._running = True
+        # Supersede any queue-wide pause still in flight from the Stop this
+        # is undoing, so its result cannot pause what is about to resume.
+        self._queue_epoch += 1
         self.queue_running_changed.emit(True)
         # Resume only items that stop_queue paused (not user-paused ones).
         for tid in list(self._auto_paused):
@@ -2159,6 +2578,7 @@ class QueueManager(QObject):
         if not self._running:
             return
         self._running = False
+        self._queue_epoch += 1
         self.queue_running_changed.emit(False)
         self._auto_paused = {t.id for t in self.tasks.values() if t.status == "active"}
         self._pause_everything()
@@ -2180,6 +2600,9 @@ class QueueManager(QObject):
         if allowed == self._scheduler_allows:
             return
         self._scheduler_allows = allowed
+        # Same reasoning as start_queue/stop_queue: crossing a schedule
+        # boundary supersedes any queue-wide pause still in flight.
+        self._queue_epoch += 1
         if allowed:
             for tid in list(self._auto_paused):
                 t = self.tasks.get(tid)
@@ -2203,19 +2626,68 @@ class QueueManager(QObject):
             self._retire_extractor_run(tid)
         self._hls_duration.clear()
         self._hls_stderr.clear()
+        self._hls_line_buffer.clear()
         self._extractor_output.clear()
         self._extractor_final_path.clear()
         self._extractor_line_buffer.clear()
 
+        epoch = self._queue_epoch
+
+        def _settled(landed: bool) -> None:
+            if landed:
+                # pause_all pauses every transfer aria2 holds, so this is the
+                # one place a queue-wide command teaches the per-task backend
+                # record what the backend now contains. Without it, a task the
+                # stale-result path steps over has no observed state at all,
+                # and nothing can tell that aria2 is holding a pause.
+                for t in self.tasks.values():
+                    if t.gid:
+                        self._note_backend_state(t.id, t.gid, True)
+            if not self._settle_pause_all(epoch):
+                self._mark_all_active_paused()
+
         def _on_fail(msg: str) -> None:
             self.error.emit(msg)
-            self._mark_all_active_paused()
+            _settled(False)
 
         self._spawn(
             self.rpc.pause_all,
-            on_done=lambda _: self._mark_all_active_paused(),
+            on_done=lambda _result=None: _settled(True),
             on_fail=_on_fail,
         )
+
+    def _settle_pause_all(self, epoch: int) -> bool:
+        """Handle a pause_all result that a later decision superseded.
+
+        Returns True when the result was stale and has been dealt with here.
+
+        A Stop immediately followed by a Start leaves a pause_all in flight
+        across the restart. Marking tasks paused then would stop downloads the
+        UI shows as running. The RPC still reaches aria2 whenever it reaches
+        it, though, so discarding the result is only half the job: anything
+        Cove currently considers active has to be unpaused again, or aria2
+        stays paused behind a running-looking queue.
+        """
+        if epoch == self._queue_epoch:
+            return False
+        if not (self._running and self._scheduler_allows):
+            return False
+        for t in self.tasks.values():
+            if t.status != "active" or not t.gid or t.id in self._removing:
+                continue
+            # A task the user paused while this queue-wide result was in
+            # flight is still "active" locally until its own pause callback
+            # lands. Compensating it here would overwrite that newer, more
+            # specific intent and resume a download the user just stopped.
+            if self._desired_for(t.id, t.gid) is True:
+                # Stepping aside is safe now: the backend state recorded above
+                # means that if this pause fails, _on_pause_failed's own
+                # convergence check will send the unpause withheld here.
+                continue
+            self._issue_state(
+                t.id, t.gid, False, self._state_sender(t.id, t.gid, False)
+            )
+        return True
 
     @property
     def is_running(self) -> bool:
@@ -2301,7 +2773,22 @@ class QueueManager(QObject):
                 return
             data = proc.readAllStandardOutput().data().decode("utf-8", errors="replace")
             self._hls_stderr[t.id] = (self._hls_stderr.get(t.id, "") + data)[-12000:]
-            for line in data.splitlines():
+            # QProcess delivers whatever bytes have arrived, so one ffmpeg
+            # progress record can straddle two readyRead events. Splitting each
+            # chunk on its own parsed the halves as two malformed records and
+            # dropped the update; the incomplete tail is carried to the next
+            # chunk instead. Same pattern as the extractor reader below.
+            #
+            # Both delimiters count. ffmpeg rewrites its status line in place
+            # and ends each one with a bare carriage return, so splitting on
+            # "\n" alone would hold every progress update in the buffer until
+            # some unrelated log line arrived - and the regexes below, which
+            # search rather than match, would then report the oldest record in
+            # the accumulated blob rather than the newest.
+            pending = self._hls_line_buffer.get(t.id, "") + data
+            lines = re.split(r"[\r\n]", pending)
+            self._hls_line_buffer[t.id] = lines.pop()
+            for line in lines:
                 info = parse_ffmpeg_progress(line, self._hls_duration.get(t.id, 0.0))
                 if "duration_secs" in info:
                     self._hls_duration[t.id] = info["duration_secs"]
@@ -2322,6 +2809,7 @@ class QueueManager(QObject):
             proc.deleteLater()
             self._hls_procs.pop(t.id, None)
             self._hls_duration.pop(t.id, None)
+            self._hls_line_buffer.pop(t.id, None)
             stderr = self._hls_stderr.pop(t.id, "")
             work = self._hls_work.pop(t.id, None) or run_work
             if t.id not in self.tasks:
@@ -2888,9 +3376,33 @@ class QueueManager(QObject):
                    provider=t.debrid_provider or None)
         return gid
 
-    def _on_unpause_failed(self, tid: int, msg: str) -> None:
+    def _on_unpause_failed(
+        self, tid: int, msg: str, gen: int | None = None, gid: str | None = None
+    ) -> None:
+        """Recover a task whose unpause aria2 refused, by relaunching it.
+
+        This is destructive - it drops the gid and requeues - so it must only
+        ever run for the command it belongs to. A failure arriving after the
+        user has paused again, or after a retry replaced the gid, would
+        otherwise detach and restart a task nobody asked to restart.
+        """
         t = self.tasks.get(tid)
         if not t:
+            return
+        if gen is not None:
+            # Ends this command's flight either way, so convergence stops
+            # waiting on it even when the recovery below is declined.
+            self._note_resolved(tid, gen)
+        if gid is not None and t.gid != gid:
+            return
+        if tid in self._removing:
+            return
+        if gen is not None and gid is not None and self._desired_for(tid, gid) is not False:
+            # The user has asked for something else since - possibly a pause
+            # held behind this very command. Relaunching is destructive, so it
+            # only ever runs for a resume that is still wanted; releasing the
+            # newer wish is the right recovery instead.
+            self._converge(tid, gid)
             return
         if t.gid:
             # Clean the dead download out of aria2 before relaunching, or
@@ -2914,6 +3426,12 @@ class QueueManager(QObject):
 
     def _mark_all_active_paused(self) -> None:
         for t in self.tasks.values():
+            # A task whose cancellation is in flight was excluded from the
+            # pause_all itself, so recording it as paused would describe a
+            # backend state nothing ever asked for. If the removal is refused,
+            # _restore_removal asserts its state explicitly instead.
+            if t.id in self._removing:
+                continue
             if t.status == "active":
                 t.status = "paused"
                 self._persist(t)
@@ -2924,16 +3442,37 @@ class QueueManager(QObject):
         if not active:
             return
         for t in active:
+            if t.id in self._removing:
+                continue
             self._spawn(
                 self.rpc.tell_status,
                 t.gid,
-                on_done=lambda status, tid=t.id: self._apply_status(tid, status),
+                on_done=lambda status, tid=t.id, gid=t.gid: self._on_poll_status(
+                    tid, gid, status
+                ),
                 on_fail=lambda *_: None,
             )
+
+    def _on_poll_status(self, tid: int, gid: str, status: dict) -> None:
+        """Apply a poll result only if it still describes the live transfer.
+
+        A retry replaces a task's gid while a tellStatus for the old one may
+        still be in flight. The answer is addressed to the task by id, so
+        without this check the old transfer's progress, error or completion
+        would be written onto its replacement.
+        """
+        t = self.tasks.get(tid)
+        if t is None or t.gid != gid:
+            return
+        self._apply_status(tid, status)
 
     def _apply_status(self, tid: int, status: dict) -> None:
         t = self.tasks.get(tid)
         if not t:
+            return
+        if tid in self._removing:
+            # Cancellation is already in flight. Completing, failing or
+            # cleaning up here would act on a task that is on its way out.
             return
         is_torrent = t.source_type == SOURCE_TORRENT
         if is_torrent:

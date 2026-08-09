@@ -1489,3 +1489,119 @@ def test_magnet_row_explains_an_unsupported_build():
     from cove.magnet_handler import HandlerStatus
 
     assert "installed or portable build" in _status_text(HandlerStatus(supported=False))
+
+
+def test_settings_dialog_does_not_probe_the_magnet_handler_on_the_gui_thread():
+    """BUG-014: xdg-mime ran inline, freezing Settings for its whole timeout.
+
+    Runs in an isolated process for the same reason as the layout test above:
+    this needs a real QApplication.
+    """
+    script = r'''
+import json, threading, time
+from PySide6.QtCore import QTimer
+from PySide6.QtWidgets import QApplication
+from cove import dialogs, magnet_handler
+from cove.config import Settings
+
+probe_threads = []
+real_status = magnet_handler.status
+
+def slow_status():
+    probe_threads.append(threading.current_thread().name)
+    time.sleep(0.4)          # stands in for a stuck xdg-mime
+    return real_status()
+
+magnet_handler.status = slow_status
+
+app = QApplication([])
+began = time.monotonic()
+dialog = dialogs.SettingsDialog(Settings())
+construction = time.monotonic() - began
+
+# Let the pooled probe finish and its queued result land on the GUI thread.
+deadline = time.monotonic() + 5
+while not probe_threads and time.monotonic() < deadline:
+    app.processEvents()
+    time.sleep(0.01)
+
+print(json.dumps({
+    "construction_secs": construction,
+    "probe_thread": probe_threads[0] if probe_threads else None,
+    "main_thread": threading.current_thread().name,
+}))
+'''
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=str(Path(__file__).resolve().parent.parent), env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert result["probe_thread"] is not None, "the status probe never ran"
+    assert result["probe_thread"] != result["main_thread"], (
+        "the magnet status was probed on the GUI thread"
+    )
+    # Construction must not have waited for the 0.4s probe.
+    assert result["construction_secs"] < 0.3, result["construction_secs"]
+
+
+def test_magnet_controls_serialize_and_always_come_back():
+    """Registration and removal rewrite the same association.
+
+    They must not overlap, a superseded callback must not touch the controls,
+    and a failed probe must not strand the user with disabled buttons.
+    """
+    script = r'''
+import json
+from PySide6.QtWidgets import QApplication
+from cove import dialogs, magnet_handler
+from cove.config import Settings
+
+app = QApplication([])
+dialog = dialogs.SettingsDialog(Settings())
+
+# Claim the controls, then deliver a result from a superseded operation.
+first = dialog._begin_magnet_op()
+second = dialog._begin_magnet_op()
+dialog._on_magnet_status(first, None)
+stale_ignored = not dialog.magnet_action_btn.isEnabled()
+
+# A probe that could not determine the state must re-enable the controls,
+# or there is no way to retry.
+dialog._on_magnet_status(second, None)
+recovered = (
+    dialog.magnet_action_btn.isEnabled()
+    and dialog.magnet_remove_btn.isEnabled()
+    and dialog.magnet_repair_check.isEnabled()
+)
+
+# Starting an operation disables every magnet control, not just its own
+# button, so enable and disable cannot run concurrently.
+dialog._on_magnet_enable()
+locked = (
+    not dialog.magnet_action_btn.isEnabled()
+    and not dialog.magnet_remove_btn.isEnabled()
+    and not dialog.magnet_repair_check.isEnabled()
+)
+
+print(json.dumps({
+    "stale_ignored": stale_ignored,
+    "recovered": recovered,
+    "locked": locked,
+}))
+'''
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=120,
+        cwd=str(Path(__file__).resolve().parent.parent), env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert result["stale_ignored"], "a superseded callback re-enabled the controls"
+    assert result["recovered"], "a failed probe left the controls stuck disabled"
+    assert result["locked"], "one operation did not lock the others out"
