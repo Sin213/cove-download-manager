@@ -90,6 +90,48 @@
     return "";
   }
 
+  const REDDIT_HOSTS = [
+    "reddit.com", "old.reddit.com", "new.reddit.com",
+    "sh.reddit.com", "np.reddit.com",
+  ];
+  const REDDIT_POST_PATH = /^\/r\/[^/]+\/comments\/[^/]+/;
+
+  function isRedditHost() {
+    try {
+      const host = new URL(location.href).hostname.toLowerCase().replace(/^www\./, "");
+      return REDDIT_HOSTS.includes(host);
+    } catch {
+      return false;
+    }
+  }
+
+  // The feed's player is MSE, so nothing on the page names the media. The post
+  // it belongs to does, though, and yt-dlp can resolve that - which also muxes
+  // Reddit's separate audio track, so the download arrives with sound.
+  //
+  // Strictly ancestor-scoped. A feed holds many posts, and reaching across to
+  // another card downloads a different video than the one clicked, which looks
+  // for all the world like a download that worked.
+  function postPermalink(video) {
+    if (!video || !isRedditHost()) return "";
+    const card = video.closest("shreddit-post, [data-permalink], article");
+    if (!card) return "";
+    let href =
+      (card.getAttribute && (card.getAttribute("permalink") ||
+                             card.getAttribute("data-permalink"))) || "";
+    if (!href && card.querySelector) {
+      const link = card.querySelector('a[href*="/comments/"]');
+      href = (link && link.getAttribute("href")) || "";
+    }
+    if (!href) return "";
+    try {
+      const url = new URL(href, location.href);
+      return REDDIT_POST_PATH.test(url.pathname) ? url.href : "";
+    } catch {
+      return "";
+    }
+  }
+
   function extractorPageUrl() {
     try {
       const url = new URL(location.href);
@@ -103,7 +145,7 @@
   }
 
   function videoUrl(video) {
-    return extractorPageUrl() || candidateUrl(video);
+    return extractorPageUrl() || candidateUrl(video) || postPermalink(video);
   }
 
   function isCurrentlyPlaying(video) {
@@ -406,7 +448,8 @@
     // release it, and deactivateVideo() refuses to run while that flag is set,
     // so forgetting once pins the pill over the page until a reload.
     const pageUrl = extractorPageUrl() || location.href;
-    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo);
+    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo) ||
+      postPermalink(activeVideo);
 
     // Generated at the origin of the request so the same id can be followed
     // through the background, the native host and Cove itself.

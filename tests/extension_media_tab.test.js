@@ -59,11 +59,36 @@ class StubNode {
   }
 
   closest(selector) {
-    return selector === "video" && this.tagName === "VIDEO" ? this : null;
+    const parts = String(selector).split(",").map((s) => s.trim());
+    let node = this;
+    while (node) {
+      for (const part of parts) {
+        const attr = part.match(/^\[([^\]=]+)\]$/);
+        if (attr) {
+          if (node.getAttribute(attr[1]) != null) return node;
+        } else if (/^[a-z][a-z0-9-]*$/i.test(part)) {
+          if (node.tagName === part.toUpperCase()) return node;
+        }
+      }
+      node = node.parentNode;
+    }
+    return null;
   }
 
-  querySelector() {
-    return null;
+  querySelector(selector) {
+    const match = String(selector).match(/^a\[href\*="([^"]+)"\]$/);
+    if (!match) return null;
+    const needle = match[1];
+    const walk = (node) => {
+      for (const child of node.children) {
+        const href = child.tagName === "A" ? child.getAttribute("href") : null;
+        if (href && href.includes(needle)) return child;
+        const found = walk(child);
+        if (found) return found;
+      }
+      return null;
+    };
+    return walk(this);
   }
 
   getAttribute(name) {
@@ -685,4 +710,118 @@ test("an unresolvable video does not wedge the pill against later clicks", async
   const download = harness.sent.find((m) => m.type === "downloadMedia");
   assert.ok(download, "the second click must be allowed through");
   assert.equal(download.url, "https://v.redd.it/abc123/DASH_720.mp4");
+});
+
+// ---------------------------------------------------------------------------
+// Reddit feed
+//
+// The feed's player is MSE, so nothing on the page names the media. The post
+// it belongs to does, and yt-dlp can resolve that - which also muxes Reddit's
+// separate audio track. Lookup is ancestor-scoped: a feed holds many posts.
+// ---------------------------------------------------------------------------
+
+function redditCard({ tag = "SHREDDIT-POST", attrs = {}, link = "" } = {}) {
+  const card = new StubNode(tag);
+  for (const [name, value] of Object.entries(attrs)) card[name] = value;
+  if (link) {
+    const anchor = new StubNode("A");
+    anchor.href = link;
+    card.appendChild(anchor);
+  }
+  return card;
+}
+
+function feedHarness(cards, tops = null) {
+  const videos = cards.map((_card, index) =>
+    blobVideo({ top: tops ? tops[index] : 200 })
+  );
+  const harness = loadMediaTab({ href: "https://www.reddit.com/", videos });
+  // loadMediaTab reparents every video onto the body, so the cards have to be
+  // wired up afterwards or closest() never reaches them.
+  cards.forEach((card, index) => {
+    harness.body.appendChild(card);
+    card.appendChild(videos[index]);
+  });
+  return { harness, videos };
+}
+
+test("a new-Reddit feed card resolves its own permalink", async () => {
+  const card = redditCard({ attrs: { permalink: "/r/aww/comments/abc123/a_title/" } });
+  const { harness, videos } = feedHarness([card]);
+
+  await clickPill(harness, videos[0]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(download.url, "https://www.reddit.com/r/aww/comments/abc123/a_title/");
+});
+
+test("an old-Reddit feed card resolves its own permalink", async () => {
+  const card = redditCard({
+    tag: "DIV",
+    attrs: { "data-permalink": "/r/aww/comments/abc123/a_title/" },
+  });
+  const { harness, videos } = feedHarness([card]);
+
+  await clickPill(harness, videos[0]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(download.url, "https://www.reddit.com/r/aww/comments/abc123/a_title/");
+});
+
+test("a card with only a comments link still resolves", async () => {
+  const card = redditCard({ tag: "ARTICLE", link: "/r/aww/comments/abc123/a_title/" });
+  const { harness, videos } = feedHarness([card]);
+
+  await clickPill(harness, videos[0]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(download.url, "https://www.reddit.com/r/aww/comments/abc123/a_title/");
+});
+
+test("a feed of several posts resolves the clicked one", async () => {
+  const first = redditCard({ attrs: { permalink: "/r/aww/comments/first/one/" } });
+  const second = redditCard({ attrs: { permalink: "/r/aww/comments/second/two/" } });
+  const third = redditCard({ attrs: { permalink: "/r/aww/comments/third/three/" } });
+  // Scrolled so only the middle post is in view. Identical positions would
+  // leave the pill's own target heuristic to break the tie, which is not what
+  // this test is about - it is about the permalink following the pill.
+  const { harness, videos } = feedHarness([first, second, third], [-600, 200, 2000]);
+
+  await clickPill(harness, videos[1]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(
+    download.url, "https://www.reddit.com/r/aww/comments/second/two/",
+    "the pill must download the post it was clicked on"
+  );
+});
+
+test("a video in no recognisable card still reports no video", async () => {
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({ href: "https://www.reddit.com/", videos: [video] });
+
+  const host = await clickPill(harness, video);
+
+  assert.equal(harness.sent.find((m) => m.type === "downloadMedia"), undefined);
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  assert.equal(pill.children[0].textContent, "No video found");
+});
+
+test("a thread page sends the playlist and never the permalink", async () => {
+  // Inside a thread the player names its own stream, which is the path that
+  // already works. The permalink must not displace it.
+  const card = redditCard({ attrs: { permalink: "/r/aww/comments/abc123/a_title/" } });
+  const video = blobVideo({ top: 200 });
+  video["data-hls-url"] = "https://v.redd.it/abc123/HLSPlaylist.m3u8";
+  card.appendChild(video);
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/r/aww/comments/abc123/a_title/",
+    videos: [video],
+  });
+  harness.body.appendChild(card);
+
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(download.url, "https://v.redd.it/abc123/HLSPlaylist.m3u8");
 });

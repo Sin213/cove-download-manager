@@ -13,11 +13,22 @@
 // globals (sendNativeMessage, markIntercepted, showNotification, diagRecord)
 // at call time, by which point that script has been evaluated.
 
+const REDDIT_HOSTS = [
+  "reddit.com", "old.reddit.com", "new.reddit.com",
+  "sh.reddit.com", "np.reddit.com",
+];
+const REDDIT_POST_PATH = /^\/r\/[^/]+\/comments\/[^/]+/;
+
 function extractorPageUrl(value) {
   try {
     const url = new URL(value || "");
     const host = url.hostname.toLowerCase().replace(/^www\./, "");
     if (host === "youtu.be" && url.pathname.length > 1) return url.href;
+    // Reddit keeps DASH audio separate from video, so the post URL goes to
+    // yt-dlp, which muxes them. A bare media link is left as a direct file.
+    if (REDDIT_HOSTS.includes(host)) {
+      return REDDIT_POST_PATH.test(url.pathname) ? url.href : "";
+    }
     if (!["youtube.com", "m.youtube.com", "music.youtube.com"].includes(host)) return "";
     if (url.pathname === "/watch" && url.searchParams.get("v")) return url.href;
     if (/^\/(?:shorts|live|embed)\/[^/]+/.test(url.pathname)) return url.href;
