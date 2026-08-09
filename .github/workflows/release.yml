@@ -342,25 +342,36 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.5.1
+          ## What's new in 3.5.2
 
-          A maintenance release for three problems 3.5.0 could describe but not fix: a Windows extractor download that failed at the last step, a browser handoff that Cove refused for a reason nobody could see, and an unfinished download whose data stayed on disk after it was removed.
+          A correctness release. An audit of the codebase turned up twenty-one confirmed defects, and this fixes all of them. Nothing here is a new feature; several are problems you could hit without ever knowing why, which is the reason for shipping them on their own rather than folding them into the next feature release.
 
           ### Fixed
 
-          - **Windows video downloads no longer fail at publication.** yt-dlp exits successfully and prints the final filename it believes it produced, and on Windows that name was sometimes not the file it actually left in Cove's private work directory - so a complete download failed with an invalid-output error. When exactly one legitimate finished file is present, Cove now publishes that file, under its real extension. Every existing safety rule still applies: the fallback looks only at the top level of the run's own work directory, never at your download folder, and anything ambiguous or empty still fails rather than guessing. A missing file is also now recorded as its own failure class, separate from a path Cove refuses to touch.
-          - **Oversized browser cookies no longer sink an otherwise valid download.** A large site's full cookie jar can exceed the bound Cove's native handoff places on the cookie header, and Cove was rejecting the whole request for it. The extension and the native host now drop a cookie header that cannot fit rather than sending it - never truncating it, since half a cookie header authenticates nothing - so the download still reaches the queue.
-          - **Removing an unfinished download now cleans up after it.** Removing an incomplete aria2 download deleted the queue row and left the partial file and its `.aria2` resume file on disk, unresumable, because the only thing that knew about them was the row just deleted. Explicit removal now clears the exact file the task owns, and its control file, with nothing scanned or guessed. Pause, errors, stopping the queue and quitting Cove all still keep resume data; a finished file is still kept unless you choose Remove and delete; and Clear all still honours its "Files on disk are kept" promise.
+          - **A removed download can no longer come back.** Cancelling an unfinished download asks aria2 to let go of it first, and only then clears the row - so a cancellation aria2 refuses leaves the download intact instead of losing track of a transfer that is still running. Quitting or crashing inside that window used to restore the download on the next launch and start it again; the row now records that it is on its way out, and startup finishes the job.
+          - **Pause and resume no longer drift out of step with aria2.** Cove sends one pause or resume per download at a time and waits for the answer before sending another. Two commands issued together could be applied by aria2 in the opposite order to the one they were sent in, leaving a download running while Cove showed it paused, or paused while Cove showed it running, with nothing to correct it. Cove now compares what you asked for against what aria2 last reported and re-sends the difference.
+          - **A download you paused stays paused across a restart.** Startup restored paused downloads as queued, so they resumed on their own.
+          - **Video download progress no longer stalls.** ffmpeg ends each progress line with a carriage return rather than a newline, and the reader was waiting for a newline that only arrived with unrelated output - so the bar sat still and then jumped, reporting an old position when it did move.
+          - **Cancelling an update no longer freezes Cove.** Cancel closed the network response directly from the interface thread, which then waited on the download thread's read for up to twenty seconds - the exact hang Cancel is there to end. It now interrupts the transfer without blocking the interface.
+          - **Cancelling an update no longer installs it anyway.** A Cancel arriving as the final chunk of the download completed was not noticed, and Cove replaced the executable and relaunched into the update you had just called off. Cancellation is now checked again before the download reports success, and once more before anything is replaced.
+          - **A corrupted settings file no longer crashes Cove or silently inverts a setting.** Values loaded from disk are type-checked at the boundary, including category directories and the schedule window. Recognising a key was previously all the loader did, and a non-empty `"false"` read as true.
+          - **Torrent files are written safely when two saves overlap.** Each save uses its own scratch file rather than a shared one two writers could truncate, and every byte is written rather than assuming a single write suffices.
+          - **Failed TorBox jobs are released.** Only a poll timeout freed the job, so failed attempts accumulated on your account.
 
           ### Also in this release
 
-          - **A refused handoff now says why.** The local IPC reply carries the fixed rejection category the app already computed, so the native-host log records `oversized_message` or `invalid_url` instead of a blanket `gui_rejected`, and the extension no longer reports "Cove is not available" for a request that a running Cove explicitly refused. The category vocabulary is fixed: no request content, no URLs and no cookies ever appear in it, and an older app or extension keeps working unchanged.
-          - **AppImage runs are labelled as AppImage.** Support logs called them plain source runs, which made Linux reports harder to place. This is labelling only - nothing about the data directory, the local socket or the native-host manifest changes.
+          - **Browsers installed only as Flatpaks now get a native-messaging manifest.** They have no conventional config directory, so they were previously skipped entirely and the browser extension could not reach Cove at all.
+          - **The extension badge shows OFF when Cove is disabled**, rather than being overwritten by a media count.
+          - **Support logs respect their size cap** with non-ASCII text. Rotation counted characters rather than bytes, so a log could grow well past its limit.
+          - **The single-instance lock lives in a private per-user directory**, checked before use so it cannot be redirected through a planted symlink, and an unusable lock file is reported as such instead of as an already-running Cove.
+          - **Checking whether Cove is your magnet handler no longer briefly freezes the window.** It runs off the interface thread, as the account test already did.
+          - **An installed copy has its icons.** They were staged only in the source checkout, so a wheel installed from PyPI had none. Python 3.10 is now declared as the minimum, which is what the code has required since it started using newer type syntax.
 
           ### Notes
 
-          - The Fedora and Flatpak handoff failures reported against 3.5.0 are not claimed as solved here. Oversized cookies are one confirmed cause of a rejected request, and the new categories exist so any remaining case reports the exact reason instead of a generic refusal.
-          - Browser extension: Firefox 1.4.6 and Chrome 1.3.7. Store submission is manual, so the store listings update separately from this release.
+          - Two audit findings were examined and rejected rather than fixed. The Windows native-messaging `.bat` wrapper is the documented approach for Firefox on Windows, and Debian handler detection does query the desktop association - the reported causes were not real.
+          - One known limit is deliberate: if Cove is killed during the moment between asking aria2 to cancel a download and aria2 confirming it, the partial file is left on disk. Cleaning it up blindly at startup risks deleting a file a still-running transfer would immediately recreate.
+          - Browser extension: unchanged at Firefox 1.4.6 and Chrome 1.3.7. The extension fixes above are in the source but not yet in a published store build; they ship with the next store submission, which is manual and separate from this release.
 
           ## Downloads
 
