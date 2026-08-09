@@ -859,3 +859,65 @@ test("a player does not borrow another player's stream", async () => {
   const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
   assert.equal(pill.children[0].textContent, "No video found");
 });
+
+// ---------------------------------------------------------------------------
+// Reddit-hosted video, without the API
+//
+// Reddit's JSON API refuses whole networks, so resolving a post through it is
+// unreliable even when logged in. A Reddit-hosted video does not need it: the
+// post card names the v.redd.it id, and that id's HLS playlist is public,
+// carries audio, and goes down the path Cove already uses for streams.
+// ---------------------------------------------------------------------------
+
+test("an old-Reddit card with a v.redd.it link yields its playlist", async () => {
+  const card = redditCard({
+    tag: "DIV",
+    attrs: {
+      "data-url": "https://v.redd.it/dzbdjfbrwuhh1",
+      "data-permalink": "/r/aww/comments/abc123/a_title/",
+    },
+  });
+  const { harness, videos } = feedHarness([card]);
+
+  await clickPill(harness, videos[0]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(
+    download.url, "https://v.redd.it/dzbdjfbrwuhh1/HLSPlaylist.m3u8",
+    "a Reddit-hosted video should not need the API at all"
+  );
+});
+
+test("a trailing slash or query on the card link is tolerated", async () => {
+  const card = redditCard({
+    tag: "DIV",
+    attrs: {
+      "data-url": "https://v.redd.it/dzbdjfbrwuhh1/?utm_source=share",
+      "data-permalink": "/r/aww/comments/abc123/a_title/",
+    },
+  });
+  const { harness, videos } = feedHarness([card]);
+
+  await clickPill(harness, videos[0]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(download.url, "https://v.redd.it/dzbdjfbrwuhh1/HLSPlaylist.m3u8");
+});
+
+test("a card linking somewhere else still falls back to the permalink", async () => {
+  // A YouTube or imgur post is not Reddit-hosted, so the extractor has to
+  // resolve it from the post instead.
+  const card = redditCard({
+    tag: "DIV",
+    attrs: {
+      "data-url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      "data-permalink": "/r/aww/comments/abc123/a_title/",
+    },
+  });
+  const { harness, videos } = feedHarness([card]);
+
+  await clickPill(harness, videos[0]);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(download.url, "https://www.reddit.com/r/aww/comments/abc123/a_title/");
+});
