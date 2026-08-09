@@ -1225,6 +1225,107 @@ def test_non_share_links_are_left_alone(url):
     assert debrid.share_link_reason(url) == ""
 
 
+@pytest.mark.parametrize(
+    "settings",
+    [None, _settings(), _settings(all_debrid_enabled=True, all_debrid_api_key=APIKEY)],
+)
+def test_share_link_reason_ad_f_link_is_rejected_regardless_of_settings(settings):
+    reason = debrid.share_link_reason("https://alldebrid.com/f/XYZ789", settings)
+    assert reason
+    assert "AllDebrid" in reason
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [None, _settings(), _settings(all_debrid_enabled=True, all_debrid_api_key=APIKEY)],
+)
+def test_share_link_reason_rd_d_link_is_rejected_when_rd_disabled(settings):
+    reason = debrid.share_link_reason("https://real-debrid.com/d/ALJRILITCGUEW127", settings)
+    assert reason
+    assert "Real-Debrid" in reason
+
+
+def test_share_link_reason_rd_d_link_is_allowed_when_rd_enabled():
+    settings = _settings(real_debrid_enabled=True, real_debrid_api_token=TOKEN)
+    assert debrid.share_link_reason("https://real-debrid.com/d/ALJRILITCGUEW127", settings) == ""
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://real-debrid.com/d/ABC", True),
+        ("https://real-debrid.com/d/ABC/file.mp4", True),
+        ("https://www.real-debrid.com/d/ABC", True),
+        ("http://real-debrid.com/d/ABC", True),
+        ("https://REAL-DEBRID.com/d/ABC", True),
+        ("https://real-debrid.com/d/ABC?x=1", True),
+        # Delivery subdomains are not share links.
+        ("https://sgp.download.real-debrid.com/d/ABC/file.mp4", False),
+        ("https://node-01.real-debrid.com/d/ABC/file.zip", False),
+        # Wrong path, lookalike hosts, non-http.
+        ("https://real-debrid.com/f/ABC", False),
+        ("https://real-debrid.com/premium", False),
+        ("https://real-debrid.com.evil.test/d/ABC", False),
+        ("https://rapidgator.net/d/ABC", False),
+        ("", False),
+        (None, False),
+        ("magnet:?xt=urn:btih:abc", False),
+    ],
+)
+def test_is_real_debrid_share_link_matches_only_apex(url, expected):
+    assert debrid.is_real_debrid_share_link(url) is expected
+
+
+def test_resolve_unrestricts_an_rd_share_link_when_rd_is_configured():
+    settings = _settings(real_debrid_enabled=True, real_debrid_api_token=TOKEN)
+    session = FakeSession({"/unrestrict/link": _ok_rd()})
+    result = debrid.resolve(
+        "https://real-debrid.com/d/ALJRILITCGUEW127", settings, session=session
+    )
+    assert result.provider == REAL_DEBRID
+    assert result.download == "https://node-01.real-debrid.com/d/A/f.zip"
+    assert len(session.calls) == 1
+    assert session.calls[0][1].endswith("/unrestrict/link")
+
+
+def test_resolve_returns_none_for_an_rd_share_link_when_rd_is_disabled():
+    settings = _settings()
+    session = FakeSession({})
+    assert debrid.resolve(
+        "https://real-debrid.com/d/ALJRILITCGUEW127", settings, session=session
+    ) is None
+    assert session.calls == []
+
+
+def test_resolve_raises_missing_credential_for_rd_share_link_when_rd_enabled_but_token_empty():
+    settings = _settings(real_debrid_enabled=True)
+    session = FakeSession({})
+    with pytest.raises(DebridError) as excinfo:
+        debrid.resolve(
+            "https://real-debrid.com/d/ALJRILITCGUEW127", settings, session=session
+        )
+    assert excinfo.value.provider == REAL_DEBRID
+    assert excinfo.value.code == "missing_credential"
+    assert excinfo.value.fallback_allowed is False
+    assert session.calls == []
+
+
+def test_resolve_routes_only_to_rd_even_when_ad_is_also_enabled():
+    settings = _settings(
+        all_debrid_enabled=True,
+        all_debrid_api_key=APIKEY,
+        real_debrid_enabled=True,
+        real_debrid_api_token=TOKEN,
+        debrid_preferred_provider="alldebrid",
+    )
+    session = FakeSession({"/unrestrict/link": _ok_rd()})
+    result = debrid.resolve(
+        "https://real-debrid.com/d/ALJRILITCGUEW127", settings, session=session
+    )
+    assert result.provider == REAL_DEBRID
+    assert all(call[1].endswith("/unrestrict/link") for call in session.calls)
+
+
 # ---------------------------------------------------------------------------
 # Cached torrents
 # ---------------------------------------------------------------------------

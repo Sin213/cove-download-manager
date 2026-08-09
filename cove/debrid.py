@@ -1142,14 +1142,46 @@ def is_provider_domain(url) -> bool:
 # direct URL that downloads fine when pasted by hand, and refusing those
 # would break a legitimate manual workflow. Matching is anchored to the bare
 # apex host plus the share path prefix so download subdomains fall through.
+#
+# Real-Debrid is the exception to "not hoster links": its `/d/<token>` form
+# is the standard unrestricted-link format the RD API itself hands back from
+# `/torrents/info` and the download history, and the API's `/unrestrict/link`
+# endpoint accepts it again. So when an RD account is configured, `/d/` links
+# are routed through the API (see is_real_debrid_share_link and resolve);
+# only without a configured RD account do they get rejected like AllDebrid's
+# `/f/` share links, which genuinely have no API unlock.
 _SHARE_LINK_HOSTS = {
     "real-debrid.com": ("/d/", REAL_DEBRID),
     "alldebrid.com": ("/f/", ALL_DEBRID),
 }
 
 
-def share_link_reason(url) -> str:
+def is_real_debrid_share_link(url) -> bool:
+    """True only for the apex `/d/` form, never for delivery subdomains.
+
+    Used both by share_link_reason (to decide whether to reject) and
+    resolve() (to route the URL to the Real-Debrid API even though it
+    lives on a provider-owned apex host).
+    """
+    host = _hostname(url)
+    if host.startswith("www."):
+        host = host[4:]
+    if host != "real-debrid.com":  # exact apex only, not *.download.real-debrid.com
+        return False
+    try:
+        return urlparse(url).path.startswith("/d/")
+    except ValueError:
+        return False
+
+
+def share_link_reason(url, settings=None) -> str:
     """Explain why an account-bound provider share link can't be downloaded.
+
+    AllDebrid `/f/` links are always rejected: they are tied to the browser
+    session that created them and have no API unlock. Real-Debrid `/d/` links
+    are rejected only when no RD account is configured (or when no settings
+    are available to check); with RD enabled they are handed to resolve(),
+    which passes them to Real-Debrid's /unrestrict/link API.
 
     Returns "" for anything Cove should keep handling normally.
     """
@@ -1167,6 +1199,8 @@ def share_link_reason(url) -> str:
     except ValueError:
         return ""
     if not path.startswith(prefix):
+        return ""
+    if provider == REAL_DEBRID and getattr(settings, "real_debrid_enabled", False) is True:
         return ""
     return (
         f"{provider_label(provider)} share links are tied to the account that "
@@ -1314,7 +1348,25 @@ def resolve(
     Raises DebridError when a provider that should have handled the link
     failed in a way the user needs to know about.
     """
-    if not _hostname(url) or is_provider_domain(url):
+    if not _hostname(url):
+        return None
+    if is_real_debrid_share_link(url):
+        # The /d/ apex is a provider-owned host, but Real-Debrid's API can
+        # unlock it for the account that owns the token, so it is not a dead
+        # end. Route it to RD only; do not ask AD/TorBox to try.
+        if getattr(settings, "real_debrid_enabled", False) is not True:
+            # No RD account: queue.py's share_link_reason gate rejects it
+            # with the share-link message before resolve() is even reached.
+            return None
+        rd_token = getattr(settings, "real_debrid_api_token", "")
+        if not isinstance(rd_token, str) or not rd_token.strip():
+            raise DebridError(
+                REAL_DEBRID, "missing_credential",
+                "is enabled but has no API key saved. Add one in Settings.",
+                False, False,
+            )
+        return real_debrid_unrestrict(url, rd_token.strip(), session=session)
+    if is_provider_domain(url):
         return None
     providers = _enabled_providers(settings)
     if not providers:

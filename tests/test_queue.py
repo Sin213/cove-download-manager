@@ -5806,40 +5806,98 @@ def test_url_intake_is_classified_without_the_token(queue_env, diag):
     assert "ALJRILITCGUEW127" not in json.dumps(diag.records())
 
 
-def test_share_link_rejection_records_provider_and_resolver(
-    queue_env, monkeypatch, diag
-):
+def test_rd_share_link_is_resolved_when_account_is_configured(queue_env, monkeypatch, diag):
+    queue, rpc, _db = queue_env(
+        real_debrid_enabled=True, real_debrid_api_token="rd-token-value"
+    )
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: Unrestricted(NODE_URL, "movie.mkv", 4096, REAL_DEBRID),
+    )
+    _sync_spawn(queue)
+    tid = queue.add_url(SHARE_URL)
+    task = queue.tasks[tid]
+    queue._launch(task)
+
+    assert task.status == "paused"  # auto-paused: the fixture disables the scheduler
+    assert task.url == SHARE_URL
+    assert task.debrid_provider == REAL_DEBRID
+    assert task.resolved_url == NODE_URL
+    assert rpc.added[0]["uris"] == [NODE_URL]
+    assert _events(diag, "debrid", "share_link_rejected") == []
+    add = _one(diag, "aria2", "add")
+    assert add["fields"]["target"] == "debrid_delivery_link"
+    assert add["fields"]["provider"] == "real_debrid"
+
+
+def test_rd_share_link_resolution_keeps_no_secret_in_diag(queue_env, monkeypatch, diag):
     queue, _rpc, _db = queue_env(
         real_debrid_enabled=True, real_debrid_api_token="rd-token-value"
     )
-    tid = queue.add_url(SHARE_URL)
-    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
-    queue._launch(queue.tasks[tid])
-
-    rejected = _one(diag, "debrid", "share_link_rejected")
-    fields = rejected["fields"]
-    assert fields["host"] == "real-debrid.com"
-    assert fields["route"] == "/d/<redacted>"
-    assert fields["provider"] == "real_debrid"
-    assert fields["resolver"] == "unsupported_share_link"
-    assert fields["rd_enabled"] is True
-    assert fields["rd_authenticated"] is True
-
-
-def test_share_link_rejection_records_credentials_as_booleans_only(
-    queue_env, monkeypatch, diag
-):
-    queue, _rpc, _db = queue_env(
-        real_debrid_enabled=True, real_debrid_api_token="rd-token-value"
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: Unrestricted(NODE_URL, "movie.mkv", 4096, REAL_DEBRID),
     )
+    _sync_spawn(queue)
     tid = queue.add_url(SHARE_URL)
-    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
     queue._launch(queue.tasks[tid])
 
     dumped = json.dumps(diag.records())
     assert "rd-token-value" not in dumped
     assert "ALJRILITCGUEW127" not in dumped
+    assert "SECRETNODE" not in dumped
     _assert_clean(dumped)
+
+
+def test_rd_share_link_persists_the_original_url_only(queue_env, monkeypatch):
+    queue, _rpc, db_path = queue_env(
+        real_debrid_enabled=True, real_debrid_api_token="rd-token-value"
+    )
+    monkeypatch.setattr(
+        debrid, "resolve",
+        lambda url, settings, **kw: Unrestricted(NODE_URL, "movie.mkv", 4096, REAL_DEBRID),
+    )
+    _sync_spawn(queue)
+    tid = queue.add_url(SHARE_URL)
+    queue._launch(queue.tasks[tid])
+
+    row = _persisted_row(db_path, tid)
+    assert row["url"] == SHARE_URL
+    row_text = _persisted_row_text(db_path, tid)
+    assert "SECRETNODE" not in row_text
+    assert NODE_URL not in row_text
+
+
+def test_rd_share_link_with_rd_enabled_but_no_token_fails_with_readable_error(
+    queue_env, monkeypatch, diag
+):
+    queue, _rpc, _db = queue_env(real_debrid_enabled=True)
+    _sync_spawn(queue)
+    tid = queue.add_url(SHARE_URL)
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "no API key" in task.error
+    assert _events(diag, "debrid", "share_link_rejected") == []
+
+
+def test_alldebrid_share_link_is_still_rejected_with_alldebrid_enabled(
+    queue_env, monkeypatch, diag
+):
+    queue, _rpc, _db = queue_env(
+        all_debrid_enabled=True, all_debrid_api_key="ad-key-value"
+    )
+    tid = queue.add_url("https://alldebrid.com/f/XYZ789")
+    monkeypatch.setattr(queue, "_spawn", lambda fn, *a, **kw: None)
+    queue._launch(queue.tasks[tid])
+
+    task = queue.tasks[tid]
+    assert task.status == "error"
+    assert "AllDebrid" in task.error
+    fields = _one(diag, "debrid", "share_link_rejected")["fields"]
+    assert fields["provider"] == "all_debrid"
+    assert fields["resolver"] == "unsupported_share_link"
 
 
 def test_share_link_rejection_reports_unauthenticated_state(
