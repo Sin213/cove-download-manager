@@ -128,7 +128,17 @@ def _host_command_parts() -> list[str]:
         return [appimage, "--native-messaging"]
 
     python = sys.executable or "python3"
-    return [python, "-c", "from cove.native_messaging import main; main()"]
+    # The browser starts the host from its own working directory, and a source
+    # checkout is not on the import path, so a bare import dies with
+    # ModuleNotFoundError - which reaches the user only as "Not connected to
+    # Cove". Carry the checkout's location in the command itself rather than
+    # depending on where it is run from.
+    root = str(Path(__file__).resolve().parent.parent)
+    return [
+        python, "-c",
+        f"import sys; sys.path.insert(0, {root!r}); "
+        "from cove.native_messaging import main; main()",
+    ]
 
 
 def _wrapper_script(parts: list[str]) -> str:

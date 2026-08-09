@@ -197,3 +197,39 @@ def test_an_unknown_flatpak_app_is_never_written_to(tmp_path, monkeypatch):
 
     assert installed == []
     assert list((tmp_path / ".var" / "app" / "org.libreoffice.LibreOffice").iterdir()) == []
+
+
+def test_source_run_host_finds_cove_from_any_directory(tmp_path, monkeypatch):
+    """The browser launches the host from its own working directory.
+
+    A source checkout is not installed on the import path, so a command that
+    just imports `cove` dies with ModuleNotFoundError wherever the browser
+    happens to start it - and the extension reports "Not connected to Cove"
+    with nothing to explain it. The checkout's location has to travel with the
+    command.
+    """
+    monkeypatch.delenv("APPIMAGE", raising=False)
+    with patch.object(sys, "executable", "/usr/bin/python3"):
+        parts = nhi._host_command_parts()
+
+    root = str(Path(nhi.__file__).resolve().parent.parent)
+    assert parts[0] == "/usr/bin/python3"
+    assert any(root in part for part in parts), (
+        "the checkout's path must be carried in the command"
+    )
+
+    # Run it somewhere else entirely: this is what the browser does.
+    import subprocess
+    proc = subprocess.run(
+        [*parts[:-1], parts[-1].replace("main()", "print('ok')")],
+        cwd=str(tmp_path), capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "ok" in proc.stdout
+
+
+def test_appimage_run_is_unchanged(monkeypatch):
+    """A packaged run already has a self-contained executable to point at."""
+    monkeypatch.setenv("APPIMAGE", "/home/someone/Cove.AppImage")
+    parts = nhi._host_command_parts()
+    assert parts == ["/home/someone/Cove.AppImage", "--native-messaging"]
