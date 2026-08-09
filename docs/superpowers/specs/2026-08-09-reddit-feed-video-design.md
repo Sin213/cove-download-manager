@@ -126,3 +126,47 @@ change is in the app, not the extension, so it carries no store risk.
 
 Firefox still needs its manual check before upload - load `dist/firefox`
 unpacked and confirm the video context menu and the pill both work.
+
+---
+
+## Outcome: reverted 2026-08-09
+
+Built, shipped behind no flag, and taken back out the same day. The feature
+worked; the environment it depends on does not.
+
+**What killed it.** Resolving a post means Reddit's JSON API, and Reddit
+refuses whole networks outright. Verified directly from the affected machine:
+
+    plain urllib:          403 Blocked
+    Chrome-impersonated:   403  text/html  (a block page)
+
+Cookies did not help. yt-dlp reported "Your IP address is unable to access the
+Reddit API", which it only says once `_is_logged_in` is true - so the session
+was recognised and refused anyway. Browser TLS impersonation did not help
+either. There is no request Cove can make that changes this answer.
+
+**The consolation prize also fell short.** A Reddit-hosted video can skip the
+API: the post card names the v.redd.it id and
+`https://v.redd.it/<id>/HLSPlaylist.m3u8` is public and carries audio. That
+worked on old Reddit. It did not work on new Reddit, whose `shreddit-post`
+does not expose the id under the attribute this assumed, and it was slow -
+ffmpeg walks an HLS playlist one segment at a time, where the direct
+`packaged-media` MP4 aria2 already handles finishes in under a second. That
+MP4 cannot be constructed; its URL carries a signature only Reddit issues.
+
+**Net effect of reverting.** Back to: old Reddit thread pages fast, new Reddit
+feed fast, old Reddit feed reports "No video found". The last of those is the
+honest answer for a page that names no media anywhere in its DOM.
+
+**Kept from the attempt**, because each stands on its own:
+
+- the pill no longer sends the page address as if it were the video, which is
+  what produced a bare 403 from a download nobody could explain
+- the in-flight flag is released when there is no video, so the pill stops
+  pinning itself over the page until a reload
+- `embeddedStreamUrl` is ancestor-scoped, so a player cannot claim the first
+  stream on the page and download the wrong video
+- the native-messaging host finds a source checkout from any directory
+
+**Before trying this again**, confirm Reddit's API answers from the network in
+question. Everything else here is downstream of that one fact.

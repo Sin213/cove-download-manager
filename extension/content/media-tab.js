@@ -93,75 +93,6 @@
     return "";
   }
 
-  const REDDIT_HOSTS = [
-    "reddit.com", "old.reddit.com", "new.reddit.com",
-    "sh.reddit.com", "np.reddit.com",
-  ];
-  const REDDIT_POST_PATH = /^\/r\/[^/]+\/comments\/[^/]+/;
-
-  function isRedditHost() {
-    try {
-      const host = new URL(location.href).hostname.toLowerCase().replace(/^www\./, "");
-      return REDDIT_HOSTS.includes(host);
-    } catch {
-      return false;
-    }
-  }
-
-  const REDDIT_CARD = "shreddit-post, [data-url], [data-permalink], article";
-  const V_REDD_IT = /^https?:\/\/v\.redd\.it\/([A-Za-z0-9]+)/i;
-
-  function redditCard(video) {
-    return video && video.closest ? video.closest(REDDIT_CARD) : null;
-  }
-
-  // A video Reddit hosts itself needs no lookup at all. The post card names
-  // the v.redd.it id, and that id's HLS playlist is public, carries its audio
-  // track, and goes down the same path Cove already uses for streams.
-  //
-  // Preferred over the permalink because resolving a post means Reddit's JSON
-  // API, which refuses whole networks outright - "Your IP address is unable to
-  // access the Reddit API" - even for a logged-in account. The playlist has no
-  // such gate.
-  function redditStreamUrl(video) {
-    if (!isRedditHost()) return "";
-    const card = redditCard(video);
-    if (!card || !card.getAttribute) return "";
-    const link = card.getAttribute("data-url") || card.getAttribute("content-href") || "";
-    const match = V_REDD_IT.exec(link);
-    return match ? `https://v.redd.it/${match[1]}/HLSPlaylist.m3u8` : "";
-  }
-
-  // The feed's player is MSE, so nothing on the page names the media. The post
-  // it belongs to does, though, and yt-dlp can resolve that - which also muxes
-  // Reddit's separate audio track, so the download arrives with sound.
-  //
-  // Only reached for a post Reddit does not host itself, since redditStreamUrl
-  // handles those without touching the API.
-  //
-  // Strictly ancestor-scoped. A feed holds many posts, and reaching across to
-  // another card downloads a different video than the one clicked, which looks
-  // for all the world like a download that worked.
-  function postPermalink(video) {
-    if (!video || !isRedditHost()) return "";
-    const card = redditCard(video);
-    if (!card) return "";
-    let href =
-      (card.getAttribute && (card.getAttribute("permalink") ||
-                             card.getAttribute("data-permalink"))) || "";
-    if (!href && card.querySelector) {
-      const link = card.querySelector('a[href*="/comments/"]');
-      href = (link && link.getAttribute("href")) || "";
-    }
-    if (!href) return "";
-    try {
-      const url = new URL(href, location.href);
-      return REDDIT_POST_PATH.test(url.pathname) ? url.href : "";
-    } catch {
-      return "";
-    }
-  }
-
   function extractorPageUrl() {
     try {
       const url = new URL(location.href);
@@ -175,8 +106,7 @@
   }
 
   function videoUrl(video) {
-    return extractorPageUrl() || candidateUrl(video) ||
-      redditStreamUrl(video) || postPermalink(video);
+    return extractorPageUrl() || candidateUrl(video);
   }
 
   function isCurrentlyPlaying(video) {
@@ -479,8 +409,7 @@
     // release it, and deactivateVideo() refuses to run while that flag is set,
     // so forgetting once pins the pill over the page until a reload.
     const pageUrl = extractorPageUrl() || location.href;
-    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo) ||
-      redditStreamUrl(activeVideo) || postPermalink(activeVideo);
+    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo);
 
     // Generated at the origin of the request so the same id can be followed
     // through the background, the native host and Cove itself.

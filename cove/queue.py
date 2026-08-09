@@ -2869,10 +2869,8 @@ class QueueManager(QObject):
 
     def _launch_extractor(self, t: DownloadTask) -> None:
         from .extractor import (
-            is_reddit_post_url,
             parse_ytdlp_final_path,
             parse_ytdlp_progress,
-            write_cookie_jar,
             ytdlp_command,
         )
 
@@ -2921,23 +2919,12 @@ class QueueManager(QObject):
         escaped_dir = str(run_work.path).replace("%", "%%")
         escaped_stem = stem.replace("%", "%%")
         output_template = os.path.join(escaped_dir, f"{escaped_stem}.%(ext)s")
-        # Reddit decides whether it is logged in by reading yt-dlp's cookie
-        # jar, which a Cookie header never reaches, so its cookies go to a file
-        # instead. It lives in the run's private directory and goes away with
-        # it. Only Reddit: YouTube answers 413 to a full jar and needs none.
-        cookie_file = ""
-        if t.cookies and is_reddit_post_url(t.url):
-            candidate = run_work.path / "cookies.txt"
-            if write_cookie_jar(t.cookies, candidate):
-                cookie_file = str(candidate)
-
         cmd = ytdlp_command(
             t.url,
             output_template,
             cookies=t.cookies,
             referrer=t.referrer,
             user_agent=t.user_agent,
-            cookie_file=cookie_file,
         )
 
         proc = QProcess(self)
