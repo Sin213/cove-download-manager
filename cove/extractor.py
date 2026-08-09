@@ -21,14 +21,12 @@ _SPEED = re.compile(r"\bat\s+(\d+(?:\.\d+)?)\s*([KMG]iB)/s", re.IGNORECASE)
 FINAL_PATH_MARKER = "__COVE_FINAL_FILE__:"
 
 
-def is_extractor_url(url: str) -> bool:
+def is_youtube_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().removeprefix("www.")
         if host == "youtu.be":
             return bool(parsed.path.strip("/"))
-        if host in _REDDIT_HOSTS:
-            return bool(_REDDIT_POST.match(parsed.path))
         if host not in {"youtube.com", "m.youtube.com", "music.youtube.com"}:
             return False
         if parsed.path == "/watch":
@@ -36,6 +34,19 @@ def is_extractor_url(url: str) -> bool:
         return bool(_YOUTUBE_PATH.match(parsed.path))
     except (TypeError, ValueError):
         return False
+
+
+def is_reddit_post_url(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        return host in _REDDIT_HOSTS and bool(_REDDIT_POST.match(parsed.path))
+    except (TypeError, ValueError):
+        return False
+
+
+def is_extractor_url(url: str) -> bool:
+    return is_youtube_url(url) or is_reddit_post_url(url)
 
 
 def resolve_ytdlp() -> str | None:
@@ -83,7 +94,12 @@ def ytdlp_command(
     # YouTube answers yt-dlp's webpage/API requests with HTTP 413. Public
     # videos need no cookies at all, so drop the header for the pages we
     # extract rather than trusting each browser call site to omit it.
-    if cookies and not is_extractor_url(url):
+    #
+    # YouTube only. Reddit has the opposite problem: it refuses anonymous
+    # callers outright, so yt-dlp reports "Account authentication is required"
+    # and downloads nothing. Testing every extractor URL here swept Reddit into
+    # a workaround written for one site's quirk.
+    if cookies and not is_youtube_url(url):
         cmd += ["--add-header", f"Cookie: {cookies}"]
     if referrer:
         cmd += ["--referer", referrer]

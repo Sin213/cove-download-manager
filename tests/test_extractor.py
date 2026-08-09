@@ -146,3 +146,43 @@ def test_non_post_reddit_urls_are_left_alone():
     assert not is_extractor_url("https://preview.redd.it/abc123.jpg")
     # Not Reddit at all.
     assert not is_extractor_url("https://reddit.com.evil.test/r/aww/comments/x/y/")
+
+
+def test_reddit_keeps_its_cookies():
+    """Reddit refuses anonymous callers, so the jar has to reach yt-dlp.
+
+    The cookie header is dropped for extractor URLs because a full YouTube
+    cookie jar makes YouTube answer with HTTP 413. That reasoning is specific
+    to YouTube; Reddit has the opposite problem and fails with "Account
+    authentication is required" when it is left out.
+    """
+    cmd = ytdlp_command(
+        "https://old.reddit.com/r/sub/comments/abc123/a_title/",
+        "/out/%(title)s.%(ext)s",
+        executable="/usr/bin/yt-dlp",
+        cookies="session=abc; token=def",
+    )
+    assert "--add-header" in cmd
+    assert "Cookie: session=abc; token=def" in cmd
+
+
+def test_youtube_still_drops_its_cookies():
+    """A full jar makes YouTube answer 413, and public videos need none."""
+    cmd = ytdlp_command(
+        "https://www.youtube.com/watch?v=BMcJirSZACw",
+        "/out/%(title)s.%(ext)s",
+        executable="/usr/bin/yt-dlp",
+        cookies="session=abc; token=def",
+    )
+    assert "--add-header" not in cmd
+    assert not any("Cookie:" in part for part in cmd)
+
+
+def test_a_direct_url_still_carries_its_cookies():
+    cmd = ytdlp_command(
+        "https://example.test/video.mp4",
+        "/out/%(title)s.%(ext)s",
+        executable="/usr/bin/yt-dlp",
+        cookies="session=abc",
+    )
+    assert "Cookie: session=abc" in cmd
