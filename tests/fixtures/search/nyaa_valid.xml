@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa">
+  <channel>
+    <title>Nyaa - "example" - Torrent File RSS</title>
+    <description>RSS Feed for Example</description>
+    <link>https://nyaa.si/</link>
+    <item>
+      <title>[Fansub] Example Show - 01 (1080p) [ABCD1234].mkv</title>
+      <link>https://nyaa.si/download/1000001.torrent</link>
+      <guid isPermaLink="true">https://nyaa.si/view/1000001</guid>
+      <pubDate>Sat, 05 Aug 2023 12:34:56 -0000</pubDate>
+      <nyaa:seeders>123</nyaa:seeders>
+      <nyaa:leechers>4</nyaa:leechers>
+      <nyaa:downloads>5678</nyaa:downloads>
+      <nyaa:infoHash>c9e15763f722f23e98a29decdfae341b98d53056</nyaa:infoHash>
+      <nyaa:categoryId>1_2</nyaa:categoryId>
+      <nyaa:category>Anime - English-translated</nyaa:category>
+      <nyaa:size>1.4 GiB</nyaa:size>
+      <nyaa:comments>0</nyaa:comments>
+      <nyaa:trusted>Yes</nyaa:trusted>
+      <nyaa:remake>No</nyaa:remake>
+    </item>
+    <item>
+      <title>[Fansub] Example Show - 02 (720p) [EF567890].mkv</title>
+      <link>https://nyaa.si/download/1000002.torrent</link>
+      <guid isPermaLink="true">https://nyaa.si/view/1000002</guid>
+      <pubDate>Sun, 06 Aug 2023 01:00:00 -0000</pubDate>
+      <nyaa:seeders>7</nyaa:seeders>
+      <nyaa:leechers>0</nyaa:leechers>
+      <nyaa:downloads>12</nyaa:downloads>
+      <nyaa:infoHash>0123456789ABCDEF0123456789ABCDEF01234567</nyaa:infoHash>
+      <nyaa:categoryId>1_2</nyaa:categoryId>
+      <nyaa:category>Anime - English-translated</nyaa:category>
+      <nyaa:size>350.2 MiB</nyaa:size>
+      <nyaa:comments>0</nyaa:comments>
+      <nyaa:trusted>No</nyaa:trusted>
+      <nyaa:remake>No</nyaa:remake>
+    </item>
+    <item>
+      <title>Example Show Subtitles Pack</title>
+      <link>https://nyaa.si/download/1000003.torrent</link>
+      <guid isPermaLink="true">https://nyaa.si/view/1000003</guid>
+      <pubDate>Mon, 07 Aug 2023 09:15:30 -0000</pubDate>
+      <nyaa:seeders>2</nyaa:seeders>
+      <nyaa:leechers>1</nyaa:leechers>
+      <nyaa:downloads>3</nyaa:downloads>
+      <nyaa:infoHash>ZHQVOY7XELZD5GFCTXWN7LRUDOMNKMCV</nyaa:infoHash>
+      <nyaa:categoryId>1_1</nyaa:categoryId>
+      <nyaa:category>Anime - AMV</nyaa:category>
+      <nyaa:size>700 Bytes</nyaa:size>
+      <nyaa:comments>0</nyaa:comments>
+      <nyaa:trusted>No</nyaa:trusted>
+      <nyaa:remake>No</nyaa:remake>
+    </item>
+  </channel>
+</rss>

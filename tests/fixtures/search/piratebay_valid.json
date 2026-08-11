@@ -1,0 +1,72 @@
+[
+  {
+    "id": "12345678",
+    "name": "Harbour Lights 2019 1080p WEB h264",
+    "info_hash": "C9E15763F722F23E98A29DECDFAE341B98D53056",
+    "leechers": "19",
+    "seeders": "204",
+    "num_files": "3",
+    "size": "1879048192",
+    "username": "uploader",
+    "added": "1567002222",
+    "status": "vip",
+    "category": "207",
+    "imdb": "tt1234567"
+  },
+  {
+    "id": "12345679",
+    "name": "Harbour Lights 2019 DVDRip XviD",
+    "info_hash": "0123456789abcdef0123456789abcdef01234567",
+    "leechers": "4",
+    "seeders": "31",
+    "num_files": "1",
+    "size": "734003200",
+    "username": "uploader",
+    "added": "1567001111",
+    "status": "member",
+    "category": "201",
+    "imdb": ""
+  },
+  {
+    "id": "12345680",
+    "name": "The Long Wait S01E04 720p HDTV",
+    "info_hash": "c9e15763f722f23e98a29decdfae341b98d53055",
+    "leechers": "12",
+    "seeders": "88",
+    "num_files": "1",
+    "size": "1073741824",
+    "username": "uploader",
+    "added": "1620001234",
+    "status": "trusted",
+    "category": "205",
+    "imdb": ""
+  },
+  {
+    "id": "12345681",
+    "name": "The Long Wait Complete Series 1080p",
+    "info_hash": "0123456789abcdef0123456789abcdef01234568",
+    "leechers": "2",
+    "seeders": "9",
+    "num_files": "24",
+    "size": "26843545600",
+    "username": "uploader",
+    "added": "1620009999",
+    "status": "member",
+    "category": "208",
+    "imdb": ""
+  },
+  {
+    "id": "12345682",
+    "name": "Harbour Lights Original Soundtrack FLAC",
+    "info_hash": "0123456789abcdef0123456789abcdef01234569",
+    "leechers": "1",
+    "seeders": "5",
+    "num_files": "12",
+    "size": "419430400",
+    "username": "uploader",
+    "added": "1567003333",
+    "status": "member",
+    "category": "104",
+    "imdb": ""
+  }
+]

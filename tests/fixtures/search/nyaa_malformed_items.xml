@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:nyaa="https://nyaa.si/xmlns/nyaa">
+  <channel>
+    <title>Nyaa - "broken" - Torrent File RSS</title>
+    <link>https://nyaa.si/</link>
+    <item>
+      <title>No Info Hash Here</title>
+      <pubDate>Sat, 05 Aug 2023 12:34:56 -0000</pubDate>
+      <nyaa:seeders>5</nyaa:seeders>
+      <nyaa:leechers>1</nyaa:leechers>
+      <nyaa:size>1.0 GiB</nyaa:size>
+    </item>
+    <item>
+      <title>Invalid Info Hash</title>
+      <pubDate>Sat, 05 Aug 2023 12:34:56 -0000</pubDate>
+      <nyaa:seeders>5</nyaa:seeders>
+      <nyaa:leechers>1</nyaa:leechers>
+      <nyaa:infoHash>not-a-hash</nyaa:infoHash>
+      <nyaa:size>1.0 GiB</nyaa:size>
+    </item>
+    <item>
+      <title>Placeholder Hash</title>
+      <pubDate>Sat, 05 Aug 2023 12:34:56 -0000</pubDate>
+      <nyaa:seeders>5</nyaa:seeders>
+      <nyaa:leechers>1</nyaa:leechers>
+      <nyaa:infoHash>0000000000000000000000000000000000000000</nyaa:infoHash>
+      <nyaa:size>1.0 GiB</nyaa:size>
+    </item>
+    <item>
+      <title>   </title>
+      <pubDate>Sat, 05 Aug 2023 12:34:56 -0000</pubDate>
+      <nyaa:seeders>5</nyaa:seeders>
+      <nyaa:leechers>1</nyaa:leechers>
+      <nyaa:infoHash>0123456789abcdef0123456789abcdef0123456a</nyaa:infoHash>
+      <nyaa:size>1.0 GiB</nyaa:size>
+    </item>
+    <item>
+      <title>Usable Despite Bad Metadata</title>
+      <pubDate>not a date at all</pubDate>
+      <nyaa:seeders>lots</nyaa:seeders>
+      <nyaa:leechers>-9</nyaa:leechers>
+      <nyaa:infoHash>c9e15763f722f23e98a29decdfae341b98d53056</nyaa:infoHash>
+      <nyaa:size>enormous</nyaa:size>
+    </item>
+  </channel>
+</rss>

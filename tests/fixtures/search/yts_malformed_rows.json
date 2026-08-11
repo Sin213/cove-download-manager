@@ -1,0 +1,41 @@
+{
+  "status": "ok",
+  "status_message": "Query was successful",
+  "data": {
+    "movie_count": 3,
+    "limit": 20,
+    "page_number": 1,
+    "movies": [
+      {
+        "id": 1,
+        "title": "Broken Rows",
+        "title_long": "Broken Rows (2018)",
+        "year": 2018,
+        "date_uploaded_unix": 1530000000,
+        "torrents": [
+          {"quality": "720p", "seeds": 5, "peers": 1, "size_bytes": 100},
+          {"hash": "not-a-hash", "quality": "1080p", "seeds": 5, "peers": 1},
+          {"hash": "0000000000000000000000000000000000000000", "quality": "1080p"},
+          "just a string",
+          {
+            "hash": "C9E15763F722F23E98A29DECDFAE341B98D53056",
+            "quality": "1080p",
+            "type": "web",
+            "seeds": "12",
+            "peers": -4,
+            "size_bytes": "not a number",
+            "date_uploaded_unix": "nonsense"
+          }
+        ]
+      },
+      "not a movie",
+      {"id": 2, "title_long": "No Torrents (2020)", "torrents": []},
+      {"id": 3, "title": "Fallback Title", "title_long": "", "torrents": [
+        {"hash": "0123456789abcdef0123456789abcdef01234567", "quality": "720p", "seeds": 1, "peers": 1}
+      ]},
+      {"id": 4, "torrents": [
+        {"hash": "c9e15763f722f23e98a29decdfae341b98d53055", "quality": "720p", "seeds": 1, "peers": 1}
+      ]}
+    ]
+  }
+}

@@ -20,7 +20,7 @@ dependencies = [
 cove = "cove.app:run"
 
 [tool.setuptools]
-packages = ["cove"]
+packages = ["cove", "cove.search", "cove.search.sources"]
 include-package-data = true
 
 [tool.setuptools.package-data]

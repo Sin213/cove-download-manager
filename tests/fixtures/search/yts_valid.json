@@ -1,0 +1,59 @@
+{
+  "status": "ok",
+  "status_message": "Query was successful",
+  "data": {
+    "movie_count": 2,
+    "limit": 20,
+    "page_number": 1,
+    "movies": [
+      {
+        "id": 57265,
+        "title": "Harbour Lights",
+        "title_long": "Harbour Lights (2019)",
+        "year": 2019,
+        "date_uploaded_unix": 1567000000,
+        "torrents": [
+          {
+            "hash": "C9E15763F722F23E98A29DECDFAE341B98D53056",
+            "quality": "720p",
+            "type": "web",
+            "seeds": 41,
+            "peers": 7,
+            "size": "850.5 MB",
+            "size_bytes": 891752448,
+            "date_uploaded_unix": 1567001111
+          },
+          {
+            "hash": "0123456789abcdef0123456789abcdef01234567",
+            "quality": "1080p",
+            "type": "bluray",
+            "seeds": 128,
+            "peers": 19,
+            "size": "1.75 GB",
+            "size_bytes": 1879048192,
+            "date_uploaded_unix": 1567002222
+          }
+        ]
+      },
+      {
+        "id": 57266,
+        "title": "The Long Wait",
+        "title_long": "The Long Wait (2021)",
+        "year": 2021,
+        "date_uploaded_unix": 1620000000,
+        "torrents": [
+          {
+            "hash": "ZHQVOY7XELZD5GFCTXWN7LRUDOMNKMCV",
+            "quality": "2160p",
+            "type": "web",
+            "seeds": 3,
+            "peers": 0,
+            "size": "4.10 GB",
+            "size_bytes": 4402341478,
+            "date_uploaded_unix": 1620001234
+          }
+        ]
+      }
+    ]
+  }
+}
