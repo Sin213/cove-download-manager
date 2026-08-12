@@ -72,6 +72,7 @@ from .dialogs import (
 )
 from .queue import PHASE_METADATA, DownloadTask, QueueManager
 from .scheduler import Scheduler
+from .search.models import SearchResult
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
     configure_speed_spin,
@@ -1112,6 +1113,16 @@ class MainWindow(QMainWindow):
             return [] if tid is None else [tid]
         chosen = self._confirm_duplicate_batch(checked)
         return self.queue.add_urls(chosen, out_dir, intake=intake) if chosen else []
+
+    def add_search_result(self, result: SearchResult) -> list[int]:
+        """Download one selected built-in Search result.
+
+        Search owns nothing past this line: only the magnet the source
+        already normalised crosses over, and the ordinary intake gate keeps
+        duplicate checking, consent, debrid resolution and the torrent
+        fallback. No second download path is created for Search.
+        """
+        return self.add_urls_checked([result.magnet], intake="search")
 
     def add_url_interactive(self, url: str) -> None:
         """Entry point for command-line and second-instance magnets."""

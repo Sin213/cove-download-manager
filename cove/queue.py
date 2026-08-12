@@ -133,7 +133,7 @@ SOURCE_TORRENT_FILE = "torrent_file"
 SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE)
 
 # Where a URL entered Cove. Diagnostics only - never affects routing.
-_INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "unknown")
+_INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "search", "unknown")
 
 # Task failures on the local BitTorrent path. Every one of these is a fixed
 # sentence: a torrent carries tracker passkeys and peer addresses, and none
@@ -900,7 +900,8 @@ class QueueManager(QObject):
             return None
         if source_type == SOURCE_PLAIN and torrent.is_magnet(url) and self._torrent_enabled():
             return self._add_magnet(
-                url, out_dir=out_dir, speed_limit_kbps=speed_limit_kbps
+                url, out_dir=out_dir, speed_limit_kbps=speed_limit_kbps,
+                intake=intake,
             )
         import posixpath
         from urllib.parse import unquote, urlparse
@@ -1159,7 +1160,8 @@ class QueueManager(QObject):
         )
 
     def _add_magnet(
-        self, url: str, *, out_dir: str | None = None, speed_limit_kbps: int = 0
+        self, url: str, *, out_dir: str | None = None, speed_limit_kbps: int = 0,
+        intake: str = "unknown",
     ) -> Optional[int]:
         """Route a magnet to a torrent source task.
 
@@ -1182,6 +1184,7 @@ class QueueManager(QObject):
             source_type=SOURCE_TORRENT,
             info_hash=magnet.info_hash,
             torrent_name=_safe_torrent_name(magnet.display_name),
+            intake=intake,
         )
 
     def add_torrent_file(
