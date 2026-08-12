@@ -24,9 +24,15 @@ from typing import Iterable
 
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 
+from cove import diagnostics
 from cove.search.models import Category, SearchResult, SourceError
 from cove.search.registry import SOURCES, sources_for
 from cove.search.sources.base import SearchHttp, Source
+
+# Every Search event is recorded under this one name, so a support log can be
+# read as one lifecycle rather than one per provider. Which source an event is
+# about is a field, never part of the component.
+_DIAG_COMPONENT = "search"
 
 # Search runs its sources on a pool of its own rather than Qt's global one:
 # the global pool is where downloads, RPC calls and hashing already queue, and
@@ -457,6 +463,37 @@ class SearchService(QObject):
         self._results: dict[str, tuple[SearchResult, ...]] = {}
         self._failures: list[SourceFailure] = []
 
+    # ---- diagnostics -----------------------------------------------------
+    #
+    # Observation only. Every record below names a transition this service has
+    # already committed to, and none of them may influence what a search does:
+    # a diagnostics call is not a lifecycle event, cannot reach a listener and
+    # is never a point a generation has to be re-checked after.
+    #
+    # What is recorded is counts and the names the service already publishes.
+    # The query itself, the rows a source found, their titles, magnets and info
+    # hashes are deliberately absent - a support log is not the place for what
+    # a user searched for or what they were shown.
+
+    def _diag(self, event: str, **fields) -> None:
+        try:
+            diagnostics.emit(_DIAG_COMPONENT, event, **fields)
+        except Exception:
+            pass
+
+    def _diag_started(
+        self, generation: int, category: Category, source_count: int, query_length: int
+    ) -> None:
+        """One search has begun. The length is of the normalised query, which
+        is the text the sources are actually given."""
+        self._diag(
+            "search_started",
+            generation=generation,
+            category=getattr(category, "value", None),
+            source_count=source_count,
+            query_length=query_length,
+        )
+
     @property
     def active(self) -> bool:
         """Whether a search is running."""
@@ -478,11 +515,17 @@ class SearchService(QObject):
         text = query.strip()
         if not text:
             # A blank query is not an error and not a search: it completes
-            # immediately so the UI gets one lifecycle rather than none.
+            # immediately so the UI gets one lifecycle rather than none. The
+            # record follows that exactly - one start, one finish, no sources -
+            # so no search is missing from the log on account of being empty.
+            self._diag_started(generation, category, 0, 0)
             self._finish(generation)
             return generation
 
         sources = sources_for(category)
+        # Recorded once the search knows what it is: which sources it will ask,
+        # and how long the question was. Never the question itself.
+        self._diag_started(generation, category, len(sources), len(text))
         if not sources:
             # A category nothing covers finishes here rather than waiting for
             # callbacks that can never arrive.
@@ -503,6 +546,15 @@ class SearchService(QObject):
         # ever reached the pool: nothing below may run, or a search the caller
         # has already replaced would go on submitting workers.
         for source in sources:
+            # Recorded where the search commits to the source - before the
+            # public event, because that event may end this search, and a
+            # source it never got to is one the log should not claim it did.
+            self._diag(
+                "source_started",
+                generation=generation,
+                source=source.id,
+                category=getattr(category, "value", None),
+            )
             self._emit_status(generation, source.id, SourceState.RUNNING, None, 0)
             if generation != self._generation:
                 return generation
@@ -523,8 +575,19 @@ class SearchService(QObject):
         for source in sources:
             cached = self._cache.get(_CacheKey(source.id, category, text))
             if cached is None:
+                # Recorded at the classification itself, so hit and miss are
+                # read off the same decision the search acted on.
+                self._diag(
+                    "source_cache_miss", generation=generation, source=source.id
+                )
                 misses.append(source)
                 continue
+            self._diag(
+                "source_cache_hit",
+                generation=generation,
+                source=source.id,
+                result_count=len(cached),
+            )
             self._pending.discard(source.id)
             if not self._complete_source(generation, source.id, cached):
                 return generation
@@ -578,8 +641,12 @@ class SearchService(QObject):
         generation, so an idle UI cannot inflate the numbering.
         """
         if not self._active:
+            # Nothing was running, so nothing was cancelled and there is
+            # nothing to record: an idle UI cannot fill the log either.
             return self._generation
 
+        cancelled = self._generation
+        pending = len(self._pending)
         self._generation += 1
         self._active = False
         self._pending.clear()
@@ -588,12 +655,21 @@ class SearchService(QObject):
         # Nothing is waiting for this search any more, so nothing may time it
         # out either.
         self._stop_deadline()
+        # Recorded as cancelled and never as superseded: the user asking for
+        # this search to stop and another search replacing it are two different
+        # things, and a log that blurs them cannot tell what the user did. How
+        # many sources it was still waiting on is what makes it read as a
+        # decision rather than a completion.
+        self._diag(
+            "search_cancelled", generation=cancelled, pending_source_count=pending
+        )
         # No search_finished: the caller asked for this and already knows.
         # Nothing else may hear from the cancelled search again.
         return self._generation
 
     def _begin(self) -> int:
         """Number the search about to start, and forget the previous one."""
+        superseded = self._generation if self._active else 0
         self._generation += 1
         self._active = False
         self._pending.clear()
@@ -603,6 +679,16 @@ class SearchService(QObject):
         # its deadline goes with it: the search about to start gets a fresh one
         # rather than inheriting whatever was left of the old window.
         self._stop_deadline()
+        # A search that was still running has been replaced, which is not the
+        # same thing as one the user cancelled: the log says which of the two
+        # happened, and names the search that took over. A superseded search
+        # never finishes, so it is never recorded as having finished either.
+        if superseded:
+            self._diag(
+                "search_superseded",
+                generation=superseded,
+                superseded_by=self._generation,
+            )
         return self._generation
 
     def _arm_deadline(self, generation: int) -> None:
@@ -642,6 +728,15 @@ class SearchService(QObject):
         for source_id in sorted(self._pending, key=_source_order):
             self._pending.discard(source_id)
             self._failures.append(SourceFailure(source_id, _TIMEOUT_ERROR))
+            # Running out of time is its own terminal record. The summary
+            # stores it as a failure, but recording it as one too would count
+            # the same source out twice in a log read for what went wrong.
+            self._diag(
+                "source_timed_out",
+                generation=generation,
+                source=source_id,
+                deadline_ms=self._deadline_ms,
+            )
             self._emit_status(
                 generation, source_id, SourceState.TIMED_OUT, _TIMEOUT_ERROR, 0
             )
@@ -728,6 +823,14 @@ class SearchService(QObject):
             # already found stays exactly as it was, so there is no new result
             # view to publish here.
             self._failures.append(SourceFailure(source_id, outcome.error_kind))
+            # The normalised kind the worker already settled on, and nothing
+            # else: no exception text, no traceback and no request.
+            self._diag(
+                "source_failed",
+                generation=generation,
+                source=source_id,
+                error_kind=outcome.error_kind,
+            )
             self._emit_status(
                 generation, source_id, SourceState.FAILED, outcome.error_kind, 0
             )
@@ -752,6 +855,16 @@ class SearchService(QObject):
         it still had to do belonged to a search that no longer exists.
         """
         self._results[source_id] = results
+        # The one terminal record a source succeeding gets, whether a worker
+        # just answered or the cache answered for it - exactly as this is the
+        # one path a source succeeds by. Which of the two it was is already on
+        # record as the hit or miss that preceded it.
+        self._diag(
+            "source_completed",
+            generation=generation,
+            source=source_id,
+            result_count=len(results),
+        )
         self._emit_status(
             generation, source_id, SourceState.COMPLETED, None, len(results)
         )
@@ -790,6 +903,16 @@ class SearchService(QObject):
         # listener may start the next search from there, and must not have its
         # brand new deadline torn down by this one's tidying up.
         self._stop_deadline()
+        # Recorded before the public event rather than after it, for the same
+        # reason the timer is disarmed first: a listener may start the next
+        # search from there, and this one's record must already be complete.
+        self._diag(
+            "search_finished",
+            generation=generation,
+            result_count=len(summary.results),
+            dedupe_dropped=summary.dedupe_dropped,
+            failure_count=len(summary.failures),
+        )
         # Nothing of this search is still pinned - every worker released
         # itself as it reported - and an older search's workers are not this
         # one's to drop, so there is no call bookkeeping to do here.

@@ -3639,3 +3639,692 @@ def test_cancelling_from_a_cached_completion_leaves_no_live_work_behind(monkeypa
     assert svc._calls == {} and svc._cache_keys == {}
     assert svc.active is False
     assert watch.finished == []
+
+
+# --- Z.N. what a search records about itself ----------------------------------
+#
+# Diagnostics is observation only: every assertion below is about what was
+# *recorded*, and every existing assertion about what the service *does* stays
+# exactly as it was. The search term itself, the rows it found, their magnets
+# and their info hashes are none of the log's business - only counts and the
+# names the service already publishes.
+
+import json  # noqa: E402
+
+from cove import diagnostics as diag_module  # noqa: E402
+
+# The one component every Search event is recorded under.
+_DIAG_COMPONENT = "search"
+
+
+@pytest.fixture
+def diag(tmp_path):
+    """The real app logger, writing where the test can read it back."""
+    diag_module.shutdown_logger()
+    log = diag_module.init_app_logger(tmp_path / "diag")
+    yield log
+    diag_module.shutdown_logger()
+
+
+def _events(log, event=None):
+    """Every Search record, optionally only the ones named ."""
+    out = []
+    for record in log.records():
+        if record["component"] != _DIAG_COMPONENT:
+            continue
+        if event is not None and record["event"] != event:
+            continue
+        out.append(record)
+    return out
+
+
+def _one_event(log, event):
+    found = _events(log, event)
+    assert len(found) == 1, "expected one {}, got {}".format(event, len(found))
+    return found[0]
+
+
+def _fields(record):
+    return record.get("fields", {})
+
+
+def _names(log):
+    return [record["event"] for record in _events(log)]
+
+
+def _trail(log, source_id):
+    """The events one source went through, in order."""
+    return [
+        record["event"]
+        for record in _events(log)
+        if _fields(record).get("source") == source_id
+    ]
+
+
+def _recorded_text(log):
+    """Everything every Search event recorded, as one searchable blob."""
+    return json.dumps([_fields(record) for record in _events(log)])
+
+
+# --- Z.N.A. a search names itself at both ends --------------------------------
+
+
+def test_a_search_records_one_start_and_one_finish(monkeypatch, diag):
+    _select(monkeypatch, [_FakeSource([_result(source="alpha")], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert len(_events(diag, "search_started")) == 1
+    assert len(_events(diag, "search_finished")) == 1
+
+
+def test_the_start_record_names_the_search_its_category_and_its_sources(
+    monkeypatch, diag
+):
+    _select(monkeypatch, [
+        _FakeSource([], source_id="alpha"),
+        _FakeSource([], source_id="beta"),
+    ])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune", Category.MOVIES)
+
+    _finish(watch)
+    fields = _fields(_one_event(diag, "search_started"))
+    assert fields["generation"] == generation
+    assert fields["category"] == "movies"
+    assert fields["source_count"] == 2
+
+
+def test_the_start_record_carries_the_length_of_the_normalised_query(
+    monkeypatch, diag
+):
+    _select(monkeypatch, [_FakeSource([], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("   dune   ")
+
+    _finish(watch)
+    fields = _fields(_one_event(diag, "search_started"))
+    assert fields["query_length"] == 4
+
+
+def test_no_search_record_carries_the_query_text(monkeypatch, diag):
+    """The UI knows what was asked. The log must not keep it."""
+    _select(monkeypatch, [_FakeSource([_result(source="alpha")], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("SECRET_SEARCH_TERM_123")
+
+    _finish(watch)
+    assert _events(diag), "the search recorded nothing at all"
+    assert "SECRET_SEARCH_TERM_123" not in _recorded_text(diag)
+
+
+def test_the_finish_record_carries_the_summary_counts(monkeypatch, diag):
+    rows = [_result(info_hash=A, source="alpha"), _result(info_hash=A, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune")
+
+    summary = _finish(watch)
+    fields = _fields(_one_event(diag, "search_finished"))
+    assert fields["generation"] == generation
+    assert fields["result_count"] == len(summary.results)
+    assert fields["dedupe_dropped"] == summary.dedupe_dropped
+    assert fields["failure_count"] == len(summary.failures)
+
+
+# --- Z.N.B. a source the cache could not answer -------------------------------
+
+
+def test_a_live_source_is_recorded_started_missed_then_completed(monkeypatch, diag):
+    rows = [_result(info_hash=A, source="alpha"), _result(info_hash=B, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _trail(diag, "alpha") == [
+        "source_started",
+        "source_cache_miss",
+        "source_completed",
+    ]
+
+
+def test_a_live_source_record_names_the_search_and_what_it_found(monkeypatch, diag):
+    rows = [_result(info_hash=A, source="alpha"), _result(info_hash=B, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune", Category.MOVIES)
+
+    _finish(watch)
+    started = _fields(_one_event(diag, "source_started"))
+    assert started == {
+        "generation": generation,
+        "source": "alpha",
+        "category": "movies",
+    }
+    completed = _fields(_one_event(diag, "source_completed"))
+    assert completed["generation"] == generation
+    assert completed["source"] == "alpha"
+    assert completed["result_count"] == 2
+
+
+def test_a_live_source_records_no_cache_hit(monkeypatch, diag):
+    _select(monkeypatch, [_FakeSource([_result(source="alpha")], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _events(diag, "source_cache_hit") == []
+
+
+def test_the_search_start_is_recorded_before_any_source(monkeypatch, diag):
+    _select(monkeypatch, [
+        _FakeSource([], source_id="alpha"),
+        _FakeSource([], source_id="beta"),
+    ])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    names = _names(diag)
+    assert names[0] == "search_started"
+    assert names[-1] == "search_finished"
+
+
+def test_no_search_record_carries_a_result_title_magnet_or_info_hash(
+    monkeypatch, diag
+):
+    """Counts only: what a source found is the UI's business, not the log's."""
+    row = _result(info_hash=_hash("f"), name="SECRET_TITLE_123", source="alpha")
+    _select(monkeypatch, [_FakeSource([row], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    recorded = _recorded_text(diag)
+    assert _events(diag), "the search recorded nothing at all"
+    assert "SECRET_TITLE_123" not in recorded
+    assert row.info_hash not in recorded
+    assert "magnet:" not in recorded
+
+
+# --- Z.N.C. a source the cache could answer -----------------------------------
+
+
+def test_a_cached_source_is_recorded_started_hit_then_completed(monkeypatch, diag):
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+    diag.clear()
+
+    generation = svc.start("dune")
+
+    _finish(watch)
+    assert _trail(diag, "alpha") == [
+        "source_started",
+        "source_cache_hit",
+        "source_completed",
+    ]
+    assert _events(diag, "source_cache_miss") == []
+    hit = _fields(_one_event(diag, "source_cache_hit"))
+    assert hit["generation"] == generation
+    assert hit["result_count"] == 1
+    assert _fields(_one_event(diag, "source_completed"))["generation"] == generation
+
+
+def test_a_cached_answer_that_found_nothing_is_recorded_as_none(monkeypatch, diag):
+    source = _FakeSource([], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+    diag.clear()
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _fields(_one_event(diag, "source_cache_hit"))["result_count"] == 0
+    assert _fields(_one_event(diag, "source_completed"))["result_count"] == 0
+    assert len(source.calls) == 1, "the empty cached answer was asked for again"
+
+
+def test_a_part_cached_search_records_a_hit_and_a_miss(monkeypatch, diag):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    diag.clear()
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _trail(diag, "alpha") == [
+        "source_started",
+        "source_cache_hit",
+        "source_completed",
+    ]
+    assert _trail(diag, "beta") == [
+        "source_started",
+        "source_cache_miss",
+        "source_completed",
+    ]
+    assert len(_events(diag, "search_finished")) == 1
+
+
+def test_a_search_every_source_answers_from_cache_records_no_miss(monkeypatch, diag):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+    diag.clear()
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _events(diag, "source_cache_miss") == []
+    assert len(_events(diag, "source_cache_hit")) == 2
+    assert len(_events(diag, "source_completed")) == 2
+    assert len(_events(diag, "search_finished")) == 1
+
+
+# --- Z.N.D. a source that fails -----------------------------------------------
+
+
+def test_a_source_error_is_recorded_once_under_its_own_kind(monkeypatch, diag):
+    failing = _FakeSource(raises=SourceError(SourceErrorKind.NETWORK), source_id="alpha")
+    _select(monkeypatch, [failing])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune")
+
+    summary = _finish(watch)
+    failed = _fields(_one_event(diag, "source_failed"))
+    assert failed["generation"] == generation
+    assert failed["source"] == "alpha"
+    assert failed["error_kind"] == summary.failures[0].error_kind
+    assert failed["error_kind"] == SourceErrorKind.NETWORK.value
+
+
+def test_a_source_that_breaks_is_recorded_as_an_internal_failure(monkeypatch, diag):
+    failing = _FakeSource(raises=RuntimeError("boom"), source_id="alpha")
+    _select(monkeypatch, [failing])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _fields(_one_event(diag, "source_failed"))["error_kind"] == "internal"
+
+
+def test_a_failing_source_gets_no_other_terminal_record(monkeypatch, diag):
+    failing = _FakeSource(raises=SourceError(SourceErrorKind.PARSE), source_id="alpha")
+    _select(monkeypatch, [failing])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert _trail(diag, "alpha") == [
+        "source_started",
+        "source_cache_miss",
+        "source_failed",
+    ]
+
+
+def test_a_failure_records_nothing_of_the_exception_itself(monkeypatch, diag):
+    failing = _FakeSource(
+        raises=RuntimeError("SECRET_EXCEPTION_TEXT_123"), source_id="alpha"
+    )
+    _select(monkeypatch, [failing])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert "SECRET_EXCEPTION_TEXT_123" not in json.dumps(_events(diag))
+
+
+def test_a_partly_failing_search_records_both_sources_and_one_finish(
+    monkeypatch, diag
+):
+    good = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    bad = _FakeSource(raises=SourceError(SourceErrorKind.HTTP), source_id="beta")
+    _select(monkeypatch, [good, bad])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert _trail(diag, "alpha")[-1] == "source_completed"
+    assert _trail(diag, "beta")[-1] == "source_failed"
+    finished = _fields(_one_event(diag, "search_finished"))
+    assert finished["failure_count"] == len(summary.failures) == 1
+    assert finished["result_count"] == len(summary.results) == 1
+
+
+# --- Z.N.E. a source that runs out of time ------------------------------------
+
+
+def test_a_timed_out_source_is_recorded_once_as_timed_out(monkeypatch, diag):
+    release = threading.Event()
+    held = _held_source([_result()], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        generation = svc.start("dune")
+        _finish(watch)
+    finally:
+        release.set()
+    assert _drained(svc)
+
+    timed_out = _fields(_one_event(diag, "source_timed_out"))
+    assert timed_out["generation"] == generation
+    assert timed_out["source"] == "alpha"
+    assert timed_out["deadline_ms"] == _TEST_DEADLINE_MS
+
+
+def test_a_timed_out_source_is_never_also_recorded_as_failed(monkeypatch, diag):
+    """One terminal record per source, or the log double-counts the failure."""
+    release = threading.Event()
+    held = _held_source([_result()], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+    assert _drained(svc)
+
+    assert _events(diag, "source_failed") == []
+    assert _trail(diag, "alpha") == [
+        "source_started",
+        "source_cache_miss",
+        "source_timed_out",
+    ]
+    finished = _fields(_one_event(diag, "search_finished"))
+    assert finished["failure_count"] == len(summary.failures) == 1
+
+
+def test_every_source_that_runs_out_of_time_is_recorded_in_the_stated_order(
+    monkeypatch, diag
+):
+    release = threading.Event()
+    held = [
+        _held_source([], source_id=source_id, release=release)
+        for source_id in ("nyaa", "yts")
+    ]
+    _select(monkeypatch, held)
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        _finish(watch)
+    finally:
+        release.set()
+    assert _drained(svc)
+
+    recorded = [
+        _fields(record)["source"] for record in _events(diag, "source_timed_out")
+    ]
+    announced = [
+        status.source_id
+        for status in watch.statuses
+        if status.state is service.SourceState.TIMED_OUT
+    ]
+    assert recorded == announced
+    assert len(_events(diag, "search_finished")) == 1
+
+
+# --- Z.N.F. superseding is not cancelling -------------------------------------
+
+
+def test_a_superseded_search_is_recorded_as_superseded_by_the_new_one(
+    monkeypatch, diag
+):
+    release = threading.Event()
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        _select(monkeypatch, [_FakeSource([], source_id="beta")])
+        second = svc.start("akira")
+    finally:
+        release.set()
+    _finish(watch)
+    assert _drained(svc)
+
+    superseded = _fields(_one_event(diag, "search_superseded"))
+    assert superseded["generation"] == first
+    assert superseded["superseded_by"] == second
+    assert _events(diag, "search_cancelled") == []
+
+
+def test_a_superseded_search_is_never_recorded_as_finished(monkeypatch, diag):
+    release = threading.Event()
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        _select(monkeypatch, [_FakeSource([], source_id="beta")])
+        svc.start("akira")
+    finally:
+        release.set()
+    _finish(watch)
+    assert _drained(svc)
+
+    finished = [_fields(record)["generation"] for record in _events(diag, "search_finished")]
+    assert first not in finished
+
+
+def test_a_search_that_follows_a_finished_one_supersedes_nothing(monkeypatch, diag):
+    _select(monkeypatch, [_FakeSource([], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+    _finish(watch)
+    watch.finished.clear()
+    svc.start("akira")
+    _finish(watch)
+
+    assert _events(diag, "search_superseded") == []
+
+
+def test_a_cancelled_search_is_recorded_as_cancelled(monkeypatch, diag):
+    release = threading.Event()
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        generation = svc.start("dune")
+        svc.cancel()
+    finally:
+        release.set()
+    assert _drained(svc)
+
+    cancelled = _fields(_one_event(diag, "search_cancelled"))
+    assert cancelled["generation"] == generation
+    assert cancelled["pending_source_count"] == 1
+    assert _events(diag, "search_superseded") == []
+    assert _events(diag, "search_finished") == []
+
+
+def test_cancelling_an_idle_service_records_nothing(diag):
+    svc = service.SearchService(http_factory=_FakeHttp)
+
+    svc.cancel()
+
+    assert _events(diag) == []
+
+
+def test_cancelling_after_a_search_finished_records_nothing_more(monkeypatch, diag):
+    _select(monkeypatch, [_FakeSource([], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+    _finish(watch)
+    svc.cancel()
+
+    assert _events(diag, "search_cancelled") == []
+
+
+# --- Z.N.G. a late answer nobody is waiting for -------------------------------
+
+
+def test_a_superseded_searchs_late_answer_records_no_terminal_event(
+    monkeypatch, diag
+):
+    release = threading.Event()
+    held = _held_source([_result(info_hash=A, source="alpha")], source_id="alpha",
+                        release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        _select(monkeypatch, [_FakeSource([], source_id="beta")])
+        svc.start("akira")
+    finally:
+        release.set()
+    _finish(watch)
+    assert _drained(svc)
+
+    assert _trail(diag, "alpha") == ["source_started", "source_cache_miss"]
+    for record in _events(diag, "source_completed") + _events(diag, "source_failed"):
+        assert _fields(record)["generation"] != first
+
+
+def test_a_cancelled_searchs_late_answer_records_no_terminal_event(
+    monkeypatch, diag
+):
+    release = threading.Event()
+    held = _held_source([_result(info_hash=A, source="alpha")], source_id="alpha",
+                        release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        svc.cancel()
+    finally:
+        release.set()
+    assert _drained(svc)
+
+    assert _trail(diag, "alpha") == ["source_started", "source_cache_miss"]
+    assert _events(diag, "source_completed") == []
+    assert _events(diag, "search_finished") == []
+
+
+def test_a_timed_out_sources_late_answer_records_no_second_terminal_event(
+    monkeypatch, diag
+):
+    release = threading.Event()
+    held = _held_source([_result(info_hash=A, source="alpha")], source_id="alpha",
+                        release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        _finish(watch)
+    finally:
+        release.set()
+    assert _drained(svc)
+
+    assert _trail(diag, "alpha") == [
+        "source_started",
+        "source_cache_miss",
+        "source_timed_out",
+    ]
+    assert len(_events(diag, "search_finished")) == 1
+
+
+# --- Z.N.H. a search that never reaches a source ------------------------------
+
+
+def test_a_whitespace_query_still_records_a_whole_lifecycle(monkeypatch, diag):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("   ")
+
+    _finish(watch)
+    assert _names(diag) == ["search_started", "search_finished"]
+    started = _fields(_one_event(diag, "search_started"))
+    assert started["generation"] == generation
+    assert started["source_count"] == 0
+    assert started["query_length"] == 0
+    finished = _fields(_one_event(diag, "search_finished"))
+    assert finished["generation"] == generation
+    assert finished["result_count"] == 0
+    assert finished["dedupe_dropped"] == 0
+    assert finished["failure_count"] == 0
+
+
+def test_a_category_no_source_covers_still_records_a_whole_lifecycle(diag):
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("halo", Category.GAMES)
+
+    _finish(watch)
+    assert _names(diag) == ["search_started", "search_finished"]
+    started = _fields(_one_event(diag, "search_started"))
+    assert started["generation"] == generation
+    assert started["category"] == "games"
+    assert started["source_count"] == 0
+    assert started["query_length"] == 4
+    assert _fields(_one_event(diag, "search_finished"))["result_count"] == 0
