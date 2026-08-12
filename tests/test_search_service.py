@@ -9,7 +9,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QRunnable, QThreadPool
+from PySide6.QtCore import QCoreApplication, QRunnable, QThread, QThreadPool
 
 from cove.search import service
 from cove.search.magnet import build_magnet
@@ -554,13 +554,20 @@ class _FakeSource(Source):
     homepage = "https://example.invalid"
     reports_swarm = True
 
-    def __init__(self, rows=None, raises=None):
+    def __init__(self, rows=None, raises=None, *, source_id=None, on_search=None):
         self._rows = rows if rows is not None else []
         self._raises = raises
+        self._on_search = on_search
+        if source_id is not None:
+            self.id = source_id
         self.calls = []
 
     def search(self, query, category, http):
         self.calls.append((query, category, http))
+        if self._on_search is not None:
+            # Lets a test hold a source inside search() long enough to observe
+            # what the service does while it is still running.
+            self._on_search()
         if self._raises is not None:
             raise self._raises
         return list(self._rows)
@@ -758,3 +765,508 @@ def test_a_call_builds_a_real_search_http_by_default():
 
     assert isinstance(source.calls[0][2], SearchHttp)
     assert [outcome.error_kind for outcome in seen] == [None]
+
+
+# --- J. lifecycle helpers ----------------------------------------------------
+
+
+class _Watch:
+    """Everything one service told its listeners, in the order it said it."""
+
+    def __init__(self, svc):
+        self.statuses = []
+        self.results = []
+        self.finished = []
+        svc.source_status.connect(self.statuses.append)
+        svc.results_updated.connect(self.results.append)
+        svc.search_finished.connect(self.finished.append)
+
+    @property
+    def order(self):
+        return [(status.source_id, status.state) for status in self.statuses]
+
+    def states(self, source_id):
+        return [
+            status.state for status in self.statuses if status.source_id == source_id
+        ]
+
+
+def _counting_http_factory():
+    """An http factory plus the list of facilities it has been asked for."""
+    made = []
+
+    def factory():
+        http = _FakeHttp()
+        made.append(http)
+        return http
+
+    return factory, made
+
+
+def _select(monkeypatch, sources):
+    """Replace source selection with the given fakes, recording the category."""
+    asked = []
+
+    def _sources_for(category=Category.ALL):
+        asked.append(category)
+        return list(sources)
+
+    monkeypatch.setattr(service, "sources_for", _sources_for)
+    return asked
+
+
+def _pump(predicate, seconds=_WAIT_SECONDS):
+    """Run the Qt event loop until the predicate holds. Always bounded."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        QCoreApplication.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    QCoreApplication.processEvents()
+    return predicate()
+
+
+def _finish(watch):
+    """Wait for exactly one completion, and return its summary."""
+    assert _pump(lambda: bool(watch.finished)), "search never finished"
+    assert len(watch.finished) == 1
+    return watch.finished[0]
+
+
+# --- K. searches that never reach a source -----------------------------------
+
+
+def test_a_whitespace_query_finishes_without_selecting_any_source(monkeypatch):
+    asked = _select(monkeypatch, [_FakeSource([_result()])])
+    svc = service.SearchService()
+    watch = _Watch(svc)
+
+    svc.start("   ")
+
+    summary = _finish(watch)
+    assert summary.results == ()
+    assert summary.failures == ()
+    assert watch.statuses == []
+    assert asked == []
+
+
+def test_a_whitespace_query_leaves_the_service_inactive(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()])])
+    svc = service.SearchService()
+
+    svc.start("\t\n ")
+
+    assert svc.active is False
+
+
+def test_a_category_no_source_covers_finishes_empty():
+    """GAMES has no built-in source yet, and must not hang on that account."""
+    factory, made = _counting_http_factory()
+    svc = service.SearchService(http_factory=factory)
+    watch = _Watch(svc)
+
+    svc.start("halo", Category.GAMES)
+
+    summary = _finish(watch)
+    assert summary.results == ()
+    assert summary.dedupe_dropped == 0
+    assert summary.failures == ()
+    assert watch.statuses == []
+    assert made == [], "a source ran for a category no source covers"
+    assert svc.active is False
+
+
+# --- L. one source, start to finish ------------------------------------------
+
+
+def test_a_single_source_search_runs_running_then_completed(monkeypatch):
+    rows = [_result(info_hash=A, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert watch.order == [
+        ("alpha", service.SourceState.RUNNING),
+        ("alpha", service.SourceState.COMPLETED),
+    ]
+    assert watch.statuses[-1].result_count == 1
+    assert watch.statuses[-1].error_kind is None
+
+
+def test_a_single_source_search_publishes_and_summarises_its_results(monkeypatch):
+    rows = [_result(info_hash=A, source="alpha"), _result(info_hash=B, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert watch.results == [aggregate(rows).results]
+    assert summary.results == aggregate(rows).results
+    assert summary.failures == ()
+    assert svc.active is False
+
+
+def test_the_default_category_is_every_source(monkeypatch):
+    """start() without a category has to mean ALL, all the way to the source."""
+    source = _FakeSource([], source_id="alpha")
+    asked = _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("  dune  ")
+
+    _finish(watch)
+    assert asked == [Category.ALL]
+    assert [call[:2] for call in source.calls] == [("dune", Category.ALL)]
+
+
+def test_an_empty_source_answer_completes_that_source(monkeypatch):
+    _select(monkeypatch, [_FakeSource([], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+    assert watch.statuses[-1].result_count == 0
+    assert summary.failures == ()
+
+
+def test_a_finished_search_keeps_no_worker_pinned(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert svc._calls == {}
+    assert svc._pending == set()
+
+
+def test_the_source_runs_off_the_owning_thread_and_the_service_answers_on_it(
+    monkeypatch,
+):
+    """The provider must not run on the owning thread, and state must not
+    change off it: both halves are asserted through Qt thread identity."""
+    ran_on = []
+    handled_on = []
+    source = _FakeSource(
+        [_result()],
+        source_id="alpha",
+        on_search=lambda: ran_on.append(QThread.currentThread()),
+    )
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    svc.source_status.connect(lambda _s: handled_on.append(QThread.currentThread()))
+
+    svc.start("dune")
+
+    _finish(watch)
+    owner = svc.thread()
+    assert owner is QThread.currentThread()
+    assert ran_on and ran_on[0] is not owner, "the source ran on the owning thread"
+    # RUNNING is emitted from start(); the second status can only come from the
+    # outcome handler, so its thread is the handler's thread.
+    assert handled_on == [owner, owner]
+
+
+# --- M. real concurrent fan-out ----------------------------------------------
+
+
+def test_two_sources_are_inside_search_at_the_same_time(monkeypatch):
+    """Overlap is proved by a barrier: neither source can leave alone."""
+    barrier = threading.Barrier(2)
+    sources = [
+        _FakeSource(
+            [_result(info_hash=A, source="alpha")],
+            source_id="alpha",
+            on_search=lambda: barrier.wait(_WAIT_SECONDS),
+        ),
+        _FakeSource(
+            [_result(info_hash=B, source="beta")],
+            source_id="beta",
+            on_search=lambda: barrier.wait(_WAIT_SECONDS),
+        ),
+    ]
+    _select(monkeypatch, sources)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert summary.failures == (), "the barrier broke, so the sources never overlapped"
+    assert {status.source_id for status in watch.statuses} == {"alpha", "beta"}
+    assert len(summary.results) == 2
+
+
+def test_every_source_is_announced_running_before_any_of_them_finishes(monkeypatch):
+    sources = [
+        _FakeSource([], source_id="alpha"),
+        _FakeSource([], source_id="beta"),
+    ]
+    _select(monkeypatch, sources)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    states = [state for _, state in watch.order]
+    assert states[:2] == [service.SourceState.RUNNING] * 2
+    assert set(states[2:]) == {service.SourceState.COMPLETED}
+
+
+# --- N. incremental aggregation ----------------------------------------------
+
+
+def test_results_grow_as_each_source_lands_and_always_come_from_aggregate(
+    monkeypatch,
+):
+    """A returns at once; B is held until A's merge has been published."""
+    first_landed = threading.Event()
+    rows_a = [_result(info_hash=A, source="alpha", seeders=9)]
+    rows_b = [_result(info_hash=B, source="beta", seeders=3)]
+    sources = [
+        _FakeSource(rows_a, source_id="alpha"),
+        _FakeSource(
+            rows_b,
+            source_id="beta",
+            on_search=lambda: first_landed.wait(_WAIT_SECONDS),
+        ),
+    ]
+    _select(monkeypatch, sources)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    assert _pump(lambda: bool(watch.results)), "the first source never published"
+    assert watch.results[0] == aggregate(rows_a).results
+    first_landed.set()
+
+    summary = _finish(watch)
+    assert watch.results[-1] == aggregate(rows_a + rows_b).results
+    assert summary.results == aggregate(rows_a + rows_b).results
+
+
+def test_a_duplicate_across_two_sources_merges_exactly_as_aggregate_would(
+    monkeypatch,
+):
+    rows_a = [_result(info_hash=A, source="alpha", seeders=2, size_bytes=None)]
+    rows_b = [_result(info_hash=A, source="beta", seeders=40, size_bytes=None, added=None)]
+    _select(
+        monkeypatch,
+        [
+            _FakeSource(rows_a, source_id="alpha"),
+            _FakeSource(rows_b, source_id="beta"),
+        ],
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    expected = aggregate(rows_a + rows_b)
+    assert summary.results == expected.results
+    assert summary.dedupe_dropped == expected.dedupe_dropped == 1
+
+
+# --- O. one source failing takes only itself out ------------------------------
+
+
+def test_a_source_error_leaves_its_healthy_peer_untouched(monkeypatch):
+    rows_b = [_result(info_hash=B, source="beta")]
+    _select(
+        monkeypatch,
+        [
+            _FakeSource(
+                raises=SourceError(SourceErrorKind.NETWORK, "no route"),
+                source_id="alpha",
+            ),
+            _FakeSource(rows_b, source_id="beta"),
+        ],
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.FAILED,
+    ]
+    assert watch.states("beta") == [
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+    failed = [s for s in watch.statuses if s.state is service.SourceState.FAILED]
+    assert [s.error_kind for s in failed] == ["network"]
+    assert [s.result_count for s in failed] == [0]
+    assert summary.results == aggregate(rows_b).results
+    assert summary.failures == (service.SourceFailure("alpha", "network"),)
+    assert svc.active is False
+
+
+def test_an_unexpected_source_exception_leaves_its_healthy_peer_untouched(monkeypatch):
+    rows_b = [_result(info_hash=B, source="beta")]
+    _select(
+        monkeypatch,
+        [
+            _FakeSource(raises=RuntimeError("adapter bug"), source_id="alpha"),
+            _FakeSource(rows_b, source_id="beta"),
+        ],
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert watch.states("alpha")[-1] is service.SourceState.FAILED
+    assert watch.states("beta")[-1] is service.SourceState.COMPLETED
+    assert summary.failures == (service.SourceFailure("alpha", "internal"),)
+    assert summary.results == aggregate(rows_b).results
+
+
+def test_a_failed_source_does_not_republish_the_same_results(monkeypatch):
+    """A failure changes no rows, so it must not look like a result update."""
+    rows_a = [_result(info_hash=A, source="alpha")]
+    _select(
+        monkeypatch,
+        [
+            _FakeSource(rows_a, source_id="alpha"),
+            _FakeSource(
+                raises=SourceError(SourceErrorKind.PARSE, "bad xml"), source_id="beta"
+            ),
+        ],
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert watch.results == [aggregate(rows_a).results]
+
+
+def test_a_search_whose_every_source_fails_still_finishes_once(monkeypatch):
+    _select(
+        monkeypatch,
+        [
+            _FakeSource(
+                raises=SourceError(SourceErrorKind.TIMEOUT, "slow"), source_id="alpha"
+            ),
+            _FakeSource(raises=RuntimeError("boom"), source_id="beta"),
+        ],
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    assert summary.results == ()
+    assert summary.dedupe_dropped == 0
+    assert set(summary.failures) == {
+        service.SourceFailure("alpha", "timeout"),
+        service.SourceFailure("beta", "internal"),
+    }
+    assert watch.results == []
+    assert svc.active is False
+    assert svc._calls == {}
+
+
+# --- P. one search at a time --------------------------------------------------
+
+
+def test_a_second_start_is_refused_while_a_search_is_running(monkeypatch):
+    release = threading.Event()
+    held = _FakeSource(
+        [_result(info_hash=A, source="alpha")],
+        source_id="alpha",
+        on_search=lambda: release.wait(_WAIT_SECONDS),
+    )
+    other = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    asked = _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+    _select(monkeypatch, [other])
+    try:
+        assert svc.active is True
+        with pytest.raises(RuntimeError):
+            svc.start("akira")
+        assert other.calls == [], "the refused search still ran a source"
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert summary.results == aggregate(held._rows).results
+    assert [call[0] for call in held.calls] == ["dune"]
+    assert asked == [Category.ALL]
+    assert svc.active is False
+
+
+def test_starting_from_a_signal_handler_cannot_corrupt_the_running_search(
+    monkeypatch,
+):
+    """A listener reacting to a public signal is refused, and the search that
+    emitted it still completes normally."""
+    rows = [_result(info_hash=A, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    refused = []
+
+    def _restart(_status):
+        try:
+            svc.start("akira")
+        except RuntimeError as error:
+            refused.append(str(error))
+
+    svc.source_status.connect(_restart)
+
+    svc.start("dune")
+
+    summary = _finish(watch)
+    # The exact message matters: a RecursionError from an unguarded restart is
+    # also a RuntimeError, and must not be able to pass for a clean refusal.
+    assert refused and set(refused) == {"search already active"}
+    assert summary.results == aggregate(rows).results
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+    assert svc.active is False
+
+
+def test_a_new_search_may_start_once_the_previous_one_finished(monkeypatch):
+    rows = [_result(info_hash=A, source="alpha")]
+    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+    _finish(watch)
+
+    watch.finished.clear()
+    svc.start("akira")
+
+    summary = _finish(watch)
+    assert summary.results == aggregate(rows).results
