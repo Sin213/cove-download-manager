@@ -2954,3 +2954,688 @@ def test_an_expired_entry_is_dropped_before_a_valid_one_is_evicted():
     assert cache.get(_key(query="b")) is not None
     assert cache.get(_key(query="c")) is not None
     assert cache.get(_key(query="d")) is not None
+
+
+# --- Z.F. cached answers inside the search lifecycle --------------------------
+
+# A cache hit is a source that has already answered. It costs no worker, no
+# HTTP facility and no pool thread, but it is still a source of the search that
+# asked for it, so it is announced exactly like a live one.
+
+
+def test_a_second_identical_search_does_not_ask_the_source_again(monkeypatch):
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    factory, made = _counting_http_factory()
+    svc = service.SearchService(http_factory=factory)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+    first = _finish(watch)
+
+    watch.finished.clear()
+    svc.start("dune")
+    second = _finish(watch)
+
+    assert len(source.calls) == 1, "the cached answer was asked for again"
+    assert len(made) == 1, "a cache hit built an HTTP facility"
+    assert second.results == first.results
+    assert second.failures == ()
+
+
+def test_a_cached_answer_belongs_to_the_search_that_asked_for_it(monkeypatch):
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+    _finish(watch)
+    watch.finished.clear()
+    watch.statuses.clear()
+    watch.results.clear()
+    watch.result_generations.clear()
+
+    second = svc.start("dune")
+    summary = _finish(watch)
+
+    assert watch.order == [
+        ("alpha", service.SourceState.RUNNING),
+        ("alpha", service.SourceState.COMPLETED),
+    ]
+    assert [status.generation for status in watch.statuses] == [second, second]
+    assert watch.statuses[-1].result_count == 1
+    assert watch.statuses[-1].error_kind is None
+    assert watch.result_generations == [second]
+    assert summary.generation == second
+    assert svc.active is False
+    assert len(source.calls) == 1, "the second search was not served from cache"
+
+
+def _prime(svc, watch, query="dune", category=Category.ALL):
+    """Run one live search to the end, and forget everything it said.
+
+    What is left behind is the cache it filled, which is the starting point
+    every test below needs: a source that has already answered once.
+    """
+    svc.start(query, category)
+    _finish(watch)
+    watch.statuses.clear()
+    watch.results.clear()
+    watch.result_generations.clear()
+    watch.finished.clear()
+
+
+def test_a_service_owns_one_production_cache_by_default():
+    svc = service.SearchService(http_factory=_FakeHttp)
+
+    assert isinstance(svc._cache, service._SearchCache)
+    assert svc._cache._max_entries == 64
+    assert svc._cache._ttl_seconds == 300.0
+    assert svc._cache._clock is time.monotonic
+
+
+def test_the_cache_outlives_the_searches_that_fill_and_abandon_it(monkeypatch):
+    """Emptying it on any of these would leave it with nothing to reuse."""
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    svc.start("   ")
+    _finish(watch)
+    watch.finished.clear()
+    svc.cancel()
+    svc.start("dune")
+    _finish(watch)
+
+    assert len(source.calls) == 1
+
+
+# --- Z.G. a cached answer that found nothing ----------------------------------
+
+
+def test_a_cached_empty_answer_is_a_hit_and_not_another_call(monkeypatch):
+    source = _FakeSource([], source_id="alpha")
+    _select(monkeypatch, [source])
+    factory, made = _counting_http_factory()
+    svc = service.SearchService(http_factory=factory)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    summary = None
+    svc.start("dune")
+    summary = _finish(watch)
+
+    assert len(source.calls) == 1, "a cached empty answer was treated as a miss"
+    assert len(made) == 1, "a cached empty answer built an HTTP facility"
+    assert summary.results == ()
+    assert summary.failures == ()
+    assert watch.order == [
+        ("alpha", service.SourceState.RUNNING),
+        ("alpha", service.SourceState.COMPLETED),
+    ]
+    assert watch.statuses[-1].result_count == 0
+
+
+# --- Z.H. what makes one cached answer that answer ----------------------------
+
+
+def test_surrounding_whitespace_reuses_the_same_cached_answer(monkeypatch):
+    """The key is the text the source was given, not the text the user typed."""
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("  dune  ")
+    _finish(watch)
+    watch.finished.clear()
+    svc.start("dune")
+    _finish(watch)
+    watch.finished.clear()
+    # And from the other direction too: what is stored and what is looked up
+    # have to be the same normalisation, not merely two that happen to agree.
+    svc.start("\tdune\n")
+    _finish(watch)
+
+    assert [call[0] for call in source.calls] == ["dune"]
+
+
+def test_a_differently_cased_query_is_not_the_same_answer(monkeypatch):
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("Dune")
+    _finish(watch)
+    watch.finished.clear()
+    svc.start("dune")
+    _finish(watch)
+
+    assert [call[0] for call in source.calls] == ["Dune", "dune"]
+
+
+def test_two_categories_of_one_query_do_not_share_a_cached_answer(monkeypatch):
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune", Category.MOVIES)
+    _finish(watch)
+    watch.finished.clear()
+    # The same category again is a hit, so the miss below is about the
+    # category and not about the key having missed the category out.
+    svc.start("dune", Category.MOVIES)
+    _finish(watch)
+    watch.finished.clear()
+    svc.start("dune", Category.TV)
+    _finish(watch)
+
+    assert [call[1] for call in source.calls] == [Category.MOVIES, Category.TV]
+
+
+def test_one_sources_cached_answer_is_not_another_sources(monkeypatch):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    _select(monkeypatch, [alpha, beta])
+    svc.start("dune")
+    _finish(watch)
+
+    assert len(alpha.calls) == 1, "alpha's own answer was not reused"
+    assert len(beta.calls) == 1, "beta was served alpha's answer"
+
+
+# --- Z.I. a search every source can answer from cache -------------------------
+
+
+def test_a_wholly_cached_search_runs_no_worker_and_arms_no_deadline(monkeypatch):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    factory, made = _counting_http_factory()
+    svc = _short_service(http_factory=factory)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    generation = svc.start("dune")
+
+    # Nothing was waited for, so it is all already said.
+    assert len(watch.finished) == 1
+    assert svc._deadline.isActive() is False, "a search with no live work armed a deadline"
+    assert svc._calls == {}
+    assert svc._cache_keys == {}
+    assert svc.active is False
+    assert len(alpha.calls) == 1 and len(beta.calls) == 1
+    assert len(made) == 2, "a cache hit built an HTTP facility"
+    assert watch.order == [
+        ("alpha", service.SourceState.RUNNING),
+        ("beta", service.SourceState.RUNNING),
+        ("alpha", service.SourceState.COMPLETED),
+        ("beta", service.SourceState.COMPLETED),
+    ]
+    summary = watch.finished[0]
+    assert summary.generation == generation
+    assert summary.failures == ()
+    assert summary.results == aggregate(
+        [_result(info_hash=A, source="alpha"), _result(info_hash=B, source="beta")]
+    ).results
+
+    # Well past the short deadline: nothing may time out a search that is over.
+    _pump(lambda: False, seconds=0.3)
+    assert len(watch.finished) == 1
+    assert [status.state for status in watch.statuses].count(
+        service.SourceState.TIMED_OUT
+    ) == 0
+
+
+def test_a_wholly_cached_empty_search_still_finishes_once(monkeypatch):
+    alpha = _FakeSource([], source_id="alpha")
+    beta = _FakeSource([], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    svc = _short_service()
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    svc.start("dune")
+
+    assert len(watch.finished) == 1
+    assert watch.finished[0].results == ()
+    assert svc._deadline.isActive() is False
+    assert len(alpha.calls) == 1 and len(beta.calls) == 1
+    assert [status.result_count for status in watch.statuses] == [0, 0, 0, 0]
+    _pump(lambda: False, seconds=0.3)
+    assert len(watch.finished) == 1
+
+
+# --- Z.J. a search that is part cached and part live --------------------------
+
+
+def test_a_cached_source_answers_before_its_live_peer_does(monkeypatch):
+    cached_rows = [_result(info_hash=A, source="alpha")]
+    live_rows = [_result(info_hash=B, source="beta")]
+    alpha = _FakeSource(cached_rows, source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    release = threading.Event()
+    beta = _held_source(live_rows, source_id="beta", release=release)
+    _select(monkeypatch, [alpha, beta])
+
+    try:
+        generation = svc.start("dune")
+        # alpha is finished from cache while beta is still inside search().
+        assert watch.states("alpha") == [
+            service.SourceState.RUNNING,
+            service.SourceState.COMPLETED,
+        ]
+        assert watch.states("beta") == [service.SourceState.RUNNING]
+        assert watch.results[-1] == aggregate(cached_rows).results
+        assert svc.active is True
+        assert svc._deadline.isActive() is True, "live work was left unbounded"
+        assert list(svc._calls) == [(generation, "beta")], "a cache hit pinned a worker"
+        assert list(svc._cache_keys) == [(generation, "beta")]
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert summary.results == aggregate(cached_rows + live_rows).results
+    assert summary.failures == ()
+    assert svc._deadline.isActive() is False
+    assert svc._calls == {} and svc._cache_keys == {}
+    assert len(alpha.calls) == 1
+
+
+def test_a_cached_row_and_a_live_row_merge_exactly_as_aggregate_would(monkeypatch):
+    cached_rows = [
+        _result(info_hash=A, name="Dune Cached", source="alpha", seeders=9, size_bytes=None)
+    ]
+    live_rows = [
+        _result(info_hash=A, name="Dune Live", source="beta", seeders=3, size_bytes=4096)
+    ]
+    alpha = _FakeSource(cached_rows, source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    beta = _FakeSource(live_rows, source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    svc.start("dune")
+    summary = _finish(watch)
+
+    expected = aggregate(cached_rows + live_rows)
+    assert summary.results == expected.results
+    assert summary.dedupe_dropped == expected.dedupe_dropped == 1
+    assert summary.results[0].size_bytes == 4096, "the cached winner was not backfilled"
+    assert len(alpha.calls) == 1
+
+
+def test_a_cached_answer_survives_a_live_peer_failing(monkeypatch):
+    cached_rows = [_result(info_hash=A, source="alpha")]
+    alpha = _FakeSource(cached_rows, source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    beta = _FakeSource(
+        raises=SourceError(SourceErrorKind.NETWORK), source_id="beta"
+    )
+    _select(monkeypatch, [alpha, beta])
+    svc.start("dune")
+    summary = _finish(watch)
+
+    assert summary.results == aggregate(cached_rows).results
+    assert summary.failures == (service.SourceFailure("beta", "network"),)
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+    assert watch.states("beta") == [
+        service.SourceState.RUNNING,
+        service.SourceState.FAILED,
+    ]
+    assert len(alpha.calls) == 1
+
+
+def test_a_cached_answer_survives_a_live_peer_timing_out(monkeypatch):
+    cached_rows = [_result(info_hash=A, source="alpha")]
+    alpha = _FakeSource(cached_rows, source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = _short_service()
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    release = threading.Event()
+    beta = _held_source([], source_id="beta", release=release)
+    _select(monkeypatch, [alpha, beta])
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    assert summary.results == aggregate(cached_rows).results
+    assert summary.failures == (service.SourceFailure("beta", _TIMEOUT_KIND),)
+    assert watch.states("beta") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+    ]
+    assert svc.active is False
+    assert svc._deadline.isActive() is False
+    assert len(alpha.calls) == 1
+    assert _drained(svc)
+
+
+# --- Z.K. what is never worth keeping -----------------------------------------
+
+
+def test_a_failed_source_is_asked_again_by_the_next_search(monkeypatch):
+    source = _FakeSource(
+        raises=SourceError(SourceErrorKind.NETWORK), source_id="alpha"
+    )
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    svc.start("dune")
+    summary = _finish(watch)
+
+    assert len(source.calls) == 2, "a failure was cached"
+    assert summary.failures == (service.SourceFailure("alpha", "network"),)
+
+
+def test_a_source_that_broke_is_asked_again_by_the_next_search(monkeypatch):
+    source = _FakeSource(raises=RuntimeError("boom"), source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    svc.start("dune")
+    summary = _finish(watch)
+
+    assert len(source.calls) == 2, "an internal failure was cached"
+    assert summary.failures == (service.SourceFailure("alpha", "internal"),)
+
+
+def test_a_timed_out_sources_late_answer_is_never_cached(monkeypatch):
+    """Its worker succeeds, but the search had already stopped taking answers."""
+    rows = [_result(info_hash=A, source="alpha")]
+    release = threading.Event()
+    held = _held_source(rows, source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        first = _finish(watch)
+        assert first.failures == (service.SourceFailure("alpha", _TIMEOUT_KIND),)
+    finally:
+        release.set()
+    assert _drained(svc), "the late answer was never handled"
+
+    watch.finished.clear()
+    svc.start("dune")
+    second = _finish(watch)
+
+    assert len(held.calls) == 2, "a timed-out search's late answer seeded the cache"
+    assert second.results == aggregate(rows).results
+
+
+def test_a_superseded_searchs_late_answer_is_never_cached(monkeypatch):
+    rows = [_result(info_hash=A, source="alpha")]
+    release = threading.Event()
+    held = _held_source(rows, source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        svc.start("arrakis")
+    finally:
+        release.set()
+    _finish(watch)
+    assert _drained(svc)
+
+    watch.finished.clear()
+    svc.start("dune")
+    _finish(watch)
+
+    assert [call[0] for call in held.calls] == ["dune", "arrakis", "dune"], (
+        "a superseded search's late answer seeded the cache"
+    )
+
+
+def test_a_cancelled_searchs_late_answer_is_never_cached(monkeypatch):
+    rows = [_result(info_hash=A, source="alpha")]
+    release = threading.Event()
+    held = _held_source(rows, source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        svc.cancel()
+    finally:
+        release.set()
+    assert _drained(svc)
+    assert watch.finished == []
+
+    svc.start("dune")
+    _finish(watch)
+
+    assert [call[0] for call in held.calls] == ["dune", "dune"], (
+        "a cancelled search's late answer seeded the cache"
+    )
+
+
+# --- Z.L. an answer only stays worth reusing for so long ----------------------
+
+
+def test_a_cached_answer_expires_and_the_source_is_asked_again(monkeypatch):
+    clock = _Clock()
+    source = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [source])
+    svc = service.SearchService(
+        http_factory=_FakeHttp, cache=service._SearchCache(clock=clock)
+    )
+    watch = _Watch(svc)
+
+    _prime(svc, watch)
+    assert len(source.calls) == 1
+
+    clock.advance(service._CACHE_TTL_SECONDS - 1)
+    svc.start("dune")
+    _finish(watch)
+    watch.finished.clear()
+    assert len(source.calls) == 1, "a still-valid answer was not reused"
+
+    clock.advance(1)
+    svc.start("dune")
+    summary = _finish(watch)
+
+    assert len(source.calls) == 2, "an expired answer was reused"
+    assert summary.results == aggregate([_result(info_hash=A, source="alpha")]).results
+
+
+# --- Z.M. a listener that changes the search from inside a cached completion --
+
+
+def test_starting_from_a_cached_sources_running_status_stops_the_old_search(
+    monkeypatch,
+):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    later = []
+
+    def restart(status):
+        if status.state is service.SourceState.RUNNING and not later:
+            later.append(svc.start("arrakis"))
+
+    svc.source_status.connect(restart)
+    first = svc.start("dune")
+    _finish(watch)
+
+    assert later and later[0] != first
+    assert [
+        status.generation
+        for status in watch.statuses
+        if status.state is service.SourceState.COMPLETED
+    ] == [later[0]]
+    assert watch.result_generations == [later[0]]
+    assert watch.finished[0].generation == later[0]
+
+
+def test_cancelling_from_a_cached_sources_running_status_stops_the_old_search(
+    monkeypatch,
+):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    def stop(status):
+        if status.state is service.SourceState.RUNNING:
+            svc.cancel()
+
+    svc.source_status.connect(stop)
+    svc.start("dune")
+
+    assert watch.finished == []
+    assert watch.results == []
+    assert [status.state for status in watch.statuses] == [
+        service.SourceState.RUNNING
+    ]
+    assert svc.active is False
+    assert svc._deadline.isActive() is False
+
+
+def test_starting_from_a_cached_completion_stops_the_old_search(monkeypatch):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    later = []
+
+    def restart(status):
+        if status.state is service.SourceState.COMPLETED and not later:
+            later.append(svc.start("arrakis"))
+
+    svc.source_status.connect(restart)
+    first = svc.start("dune")
+    _finish(watch)
+
+    completed = [
+        (status.source_id, status.generation)
+        for status in watch.statuses
+        if status.state is service.SourceState.COMPLETED
+    ]
+    # The old search stopped at alpha: beta was never completed for it.
+    assert [pair for pair in completed if pair[1] == first] == [("alpha", first)]
+    # The new search completed both of its own, in whichever order its two live
+    # sources happened to answer.
+    assert sorted(pair for pair in completed if pair[1] == later[0]) == [
+        ("alpha", later[0]),
+        ("beta", later[0]),
+    ]
+    assert set(watch.result_generations) == {later[0]}
+    assert len(watch.finished) == 1
+    assert watch.finished[0].generation == later[0]
+
+
+def test_cancelling_from_a_cached_results_view_stops_the_old_search(monkeypatch):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    svc.results_updated.connect(lambda generation, results: svc.cancel())
+    svc.start("dune")
+
+    assert watch.finished == [], "a cancelled search still summarised itself"
+    assert len(watch.results) == 1
+    assert watch.states("beta") == [service.SourceState.RUNNING]
+    assert svc.active is False
+    assert svc._deadline.isActive() is False
+
+
+def test_a_reentrant_search_stops_the_old_one_before_its_live_source_is_submitted(
+    monkeypatch,
+):
+    """The old search's miss must never reach the pool once it is replaced."""
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+
+    later = []
+
+    def restart(status):
+        if status.state is service.SourceState.COMPLETED and not later:
+            later.append(svc.start("arrakis"))
+
+    svc.source_status.connect(restart)
+    svc.start("dune")
+    _finish(watch)
+
+    assert [call[0] for call in beta.calls] == ["arrakis"], (
+        "the replaced search still submitted its live source"
+    )
+    assert svc._deadline_generation in (0, later[0])
+    assert len(watch.finished) == 1
+    assert watch.finished[0].generation == later[0]
+
+
+def test_cancelling_from_a_cached_completion_leaves_no_live_work_behind(monkeypatch):
+    alpha = _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")
+    _select(monkeypatch, [alpha])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    _prime(svc, watch)
+
+    beta = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [alpha, beta])
+
+    def stop(status):
+        if status.state is service.SourceState.COMPLETED:
+            svc.cancel()
+
+    svc.source_status.connect(stop)
+    svc.start("dune")
+
+    assert beta.calls == [], "a cancelled search still submitted its live source"
+    assert svc._deadline.isActive() is False, "a cancelled search armed a deadline"
+    assert svc._calls == {} and svc._cache_keys == {}
+    assert svc.active is False
+    assert watch.finished == []

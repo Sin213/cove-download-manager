@@ -400,11 +400,19 @@ class SearchService(QObject):
         *,
         http_factory=SearchHttp,
         deadline_ms: int = _SEARCH_DEADLINE_MS,
+        cache=None,
     ):
         super().__init__(parent)
         # The one seam a test needs: the workers build their own HTTP, so the
         # service never touches a session itself.
         self._http_factory = http_factory
+        # One cache for the service, not one per search: an answer is worth
+        # reusing precisely because the search that stored it is over. Nothing
+        # here empties it when a search finishes, is superseded or is
+        # cancelled - that would leave it with nothing to reuse. The third
+        # seam, and private: a test that needs a cache whose clock it controls
+        # passes one, and production never does.
+        self._cache = _SearchCache() if cache is None else cache
         # The second seam: a test proves what happens at the deadline without
         # waiting half a minute for it. Production never passes this.
         if not isinstance(deadline_ms, int) or isinstance(deadline_ms, bool) or deadline_ms <= 0:
@@ -439,6 +447,12 @@ class SearchService(QObject):
         # be running in two generations at once, and the newer call must never
         # evict the older one from its own ownership.
         self._calls: dict[tuple[int, str], _SourceCall] = {}
+        # What each submitted call would be cached under, remembered for
+        # exactly as long as the call itself is. The key is settled when the
+        # worker is submitted rather than read back off the service when its
+        # outcome lands: by then the query and category the service holds may
+        # belong to an entirely different search.
+        self._cache_keys: dict[tuple[int, str], _CacheKey] = {}
         self._pending: set[str] = set()
         self._results: dict[str, tuple[SearchResult, ...]] = {}
         self._failures: list[SourceFailure] = []
@@ -493,10 +507,41 @@ class SearchService(QObject):
             if generation != self._generation:
                 return generation
 
-        # Only this search's own calls are submitted. An older search's
-        # workers are already on the pool and are not restarted here.
-        pool = _pool()
+        # What the sources have already answered is settled before any worker
+        # is submitted, so a source the cache can serve never reaches the pool
+        # at all. The query used here is the normalised text the sources
+        # themselves are given, which is what makes "  dune  " and "dune" one
+        # answer; nothing else is done to it, so "Dune" stays a question of its
+        # own.
+        #
+        # Each completion hands control to listeners exactly as a live one
+        # does, and a listener may start or cancel a search from there. If it
+        # does, this search is over: the sources still to be looked up, the
+        # workers still to be submitted and the deadline that would have bound
+        # them all belonged to a search that no longer exists.
+        misses = []
         for source in sources:
+            cached = self._cache.get(_CacheKey(source.id, category, text))
+            if cached is None:
+                misses.append(source)
+                continue
+            self._pending.discard(source.id)
+            if not self._complete_source(generation, source.id, cached):
+                return generation
+
+        if not misses:
+            # Every source answered from cache, so there is no live work for a
+            # deadline to bound and nothing left to wait for. The search ends
+            # here, on the thread that asked for it.
+            self._finish(generation)
+            return generation
+
+        # Only this search's own calls are submitted, and only for the sources
+        # the cache could not answer. An older search's workers are already on
+        # the pool and are not restarted here.
+        pool = _pool()
+        for source in misses:
+            key = _CacheKey(source.id, category, text)
             call = _SourceCall(
                 source,
                 text,
@@ -506,12 +551,15 @@ class SearchService(QObject):
             )
             call.signals.finished.connect(self._on_outcome, Qt.QueuedConnection)
             self._calls[(generation, source.id)] = call
+            self._cache_keys[(generation, source.id)] = key
             pool.start(call)
 
         # Armed last, once this search is certainly still the current one and
-        # its work is on the pool. Nothing between here and the announce loop
-        # above hands control to a listener, so the search this arms for cannot
-        # have been replaced in between.
+        # its live work is on the pool. Every point above that hands control to
+        # a listener returns rather than reaching here, so this can only arm
+        # for a search that is still the current one - and a search with no
+        # live work at all never arms it, because there is nothing left for a
+        # deadline to be about.
         self._arm_deadline(generation)
         return generation
 
@@ -631,8 +679,11 @@ class SearchService(QObject):
         source_id = outcome.source_id
         # Releasing the worker comes first and happens whatever else is true:
         # the runnable was pinned only until it reported, and a search nobody
-        # wants any more still has to stop owning its threads.
+        # wants any more still has to stop owning its threads. What it would
+        # have been cached under goes with it, whether or not anything is ever
+        # stored: a key nobody can use again is not kept.
         self._calls.pop((generation, source_id), None)
+        cache_key = self._cache_keys.pop((generation, source_id), None)
 
         if generation != self._generation:
             # A superseded or cancelled search. Its worker has just been let
@@ -657,19 +708,20 @@ class SearchService(QObject):
         self._pending.discard(source_id)
 
         if outcome.error_kind is None:
-            self._results[source_id] = outcome.results
-            self._emit_status(
-                generation, source_id, SourceState.COMPLETED, None, len(outcome.results)
-            )
-            if generation != self._generation:
-                # A listener replaced or cancelled the search from inside that
-                # status. Everything left to do here was this search's, and
-                # this search no longer exists.
-                return
-            # A source that found nothing still succeeded; republishing the
-            # same merged view costs nothing and keeps the rule simple.
-            self.results_updated.emit(generation, self._merged().results)
-            if generation != self._generation:
+            # Cached here and nowhere else: every guard that could reject this
+            # outcome has already run, so what is stored is an answer the
+            # current search actually accepted. A worker whose search was
+            # superseded, cancelled or already timed out has returned above and
+            # cannot reach this line, which is what keeps a rejected answer out
+            # of the cache. A listener that supersedes the search from one of
+            # the emits below cannot make the provider call itself any less of
+            # a success, so this comes first and stands.
+            if cache_key is not None:
+                self._cache.put(cache_key, outcome.results)
+            if not self._complete_source(generation, source_id, outcome.results):
+                # A listener replaced or cancelled the search from inside one
+                # of those events. Everything left to do here was this
+                # search's, and this search no longer exists.
                 return
         else:
             # One source is out. Its peers keep running and whatever they
@@ -684,6 +736,31 @@ class SearchService(QObject):
 
         if not self._pending:
             self._finish(generation)
+
+    def _complete_source(
+        self, generation: int, source_id: str, results: tuple[SearchResult, ...]
+    ) -> bool:
+        """Record and announce one source's successful rows.
+
+        The one path a source succeeds by, whether a worker just answered or
+        the cache answered for it: an answer that was cached must reach a
+        listener as exactly the same events, in the same order, carrying the
+        same merged view, or the UI would need a second lifecycle to read.
+
+        Returns False when a listener replaced or cancelled the search from
+        inside one of the events, which is the caller's signal that everything
+        it still had to do belonged to a search that no longer exists.
+        """
+        self._results[source_id] = results
+        self._emit_status(
+            generation, source_id, SourceState.COMPLETED, None, len(results)
+        )
+        if generation != self._generation:
+            return False
+        # A source that found nothing still succeeded; republishing the same
+        # merged view costs nothing and keeps the rule simple.
+        self.results_updated.emit(generation, self._merged().results)
+        return generation == self._generation
 
     def _merged(self) -> Aggregation:
         """Everything the successful sources have reported so far, merged.
