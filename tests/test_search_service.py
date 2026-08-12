@@ -9,7 +9,7 @@ import threading
 import time
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QRunnable, QThread, QThreadPool
+from PySide6.QtCore import Qt, QCoreApplication, QRunnable, QThread, QThreadPool
 
 from cove.search import service
 from cove.search.magnet import build_magnet
@@ -1893,3 +1893,687 @@ def test_the_generation_only_ever_goes_up(monkeypatch):
     numbers = [fresh, completed, abandoned, superseding, cancelled, blank, uncovered]
     assert numbers == sorted(numbers), f"a generation went backwards: {numbers}"
     assert len(set(numbers)) == len(numbers), f"a generation was reused: {numbers}"
+
+
+# --- X. one global deadline per search ----------------------------------------
+
+# Short enough that a whole suite of deadline tests costs a few seconds, long
+# enough that a loaded CI box is not mistaken for a hung provider. Nothing here
+# ever waits for the production 30 seconds.
+_TEST_DEADLINE_MS = 120
+
+# The stable name a timed-out source is reported under.
+_TIMEOUT_KIND = "timeout"
+
+
+def _short_service(http_factory=_FakeHttp):
+    """A service whose product deadline is the short test one."""
+    return service.SearchService(http_factory=http_factory, deadline_ms=_TEST_DEADLINE_MS)
+
+
+def test_the_production_search_deadline_is_thirty_seconds():
+    assert service._SEARCH_DEADLINE_MS == 30_000
+
+
+def test_a_service_uses_the_production_deadline_by_default():
+    svc = service.SearchService(http_factory=_FakeHttp)
+
+    assert svc._deadline_ms == 30_000
+
+
+def test_a_nonsensical_deadline_is_rejected():
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            service.SearchService(http_factory=_FakeHttp, deadline_ms=bad)
+
+
+def test_a_provider_backed_search_arms_one_single_shot_deadline(monkeypatch):
+    """The default 30-second service is used here, and never waited on."""
+    release = threading.Event()
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        assert svc._deadline.isActive() is True
+        assert svc._deadline.isSingleShot() is True
+    finally:
+        release.set()
+
+    _finish(watch)
+
+
+def test_a_whitespace_query_leaves_no_deadline_armed(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("   ")
+
+    _finish(watch)
+    assert svc._deadline.isActive() is False
+
+
+def test_a_category_no_source_covers_leaves_no_deadline_armed():
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("halo", Category.GAMES)
+
+    _finish(watch)
+    assert svc._deadline.isActive() is False
+
+
+def test_a_normal_completion_disarms_the_deadline(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert svc._deadline.isActive() is False
+
+
+# --- Y. a source that runs out of time ----------------------------------------
+
+
+def test_a_source_that_never_answers_still_finishes_the_search(monkeypatch):
+    """The whole point: one silent provider cannot hold a search open."""
+    release = threading.Event()
+    held = _held_source([_result()], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    started = time.monotonic()
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    # Bounded on both sides: the deadline is a wait, not an instant giving up,
+    # and it is emphatically not the five seconds the provider would have taken.
+    assert elapsed >= (_TEST_DEADLINE_MS / 1000) * 0.5, f"finished far too early: {elapsed}"
+    assert elapsed < 2.0, f"the deadline did not bound the search: {elapsed}"
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+    ]
+    assert summary.failures == (service.SourceFailure("alpha", "timeout"),)
+    assert summary.results == ()
+    assert summary.dedupe_dropped == 0
+    assert svc.active is False
+    assert len(watch.finished) == 1
+
+
+def test_a_timed_out_source_status_names_the_timeout_and_no_rows(monkeypatch):
+    release = threading.Event()
+    held = _held_source([_result()], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        generation = svc.start("dune")
+        _finish(watch)
+    finally:
+        release.set()
+
+    timed_out = [
+        status
+        for status in watch.statuses
+        if status.state is service.SourceState.TIMED_OUT
+    ]
+    assert len(timed_out) == 1
+    assert timed_out[0].generation == generation
+    assert timed_out[0].source_id == "alpha"
+    assert timed_out[0].error_kind == "timeout"
+    assert timed_out[0].result_count == 0
+
+
+def test_a_search_that_timed_out_leaves_no_deadline_armed(monkeypatch):
+    release = threading.Event()
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    started = time.monotonic()
+    try:
+        svc.start("dune")
+        _finish(watch)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 2.0, f"the deadline did not bound the search: {elapsed}"
+    assert svc._deadline.isActive() is False
+
+
+def test_a_successful_source_survives_a_peer_timing_out(monkeypatch):
+    """A search is not thrown away because one of its sources went quiet."""
+    release = threading.Event()
+    rows = [_result(info_hash=A, source="beta", seeders=7)]
+    quick = _FakeSource(rows, source_id="beta")
+    held = _held_source(
+        [_result(info_hash=B, source="alpha")], source_id="alpha", release=release
+    )
+    _select(monkeypatch, [quick, held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    assert summary.results == aggregate(rows).results
+    assert summary.failures == (service.SourceFailure("alpha", _TIMEOUT_KIND),)
+    assert watch.states("beta") == [
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+    ]
+    assert len(watch.finished) == 1
+    assert svc.active is False
+
+
+def test_the_rows_published_before_a_timeout_are_the_rows_summarised(monkeypatch):
+    release = threading.Event()
+    rows = [_result(info_hash=A, source="beta"), _result(info_hash=C, source="beta")]
+    quick = _FakeSource(rows, source_id="beta")
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [quick, held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    assert watch.results == [aggregate(rows).results]
+    assert summary.results == watch.results[-1]
+
+
+def test_a_search_whose_every_source_goes_quiet_still_finishes_once(monkeypatch):
+    release = threading.Event()
+    first = _held_source([_result()], source_id="alpha", release=release)
+    second = _held_source([_result()], source_id="beta", release=release)
+    _select(monkeypatch, [first, second])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    assert summary.results == ()
+    assert set(summary.failures) == {
+        service.SourceFailure("alpha", _TIMEOUT_KIND),
+        service.SourceFailure("beta", _TIMEOUT_KIND),
+    }
+    assert watch.results == []
+    assert len(watch.finished) == 1
+    assert svc.active is False
+
+
+def test_a_normal_failure_and_a_timeout_are_both_reported(monkeypatch):
+    """The two are different things and neither may be reported as the other."""
+    release = threading.Event()
+    broken = _FakeSource(
+        raises=SourceError(SourceErrorKind.NETWORK, "down"), source_id="beta"
+    )
+    held = _held_source([], source_id="alpha", release=release)
+    _select(monkeypatch, [broken, held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    assert set(summary.failures) == {
+        service.SourceFailure("beta", SourceErrorKind.NETWORK.value),
+        service.SourceFailure("alpha", _TIMEOUT_KIND),
+    }
+    assert watch.states("beta") == [
+        service.SourceState.RUNNING,
+        service.SourceState.FAILED,
+    ]
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+    ]
+
+
+def test_several_sources_time_out_in_a_deterministic_order(monkeypatch):
+    """Which order the UI hears about them in cannot come from a set."""
+    release = threading.Event()
+    ids = ["zulu", "alpha", "mike", "bravo"]
+    _select(
+        monkeypatch,
+        [_held_source([], source_id=name, release=release) for name in ids],
+    )
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    timed_out = [
+        status.source_id
+        for status in watch.statuses
+        if status.state is service.SourceState.TIMED_OUT
+    ]
+    assert timed_out == sorted(ids)
+    assert [failure.source_id for failure in summary.failures] == sorted(ids)
+
+
+def test_timed_out_sources_follow_the_registry_order_first(monkeypatch):
+    """A known source outranks an unknown one, exactly as ranking does."""
+    release = threading.Event()
+    known = SOURCES[1].id
+    ids = ["zzz", known, SOURCES[0].id]
+    _select(
+        monkeypatch,
+        [_held_source([], source_id=name, release=release) for name in ids],
+    )
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        _finish(watch)
+    finally:
+        release.set()
+
+    timed_out = [
+        status.source_id
+        for status in watch.statuses
+        if status.state is service.SourceState.TIMED_OUT
+    ]
+    assert timed_out == [SOURCES[0].id, known, "zzz"]
+
+
+def test_a_timed_out_worker_that_finally_answers_changes_nothing(monkeypatch):
+    """The provider was never killed, so its rows do eventually arrive."""
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha", seeders=99)],
+        source_id="alpha",
+        release=release,
+    )
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+        assert svc._calls, "the still-running worker was let go before it reported"
+    finally:
+        release.set()
+
+    assert _drained(svc), "the late worker stayed pinned"
+    assert watch.results == []
+    assert len(watch.finished) == 1
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+    ]
+    assert summary.results == ()
+    assert svc.active is False
+    assert svc._deadline.isActive() is False
+
+
+def test_a_timed_out_worker_that_finally_fails_changes_nothing(monkeypatch):
+    release = threading.Event()
+    held = _FakeSource(
+        raises=SourceError(SourceErrorKind.NETWORK, "down"),
+        source_id="alpha",
+        on_search=lambda: release.wait(_WAIT_SECONDS),
+    )
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        summary = _finish(watch)
+    finally:
+        release.set()
+
+    assert _drained(svc), "the late worker stayed pinned"
+    assert len(watch.finished) == 1
+    assert watch.states("alpha") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+    ]
+    # The timeout stands: a failure that arrived after Cove stopped waiting
+    # does not get to rewrite what the search already reported.
+    assert summary.failures == (service.SourceFailure("alpha", _TIMEOUT_KIND),)
+
+
+def test_a_superseding_search_gets_its_own_full_deadline(monkeypatch):
+    """Generation two does not inherit what was left of generation one."""
+    release = threading.Event()
+    first = _held_source([], source_id="alpha", release=release)
+    second = _held_source([], source_id="beta", release=release)
+    _select(monkeypatch, [first])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        # Spend most of the first search's window before replacing it.
+        _pump(lambda: False, seconds=(_TEST_DEADLINE_MS / 1000) * 0.8)
+        _select(monkeypatch, [second])
+        started = time.monotonic()
+        generation = svc.start("akira")
+        summary = _finish(watch)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert summary.generation == generation
+    assert summary.failures == (service.SourceFailure("beta", _TIMEOUT_KIND),)
+    assert elapsed >= (_TEST_DEADLINE_MS / 1000) * 0.5, (
+        f"the new search inherited the old window: {elapsed}"
+    )
+    assert elapsed < 2.0
+    assert len(watch.finished) == 1
+
+
+def test_a_stale_deadline_cannot_time_out_the_search_that_replaced_it(monkeypatch):
+    """A timer event already in flight when a search is replaced does nothing."""
+    release = threading.Event()
+    first = _held_source([], source_id="alpha", release=release)
+    second = _held_source([], source_id="beta", release=release)
+    _select(monkeypatch, [first])
+    # The production deadline, so nothing here can expire on its own.
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        stale = svc.start("dune")
+        _select(monkeypatch, [second])
+        fresh = svc.start("akira")
+
+        svc._expire(stale)
+
+        assert svc.active is True
+        assert svc._pending == {"beta"}
+        assert watch.finished == []
+        assert watch.states("beta") == [service.SourceState.RUNNING]
+        assert svc._deadline.isActive() is True, "the new search lost its deadline"
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert summary.generation == fresh
+    assert summary.failures == ()
+
+
+def test_cancelling_takes_the_deadline_with_it(monkeypatch):
+    release = threading.Event()
+    held = _held_source([_result()], source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        generation = svc.start("dune")
+        assert svc._deadline.isActive() is True
+        svc.cancel()
+        assert svc._deadline.isActive() is False
+
+        # Well past when the cancelled search would have run out of time.
+        _pump(lambda: False, seconds=(_TEST_DEADLINE_MS / 1000) * 3)
+        # And a timer event that was already in flight when it was cancelled.
+        svc._expire(generation)
+
+        assert watch.finished == []
+        assert [status.state for status in watch.statuses] == [
+            service.SourceState.RUNNING
+        ]
+    finally:
+        release.set()
+
+    assert _drained(svc), "the abandoned worker stayed pinned"
+    assert watch.finished == [], "the cancelled search finished anyway"
+    assert svc.active is False
+
+
+def test_the_same_source_id_survives_a_timeout_and_a_new_search(monkeypatch):
+    """A timed-out worker's late answer cannot be taken for its namesake's."""
+    stale_release = threading.Event()
+    fresh_release = threading.Event()
+    stale_rows = [_result(info_hash=A, source="same", seeders=99)]
+    fresh_rows = [_result(info_hash=B, source="same", seeders=1)]
+    held = _held_source(stale_rows, source_id="same", release=stale_release)
+    fresh = _held_source(fresh_rows, source_id="same", release=fresh_release)
+    _select(monkeypatch, [held])
+    svc = _short_service()
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        timed_out = _finish(watch)
+        assert timed_out.failures == (service.SourceFailure("same", _TIMEOUT_KIND),)
+
+        _select(monkeypatch, [fresh])
+        svc.start("akira")
+        assert _pump(lambda: len(svc._calls) == 2), "the new call evicted the old pin"
+
+        stale_release.set()
+        assert _pump(lambda: len(svc._calls) == 1), "the stale worker was never released"
+
+        assert svc._pending == {"same"}, "the stale outcome cleared the live source"
+        assert svc.active is True
+        assert len(watch.finished) == 1
+    finally:
+        stale_release.set()
+        fresh_release.set()
+
+    assert _pump(lambda: len(watch.finished) == 2), "the new search never finished"
+    assert _drained(svc), "a worker stayed pinned"
+    summary = watch.finished[-1]
+    assert summary.results == aggregate(fresh_rows).results
+    assert summary.failures == ()
+    assert watch.states("same") == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+
+
+def test_starting_from_a_timed_out_status_handler_supersedes_cleanly(monkeypatch):
+    """A listener may replace the search from the first timeout it hears."""
+    release = threading.Event()
+    _select(
+        monkeypatch,
+        [
+            _held_source([], source_id=name, release=release)
+            for name in ("alpha", "bravo")
+        ],
+    )
+    fresh_rows = [_result(info_hash=B, source="beta")]
+    fresh = _FakeSource(fresh_rows, source_id="beta")
+    svc = _short_service()
+    watch = _Watch(svc)
+    restarted = []
+
+    def _restart(status):
+        if status.state is service.SourceState.TIMED_OUT and not restarted:
+            restarted.append(status.generation)
+            _select(monkeypatch, [fresh])
+            svc.start("akira")
+
+    svc.source_status.connect(_restart)
+
+    try:
+        first = svc.start("dune")
+        assert _pump(lambda: bool(watch.finished)), "no search ever finished"
+        _pump(lambda: False, seconds=(_TEST_DEADLINE_MS / 1000) * 2)
+    finally:
+        release.set()
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert restarted == [first]
+    timed_out = [
+        status.source_id
+        for status in watch.statuses
+        if status.state is service.SourceState.TIMED_OUT
+    ]
+    assert timed_out == ["alpha"], "the replaced search went on timing sources out"
+    assert len(watch.finished) == 1, "the replaced search finished as well"
+    summary = watch.finished[0]
+    assert summary.generation > first
+    assert summary.results == aggregate(fresh_rows).results
+    assert summary.failures == ()
+    assert svc.active is False
+
+
+def test_cancelling_from_a_timed_out_status_handler_stops_the_search(monkeypatch):
+    release = threading.Event()
+    _select(
+        monkeypatch,
+        [
+            _held_source([], source_id=name, release=release)
+            for name in ("alpha", "bravo")
+        ],
+    )
+    svc = _short_service()
+    watch = _Watch(svc)
+    stopped = []
+
+    def _stop(status):
+        if status.state is service.SourceState.TIMED_OUT and not stopped:
+            stopped.append(status.source_id)
+            svc.cancel()
+
+    svc.source_status.connect(_stop)
+
+    try:
+        svc.start("dune")
+        assert _pump(lambda: bool(stopped)), "nothing ever timed out"
+        _pump(lambda: False, seconds=(_TEST_DEADLINE_MS / 1000) * 2)
+    finally:
+        release.set()
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert stopped == ["alpha"]
+    timed_out = [
+        status.source_id
+        for status in watch.statuses
+        if status.state is service.SourceState.TIMED_OUT
+    ]
+    assert timed_out == ["alpha"], "the cancelled search went on timing sources out"
+    assert watch.finished == [], "the cancelled search finished anyway"
+    assert svc.active is False
+    assert svc._deadline.isActive() is False
+
+
+def test_starting_from_a_timed_out_searchs_finish_runs_the_next_search(monkeypatch):
+    """The timed-out search is entirely tidied up before it says so."""
+    release = threading.Event()
+    _select(monkeypatch, [_held_source([], source_id="alpha", release=release)])
+    fresh_rows = [_result(info_hash=B, source="beta")]
+    fresh = _FakeSource(fresh_rows, source_id="beta")
+    svc = _short_service()
+    watch = _Watch(svc)
+    restarted = []
+
+    def _restart(summary):
+        if not restarted:
+            restarted.append(summary.generation)
+            _select(monkeypatch, [fresh])
+            svc.start("akira")
+
+    svc.search_finished.connect(_restart)
+
+    try:
+        first = svc.start("dune")
+        assert _pump(lambda: len(watch.finished) == 2), "the next search never ran"
+    finally:
+        release.set()
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert restarted == [first]
+    assert watch.finished[0].failures == (service.SourceFailure("alpha", _TIMEOUT_KIND),)
+    assert watch.finished[1].generation > first
+    assert watch.finished[1].results == aggregate(fresh_rows).results
+    assert watch.finished[1].failures == ()
+    assert svc.active is False
+    assert svc._deadline.isActive() is False
+
+
+def test_the_deadline_reports_on_the_services_own_thread(monkeypatch):
+    release = threading.Event()
+    _select(monkeypatch, [_held_source([], source_id="alpha", release=release)])
+    svc = _short_service()
+    watch = _Watch(svc)
+    owning = QThread.currentThread()
+    seen = []
+    svc.source_status.connect(
+        lambda status: seen.append((status.state, QThread.currentThread()))
+    )
+    svc.search_finished.connect(
+        lambda summary: seen.append(("finished", QThread.currentThread()))
+    )
+
+    try:
+        svc.start("dune")
+        _finish(watch)
+    finally:
+        release.set()
+
+    assert svc.thread() is owning
+    assert svc._deadline.thread() is owning
+    assert [what for what, _ in seen] == [
+        service.SourceState.RUNNING,
+        service.SourceState.TIMED_OUT,
+        "finished",
+    ]
+    assert all(thread is owning for _, thread in seen)
+
+
+def test_dropping_a_service_with_an_armed_deadline_is_harmless():
+    """Qt owns the timer through the service, so nothing outlives it."""
+    svc = _short_service()
+    svc._arm_deadline(svc.generation + 1)
+    assert svc._deadline.isActive() is True
+
+    svc.deleteLater()
+    del svc
+
+    # Well past when that deadline would have fired.
+    _pump(lambda: False, seconds=(_TEST_DEADLINE_MS / 1000) * 3)
+
+
+def test_the_deadline_timer_never_fires_early():
+    """A coarse timer may fire up to 5% early, which on the production
+    deadline is a second and a half a source was promised and did not get."""
+    svc = service.SearchService(http_factory=_FakeHttp)
+
+    assert svc._deadline.timerType() is Qt.PreciseTimer

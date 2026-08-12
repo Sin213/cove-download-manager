@@ -20,7 +20,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable
 
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 
 from cove.search.models import Category, SearchResult, SourceError
 from cove.search.registry import SOURCES, sources_for
@@ -37,10 +37,24 @@ _MAX_POOL_THREADS = 12
 
 _POOL: QThreadPool | None = None
 
+# How long Cove waits for a whole search before it stops waiting. This is a
+# product promise about the search, not a network setting: SearchHttp already
+# bounds each individual request, and this is what makes the search itself
+# finish even when a source stops answering without failing.
+#
+# One deadline covers the search, never one per source: a slow indexer is
+# allowed to use the whole window if its peers are quick.
+_SEARCH_DEADLINE_MS = 30_000
+
 # What a source failure is called when the source did not raise SourceError at
 # all. A bug in an adapter is not a network problem and must not be reported as
 # one, but it is still just one failed source - never a crashed search.
 _INTERNAL_ERROR = "internal"
+
+# What a source failure is called when the source never said anything at all.
+# It is deliberately not "network": the provider may be perfectly healthy and
+# simply slower than Cove is willing to wait.
+_TIMEOUT_ERROR = "timeout"
 
 # The registry is the one ranking authority: a duplicate from an earlier source
 # wins a tie, rather than a second hand-written source order drifting from it.
@@ -71,6 +85,20 @@ def _priority_key(row: SearchResult, arrival: int) -> tuple[int, int, str, int]:
     if rank is None:
         return (1, 0, row.source, arrival)
     return (0, rank, "", arrival)
+
+
+def _source_order(source_id: str) -> tuple[int, int, str]:
+    """Where one source id sorts when several are reported at once.
+
+    The registry is the authority here too, so a listener hears about sources
+    in the order it already ranks them; ids the registry does not know sort
+    behind every built-in one and among themselves by the id. This is about
+    announcement order only and touches no ranking of results.
+    """
+    rank = _SOURCE_RANK.get(source_id)
+    if rank is None:
+        return (1, 0, source_id)
+    return (0, rank, "")
 
 
 def _winner_key(row: SearchResult, arrival: int) -> tuple:
@@ -271,15 +299,20 @@ class _SourceCall(QRunnable):
 class SourceState(Enum):
     """Where one source of the current search has got to.
 
-    These three are the whole of it. A cancelled or superseded search has no
+    These four are the whole of it. A cancelled or superseded search has no
     state of its own here: it simply stops being reported, so its sources are
-    last heard of running rather than announced as anything new. A timed-out
-    source is a separate lifecycle and deliberately has no value here yet.
+    last heard of running rather than announced as anything new.
+
+    TIMED_OUT is not FAILED. A failed source answered and said it could not
+    help; a timed-out one is still running somewhere and simply did not answer
+    inside the search's deadline, which is a statement about Cove's patience
+    rather than about the provider being broken.
     """
 
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    TIMED_OUT = "timed_out"
 
 
 @dataclass(frozen=True)
@@ -340,11 +373,16 @@ class SearchService(QObject):
     search may no longer speak. Every public event names the search it came
     from, so a listener can always tell which one it is hearing.
 
-    Superseding and cancelling are suppression, never termination: nothing
-    here kills a thread, aborts a request or drops a runnable the pool still
-    owns. A provider call that never returns therefore stays alive and pinned.
-    A bounded overall deadline, and finalising a source that outlives it, are
-    a separate concern and are not implemented here.
+    Every search also has a deadline, so one silent source cannot hold a
+    search open: when it expires the sources that have not answered are
+    reported as timed out, whatever the others found is summarised as usual,
+    and the search is over.
+
+    Superseding, cancelling and timing out are all suppression, never
+    termination: nothing here kills a thread, aborts a request or drops a
+    runnable the pool still owns. A provider call that never returns therefore
+    stays alive, keeps one of the private pool's threads, and stays pinned
+    until it reports - the deadline bounds this service, not the provider.
     """
 
     # Every one of these names its search. Two carry it inside the payload
@@ -354,11 +392,38 @@ class SearchService(QObject):
     results_updated = Signal(int, object)
     search_finished = Signal(object)
 
-    def __init__(self, parent: QObject | None = None, *, http_factory=SearchHttp):
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        http_factory=SearchHttp,
+        deadline_ms: int = _SEARCH_DEADLINE_MS,
+    ):
         super().__init__(parent)
         # The one seam a test needs: the workers build their own HTTP, so the
         # service never touches a session itself.
         self._http_factory = http_factory
+        # The second seam: a test proves what happens at the deadline without
+        # waiting half a minute for it. Production never passes this.
+        if not isinstance(deadline_ms, int) or isinstance(deadline_ms, bool) or deadline_ms <= 0:
+            raise ValueError("deadline_ms must be a positive number of milliseconds")
+        self._deadline_ms = deadline_ms
+        # Owned by the service and living on its thread, so the deadline fires
+        # where every other state change already happens. One timer for the
+        # service, armed for whichever search is current - never one per
+        # source, and never a thread of its own.
+        self._deadline = QTimer(self)
+        self._deadline.setSingleShot(True)
+        # Precise, because the deadline is a promise to the sources as much as
+        # to the user: Qt's default coarse timer is allowed to fire up to 5%
+        # early, which on 30 seconds is a second and a half a source was told
+        # it had. A source that answers inside the window must never be
+        # reported as having missed it.
+        self._deadline.setTimerType(Qt.PreciseTimer)
+        self._deadline.timeout.connect(self._on_deadline)
+        # Which search the armed timer belongs to. 0 is no search, so a timer
+        # that is not armed can never be mistaken for one that is.
+        self._deadline_generation = 0
         # Every search this service ever runs is numbered, and the number only
         # ever goes up. 0 is the number of the search that has not happened
         # yet, so no real search can ever be mistaken for it.
@@ -440,6 +505,12 @@ class SearchService(QObject):
             call.signals.finished.connect(self._on_outcome, Qt.QueuedConnection)
             self._calls[(generation, source.id)] = call
             pool.start(call)
+
+        # Armed last, once this search is certainly still the current one and
+        # its work is on the pool. Nothing between here and the announce loop
+        # above hands control to a listener, so the search this arms for cannot
+        # have been replaced in between.
+        self._arm_deadline(generation)
         return generation
 
     def cancel(self) -> int:
@@ -451,7 +522,7 @@ class SearchService(QObject):
         thread, abort a request or drop a runnable the pool still owns - and
         what changes is only that this service will ignore whatever they
         eventually report. A worker that never returns therefore stays alive,
-        and pinned, until a later slice gives Search a bounded deadline.
+        and pinned, for as long as it goes on running.
 
         Cancelling when nothing is running is a no-op and spends no
         generation, so an idle UI cannot inflate the numbering.
@@ -464,6 +535,9 @@ class SearchService(QObject):
         self._pending.clear()
         self._results.clear()
         self._failures.clear()
+        # Nothing is waiting for this search any more, so nothing may time it
+        # out either.
+        self._stop_deadline()
         # No search_finished: the caller asked for this and already knows.
         # Nothing else may hear from the cancelled search again.
         return self._generation
@@ -475,7 +549,62 @@ class SearchService(QObject):
         self._pending.clear()
         self._results.clear()
         self._failures.clear()
+        # The previous search is over as far as this service is concerned, so
+        # its deadline goes with it: the search about to start gets a fresh one
+        # rather than inheriting whatever was left of the old window.
+        self._stop_deadline()
         return self._generation
+
+    def _arm_deadline(self, generation: int) -> None:
+        """Start the one deadline for the numbered search."""
+        self._deadline.stop()
+        self._deadline_generation = generation
+        self._deadline.start(self._deadline_ms)
+
+    def _stop_deadline(self) -> None:
+        """Disarm the deadline, whichever search it belonged to."""
+        self._deadline.stop()
+        self._deadline_generation = 0
+
+    def _on_deadline(self) -> None:
+        """The timer fired: expire whichever search armed it."""
+        self._expire(self._deadline_generation)
+
+    def _expire(self, generation: int) -> None:
+        """End the numbered search on the sources that never answered.
+
+        Nothing is terminated here. The provider calls still running keep
+        running to their own natural end and stay pinned until they report;
+        what changes is that this search stops waiting for them, so it can
+        tell the user what the sources that did answer found.
+        """
+        # Being active is not enough: the search that armed this deadline may
+        # already have been replaced by another one that is also active, and a
+        # window the user never spent must never expire on the search that
+        # replaced it.
+        if generation != self._generation or not self._active:
+            return
+        self._deadline_generation = 0
+
+        # Several sources can run out of time in the same instant, and which
+        # order they are announced in must not be whatever a set happened to
+        # iterate in.
+        for source_id in sorted(self._pending, key=_source_order):
+            self._pending.discard(source_id)
+            self._failures.append(SourceFailure(source_id, _TIMEOUT_ERROR))
+            self._emit_status(
+                generation, source_id, SourceState.TIMED_OUT, _TIMEOUT_ERROR, 0
+            )
+            if generation != self._generation:
+                # A listener replaced or cancelled the search from inside that
+                # timeout. The sources still to be expired, and the summary
+                # they would have gone into, belonged to a search that no
+                # longer exists, so this stops here rather than finishing it.
+                return
+
+        # Whatever the sources that did answer found is exactly as valid as it
+        # was a millisecond ago, so the search is summarised, never discarded.
+        self._finish(generation)
 
     def _emit_status(
         self,
@@ -511,9 +640,17 @@ class SearchService(QObject):
             return
 
         if source_id not in self._pending:
-            # A worker reports once, so this is only reachable if something
-            # ever changes that; still, a second outcome must never be able to
-            # finish a search twice.
+            # Not pending is the whole of "this search is no longer taking
+            # answers from you", and it is why the generation alone is not
+            # enough: a source the deadline already timed out belongs to the
+            # generation that is still current, and its worker is still
+            # running. Being dropped from pending is what closed it, here and
+            # at the end of every search.
+            #
+            # Both events arrive on this one thread, so the race at the
+            # deadline needs no clock: whichever of the outcome and the
+            # deadline is processed first is the one that decides, and the
+            # other finds this source already settled.
             return
         self._pending.discard(source_id)
 
@@ -569,6 +706,11 @@ class SearchService(QObject):
         )
         self._active = False
         self._pending.clear()
+        # A search that has finished cannot also run out of time, and the
+        # timer is disarmed before the final event rather than after it: a
+        # listener may start the next search from there, and must not have its
+        # brand new deadline torn down by this one's tidying up.
+        self._stop_deadline()
         # Nothing of this search is still pinned - every worker released
         # itself as it reported - and an older search's workers are not this
         # one's to drop, so there is no call bookkeeping to do here.
