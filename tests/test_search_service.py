@@ -594,7 +594,7 @@ def _run_on_pool(call, seen) -> None:
 
 def test_a_source_call_reports_the_rows_the_source_returned():
     rows = [_result(info_hash=A), _result(info_hash=B)]
-    call = service._SourceCall(_FakeSource(rows), "dune", Category.MOVIES, http_factory=_FakeHttp)
+    call = service._SourceCall(_FakeSource(rows), "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp)
     seen = _collect(call)
 
     call.run()
@@ -607,7 +607,7 @@ def test_a_source_call_reports_the_rows_the_source_returned():
 
 def test_a_source_call_delivers_its_outcome_through_the_pool(_fresh_pool):
     call = service._SourceCall(
-        _FakeSource([_result()]), "dune", Category.MOVIES, http_factory=_FakeHttp
+        _FakeSource([_result()]), "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp
     )
     seen = _collect(call)
 
@@ -620,7 +620,9 @@ def test_a_source_call_delivers_its_outcome_through_the_pool(_fresh_pool):
 def test_a_source_call_passes_the_query_and_category_to_the_source():
     source = _FakeSource([])
     http = _FakeHttp()
-    call = service._SourceCall(source, "akira", Category.ANIME, http_factory=lambda: http)
+    call = service._SourceCall(
+        source, "akira", Category.ANIME, generation=1, http_factory=lambda: http
+    )
 
     call.run()
 
@@ -628,7 +630,7 @@ def test_a_source_call_passes_the_query_and_category_to_the_source():
 
 
 def test_an_empty_source_answer_is_a_success():
-    call = service._SourceCall(_FakeSource([]), "dune", Category.MOVIES, http_factory=_FakeHttp)
+    call = service._SourceCall(_FakeSource([]), "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp)
     seen = _collect(call)
 
     call.run()
@@ -640,7 +642,7 @@ def test_an_empty_source_answer_is_a_success():
 
 def test_a_source_error_becomes_one_failed_outcome_carrying_its_kind():
     source = _FakeSource(raises=SourceError(SourceErrorKind.TIMEOUT, "too slow"))
-    call = service._SourceCall(source, "dune", Category.MOVIES, http_factory=_FakeHttp)
+    call = service._SourceCall(source, "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp)
     seen = _collect(call)
 
     call.run()
@@ -653,7 +655,7 @@ def test_a_source_error_becomes_one_failed_outcome_carrying_its_kind():
 def test_every_source_error_kind_survives_as_the_outcome_kind():
     for kind in SourceErrorKind:
         call = service._SourceCall(
-            _FakeSource(raises=SourceError(kind)), "dune", Category.MOVIES, http_factory=_FakeHttp
+            _FakeSource(raises=SourceError(kind)), "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp
         )
         seen = _collect(call)
 
@@ -664,7 +666,7 @@ def test_every_source_error_kind_survives_as_the_outcome_kind():
 
 def test_an_unexpected_source_exception_becomes_one_internal_failure():
     source = _FakeSource(raises=RuntimeError("boom"))
-    call = service._SourceCall(source, "dune", Category.MOVIES, http_factory=_FakeHttp)
+    call = service._SourceCall(source, "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp)
     seen = _collect(call)
 
     call.run()
@@ -676,7 +678,7 @@ def test_an_unexpected_source_exception_becomes_one_internal_failure():
 
 def test_an_unexpected_exception_does_not_escape_a_pooled_worker(_fresh_pool):
     call = service._SourceCall(
-        _FakeSource(raises=RuntimeError("boom")), "dune", Category.MOVIES, http_factory=_FakeHttp
+        _FakeSource(raises=RuntimeError("boom")), "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp
     )
     seen = _collect(call)
 
@@ -686,7 +688,7 @@ def test_an_unexpected_exception_does_not_escape_a_pooled_worker(_fresh_pool):
 
 
 def test_an_outcome_is_immutable():
-    call = service._SourceCall(_FakeSource([]), "dune", Category.MOVIES, http_factory=_FakeHttp)
+    call = service._SourceCall(_FakeSource([]), "dune", Category.MOVIES, generation=1, http_factory=_FakeHttp)
     seen = _collect(call)
 
     call.run()
@@ -701,7 +703,7 @@ def test_an_outcome_is_immutable():
 def test_the_owned_http_is_closed_after_a_successful_call():
     http = _FakeHttp()
     call = service._SourceCall(
-        _FakeSource([_result()]), "dune", Category.MOVIES, http_factory=lambda: http
+        _FakeSource([_result()]), "dune", Category.MOVIES, generation=1, http_factory=lambda: http
     )
 
     call.run()
@@ -715,6 +717,7 @@ def test_the_owned_http_is_closed_after_a_source_error():
         _FakeSource(raises=SourceError(SourceErrorKind.NETWORK)),
         "dune",
         Category.MOVIES,
+        generation=1,
         http_factory=lambda: http,
     )
 
@@ -729,6 +732,7 @@ def test_the_owned_http_is_closed_after_an_unexpected_exception():
         _FakeSource(raises=RuntimeError("boom")),
         "dune",
         Category.MOVIES,
+        generation=1,
         http_factory=lambda: http,
     )
 
@@ -743,7 +747,7 @@ def test_a_failing_close_still_leaves_exactly_one_outcome():
             super().close()
             raise RuntimeError("close failed")
 
-    call = service._SourceCall(_FakeSource([]), "dune", Category.MOVIES, http_factory=_RudeHttp)
+    call = service._SourceCall(_FakeSource([]), "dune", Category.MOVIES, generation=1, http_factory=_RudeHttp)
     seen = _collect(call)
 
     call.run()
@@ -758,7 +762,7 @@ def test_a_call_builds_a_real_search_http_by_default():
     never touches it keeps this off the network entirely.
     """
     source = _FakeSource([])
-    call = service._SourceCall(source, "dune", Category.MOVIES)
+    call = service._SourceCall(source, "dune", Category.MOVIES, generation=1)
     seen = _collect(call)
 
     call.run()
@@ -776,10 +780,15 @@ class _Watch:
     def __init__(self, svc):
         self.statuses = []
         self.results = []
+        self.result_generations = []
         self.finished = []
         svc.source_status.connect(self.statuses.append)
-        svc.results_updated.connect(self.results.append)
+        svc.results_updated.connect(self._on_results)
         svc.search_finished.connect(self.finished.append)
+
+    def _on_results(self, generation, results):
+        self.result_generations.append(generation)
+        self.results.append(results)
 
     @property
     def order(self):
@@ -1194,68 +1203,6 @@ def test_a_search_whose_every_source_fails_still_finishes_once(monkeypatch):
 # --- P. one search at a time --------------------------------------------------
 
 
-def test_a_second_start_is_refused_while_a_search_is_running(monkeypatch):
-    release = threading.Event()
-    held = _FakeSource(
-        [_result(info_hash=A, source="alpha")],
-        source_id="alpha",
-        on_search=lambda: release.wait(_WAIT_SECONDS),
-    )
-    other = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
-    asked = _select(monkeypatch, [held])
-    svc = service.SearchService(http_factory=_FakeHttp)
-    watch = _Watch(svc)
-
-    svc.start("dune")
-    _select(monkeypatch, [other])
-    try:
-        assert svc.active is True
-        with pytest.raises(RuntimeError):
-            svc.start("akira")
-        assert other.calls == [], "the refused search still ran a source"
-    finally:
-        release.set()
-
-    summary = _finish(watch)
-    assert summary.results == aggregate(held._rows).results
-    assert [call[0] for call in held.calls] == ["dune"]
-    assert asked == [Category.ALL]
-    assert svc.active is False
-
-
-def test_starting_from_a_signal_handler_cannot_corrupt_the_running_search(
-    monkeypatch,
-):
-    """A listener reacting to a public signal is refused, and the search that
-    emitted it still completes normally."""
-    rows = [_result(info_hash=A, source="alpha")]
-    _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
-    svc = service.SearchService(http_factory=_FakeHttp)
-    watch = _Watch(svc)
-    refused = []
-
-    def _restart(_status):
-        try:
-            svc.start("akira")
-        except RuntimeError as error:
-            refused.append(str(error))
-
-    svc.source_status.connect(_restart)
-
-    svc.start("dune")
-
-    summary = _finish(watch)
-    # The exact message matters: a RecursionError from an unguarded restart is
-    # also a RuntimeError, and must not be able to pass for a clean refusal.
-    assert refused and set(refused) == {"search already active"}
-    assert summary.results == aggregate(rows).results
-    assert watch.states("alpha") == [
-        service.SourceState.RUNNING,
-        service.SourceState.COMPLETED,
-    ]
-    assert svc.active is False
-
-
 def test_a_new_search_may_start_once_the_previous_one_finished(monkeypatch):
     rows = [_result(info_hash=A, source="alpha")]
     _select(monkeypatch, [_FakeSource(rows, source_id="alpha")])
@@ -1270,3 +1217,679 @@ def test_a_new_search_may_start_once_the_previous_one_finished(monkeypatch):
 
     summary = _finish(watch)
     assert summary.results == aggregate(rows).results
+
+
+# --- Q. every search is numbered ----------------------------------------------
+
+
+def _held_source(rows, *, source_id, release):
+    """A source that stays inside search() until  is set.
+
+    The wait is bounded, and every test that builds one releases it in a
+    finally block, so a search this test deliberately abandons can never hold
+    the suite open.
+    """
+    return _FakeSource(
+        rows, source_id=source_id, on_search=lambda: release.wait(_WAIT_SECONDS)
+    )
+
+
+def test_a_fresh_service_has_not_numbered_a_search_yet():
+    svc = service.SearchService(http_factory=_FakeHttp)
+
+    assert svc.generation == 0
+
+
+def test_the_first_search_is_given_its_own_generation(monkeypatch):
+    _select(monkeypatch, [_FakeSource([], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune")
+
+    _finish(watch)
+    assert generation > 0
+    assert svc.generation == generation
+
+
+def test_a_later_search_is_given_a_larger_generation(monkeypatch):
+    _select(monkeypatch, [_FakeSource([], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    first = svc.start("dune")
+    _finish(watch)
+    watch.finished.clear()
+    second = svc.start("akira")
+    _finish(watch)
+
+    assert second > first
+    assert svc.generation == second
+
+
+def test_a_whitespace_query_still_takes_a_generation(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    before = svc.generation
+
+    generation = svc.start("   ")
+
+    _finish(watch)
+    assert generation > before
+    assert svc.generation == generation
+    assert svc.active is False
+
+
+def test_a_category_no_source_covers_still_takes_a_generation():
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    before = svc.generation
+
+    generation = svc.start("halo", Category.GAMES)
+
+    _finish(watch)
+    assert generation > before
+    assert svc.generation == generation
+    assert svc.active is False
+
+
+# --- R. a new search supersedes the running one -------------------------------
+
+
+def _drained(svc) -> bool:
+    """Wait until nothing is pinned, so every late outcome has been handled.
+
+    Bounded like every other wait here, and it is what makes "the stale result
+    was ignored" a fact rather than a guess about timing.
+    """
+    return _pump(lambda: not svc._calls)
+
+
+def test_a_second_start_supersedes_the_running_search(monkeypatch):
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
+    )
+    other = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        assert svc.active is True
+        _select(monkeypatch, [other])
+        second = svc.start("akira")
+        assert second > first
+        assert svc.active is True
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert summary.results == aggregate(other._rows).results
+    assert [call[0] for call in held.calls] == ["dune"]
+    assert [call[0] for call in other.calls] == ["akira"]
+    assert len(watch.finished) == 1, "the superseded search finished too"
+    assert svc.active is False
+
+
+def test_an_old_searchs_results_cannot_reach_the_new_one(monkeypatch):
+    release = threading.Event()
+    stale_rows = [_result(info_hash=A, source="alpha", seeders=99)]
+    fresh_rows = [_result(info_hash=B, source="beta", seeders=1)]
+    held = _held_source(stale_rows, source_id="alpha", release=release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        _select(monkeypatch, [_FakeSource(fresh_rows, source_id="beta")])
+        svc.start("akira")
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert summary.results == aggregate(fresh_rows).results
+    assert watch.results == [aggregate(fresh_rows).results]
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+    assert len(watch.finished) == 1
+
+
+def test_an_old_searchs_failure_cannot_reach_the_new_one(monkeypatch):
+    release = threading.Event()
+    fresh_rows = [_result(info_hash=B, source="beta")]
+    held = _FakeSource(
+        raises=SourceError(SourceErrorKind.NETWORK, "no route"),
+        source_id="alpha",
+        on_search=lambda: release.wait(_WAIT_SECONDS),
+    )
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        _select(monkeypatch, [_FakeSource(fresh_rows, source_id="beta")])
+        svc.start("akira")
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert summary.failures == ()
+    assert summary.results == aggregate(fresh_rows).results
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+    assert len(watch.finished) == 1
+
+
+def test_a_whitespace_query_supersedes_the_running_search(monkeypatch):
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
+    )
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        second = svc.start("   ")
+        assert second > first
+        assert svc.active is False
+        assert len(watch.finished) == 1, "the blank search did not finish at once"
+    finally:
+        release.set()
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert watch.finished[0].results == ()
+    assert len(watch.finished) == 1
+    assert watch.results == []
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+
+
+def test_a_category_no_source_covers_supersedes_the_running_search(monkeypatch):
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
+    )
+    real_sources_for = service.sources_for
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        # Real selection again, so GAMES genuinely covers no built-in source.
+        monkeypatch.setattr(service, "sources_for", real_sources_for)
+        second = svc.start("halo", Category.GAMES)
+        assert second > first
+        assert svc.active is False
+    finally:
+        release.set()
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert len(watch.finished) == 1
+    assert watch.finished[0].results == ()
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+
+
+# --- S. reentrant lifecycle changes from a public signal ----------------------
+
+
+def test_starting_from_a_running_status_handler_supersedes_cleanly(monkeypatch):
+    """A listener that starts a new search from the first RUNNING status gets a
+    clean supersede: the old search must not go on submitting sources."""
+    seen_first = []
+    fresh_rows = [_result(info_hash=B, source="beta")]
+    old_sources = [
+        _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha"),
+        _FakeSource([_result(info_hash=A, source="gamma")], source_id="gamma"),
+    ]
+    fresh = _FakeSource(fresh_rows, source_id="beta")
+    _select(monkeypatch, old_sources)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    def _restart(status):
+        if seen_first:
+            return
+        seen_first.append(status.source_id)
+        _select(monkeypatch, [fresh])
+        svc.start("akira")
+
+    svc.source_status.connect(_restart)
+
+    first = svc.start("dune")
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert seen_first == ["alpha"]
+    assert svc.generation > first
+    # The restart happened during the very first RUNNING status, so no source
+    # of the superseded search may have been submitted at all.
+    assert [source.calls for source in old_sources] == [[], []]
+    assert summary.results == aggregate(fresh_rows).results
+    assert len(watch.finished) == 1
+    assert svc.active is False
+
+
+# --- T. the same source id in two generations ---------------------------------
+
+
+def test_the_same_source_id_in_two_generations_keeps_two_workers(monkeypatch):
+    """Two searches can be running the same source at once.
+
+    Ownership therefore cannot be keyed on the source id alone: the newer call
+    would evict the older one from the service's own pins while the pool is
+    still running it, and the older outcome would then be taken for the newer
+    search's.
+    """
+    stale_release = threading.Event()
+    fresh_release = threading.Event()
+    stale_rows = [_result(info_hash=A, source="same", seeders=99)]
+    fresh_rows = [_result(info_hash=B, source="same", seeders=1)]
+    held = _held_source(stale_rows, source_id="same", release=stale_release)
+    fresh = _held_source(fresh_rows, source_id="same", release=fresh_release)
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        _select(monkeypatch, [fresh])
+        svc.start("akira")
+
+        assert _pump(lambda: len(svc._calls) == 2), "the new call evicted the old pin"
+
+        stale_release.set()
+        assert _pump(lambda: len(svc._calls) == 1), "the stale worker was never released"
+
+        assert svc._pending == {"same"}, "the stale outcome cleared the live source"
+        assert watch.results == [], "the stale outcome published rows"
+        assert watch.finished == [], "the stale outcome finished the live search"
+        assert svc.active is True
+        assert watch.states("same") == [
+            service.SourceState.RUNNING,
+            service.SourceState.RUNNING,
+        ]
+    finally:
+        stale_release.set()
+        fresh_release.set()
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert summary.results == aggregate(fresh_rows).results
+    assert summary.failures == ()
+    assert len(watch.finished) == 1
+    assert watch.states("same") == [
+        service.SourceState.RUNNING,
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
+
+
+# --- U. cancelling the current search -----------------------------------------
+
+
+def test_cancelling_an_active_search_drops_its_late_result(monkeypatch):
+    """cancel() is not termination: the provider call is still running, and
+    the point is that whatever it eventually says is no longer wanted."""
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
+    )
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        cancelled = svc.cancel()
+        assert cancelled > first
+        assert svc.generation == cancelled
+        assert svc.active is False
+    finally:
+        release.set()
+
+    assert _drained(svc), "the cancelled worker stayed pinned"
+    assert held.calls, "the cancelled search never reached its source"
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+    assert watch.results == []
+    assert watch.finished == [], "a cancelled search finished anyway"
+
+
+def test_cancelling_an_active_search_drops_its_late_failure(monkeypatch):
+    release = threading.Event()
+    held = _FakeSource(
+        raises=SourceError(SourceErrorKind.NETWORK, "no route"),
+        source_id="alpha",
+        on_search=lambda: release.wait(_WAIT_SECONDS),
+    )
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        svc.start("dune")
+        svc.cancel()
+    finally:
+        release.set()
+
+    assert _drained(svc), "the cancelled worker stayed pinned"
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+    assert watch.finished == []
+    assert svc.active is False
+
+
+def test_cancelling_when_nothing_is_running_changes_nothing():
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    before = svc.generation
+
+    assert svc.cancel() == before
+
+    assert svc.generation == before, "an idle cancel spent a generation"
+    assert svc.active is False
+    assert watch.statuses == []
+    assert watch.results == []
+    assert watch.finished == []
+
+
+def test_cancelling_a_search_that_already_finished_changes_nothing(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune")
+    _finish(watch)
+
+    assert svc.cancel() == generation
+    assert svc.generation == generation
+    assert len(watch.finished) == 1
+
+
+def test_a_search_started_after_a_cancel_gets_a_later_generation(monkeypatch):
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
+    )
+    fresh_rows = [_result(info_hash=B, source="beta")]
+    _select(monkeypatch, [held])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    try:
+        first = svc.start("dune")
+        cancelled = svc.cancel()
+        _select(monkeypatch, [_FakeSource(fresh_rows, source_id="beta")])
+        second = svc.start("akira")
+        assert second > cancelled > first
+    finally:
+        release.set()
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert summary.results == aggregate(fresh_rows).results
+    assert len(watch.finished) == 1
+    assert watch.states("alpha") == [service.SourceState.RUNNING]
+
+
+# --- V. every public event names the search it belongs to ---------------------
+
+
+def test_every_event_of_one_search_names_that_search(monkeypatch):
+    rows = [_result(info_hash=A, source="alpha")]
+    _select(
+        monkeypatch,
+        [
+            _FakeSource(rows, source_id="alpha"),
+            _FakeSource(
+                raises=SourceError(SourceErrorKind.PARSE, "bad xml"), source_id="beta"
+            ),
+        ],
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("dune")
+
+    summary = _finish(watch)
+    assert {status.generation for status in watch.statuses} == {generation}
+    assert {status.state for status in watch.statuses} == {
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+        service.SourceState.FAILED,
+    }
+    assert watch.result_generations == [generation]
+    assert summary.generation == generation
+
+
+def test_an_immediate_blank_search_names_its_generation(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()], source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("   ")
+
+    assert _finish(watch).generation == generation
+
+
+def test_an_immediate_uncovered_category_names_its_generation():
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    generation = svc.start("halo", Category.GAMES)
+
+    assert _finish(watch).generation == generation
+
+
+def test_two_searches_events_are_told_apart_by_generation(monkeypatch):
+    rows_first = [_result(info_hash=A, source="alpha")]
+    rows_second = [_result(info_hash=B, source="beta")]
+    _select(monkeypatch, [_FakeSource(rows_first, source_id="alpha")])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    first = svc.start("dune")
+    _finish(watch)
+    watch.finished.clear()
+    _select(monkeypatch, [_FakeSource(rows_second, source_id="beta")])
+    second = svc.start("akira")
+    _finish(watch)
+
+    by_generation = {}
+    for status in watch.statuses:
+        by_generation.setdefault(status.generation, set()).add(status.source_id)
+    assert by_generation == {first: {"alpha"}, second: {"beta"}}
+    assert watch.result_generations == [first, second]
+    assert [summary.generation for summary in watch.finished] == [second]
+
+
+def test_cancelling_from_a_running_status_handler_stops_the_search(monkeypatch):
+    """A listener that cancels from the first RUNNING status must be obeyed
+    before the search submits anything at all."""
+    seen_first = []
+    old_sources = [
+        _FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha"),
+        _FakeSource([_result(info_hash=B, source="gamma")], source_id="gamma"),
+    ]
+    _select(monkeypatch, old_sources)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    def _stop(status):
+        if seen_first:
+            return
+        seen_first.append(status.source_id)
+        svc.cancel()
+
+    svc.source_status.connect(_stop)
+
+    generation = svc.start("dune")
+
+    assert seen_first == ["alpha"]
+    assert svc.generation > generation
+    assert svc.active is False
+    assert [source.calls for source in old_sources] == [[], []]
+    assert svc._calls == {}, "a worker was submitted after the cancel"
+    assert watch.results == []
+    assert watch.finished == [], "a cancelled search finished anyway"
+
+
+def test_starting_from_a_completed_status_handler_supersedes_cleanly(monkeypatch):
+    """The outcome handler emitted a terminal status and the listener changed
+    the search underneath it: everything after that emit belongs to nobody."""
+    restarted = []
+    fresh_rows = [_result(info_hash=B, source="beta")]
+    _select(
+        monkeypatch, [_FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")]
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    def _restart(status):
+        if restarted or status.state is not service.SourceState.COMPLETED:
+            return
+        restarted.append(status.source_id)
+        _select(monkeypatch, [_FakeSource(fresh_rows, source_id="beta")])
+        svc.start("akira")
+
+    svc.source_status.connect(_restart)
+
+    first = svc.start("dune")
+
+    summary = _finish(watch)
+    assert _drained(svc), "a worker stayed pinned"
+    assert restarted == ["alpha"]
+    assert summary.generation > first
+    assert summary.results == aggregate(fresh_rows).results
+    assert watch.result_generations == [summary.generation], (
+        "the superseded search published its rows after the restart"
+    )
+    assert len(watch.finished) == 1
+
+
+def test_starting_from_a_results_updated_handler_supersedes_cleanly(monkeypatch):
+    """The replacement search is one that finishes on the spot, so the old
+    handler resuming afterwards would visibly finish a second time."""
+    restarted = []
+    _select(
+        monkeypatch, [_FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")]
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    def _restart(generation, _results):
+        if restarted:
+            return
+        restarted.append(generation)
+        svc.start("   ")
+
+    svc.results_updated.connect(_restart)
+
+    first = svc.start("dune")
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert restarted == [first]
+    assert svc.generation > first
+    assert svc.active is False
+    assert [summary.generation for summary in watch.finished] == [svc.generation], (
+        "the superseded search finished after the restart"
+    )
+    assert watch.result_generations == [first]
+
+
+def test_cancelling_from_a_results_updated_handler_stops_the_search(monkeypatch):
+    cancelled = []
+    _select(
+        monkeypatch, [_FakeSource([_result(info_hash=A, source="alpha")], source_id="alpha")]
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    def _stop(generation, _results):
+        cancelled.append(generation)
+        svc.cancel()
+
+    svc.results_updated.connect(_stop)
+
+    first = svc.start("dune")
+
+    assert _drained(svc), "a worker stayed pinned"
+    assert _pump(lambda: cancelled == [first], 1.0), "the source never published"
+    assert svc.generation > first
+    assert svc.active is False
+    assert watch.finished == [], "a cancelled search finished anyway"
+
+
+# --- W. the worker carries the number, and never reads it ---------------------
+
+
+def test_a_source_call_hands_back_the_generation_it_was_given():
+    call = service._SourceCall(
+        _FakeSource([_result()]), "dune", Category.MOVIES, generation=7, http_factory=_FakeHttp
+    )
+    seen = _collect(call)
+
+    call.run()
+
+    assert [outcome.generation for outcome in seen] == [7]
+
+
+def test_a_failed_source_call_still_hands_back_its_generation():
+    call = service._SourceCall(
+        _FakeSource(raises=SourceError(SourceErrorKind.HTTP)),
+        "dune",
+        Category.MOVIES,
+        generation=9,
+        http_factory=_FakeHttp,
+    )
+    seen = _collect(call)
+
+    call.run()
+
+    assert [(o.generation, o.error_kind) for o in seen] == [(9, "http")]
+
+
+def test_the_generation_only_ever_goes_up(monkeypatch):
+    """One service, every lifecycle it has: nothing reuses or rewinds."""
+    release = threading.Event()
+    held = _held_source(
+        [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
+    )
+    plain = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
+    real_sources_for = service.sources_for
+    _select(monkeypatch, [plain])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+    fresh = svc.generation
+
+    try:
+        completed = svc.start("dune")             # a search that completes
+        _finish(watch)
+        after_finishing = svc.generation
+        _select(monkeypatch, [held])
+        abandoned = svc.start("akira")            # a search left running
+        _select(monkeypatch, [plain])
+        superseding = svc.start("cowboy")         # which this one replaces
+        cancelled = svc.cancel()                  # and this one abandons
+        idle = svc.cancel()                       # an idle cancel spends none
+        blank = svc.start("   ")                  # a blank search
+        monkeypatch.setattr(service, "sources_for", real_sources_for)
+        uncovered = svc.start("halo", Category.GAMES)
+    finally:
+        release.set()
+
+    assert _drained(svc), "a worker stayed pinned"
+    # Finishing and cancelling nothing are the only two events that may leave
+    # the number where it was. Every start, and the one real cancel, moves it
+    # on, and nothing ever hands back a number that has already been used.
+    assert after_finishing == completed
+    assert idle == cancelled
+    numbers = [fresh, completed, abandoned, superseding, cancelled, blank, uncovered]
+    assert numbers == sorted(numbers), f"a generation went backwards: {numbers}"
+    assert len(set(numbers)) == len(numbers), f"a generation was reused: {numbers}"

@@ -181,8 +181,13 @@ class _SourceOutcome:
     reading what the worker sent, not something the worker could still change.
     An empty ``results`` with no ``error_kind`` is a source that legitimately
     found nothing, which is a success and never a failure.
+
+    ``generation`` is carried, never interpreted: the worker was handed it and
+    hands it back, so whoever receives the outcome can tell which search asked
+    for it without the worker knowing what a search is.
     """
 
+    generation: int
     source_id: str
     results: tuple[SearchResult, ...]
     error_kind: str | None
@@ -211,11 +216,15 @@ class _SourceCall(QRunnable):
         query: str,
         category: Category,
         *,
+        generation: int,
         http_factory=SearchHttp,
     ):
         super().__init__()
         self.setAutoDelete(False)
         self.signals = self._Sig()
+        # Opaque here on purpose: the call never compares it to anything and
+        # never asks whether the search it belongs to is still wanted.
+        self._generation = generation
         self._source = source
         # Read once, up front: the outcome must be able to name its source
         # even if the adapter itself is what misbehaved.
@@ -237,18 +246,18 @@ class _SourceCall(QRunnable):
         try:
             http = self._http_factory()
         except Exception:  # pragma: no cover - defensive
-            return _SourceOutcome(self._source_id, (), _INTERNAL_ERROR)
+            return _SourceOutcome(self._generation, self._source_id, (), _INTERNAL_ERROR)
         try:
             rows = self._source.search(self._query, self._category, http)
-            return _SourceOutcome(self._source_id, tuple(rows), None)
+            return _SourceOutcome(self._generation, self._source_id, tuple(rows), None)
         except SourceError as error:
             # The kind is the stable part of a SourceError; its message is
             # written for a human and is not part of this contract.
-            return _SourceOutcome(self._source_id, (), error.kind.value)
+            return _SourceOutcome(self._generation, self._source_id, (), error.kind.value)
         except Exception:
             # A broken adapter takes itself out of the search and nothing
             # else. The traceback belongs in a log, never in the outcome.
-            return _SourceOutcome(self._source_id, (), _INTERNAL_ERROR)
+            return _SourceOutcome(self._generation, self._source_id, (), _INTERNAL_ERROR)
         finally:
             # The call owns its HTTP facility for exactly this long, on every
             # path - and a session that refuses to close is not a reason to
@@ -262,8 +271,10 @@ class _SourceCall(QRunnable):
 class SourceState(Enum):
     """Where one source of the current search has got to.
 
-    These three are the whole of a normal search. Cancellation and a timed-out
-    source are separate lifecycles and deliberately have no value here yet.
+    These three are the whole of it. A cancelled or superseded search has no
+    state of its own here: it simply stops being reported, so its sources are
+    last heard of running rather than announced as anything new. A timed-out
+    source is a separate lifecycle and deliberately has no value here yet.
     """
 
     RUNNING = "running"
@@ -286,8 +297,14 @@ class SourceFailure:
 
 @dataclass(frozen=True)
 class SourceStatus:
-    """One source's current state, as the UI needs to show it."""
+    """One source's current state, as the UI needs to show it.
 
+    ``generation`` names the search this is about. A listener needs it because
+    a superseded search may already have announced a source as running before
+    the newer search announced the same one.
+    """
+
+    generation: int
     source_id: str
     state: SourceState
     error_kind: str | None
@@ -301,8 +318,13 @@ class SearchSummary:
     Data only: the UI decides how to word "two sources failed", so nothing
     here is a sentence. failures names every source that could not answer,
     which is how a search that returned few rows explains itself.
+
+    ``generation`` names the search that produced it. Only a search that ran
+    to its own natural end is summarised at all: one that was superseded or
+    cancelled is never summarised, so no field here says so.
     """
 
+    generation: int
     results: tuple[SearchResult, ...]
     dedupe_dropped: int
     failures: tuple[SourceFailure, ...]
@@ -311,14 +333,25 @@ class SearchSummary:
 class SearchService(QObject):
     """Runs one search across the built-in sources and reports what it finds.
 
-    This is the whole of the normal lifecycle and deliberately no more: one
-    search at a time, and a second start while one is running is refused
-    rather than silently replacing it. Superseding, cancellation and a bounded
-    overall deadline are separate concerns and are not implemented here.
+    One search is current at a time, and every search is numbered. Starting
+    another replaces the current one and cancel() abandons it; in both cases
+    the older search's workers are left to finish on their own and whatever
+    they eventually report is discarded, because a superseded or cancelled
+    search may no longer speak. Every public event names the search it came
+    from, so a listener can always tell which one it is hearing.
+
+    Superseding and cancelling are suppression, never termination: nothing
+    here kills a thread, aborts a request or drops a runnable the pool still
+    owns. A provider call that never returns therefore stays alive and pinned.
+    A bounded overall deadline, and finalising a source that outlives it, are
+    a separate concern and are not implemented here.
     """
 
+    # Every one of these names its search. Two carry it inside the payload
+    # they already had; the merged result list is a bare tuple with nowhere to
+    # put it, so that one sends the number alongside.
     source_status = Signal(object)
-    results_updated = Signal(object)
+    results_updated = Signal(int, object)
     search_finished = Signal(object)
 
     def __init__(self, parent: QObject | None = None, *, http_factory=SearchHttp):
@@ -326,74 +359,135 @@ class SearchService(QObject):
         # The one seam a test needs: the workers build their own HTTP, so the
         # service never touches a session itself.
         self._http_factory = http_factory
+        # Every search this service ever runs is numbered, and the number only
+        # ever goes up. 0 is the number of the search that has not happened
+        # yet, so no real search can ever be mistaken for it.
+        self._generation = 0
         self._active = False
         # The runnables still owed an outcome. Qt may reap a QRunnable the
         # moment it finishes, so the service holds each one until its outcome
-        # has actually been handled.
-        self._calls: dict[str, _SourceCall] = {}
+        # has actually been handled - including the workers of searches that
+        # have already been superseded or cancelled, which is why the key is
+        # the search as well as the source. The same source may legitimately
+        # be running in two generations at once, and the newer call must never
+        # evict the older one from its own ownership.
+        self._calls: dict[tuple[int, str], _SourceCall] = {}
         self._pending: set[str] = set()
         self._results: dict[str, tuple[SearchResult, ...]] = {}
         self._failures: list[SourceFailure] = []
 
     @property
     def active(self) -> bool:
-        """Whether a search is running. A second start is refused while true."""
+        """Whether a search is running."""
         return self._active
 
-    def start(self, query: str, category: Category = Category.ALL) -> None:
-        """Search for the given text across every source serving the category."""
-        if self._active:
-            raise RuntimeError("search already active")
+    @property
+    def generation(self) -> int:
+        """The number of the newest search. Read-only, and never goes back."""
+        return self._generation
 
-        self._reset()
+    def start(self, query: str, category: Category = Category.ALL) -> int:
+        """Search for the given text across every source serving the category.
+
+        Returns the number given to this search, which is what tells its
+        events apart from an older search's.
+        """
+        generation = self._begin()
+
         text = query.strip()
         if not text:
             # A blank query is not an error and not a search: it completes
             # immediately so the UI gets one lifecycle rather than none.
-            self._finish()
-            return
+            self._finish(generation)
+            return generation
 
         sources = sources_for(category)
         if not sources:
             # A category nothing covers finishes here rather than waiting for
             # callbacks that can never arrive.
-            self._finish()
-            return
+            self._finish(generation)
+            return generation
 
         # Active before the first emit: a listener reacting to a running
         # status must already see a search in progress.
         self._active = True
-        for source in sources:
-            call = _SourceCall(source, text, category, http_factory=self._http_factory)
-            call.signals.finished.connect(self._on_outcome, Qt.QueuedConnection)
-            self._calls[source.id] = call
-            self._pending.add(source.id)
+        self._pending.update(source.id for source in sources)
 
         # Every source is announced running before any of them is submitted,
         # so no worker can report a terminal state for a source the UI has
         # not been told about yet.
+        #
+        # Emitting hands control to listeners, and a listener may start or
+        # cancel a search from here. If it does, this search is over before it
+        # ever reached the pool: nothing below may run, or a search the caller
+        # has already replaced would go on submitting workers.
         for source in sources:
-            self._emit_status(source.id, SourceState.RUNNING, None, 0)
+            self._emit_status(generation, source.id, SourceState.RUNNING, None, 0)
+            if generation != self._generation:
+                return generation
 
+        # Only this search's own calls are submitted. An older search's
+        # workers are already on the pool and are not restarted here.
         pool = _pool()
-        for call in self._calls.values():
+        for source in sources:
+            call = _SourceCall(
+                source,
+                text,
+                category,
+                generation=generation,
+                http_factory=self._http_factory,
+            )
+            call.signals.finished.connect(self._on_outcome, Qt.QueuedConnection)
+            self._calls[(generation, source.id)] = call
             pool.start(call)
+        return generation
 
-    def _reset(self) -> None:
-        """Forget the previous search before a new one begins."""
-        self._calls.clear()
+    def cancel(self) -> int:
+        """Stop accepting the current search's results, and return the number
+        that is now current.
+
+        This is suppression, not termination. The provider calls already in
+        flight keep running to their own natural end - Cove does not kill a
+        thread, abort a request or drop a runnable the pool still owns - and
+        what changes is only that this service will ignore whatever they
+        eventually report. A worker that never returns therefore stays alive,
+        and pinned, until a later slice gives Search a bounded deadline.
+
+        Cancelling when nothing is running is a no-op and spends no
+        generation, so an idle UI cannot inflate the numbering.
+        """
+        if not self._active:
+            return self._generation
+
+        self._generation += 1
+        self._active = False
         self._pending.clear()
         self._results.clear()
         self._failures.clear()
+        # No search_finished: the caller asked for this and already knows.
+        # Nothing else may hear from the cancelled search again.
+        return self._generation
+
+    def _begin(self) -> int:
+        """Number the search about to start, and forget the previous one."""
+        self._generation += 1
+        self._active = False
+        self._pending.clear()
+        self._results.clear()
+        self._failures.clear()
+        return self._generation
 
     def _emit_status(
         self,
+        generation: int,
         source_id: str,
         state: SourceState,
         error_kind: str | None,
         result_count: int,
     ) -> None:
-        self.source_status.emit(SourceStatus(source_id, state, error_kind, result_count))
+        self.source_status.emit(
+            SourceStatus(generation, source_id, state, error_kind, result_count)
+        )
 
     def _on_outcome(self, outcome: _SourceOutcome) -> None:
         """Take one source's terminal outcome, on the service's own thread.
@@ -402,33 +496,55 @@ class SearchService(QObject):
         the only place the search's state changes - the pool threads never
         touch it.
         """
+        generation = outcome.generation
         source_id = outcome.source_id
+        # Releasing the worker comes first and happens whatever else is true:
+        # the runnable was pinned only until it reported, and a search nobody
+        # wants any more still has to stop owning its threads.
+        self._calls.pop((generation, source_id), None)
+
+        if generation != self._generation:
+            # A superseded or cancelled search. Its worker has just been let
+            # go and that is the whole of what it may do here: the current
+            # search's results, failures, pending sources, signals and
+            # completion are none of its business.
+            return
+
         if source_id not in self._pending:
             # A worker reports once, so this is only reachable if something
             # ever changes that; still, a second outcome must never be able to
             # finish a search twice.
             return
         self._pending.discard(source_id)
-        # Only this worker is released. Its peers are still owed an outcome.
-        self._calls.pop(source_id, None)
 
         if outcome.error_kind is None:
             self._results[source_id] = outcome.results
             self._emit_status(
-                source_id, SourceState.COMPLETED, None, len(outcome.results)
+                generation, source_id, SourceState.COMPLETED, None, len(outcome.results)
             )
+            if generation != self._generation:
+                # A listener replaced or cancelled the search from inside that
+                # status. Everything left to do here was this search's, and
+                # this search no longer exists.
+                return
             # A source that found nothing still succeeded; republishing the
             # same merged view costs nothing and keeps the rule simple.
-            self.results_updated.emit(self._merged().results)
+            self.results_updated.emit(generation, self._merged().results)
+            if generation != self._generation:
+                return
         else:
             # One source is out. Its peers keep running and whatever they
             # already found stays exactly as it was, so there is no new result
             # view to publish here.
             self._failures.append(SourceFailure(source_id, outcome.error_kind))
-            self._emit_status(source_id, SourceState.FAILED, outcome.error_kind, 0)
+            self._emit_status(
+                generation, source_id, SourceState.FAILED, outcome.error_kind, 0
+            )
+            if generation != self._generation:
+                return
 
         if not self._pending:
-            self._finish()
+            self._finish(generation)
 
     def _merged(self) -> Aggregation:
         """Everything the successful sources have reported so far, merged.
@@ -442,16 +558,21 @@ class SearchService(QObject):
             rows.extend(source_results)
         return aggregate(rows)
 
-    def _finish(self) -> None:
-        """End the current search, exactly once, and go inactive."""
+    def _finish(self, generation: int) -> None:
+        """End the numbered search, exactly once, and go inactive."""
         merged = self._merged()
         summary = SearchSummary(
+            generation=generation,
             results=merged.results,
             dedupe_dropped=merged.dedupe_dropped,
             failures=tuple(self._failures),
         )
         self._active = False
-        self._calls.clear()
+        self._pending.clear()
+        # Nothing of this search is still pinned - every worker released
+        # itself as it reported - and an older search's workers are not this
+        # one's to drop, so there is no call bookkeeping to do here.
+        #
         # Last statement on purpose: a listener may legitimately start the
         # next search from here, and must not find this one still tidying up.
         self.search_finished.emit(summary)
