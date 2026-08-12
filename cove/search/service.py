@@ -16,6 +16,8 @@ here and there must never be.
 """
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Iterable
@@ -718,3 +720,123 @@ class SearchService(QObject):
         # Last statement on purpose: a listener may legitimately start the
         # next search from here, and must not find this one still tidying up.
         self.search_finished.emit(summary)
+
+
+# How long a source's successful answer stays worth reusing. Five minutes is a
+# product judgement about indexers, not a network setting: swarm counts drift
+# slowly, and a user refining a query should not re-ask the same source for the
+# same words seconds apart.
+_CACHE_TTL_SECONDS = 300.0
+
+# How many answers are worth keeping at once. The cache is a small convenience,
+# not a store: a hard ceiling is what keeps a long session from holding every
+# result set the user ever scrolled past.
+_CACHE_MAX_ENTRIES = 64
+
+
+@dataclass(frozen=True)
+class _CacheKey:
+    """What makes one cached answer that answer and no other.
+
+    All three parts matter: one source's answer is not another's, one
+    category's is not another's, and the query is taken exactly as given.
+    The generation is deliberately absent - a still-valid answer is worth
+    reusing by a later search, which is the entire point.
+    """
+
+    source_id: str
+    category: Category
+    query: str
+
+
+class _SearchCache:
+    """A small bounded cache of what one source answered, kept in memory.
+
+    It stores one source's successful rows, never a merged search, never a
+    failure and never a timeout: the caller decides what is worth keeping,
+    and this only decides how long and how many.
+    """
+
+    def __init__(
+        self,
+        max_entries: int = _CACHE_MAX_ENTRIES,
+        ttl_seconds: float = _CACHE_TTL_SECONDS,
+        clock=time.monotonic,
+    ) -> None:
+        # A cache that cannot hold a whole answer, or one whose answers are
+        # born expired, is a bug rather than a policy - and a bool is a count
+        # nobody meant to write.
+        if isinstance(max_entries, bool) or not isinstance(max_entries, int):
+            raise ValueError(f"max_entries must be an integer: {max_entries!r}")
+        if max_entries < 1:
+            raise ValueError(f"max_entries must be positive: {max_entries!r}")
+        if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, (int, float)):
+            raise ValueError(f"ttl_seconds must be a number: {ttl_seconds!r}")
+        # NaN fails every comparison, so it is caught by asking for a real
+        # span of time rather than by ruling it out afterwards.
+        if not (0 < float(ttl_seconds) < float("inf")):
+            raise ValueError(f"ttl_seconds must be a finite span: {ttl_seconds!r}")
+        self._max_entries = max_entries
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._entries: OrderedDict[_CacheKey, tuple[float, tuple[SearchResult, ...]]]
+        self._entries = OrderedDict()
+
+    def get(self, key: _CacheKey) -> tuple[SearchResult, ...] | None:
+        """The rows stored for the key, or None when there are none.
+
+        None is the one and only miss: a hit carrying no rows is a source that
+        legitimately found nothing, and reads back as the empty tuple.
+
+        Entries die where they are read - there is no sweeper - so an answer
+        found too old is dropped here and reported as the miss it is.
+        """
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        stored_at, results = entry
+        # An answer is worth its full lifetime and not a tick more: reading it
+        # tells nothing about how fresh the source's rows still are, so a hit
+        # never resets stored_at.
+        if self._clock() - stored_at >= self._ttl_seconds:
+            del self._entries[key]
+            return None
+        # Using an answer is what keeps it: this is the only thing a hit
+        # changes, and it decides eviction order, never lifetime.
+        self._entries.move_to_end(key)
+        return results
+
+    def put(self, key: _CacheKey, results: Iterable[SearchResult]) -> None:
+        """Store the rows a source answered with for the key.
+
+        Storing a key it already holds replaces the rows and starts the
+        lifetime over rather than adding anything, so an update can never cost
+        a neighbour its place.
+        """
+        self._entries[key] = (self._clock(), tuple(results))
+        self._entries.move_to_end(key)
+        if len(self._entries) > self._max_entries:
+            # Room is made out of what nobody could have used anyway. An entry
+            # that has run out of time is worth nothing however recently it was
+            # read, so it goes before any still-valid neighbour does - which is
+            # also the only place a lookup would never reach on its own.
+            self._drop_expired()
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+    def _drop_expired(self) -> None:
+        """Forget every entry that has outlived its time."""
+        now = self._clock()
+        for key in [
+            key
+            for key, (stored_at, _) in self._entries.items()
+            if now - stored_at >= self._ttl_seconds
+        ]:
+            del self._entries[key]
+
+    def clear(self) -> None:
+        """Forget everything, so nothing answered before is reused."""
+        self._entries.clear()
+
+    def __len__(self) -> int:
+        return len(self._entries)

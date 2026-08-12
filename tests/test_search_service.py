@@ -2577,3 +2577,380 @@ def test_the_deadline_timer_never_fires_early():
     svc = service.SearchService(http_factory=_FakeHttp)
 
     assert svc._deadline.timerType() is Qt.PreciseTimer
+
+
+# --- Z. the bounded Search result cache ---------------------------------------
+#
+# A pure primitive: no Qt, no threads, no network, no SearchService. Every
+# test drives it with a deterministic fake monotonic clock rather than sleeping.
+
+
+class _Clock:
+    """A fake monotonic clock: it only ever moves forward, on demand."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = float(now)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        assert seconds >= 0, "a monotonic clock never goes backwards"
+        self.now += seconds
+
+
+def _key(source_id="yts", category=Category.MOVIES, query="dune"):
+    return service._CacheKey(source_id=source_id, category=category, query=query)
+
+
+def _cache(clock=None, max_entries=3, ttl_seconds=300.0):
+    return service._SearchCache(
+        max_entries=max_entries,
+        ttl_seconds=ttl_seconds,
+        clock=clock or _Clock(),
+    )
+
+
+# --- Z.A. basic hit and miss --------------------------------------------------
+
+
+def test_an_unknown_key_is_a_cache_miss():
+    assert _cache().get(_key()) is None
+
+
+def test_a_stored_key_is_a_cache_hit():
+    cache = _cache()
+    rows = (_result(),)
+
+    cache.put(_key(), rows)
+
+    assert cache.get(_key()) == rows
+
+
+def test_a_hit_returns_the_rows_that_were_stored():
+    cache = _cache()
+    rows = (_result(info_hash=A), _result(info_hash=B, name="Other"))
+
+    cache.put(_key(), rows)
+
+    assert cache.get(_key()) == rows
+
+
+def test_a_cached_empty_result_is_a_hit_and_not_a_miss():
+    """A source that legitimately found nothing is a success, so its empty
+    answer is worth caching - and must not read back as "never asked"."""
+    cache = _cache()
+
+    cache.put(_key(), ())
+
+    assert cache.get(_key()) == ()
+    assert cache.get(_key()) is not None
+
+
+# --- Z.B. key identity --------------------------------------------------------
+
+
+def test_two_sources_answering_the_same_query_do_not_share_an_entry():
+    cache = _cache()
+    rows = (_result(),)
+
+    cache.put(_key(source_id="yts"), rows)
+
+    assert cache.get(_key(source_id="piratebay")) is None
+    assert cache.get(_key(source_id="yts")) == rows
+
+
+def test_two_categories_of_the_same_query_do_not_share_an_entry():
+    cache = _cache()
+    rows = (_result(),)
+
+    cache.put(_key(category=Category.MOVIES), rows)
+
+    assert cache.get(_key(category=Category.TV)) is None
+    assert cache.get(_key(category=Category.MOVIES)) == rows
+
+
+def test_the_cache_does_not_casefold_the_query():
+    """Normalising the query is the caller's job: this primitive must never
+    quietly change what a source was asked for."""
+    cache = _cache()
+    rows = (_result(),)
+
+    cache.put(_key(query="Dune"), rows)
+
+    assert cache.get(_key(query="dune")) is None
+    assert cache.get(_key(query="Dune")) == rows
+
+
+def test_the_cache_does_not_strip_whitespace_from_the_query():
+    cache = _cache()
+    rows = (_result(),)
+
+    cache.put(_key(query="dune"), rows)
+
+    assert cache.get(_key(query=" dune ")) is None
+    assert cache.get(_key(query="dune")) == rows
+
+
+def test_a_cache_key_is_hashable_and_compares_by_its_three_parts():
+    assert _key() == _key()
+    assert hash(_key()) == hash(_key())
+    assert len({_key(), _key()}) == 1
+    assert _key(source_id="piratebay") != _key(source_id="yts")
+
+
+# --- Z.C. time to live --------------------------------------------------------
+
+
+def test_an_entry_stored_now_is_valid_now():
+    clock = _Clock()
+    cache = _cache(clock=clock, ttl_seconds=300.0)
+    rows = (_result(),)
+
+    cache.put(_key(), rows)
+
+    assert cache.get(_key()) == rows
+
+
+def test_an_entry_is_still_valid_a_moment_before_its_ttl():
+    clock = _Clock()
+    cache = _cache(clock=clock, ttl_seconds=300.0)
+    rows = (_result(),)
+    cache.put(_key(), rows)
+
+    clock.advance(299.999)
+
+    assert cache.get(_key()) == rows
+
+
+def test_an_entry_is_expired_exactly_at_its_ttl():
+    """The boundary is age < ttl, so the tick the lifetime is reached is
+    already too late."""
+    clock = _Clock()
+    cache = _cache(clock=clock, ttl_seconds=300.0)
+    cache.put(_key(), (_result(),))
+
+    clock.advance(300.0)
+
+    assert cache.get(_key()) is None
+
+
+def test_looking_up_an_expired_entry_drops_it():
+    """Expiry is lazy - nothing sweeps in the background - so the lookup that
+    finds an entry too old is what removes it."""
+    clock = _Clock()
+    cache = _cache(clock=clock, ttl_seconds=300.0)
+    cache.put(_key(), (_result(),))
+    assert len(cache) == 1
+
+    clock.advance(300.0)
+    cache.get(_key())
+
+    assert len(cache) == 0
+
+
+def test_a_cache_hit_does_not_extend_the_lifetime_of_the_entry():
+    """Reading an answer does not make it any fresher than it is."""
+    clock = _Clock()
+    cache = _cache(clock=clock, ttl_seconds=300.0)
+    rows = (_result(),)
+    cache.put(_key(), rows)
+
+    clock.advance(299.0)
+    assert cache.get(_key()) == rows
+    clock.advance(1.0)
+
+    assert cache.get(_key()) is None
+
+
+def test_storing_a_key_again_starts_its_lifetime_over():
+    clock = _Clock()
+    cache = _cache(clock=clock, ttl_seconds=300.0)
+    rows = (_result(),)
+    cache.put(_key(), rows)
+
+    clock.advance(250.0)
+    cache.put(_key(), rows)
+    clock.advance(250.0)
+
+    assert cache.get(_key()) == rows
+    clock.advance(50.0)
+    assert cache.get(_key()) is None
+
+
+# --- Z.D. capacity and least-recently-used eviction ---------------------------
+
+
+def test_the_cache_never_holds_more_entries_than_it_is_allowed():
+    cache = _cache(max_entries=3)
+
+    for word in ("a", "b", "c", "d", "e"):
+        cache.put(_key(query=word), (_result(),))
+
+    assert len(cache) == 3
+
+
+def test_the_least_recently_used_entry_is_the_one_evicted():
+    cache = _cache(max_entries=3)
+    cache.put(_key(query="a"), (_result(),))
+    cache.put(_key(query="b"), (_result(),))
+    cache.put(_key(query="c"), (_result(),))
+
+    cache.put(_key(query="d"), (_result(),))
+
+    assert cache.get(_key(query="a")) is None
+    assert cache.get(_key(query="b")) is not None
+    assert cache.get(_key(query="c")) is not None
+    assert cache.get(_key(query="d")) is not None
+
+
+def test_reading_an_entry_saves_it_from_the_next_eviction():
+    """A hit is use: the entry read most recently is not the one to drop."""
+    cache = _cache(max_entries=3)
+    cache.put(_key(query="a"), (_result(),))
+    cache.put(_key(query="b"), (_result(),))
+    cache.put(_key(query="c"), (_result(),))
+
+    assert cache.get(_key(query="a")) is not None
+    cache.put(_key(query="d"), (_result(),))
+
+    assert cache.get(_key(query="a")) is not None
+    assert cache.get(_key(query="b")) is None
+
+
+def test_replacing_an_existing_key_does_not_grow_the_cache():
+    cache = _cache(max_entries=3)
+    cache.put(_key(query="a"), (_result(),))
+    cache.put(_key(query="b"), (_result(),))
+    cache.put(_key(query="c"), (_result(),))
+
+    cache.put(_key(query="a"), (_result(name="Newer"),))
+
+    assert len(cache) == 3
+    assert cache.get(_key(query="b")) is not None
+    assert cache.get(_key(query="c")) is not None
+
+
+def test_replacing_an_existing_key_returns_the_new_rows():
+    cache = _cache(max_entries=3)
+    cache.put(_key(), (_result(name="Older"),))
+
+    newer = (_result(name="Newer"),)
+    cache.put(_key(), newer)
+
+    assert cache.get(_key()) == newer
+
+
+def test_replacing_an_existing_key_saves_it_from_the_next_eviction():
+    cache = _cache(max_entries=3)
+    cache.put(_key(query="a"), (_result(),))
+    cache.put(_key(query="b"), (_result(),))
+    cache.put(_key(query="c"), (_result(),))
+
+    cache.put(_key(query="a"), (_result(name="Newer"),))
+    cache.put(_key(query="d"), (_result(),))
+
+    assert cache.get(_key(query="a")) is not None
+    assert cache.get(_key(query="b")) is None
+
+
+def test_an_expired_lookup_drops_the_entry_instead_of_making_it_recent():
+    """An answer too old to use is not use at all - it leaves the cache rather
+    than pushing a still-valid neighbour out of it."""
+    clock = _Clock()
+    cache = _cache(clock=clock, max_entries=3, ttl_seconds=300.0)
+    cache.put(_key(query="a"), (_result(),))
+    clock.advance(300.0)
+    cache.put(_key(query="b"), (_result(),))
+    cache.put(_key(query="c"), (_result(),))
+
+    assert cache.get(_key(query="a")) is None
+    assert len(cache) == 2
+
+    cache.put(_key(query="d"), (_result(),))
+
+    assert len(cache) == 3
+    assert cache.get(_key(query="b")) is not None
+
+
+# --- Z.E. ownership, emptying and configuration -------------------------------
+
+
+def test_the_cache_does_not_keep_the_list_the_caller_handed_it():
+    """The caller's list is the caller's: what was stored is what was asked
+    for, however that list is used afterwards."""
+    cache = _cache()
+    rows = [_result(info_hash=A)]
+
+    cache.put(_key(), rows)
+    rows.append(_result(info_hash=B, name="Other"))
+
+    assert cache.get(_key()) == (_result(info_hash=A),)
+
+
+def test_a_hit_is_always_a_tuple():
+    cache = _cache()
+
+    cache.put(_key(), [_result()])
+
+    assert isinstance(cache.get(_key()), tuple)
+
+
+def test_clearing_the_cache_empties_it():
+    cache = _cache()
+    cache.put(_key(query="a"), (_result(),))
+    cache.put(_key(query="b"), (_result(),))
+
+    cache.clear()
+
+    assert len(cache) == 0
+    assert cache.get(_key(query="a")) is None
+    assert cache.get(_key(query="b")) is None
+
+
+def test_the_default_cache_is_the_production_one():
+    """No argument means the shipped policy: five minutes, sixty-four answers,
+    and a clock the system time can never move."""
+    cache = service._SearchCache()
+
+    assert cache._ttl_seconds == 300.0
+    assert cache._max_entries == 64
+    assert cache._clock is time.monotonic
+    assert service._CACHE_TTL_SECONDS == 300.0
+    assert service._CACHE_MAX_ENTRIES == 64
+
+
+@pytest.mark.parametrize("bad", [0, -1, True, False, 2.5])
+def test_a_cache_that_could_hold_nothing_sensible_is_refused(bad):
+    with pytest.raises(ValueError):
+        service._SearchCache(max_entries=bad)
+
+
+@pytest.mark.parametrize(
+    "bad", [0, 0.0, -1.0, True, False, float("nan"), float("inf"), float("-inf")]
+)
+def test_a_lifetime_that_is_not_a_real_span_of_time_is_refused(bad):
+    with pytest.raises(ValueError):
+        service._SearchCache(ttl_seconds=bad)
+
+
+def test_an_expired_entry_is_dropped_before_a_valid_one_is_evicted():
+    """Making room must cost the cache something it could not have used: an
+    answer that is merely older than its neighbours is still worth more than
+    one that has run out of time, however recently it was read."""
+    clock = _Clock()
+    cache = _cache(clock=clock, max_entries=3, ttl_seconds=300.0)
+    cache.put(_key(query="a"), (_result(),))
+    clock.advance(1.0)
+    cache.put(_key(query="b"), (_result(),))
+    cache.put(_key(query="c"), (_result(),))
+    assert cache.get(_key(query="a")) is not None
+
+    # Only "a" has run out of time, and it is the most recently read entry.
+    clock.advance(299.0)
+    cache.put(_key(query="d"), (_result(),))
+
+    assert cache.get(_key(query="a")) is None
+    assert cache.get(_key(query="b")) is not None
+    assert cache.get(_key(query="c")) is not None
+    assert cache.get(_key(query="d")) is not None
