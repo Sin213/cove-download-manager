@@ -1,10 +1,11 @@
 """The Search page's Qt widget.
 
 Presentation only. The widget renders whatever results it is handed, in the
-order it is handed them, and reports one thing back: that the user asked for a
-search. It never calls a source, never owns a SearchService and never starts a
-download - ranking, normalisation, deadlines and intake all live behind it, so
-this file imports nothing from Cove but the Search data model.
+order it is handed them, and reports two things back: that the user asked for a
+search, and that the user asked to download one result. It never calls a
+source, never owns a SearchService and never performs a download - ranking,
+normalisation, deadlines and intake all live behind it, so this file imports
+nothing from Cove but the Search data model.
 """
 from __future__ import annotations
 
@@ -108,6 +109,12 @@ class SearchWidget(QWidget):
     #: only by the button and by Return in the query field - never by editing.
     search_requested = Signal(str, object)
 
+    #: The user asked to download one result: the SearchResult object itself,
+    #: exactly as the source produced it. Never a magnet, a hash or a row
+    #: index - what to do with the result is the window's business, and
+    #: anything less than the whole object would have to be rebuilt there.
+    download_requested = Signal(object)
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
 
@@ -143,14 +150,30 @@ class SearchWidget(QWidget):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COLUMNS.index("Name"), QHeaderView.Stretch)
 
+        self.download_button = QPushButton("Download", self)
+        # Nothing is selected yet, so there is nothing to download. Selection
+        # is the only thing that ever lifts this.
+        self.download_button.setEnabled(False)
+
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        actions.addWidget(self.download_button)
+
         outer = QVBoxLayout(self)
         outer.addLayout(controls)
         outer.addWidget(self.status)
         outer.addWidget(self.table, 1)
+        outer.addLayout(actions)
 
         # One path for both gestures, so they cannot drift apart.
         self.search_button.clicked.connect(self._emit_search_requested)
         self.query.returnPressed.connect(self._emit_search_requested)
+
+        # Selection only ever changes what the button offers; it never asks
+        # for a download of its own accord.
+        self.table.itemSelectionChanged.connect(self._sync_download_enabled)
+        self.table.cellDoubleClicked.connect(self._request_download_for_row)
+        self.download_button.clicked.connect(self._request_download)
 
     def current_category(self) -> Category:
         """The Category the user selected, as the enum member itself."""
@@ -198,6 +221,9 @@ class SearchWidget(QWidget):
             self.table.item(row, 0).setData(Qt.UserRole, result)
         self.table.clearSelection()
         self.table.setCurrentCell(-1, -1)
+        # Nothing re-enables the download action here, and nothing has to
+        # disable it either: the rows the old selection belonged to are gone,
+        # and dropping that selection takes the action away with them.
 
     def selected_result(self) -> SearchResult | None:
         """The SearchResult object behind the selected row, or None."""
@@ -210,3 +236,36 @@ class SearchWidget(QWidget):
     def _emit_search_requested(self) -> None:
         # text() verbatim: trimming and casefolding are SearchService's job.
         self.search_requested.emit(self.query.text(), self.current_category())
+
+    def _sync_download_enabled(self) -> None:
+        """Offer the download action exactly when a result is selected.
+
+        Deliberately not tied to whether a search is running: SearchService
+        publishes partial snapshots, and a result already on screen is worth
+        downloading while the remaining sources are still answering.
+        """
+        self.download_button.setEnabled(self.selected_result() is not None)
+
+    def _request_download(self) -> None:
+        """The Download button. Reports intent for the selected result."""
+        result = self.selected_result()
+        # The button is disabled without a selection, so this is belt and
+        # braces - but a request carrying nothing is worse than no request.
+        if result is None:
+            return
+        self.download_requested.emit(result)
+
+    def _request_download_for_row(self, row: int, _column: int) -> None:
+        """A double-clicked row. The clicked row is the authoritative one.
+
+        Read from the row Qt reports rather than from the current selection:
+        the two agree in practice, and relying on that would make the gesture
+        depend on selection ordering the widget does not control.
+        """
+        item = self.table.item(row, 0)
+        if item is None:
+            return
+        result = item.data(Qt.UserRole)
+        if result is None:
+            return
+        self.download_requested.emit(result)

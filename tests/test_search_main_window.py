@@ -17,8 +17,11 @@ No test here reaches the network. Sources are real Source subclasses that
 answer from memory, every wait is bounded, and every held source is released
 in a finally.
 """
+import ast
+import inspect
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QCoreApplication
@@ -697,24 +700,6 @@ def test_the_rows_a_working_source_found_survive_a_failing_peer(monkeypatch):
 # --- Group I: what this slice deliberately does not do -----------------------
 
 
-def test_the_search_page_never_hands_a_result_to_intake(monkeypatch):
-    """Downloading a result is the next slice: nothing here may start one."""
-    taken = []
-    host = _host(monkeypatch, [_FakeSource([_result(name="Found", source="alpha")], source_id="alpha")])
-    monkeypatch.setattr(host, "add_search_result", lambda result: taken.append(result))
-    monkeypatch.setattr(
-        host, "add_urls_checked", lambda *a, **k: taken.append(a), raising=False
-    )
-    host.search_widget.query.setText("dune")
-
-    host.search_widget.search_button.click()
-    assert _pump(lambda: host.search_service.active is False)
-    host.search_widget.table.selectRow(0)
-    host.search_widget.table.cellDoubleClicked.emit(0, 0)
-
-    assert taken == []
-
-
 def test_one_service_event_produces_one_page_update(monkeypatch):
     """Proves the three signals are each connected exactly once."""
     host = _host(monkeypatch, [])
@@ -755,3 +740,298 @@ def test_the_final_status_counts_come_from_the_summary(results, failures, expect
     )
 
     assert mw._search_status_text(summary) == expected
+
+
+# --- Group J: a chosen result reaches the approved intake boundary -----------
+
+
+def _spy_add_search_result(monkeypatch, host):
+    """Record every call to the window's approved Search intake boundary."""
+    taken = []
+
+    def _add_search_result(result):
+        taken.append(result)
+        return [1]
+
+    monkeypatch.setattr(host, "add_search_result", _add_search_result)
+    return taken
+
+
+def _spy_add_urls_checked(monkeypatch, host):
+    """Record the intake gate's arguments, without reaching the queue.
+
+    The seam is deliberately one step past the real add_search_result: the
+    composition under test ends there, and tests/test_search_intake.py already
+    owns what add_urls_checked does with a magnet.
+    """
+    calls = []
+
+    def _add_urls_checked(urls, *args, **kwargs):
+        calls.append((list(urls), args, kwargs))
+        return [1]
+
+    monkeypatch.setattr(host, "add_urls_checked", _add_urls_checked, raising=False)
+    return calls
+
+
+def _shown(host, results):
+    """Put results on the page without running a search."""
+    host.search_widget.set_results(results)
+
+
+def test_the_download_button_hands_the_result_to_the_intake_boundary(monkeypatch):
+    host = _host(monkeypatch, [])
+    taken = _spy_add_search_result(monkeypatch, host)
+    results = (_result(name="One"), _result(info_hash=B, name="Two"))
+    _shown(host, results)
+    host.search_widget.table.selectRow(1)
+
+    host.search_widget.download_button.click()
+
+    assert len(taken) == 1
+    # Identity through the whole UI boundary: a window that rebuilt the result
+    # from the row would pass an equality check and lose the source's magnet.
+    assert taken[0] is results[1]
+
+
+def test_double_clicking_a_row_hands_that_result_to_the_intake_boundary(monkeypatch):
+    host = _host(monkeypatch, [])
+    taken = _spy_add_search_result(monkeypatch, host)
+    results = (_result(name="One"), _result(info_hash=B, name="Two"))
+    _shown(host, results)
+    host.search_widget.table.selectRow(0)
+
+    host.search_widget.table.cellDoubleClicked.emit(1, 0)
+
+    assert taken == [results[1]]
+    assert taken[0] is results[1]
+
+
+def test_selecting_a_result_asks_for_no_download(monkeypatch):
+    host = _host(monkeypatch, [])
+    taken = _spy_add_search_result(monkeypatch, host)
+    _shown(host, (_result(name="One"), _result(info_hash=B, name="Two")))
+
+    host.search_widget.table.selectRow(0)
+    host.search_widget.table.selectRow(1)
+
+    assert taken == []
+
+
+def test_a_new_result_snapshot_asks_for_no_download(monkeypatch):
+    """A service update replaces the rows; it must never download one."""
+    host = _host(monkeypatch, [])
+    taken = _spy_add_search_result(monkeypatch, host)
+    _shown(host, (_result(name="One"),))
+    host.search_widget.table.selectRow(0)
+    host.search_service._generation = 2
+
+    host._on_search_results(2, (_result(info_hash=B, name="Two"),))
+    host._on_search_finished(
+        SearchSummary(
+            generation=2,
+            results=(_result(info_hash=B, name="Two"),),
+            dedupe_dropped=0,
+            failures=(),
+        )
+    )
+
+    assert taken == []
+
+
+def test_the_download_request_is_connected_exactly_once(monkeypatch):
+    host = _host(monkeypatch, [])
+    taken = _spy_add_search_result(monkeypatch, host)
+    results = (_result(name="One"),)
+    _shown(host, results)
+    host.search_widget.table.selectRow(0)
+
+    host.search_widget.download_requested.emit(results[0])
+
+    assert len(taken) == 1
+
+
+def test_navigating_away_and_back_does_not_reconnect_the_download(monkeypatch):
+    host = _host(monkeypatch, [])
+    taken = _spy_add_search_result(monkeypatch, host)
+    results = (_result(name="One"),)
+    _shown(host, results)
+
+    host.nav_search.click()
+    host.nav_downloads.click()
+    host.nav_search.click()
+    host.search_widget.table.selectRow(0)
+    host.search_widget.download_button.click()
+
+    assert len(taken) == 1
+
+
+# --- Group K: the approved composition, end to end ---------------------------
+
+
+def test_the_download_action_reaches_intake_with_the_untouched_magnet(monkeypatch):
+    """The real add_search_result, driven by the real widget action.
+
+    Only the queue-facing seam is stubbed. Everything between the button and
+    it is production code, so an extra intake path or a rebuilt magnet shows
+    up here.
+    """
+    host = _host(monkeypatch, [])
+    calls = _spy_add_urls_checked(monkeypatch, host)
+    result = _result(name="Dune (2021) [1080p] BluRay", source="yts")
+    _shown(host, (result,))
+    host.search_widget.table.selectRow(0)
+
+    host.search_widget.download_button.click()
+
+    assert len(calls) == 1
+    urls, args, kwargs = calls[0]
+    # The exact string the source's magnet builder produced: xt, dn and every
+    # tracker, byte for byte.
+    assert urls == [result.magnet]
+    assert "&tr=" in result.magnet and "&dn=" in result.magnet
+    assert args == ()
+    assert kwargs == {"intake": "search"}
+
+
+def test_a_double_clicked_result_reaches_intake_the_same_way(monkeypatch):
+    host = _host(monkeypatch, [])
+    calls = _spy_add_urls_checked(monkeypatch, host)
+    result = _result(name="Dune (2021) [1080p] BluRay", source="yts")
+    _shown(host, (result,))
+
+    host.search_widget.table.cellDoubleClicked.emit(0, 0)
+
+    assert calls == [([result.magnet], (), {"intake": "search"})]
+
+
+def test_a_partial_result_is_downloadable_while_the_search_runs(monkeypatch):
+    """One source has landed, another is held: the visible row still works."""
+    hold = threading.Event()
+    quick = _FakeSource([_result(name="Quick", source="alpha")], source_id="alpha")
+    slow = _FakeSource(
+        [_result(info_hash=B, name="Slow", source="beta")], source_id="beta", hold=hold
+    )
+    host = _host(monkeypatch, [quick, slow])
+    calls = _spy_add_urls_checked(monkeypatch, host)
+    host.search_widget.query.setText("dune")
+
+    try:
+        host.search_widget.search_button.click()
+        assert _pump(lambda: _rows_shown(host) == ["Quick"]), "partial rows never shown"
+        host.search_widget.table.selectRow(0)
+
+        assert host.search_widget.download_button.isEnabled() is True
+        host.search_widget.download_button.click()
+
+        assert len(calls) == 1
+        assert calls[0][2] == {"intake": "search"}
+        # The download did not end the search it was chosen from.
+        assert host.search_service.active is True
+        assert _searching(host) is True
+        assert host.search_service.generation == 1
+    finally:
+        hold.set()
+
+    assert _pump(lambda: host.search_service.active is False), "search never finished"
+    assert sorted(_rows_shown(host)) == ["Quick", "Slow"]
+    assert _status(host) == "2 results"
+
+
+# --- Group L: the download leaves the search alone ---------------------------
+
+
+class _LifecycleSpy(SearchService):
+    """The real service, plus a record of every lifecycle call it was given."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, http_factory=_FakeHttp)
+        self.starts = []
+        self.cancels = 0
+
+    def start(self, query, category=Category.ALL):
+        self.starts.append((query, category))
+        return super().start(query, category)
+
+    def cancel(self):
+        self.cancels += 1
+        return super().cancel()
+
+
+def test_downloading_a_result_does_not_touch_the_search_lifecycle(monkeypatch):
+    monkeypatch.setattr(mw, "SearchService", _LifecycleSpy)
+    _select(monkeypatch, [])
+    host = _wire(Host())
+    _spy_add_urls_checked(monkeypatch, host)
+    host.search_service._generation = 4
+    _shown(host, (_result(name="One"),))
+    host.search_widget.table.selectRow(0)
+
+    host.search_widget.download_button.click()
+    host.search_widget.table.cellDoubleClicked.emit(0, 0)
+
+    assert host.search_service.starts == []
+    assert host.search_service.cancels == 0
+    assert host.search_service.generation == 4
+    assert host.search_service.active is False
+
+
+def test_downloading_a_result_leaves_the_page_exactly_as_it_was(monkeypatch):
+    """Search status describes the search. A download may not overwrite it."""
+    host = _host(monkeypatch, [])
+    _spy_add_urls_checked(monkeypatch, host)
+    _shown(host, (_result(name="One"), _result(info_hash=B, name="Two")))
+    host.search_widget.set_status("2 results")
+    host.search_widget.table.selectRow(1)
+
+    host.search_widget.download_button.click()
+
+    assert _rows_shown(host) == ["One", "Two"]
+    assert _status(host) == "2 results"
+    assert host.search_widget.table.selectionModel().selectedRows()[0].row() == 1
+    assert host.search_widget.download_button.isEnabled() is True
+
+
+# --- Group M: the handler uses the approved boundary and nothing else --------
+
+
+def _handler_node():
+    source = Path(inspect.getfile(mw)).read_text(encoding="utf-8")
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name == "_on_search_download_requested"
+        ):
+            return node
+    raise AssertionError("the Search download handler is not defined")
+
+
+def test_the_download_handler_calls_the_approved_intake_boundary():
+    calls = {
+        child.func.attr
+        for child in ast.walk(_handler_node())
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute)
+    }
+
+    assert calls == {"add_search_result"}
+
+
+def test_the_download_handler_never_opens_a_second_intake_path():
+    """No magnet, no queue, no debrid: add_search_result owns all of that."""
+    node = _handler_node()
+    attributes = {
+        child.attr for child in ast.walk(node) if isinstance(child, ast.Attribute)
+    }
+
+    for forbidden in (
+        "add_urls_checked",
+        "add_url",
+        "add_urls",
+        "magnet",
+        "info_hash",
+        "queue",
+        "debrid",
+        "torrent",
+        "aria2",
+    ):
+        assert forbidden not in attributes

@@ -751,6 +751,9 @@ class MainWindow(QMainWindow):
         self.search_widget = SearchWidget()
         self.search_service = SearchService(self)
         self.search_widget.search_requested.connect(self._on_search_requested)
+        self.search_widget.download_requested.connect(
+            self._on_search_download_requested
+        )
         self.search_service.results_updated.connect(self._on_search_results)
         self.search_service.search_finished.connect(self._on_search_finished)
         return self.search_widget
@@ -772,6 +775,20 @@ class MainWindow(QMainWindow):
         self.search_widget.set_status("Searching…")
         self.search_widget.set_searching(True)
         self.search_service.start(query, category)
+
+    def _on_search_download_requested(self, result: SearchResult) -> None:
+        """The user chose one result. Hand it to the one Search intake there is.
+
+        Everything a download needs already lives behind add_search_result:
+        duplicate checking, consent, debrid resolution and the torrent
+        fallback. Reading the magnet here to save a call would be a second
+        intake path, and the two would drift.
+
+        The search itself is untouched - it keeps running, keeps its
+        generation, and keeps the rows and status it published. Downloading a
+        result is not an answer to the search that found it.
+        """
+        self.add_search_result(result)
 
     def _on_search_results(self, generation: int, results) -> None:
         """Show one search's rows, if it is still the search being shown."""

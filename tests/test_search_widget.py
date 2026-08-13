@@ -317,6 +317,216 @@ def test_replacing_the_results_drops_the_old_selection():
     assert w.selected_result() is None
 
 
+# --- download action: control state -----------------------------------------
+
+
+def _record_downloads(widget):
+    """Capture every download_requested emission, as the objects themselves."""
+    seen = []
+    widget.download_requested.connect(seen.append)
+    return seen
+
+
+def test_the_widget_has_one_download_button():
+    w = SearchWidget()
+
+    assert isinstance(w.download_button, QPushButton)
+    assert w.download_button.text() == "Download"
+
+
+def test_the_download_button_starts_disabled():
+    """Nothing is selected yet, so there is nothing to download."""
+    w = SearchWidget()
+
+    assert w.download_button.isEnabled() is False
+
+
+def test_results_alone_do_not_enable_the_download_button():
+    w = SearchWidget()
+
+    w.set_results((_result(1), _result(2)))
+
+    assert w.download_button.isEnabled() is False
+
+
+def test_selecting_a_row_enables_the_download_button():
+    w = SearchWidget()
+    w.set_results((_result(1), _result(2)))
+
+    w.table.selectRow(1)
+
+    assert w.download_button.isEnabled() is True
+
+
+def test_clearing_the_selection_disables_the_download_button():
+    w = SearchWidget()
+    w.set_results((_result(1), _result(2)))
+    w.table.selectRow(1)
+
+    w.table.clearSelection()
+
+    assert w.download_button.isEnabled() is False
+
+
+def test_a_new_result_snapshot_disables_the_download_button():
+    """SearchService replaces the rows mid-search; the old action must not survive."""
+    w = SearchWidget()
+    w.set_results((_result(1), _result(2)))
+    w.table.selectRow(1)
+
+    w.set_results((_result(3), _result(4)))
+
+    assert w.download_button.isEnabled() is False
+    assert w.selected_result() is None
+
+
+def test_emptying_the_results_disables_the_download_button():
+    w = SearchWidget()
+    w.set_results((_result(1),))
+    w.table.selectRow(0)
+
+    w.set_results(())
+
+    assert w.download_button.isEnabled() is False
+
+
+def test_searching_does_not_disable_the_download_button():
+    """Partial results are downloadable: only the Search button locks."""
+    w = SearchWidget()
+    w.set_results((_result(1),))
+    w.table.selectRow(0)
+
+    w.set_searching(True)
+
+    assert w.download_button.isEnabled() is True
+    assert w.search_button.isEnabled() is False
+
+
+# --- download action: the signal --------------------------------------------
+
+
+def test_selecting_a_row_does_not_request_a_download():
+    """Selection is not intent. Only an explicit gesture downloads."""
+    w = SearchWidget()
+    results = (_result(1), _result(2))
+    w.set_results(results)
+    seen = _record_downloads(w)
+
+    w.table.selectRow(0)
+    w.table.selectRow(1)
+    w.table.clearSelection()
+
+    assert seen == []
+
+
+def test_the_state_setters_never_request_a_download():
+    w = SearchWidget()
+    w.set_results((_result(1),))
+    w.table.selectRow(0)
+    seen = _record_downloads(w)
+
+    w.set_status("anything")
+    w.set_searching(True)
+    w.set_searching(False)
+    w.set_results((_result(2),))
+    w.set_results(())
+
+    assert seen == []
+
+
+def test_the_download_button_requests_the_selected_result_once():
+    w = SearchWidget()
+    results = (_result(1), _result(2), _result(3))
+    w.set_results(results)
+    w.table.selectRow(1)
+    seen = _record_downloads(w)
+
+    w.download_button.click()
+
+    assert len(seen) == 1
+    # Identity, not equality: the intake boundary receives this exact object,
+    # so a result rebuilt from the displayed cells would be a silent regression.
+    assert seen[0] is results[1]
+
+
+def test_the_download_button_does_nothing_without_a_selection():
+    w = SearchWidget()
+    w.set_results((_result(1),))
+    seen = _record_downloads(w)
+
+    # Straight at the handler: the button is disabled, so a click alone could
+    # never reach it, and the guard would go untested.
+    w._request_download()
+
+    assert seen == []
+
+
+def test_a_second_click_requests_the_same_result_again():
+    """Duplicate handling belongs to the intake gate, not to this widget."""
+    w = SearchWidget()
+    results = (_result(1),)
+    w.set_results(results)
+    w.table.selectRow(0)
+    seen = _record_downloads(w)
+
+    w.download_button.click()
+    w.download_button.click()
+
+    assert seen == [results[0], results[0]]
+
+
+# --- download action: double-click -------------------------------------------
+
+
+def test_double_clicking_a_row_requests_that_result_once():
+    w = SearchWidget()
+    results = (_result(1), _result(2), _result(3))
+    w.set_results(results)
+    seen = _record_downloads(w)
+
+    w.table.cellDoubleClicked.emit(1, 0)
+
+    assert len(seen) == 1
+    assert seen[0] is results[1]
+
+
+def test_double_clicking_uses_the_clicked_row_not_the_selected_one():
+    """The clicked row is authoritative, whatever was selected before it."""
+    w = SearchWidget()
+    results = (_result(1), _result(2), _result(3))
+    w.set_results(results)
+    w.table.selectRow(0)
+    seen = _record_downloads(w)
+
+    w.table.cellDoubleClicked.emit(2, 3)
+
+    assert seen == [results[2]]
+    assert seen[0] is results[2]
+
+
+def test_double_clicking_a_row_that_is_gone_requests_nothing():
+    w = SearchWidget()
+    w.set_results((_result(1),))
+    seen = _record_downloads(w)
+
+    w.table.cellDoubleClicked.emit(7, 0)
+
+    assert seen == []
+
+
+def test_both_gestures_use_the_one_download_signal():
+    w = SearchWidget()
+    results = (_result(1), _result(2))
+    w.set_results(results)
+    seen = _record_downloads(w)
+
+    w.table.selectRow(0)
+    w.download_button.click()
+    w.table.cellDoubleClicked.emit(1, 0)
+
+    assert seen == [results[0], results[1]]
+
+
 # --- passive state API ------------------------------------------------------
 
 
@@ -402,10 +612,35 @@ def test_the_widget_module_imports_nothing_but_the_search_model():
 
 
 def test_the_widget_starts_no_download_and_no_work():
+    """The widget reports intent. It never performs the download itself."""
     source = _widget_source()
 
     for forbidden in ("add_search_result", "add_urls_checked", "QTimer", "QThread"):
         assert forbidden not in source
+
+
+def _function_node(name):
+    tree = ast.parse(_widget_source())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} is not defined in cove.search.widget")
+
+
+def test_the_download_path_never_reads_the_magnet_or_the_hash():
+    """The whole result crosses the boundary; the widget reads none of it.
+
+    Read as an AST over the download methods only, rather than as a substring
+    search over the module: the visible columns legitimately read other result
+    fields, and a text match would fail on a comment.
+    """
+    for name in ("_request_download", "_request_download_for_row"):
+        node = _function_node(name)
+        attributes = {
+            child.attr for child in ast.walk(node) if isinstance(child, ast.Attribute)
+        }
+        assert "magnet" not in attributes
+        assert "info_hash" not in attributes
 
 
 # --- hostile provider metadata ----------------------------------------------
