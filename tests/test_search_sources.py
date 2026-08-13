@@ -663,3 +663,377 @@ def test_nyaa_returns_nothing_for_a_category_it_does_not_serve():
     http, session = http_with(FakeResponse(fixture("nyaa_valid.xml")))
     assert source.search("x", Category.MOVIES, http) == []
     assert session.calls == []
+
+
+# --- FitGirl ---------------------------------------------------------------
+
+FITGIRL_ENDPOINT = "https://fitgirl-repacks.site/"
+
+
+def fitgirl_source():
+    from cove.search.sources.fitgirl import FitGirlSource
+
+    return FitGirlSource()
+
+
+def fitgirl_search_page(*hrefs: str) -> bytes:
+    """A results page whose entries link to `hrefs`, and nothing else."""
+    entries = "".join(
+        f'<article id="post-{index}" class="post hentry">'
+        f'<h1 class="entry-title"><a href="{href}" rel="bookmark">Entry {index}</a></h1>'
+        "</article>"
+        for index, href in enumerate(hrefs, start=1)
+    )
+    return (
+        '<!DOCTYPE html><html><body class="search search-results list-view">'
+        f'<div id="primary"><main id="main">{entries}</main></div>'
+        "</body></html>"
+    ).encode()
+
+
+def fitgirl_page(name: str) -> FakeResponse:
+    return FakeResponse(fixture(name))
+
+
+# Group A - source metadata
+
+
+def test_fitgirl_declares_games_only():
+    source = fitgirl_source()
+    assert source.id == "fitgirl"
+    assert source.label == "FitGirl"
+    assert source.categories == (Category.GAMES,)
+    assert source.enabled_default is True
+    # FitGirl publishes no swarm counts, so it must say so rather than
+    # reporting a fabricated zero as if it had been measured.
+    assert source.reports_swarm is False
+
+
+def test_fitgirl_is_a_source_and_is_not_registered_yet():
+    from cove.search.registry import SOURCES
+
+    assert isinstance(fitgirl_source(), Source)
+    assert "fitgirl" not in {source.id for source in SOURCES}
+
+
+def test_fitgirl_returns_nothing_for_a_category_it_does_not_serve():
+    source = fitgirl_source()
+    http, session = http_with(fitgirl_page("fitgirl_search_results.html"))
+    assert source.search("x", Category.MOVIES, http) == []
+    assert session.calls == []
+
+
+# Group B - search URL and query encoding
+
+
+def test_fitgirl_queries_the_site_search_endpoint():
+    source = fitgirl_source()
+    http, session = http_with(fitgirl_page("fitgirl_search_empty.html"))
+    source.search("example game", Category.GAMES, http)
+    url, kwargs = session.calls[0]
+    assert url == FITGIRL_ENDPOINT
+    assert kwargs["params"] == {"s": "example game"}
+
+
+def test_fitgirl_hands_awkward_queries_over_as_a_parameter_not_a_url():
+    source = fitgirl_source()
+    query = "tom & jerry + 50% ünicode/slash?q"
+    http, session = http_with(fitgirl_page("fitgirl_search_empty.html"))
+    source.search(query, Category.GAMES, http)
+    url, kwargs = session.calls[0]
+    # The query is never spliced into the URL, so encoding stays with the
+    # transport and the semantic query is passed through untouched.
+    assert url == FITGIRL_ENDPOINT
+    assert "?" not in url and "&" not in url
+    assert kwargs["params"]["s"] == query
+
+
+def test_fitgirl_serves_the_all_category():
+    source = fitgirl_source()
+    http, session = http_with(fitgirl_page("fitgirl_search_empty.html"))
+    assert source.search("anything", Category.ALL, http) == []
+    assert len(session.calls) == 1
+
+
+# Group C - search-page parsing
+
+
+def test_fitgirl_visits_the_result_entries_in_page_order():
+    source = fitgirl_source()
+    http, session = http_with(
+        fitgirl_page("fitgirl_search_results.html"),
+        fitgirl_page("fitgirl_detail_primary.html"),
+        fitgirl_page("fitgirl_detail_secondary.html"),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+    )
+    source.search("example", Category.GAMES, http)
+    # Navigation, tag, meta and footer links are not entries; the relative
+    # second entry resolves against the canonical origin.
+    assert [url for url, _ in session.calls] == [
+        FITGIRL_ENDPOINT,
+        "https://fitgirl-repacks.site/example-game-one/",
+        "https://fitgirl-repacks.site/example-game-two/",
+        "https://fitgirl-repacks.site/example-game-three/",
+    ]
+
+
+# Group D - canonical-host boundary
+
+
+def test_fitgirl_only_follows_entries_on_the_canonical_https_host():
+    source = fitgirl_source()
+    page = fitgirl_search_page(
+        "https://fitgirl-repacks.site/ok-absolute/",
+        "https://evil.example/elsewhere/",
+        "http://fitgirl-repacks.site/downgraded/",
+        "//evil.example/protocol-relative/",
+        "javascript:alert(1)",
+        "data:text/html,<b>x</b>",
+        "file:///etc/passwd",
+        "https://user:secret@fitgirl-repacks.site/credentials/",
+        "https://fitgirl-repacks.site.evil.example/lookalike/",
+        "http://[malformed",
+        "",
+        "/ok-relative/",
+    )
+    http, session = http_with(
+        FakeResponse(page),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+    )
+    source.search("boundary", Category.GAMES, http)
+    # Every rejected link is rejected before a request is made, not after.
+    assert [url for url, _ in session.calls] == [
+        FITGIRL_ENDPOINT,
+        "https://fitgirl-repacks.site/ok-absolute/",
+        "https://fitgirl-repacks.site/ok-relative/",
+    ]
+
+
+# Group E - magnet extraction
+
+
+def test_fitgirl_preserves_the_provider_magnet_and_normalises_its_hash():
+    source = fitgirl_source()
+    http, _ = http_with(
+        FakeResponse(fitgirl_search_page("/example-game-one/")),
+        fitgirl_page("fitgirl_detail_primary.html"),
+    )
+    result = source.search("example", Category.GAMES, http)[0]
+    assert result.info_hash == "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+    # The provider's own magnet is kept verbatim, trackers and all, and its
+    # HTML entities are decoded into real separators.
+    assert result.magnet == (
+        "magnet:?xt=urn:btih:AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555"
+        "&dn=Example+Game+One"
+        "&tr=udp%3A%2F%2Ftracker.example%3A1337%2Fannounce"
+    )
+    assert "&amp;" not in result.magnet
+    assert "tracker.example" in result.magnet
+
+
+def test_fitgirl_takes_the_first_valid_magnet_in_the_content_region():
+    source = fitgirl_source()
+    http, _ = http_with(
+        FakeResponse(fitgirl_search_page("/example-game-one/")),
+        fitgirl_page("fitgirl_detail_primary.html"),
+    )
+    results = source.search("example", Category.GAMES, http)
+    # Two valid magnets, one result: the first in document order wins.
+    assert len(results) == 1
+    assert results[0].info_hash == "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+
+
+def test_fitgirl_skips_malformed_magnets_and_uses_the_first_usable_one():
+    source = fitgirl_source()
+    http, _ = http_with(
+        FakeResponse(fitgirl_search_page("/example-game-four/")),
+        fitgirl_page("fitgirl_detail_malformed_magnet.html"),
+    )
+    results = source.search("example", Category.GAMES, http)
+    assert [r.info_hash for r in results] == ["c9e15763f722f23e98a29decdfae341b98d53055"]
+
+
+# Group F - complete results
+
+
+def test_fitgirl_builds_complete_results_from_the_search_and_repack_pages():
+    source = fitgirl_source()
+    http, session = http_with(
+        fitgirl_page("fitgirl_search_results.html"),
+        fitgirl_page("fitgirl_detail_primary.html"),
+        fitgirl_page("fitgirl_detail_secondary.html"),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+    )
+    results = source.search("example", Category.GAMES, http)
+
+    assert [r.name for r in results] == [
+        "Example Game One & Friends - v1.0 + 2 DLCs",
+        "Example Game Two",
+    ]
+    assert [r.info_hash for r in results] == [
+        "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "c9e15763f722f23e98a29decdfae341b98d53056",
+    ]
+    first = results[0]
+    assert isinstance(first, SearchResult)
+    assert first.source == "fitgirl"
+    # FitGirl publishes no size or swarm data on either page, and inventing
+    # either would feed the aggregator numbers nobody measured.
+    assert first.size_bytes is None
+    assert first.seeders == 0
+    assert first.leechers == 0
+    # 2026-08-11T20:25:08+00:00 and 2026-07-04T10:00:00+00:00.
+    assert first.added == 1786479908
+    assert results[1].added == 1783159200
+    assert len(session.calls) == 4
+
+
+def test_fitgirl_leaves_added_unknown_when_the_entry_has_no_timestamp():
+    source = fitgirl_source()
+    http, _ = http_with(
+        FakeResponse(fitgirl_search_page("/example-game-two/")),
+        fitgirl_page("fitgirl_detail_secondary.html"),
+    )
+    assert source.search("example", Category.GAMES, http)[0].added is None
+
+
+# Group G - empty and broken pages
+
+
+def test_fitgirl_returns_empty_for_the_explicit_no_results_page():
+    source = fitgirl_source()
+    http, session = http_with(fitgirl_page("fitgirl_search_empty.html"))
+    assert source.search("nothing at all", Category.GAMES, http) == []
+    assert len(session.calls) == 1
+
+
+def test_fitgirl_raises_parse_for_an_unrecognised_search_page():
+    source = fitgirl_source()
+    http, session = http_with(fitgirl_page("fitgirl_search_unrecognized.html"))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.GAMES, http)
+    # A challenge page is a provider failure, not an honest "no results".
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+def test_fitgirl_does_not_turn_a_search_page_failure_into_empty_results():
+    source = fitgirl_source()
+    http, session = http_with(FakeResponse(b"nope", status_code=503))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.HTTP
+    assert len(session.calls) == 1
+
+
+def test_fitgirl_returns_empty_when_recognised_pages_carry_no_magnet():
+    source = fitgirl_source()
+    http, _ = http_with(
+        fitgirl_page("fitgirl_search_results.html"),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+        fitgirl_page("fitgirl_detail_no_magnet.html"),
+    )
+    # Content absence is not transport failure.
+    assert source.search("example", Category.GAMES, http) == []
+
+
+def test_fitgirl_ignores_magnets_outside_the_content_region():
+    source = fitgirl_source()
+    http, _ = http_with(
+        FakeResponse(fitgirl_search_page("/one/", "/two/")),
+        fitgirl_page("fitgirl_detail_unrecognized.html"),
+        fitgirl_page("fitgirl_detail_secondary.html"),
+    )
+    results = source.search("example", Category.GAMES, http)
+    assert [r.info_hash for r in results] == ["c9e15763f722f23e98a29decdfae341b98d53056"]
+
+
+# Group H - per-candidate failure isolation
+
+
+def test_fitgirl_keeps_valid_entries_when_one_repack_page_fails():
+    source = fitgirl_source()
+    http, session = http_with(
+        fitgirl_page("fitgirl_search_results.html"),
+        fitgirl_page("fitgirl_detail_primary.html"),
+        FakeResponse(b"nope", status_code=503),
+        fitgirl_page("fitgirl_detail_secondary.html"),
+    )
+    results = source.search("example", Category.GAMES, http)
+    assert [r.name for r in results] == [
+        "Example Game One & Friends - v1.0 + 2 DLCs",
+        "Example Game Three",
+    ]
+    assert len(session.calls) == 4
+
+
+def test_fitgirl_raises_when_every_repack_page_fails_to_load():
+    source = fitgirl_source()
+    http, _ = http_with(
+        fitgirl_page("fitgirl_search_results.html"),
+        FakeResponse(b"nope", status_code=503),
+        FakeResponse(b"nope", status_code=503),
+        FakeResponse(b"nope", status_code=503),
+    )
+    with pytest.raises(SourceError) as excinfo:
+        source.search("example", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.HTTP
+
+
+def test_fitgirl_raises_when_every_repack_page_is_unrecognised():
+    source = fitgirl_source()
+    http, _ = http_with(
+        fitgirl_page("fitgirl_search_results.html"),
+        fitgirl_page("fitgirl_detail_unrecognized.html"),
+        fitgirl_page("fitgirl_detail_unrecognized.html"),
+        fitgirl_page("fitgirl_detail_unrecognized.html"),
+    )
+    with pytest.raises(SourceError) as excinfo:
+        source.search("example", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+# Group I - fanout cap
+
+
+def test_fitgirl_stops_fetching_after_the_repack_page_cap():
+    from cove.search.sources.fitgirl import MAX_DETAIL_PAGES
+
+    source = fitgirl_source()
+    page = fitgirl_search_page(*[f"/entry-{index}/" for index in range(1, 21)])
+    responses = [fitgirl_page("fitgirl_detail_secondary.html")] * MAX_DETAIL_PAGES
+    http, session = http_with(FakeResponse(page), *responses)
+    results = source.search("many", Category.GAMES, http)
+
+    assert MAX_DETAIL_PAGES == 8
+    assert len(session.calls) == 1 + MAX_DETAIL_PAGES
+    assert len(results) == MAX_DETAIL_PAGES
+    assert not [url for url, _ in session.calls if url.endswith("/entry-9/")]
+
+
+def test_fitgirl_never_paginates():
+    source = fitgirl_source()
+    http, session = http_with(fitgirl_page("fitgirl_search_empty.html"))
+    source.search("nothing", Category.GAMES, http)
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["params"] == {"s": "nothing"}
+
+
+def test_fitgirl_never_bypasses_search_http():
+    import inspect
+
+    from cove.search.sources import fitgirl as module
+
+    text = inspect.getsource(module)
+    for banned in (
+        "import requests",
+        "urllib.request",
+        "import httpx",
+        "import aiohttp",
+        "import subprocess",
+        "BeautifulSoup",
+        "lxml",
+    ):
+        assert banned not in text
