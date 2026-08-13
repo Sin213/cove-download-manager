@@ -1036,3 +1036,340 @@ def test_fitgirl_never_bypasses_search_http():
         "lxml",
     ):
         assert banned not in text
+
+
+# --- SubsPlease -------------------------------------------------------------
+
+SUBSPLEASE_ENDPOINT = "https://subsplease.org/api/"
+
+
+def subsplease_source():
+    from cove.search.sources.subsplease import SubsPleaseSource
+
+    return SubsPleaseSource()
+
+
+# Group A - source metadata
+
+
+def test_subsplease_declares_anime_only():
+    source = subsplease_source()
+    assert source.id == "subsplease"
+    assert source.label == "SubsPlease"
+    assert source.categories == (Category.ANIME,)
+    assert source.enabled_default is True
+    # The search API publishes no swarm counts at all, so the adapter says so
+    # rather than reporting a measured-looking zero.
+    assert source.reports_swarm is False
+
+
+def test_subsplease_is_a_source():
+    # Whether it is registered is the registry suite's question, not this
+    # one's - this file owns the adapter, not Cove's source inventory.
+    assert isinstance(subsplease_source(), Source)
+
+
+def test_subsplease_returns_nothing_for_a_category_it_does_not_serve():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(fixture("subsplease_search_results.json")))
+    for category in (Category.MOVIES, Category.TV, Category.GAMES):
+        assert source.search("x", category, http) == []
+    assert session.calls == []
+
+
+# Group B - search URL and query encoding
+
+
+def test_subsplease_queries_the_search_api():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(fixture("subsplease_search_empty.json")))
+    source.search("example anime", Category.ANIME, http)
+    url, kwargs = session.calls[0]
+    assert url == SUBSPLEASE_ENDPOINT
+    # f selects the API's search mode and tz fixes the timezone the release
+    # dates are rendered in, so a search does not depend on the local clock.
+    assert kwargs["params"] == {"f": "search", "tz": "UTC", "s": "example anime"}
+
+
+def test_subsplease_hands_awkward_queries_over_as_a_parameter_not_a_url():
+    source = subsplease_source()
+    query = "tom & jerry + 50% ünicode/slash?q"
+    http, session = http_with(FakeResponse(fixture("subsplease_search_empty.json")))
+    source.search(query, Category.ANIME, http)
+    url, kwargs = session.calls[0]
+    # The query is never spliced into the URL, so encoding stays with the
+    # transport and the semantic query is passed through untouched.
+    assert url == SUBSPLEASE_ENDPOINT
+    assert "?" not in url and "&" not in url
+    assert kwargs["params"]["s"] == query
+
+
+def test_subsplease_serves_the_all_category():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(fixture("subsplease_search_empty.json")))
+    assert source.search("anything", Category.ALL, http) == []
+    assert len(session.calls) == 1
+
+
+# Group C - top-level response classification
+
+
+def test_subsplease_returns_empty_for_the_explicit_no_results_payload():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(fixture("subsplease_search_empty.json")))
+    assert source.search("nothing", Category.ANIME, http) == []
+    assert len(session.calls) == 1
+
+
+def test_subsplease_does_not_read_an_empty_object_as_no_results():
+    # The API says "nothing matched" with an empty array, never with an empty
+    # object, so an empty map is an undocumented answer rather than a search
+    # that found nothing.
+    source = subsplease_source()
+    http, session = http_with(json_response({}))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("nothing", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+def test_subsplease_raises_parse_for_malformed_json():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(b'{"Example Anime - 01": {'))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not a payload",
+        42,
+        None,
+        True,
+        # A populated array is not a shape the API publishes: only the empty
+        # array means "no matches", so a non-empty one is a broken contract,
+        # not an answer.
+        [{"show": "Example Anime"}],
+    ],
+)
+def test_subsplease_raises_parse_for_a_top_level_shape_it_does_not_publish(payload):
+    source = subsplease_source()
+    http, _ = http_with(json_response(payload))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+def test_subsplease_does_not_read_a_challenge_page_as_no_results():
+    source = subsplease_source()
+    http, _ = http_with(
+        FakeResponse(b"<!DOCTYPE html><html><body>Checking...</body></html>")
+    )
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+def test_subsplease_does_not_turn_a_transport_failure_into_empty_results():
+    source = subsplease_source()
+    http, _ = http_with(FakeResponse(b"nope", status_code=503))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.HTTP
+
+
+def test_subsplease_error_details_do_not_echo_the_query_or_the_body():
+    source = subsplease_source()
+    http, _ = http_with(json_response({"Example Anime - 01": {"downloads": "gone"}}))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("a secret query", Category.ANIME, http)
+    message = str(excinfo.value)
+    assert "secret" not in message
+    assert "Example Anime" not in message
+    assert len(message) < 200
+
+
+# Group D - torrent extraction
+
+
+def test_subsplease_normalises_valid_releases():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(fixture("subsplease_search_results.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # Provider order, releases then variants, with no local re-sorting.
+    assert [r.info_hash for r in results] == [
+        "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "1111222233334444555566667777888899990000",
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "0123456789abcdef0123456789abcdef01234567",
+    ]
+    first = results[0]
+    assert isinstance(first, SearchResult)
+    assert first.source == "subsplease"
+    assert first.name == "Example Anime - 01 [480]"
+    assert first.added == 1786291423
+    # No swarm counts exist in this API, so none are invented - the source's
+    # reports_swarm flag is what tells a caller these zeroes are unknowns.
+    assert first.seeders == 0 and first.leechers == 0
+    assert all(r.size_bytes is None for r in results)
+    assert results[-1].added == 1786180500
+    assert len(session.calls) == 1
+
+
+def test_subsplease_preserves_the_provider_magnet_and_normalises_its_hash():
+    source = subsplease_source()
+    http, _ = http_with(FakeResponse(fixture("subsplease_search_results.json")))
+    result = source.search("example", Category.ANIME, http)[0]
+    # The API's own magnet is kept verbatim, base32 hash and trackers and all,
+    # and only the info_hash beside it is normalised to hex.
+    assert result.magnet == (
+        "magnet:?xt=urn:btih:VKVBCEN3XMRCFTGMGMZ53XKEITXO4VKV"
+        "&dn=%5BSubsPlease%5D%20Example%20Anime%20-%2001%20%28480p%29.mkv"
+        "&xl=376124912&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+    )
+    assert result.info_hash == "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+    assert "tracker.example" in result.magnet
+
+
+def test_subsplease_leaves_added_unknown_when_the_release_date_is_unusable():
+    source = subsplease_source()
+    http, _ = http_with(FakeResponse(fixture("subsplease_search_partial.json")))
+    results = source.search("example", Category.ANIME, http)
+    assert results[-1].added is None
+
+
+# Group E - resolution variants
+
+
+def test_subsplease_keeps_every_resolution_as_its_own_result():
+    source = subsplease_source()
+    http, _ = http_with(FakeResponse(fixture("subsplease_search_results.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    names = [r.name for r in results]
+    assert names == [
+        "Example Anime - 01 [480]",
+        "Example Anime - 01 [720]",
+        "Example Anime - 01 [1080]",
+        "Example Show - 12 [1080]",
+    ]
+    # Three different hashes are three different torrents, so no "best"
+    # resolution is picked and nothing is collapsed onto one entry.
+    assert len(set(r.info_hash for r in results)) == len(results)
+    assert len(set(names)) == len(names)
+
+
+# Group F/G - malformed releases and torrent identities
+
+
+def test_subsplease_drops_malformed_entries_but_keeps_the_good_ones():
+    source = subsplease_source()
+    http, _ = http_with(FakeResponse(fixture("subsplease_search_partial.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # A null magnet, an unparseable magnet and a string in place of a download
+    # object each cost only themselves; their valid peers survive, including
+    # the ones in later releases.
+    assert [r.info_hash for r in results] == [
+        "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00",
+    ]
+    # A release with no resolution still gets a usable name.
+    assert results[-1].name == "Example Show - 12"
+
+
+def test_subsplease_raises_parse_when_no_release_yields_a_torrent():
+    source = subsplease_source()
+    payload = {
+        "Example Anime - 01": {"downloads": [{"res": "1080", "magnet": "broken"}]},
+        "Example Show - 12": {"downloads": [{"res": "1080", "magnet": None}]},
+    }
+    http, _ = http_with(json_response(payload))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("example", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+# Group J - schema drift must never look like an empty search
+
+
+def test_subsplease_raises_parse_when_the_downloads_container_is_renamed():
+    source = subsplease_source()
+    http, session = http_with(
+        FakeResponse(fixture("subsplease_search_schema_drift.json"))
+    )
+    with pytest.raises(SourceError) as excinfo:
+        source.search("example", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+# Group H - result cap and request cost
+
+
+def subsplease_payload(releases: int, per_release: int = 1) -> dict:
+    return {
+        f"Example Anime - {index:04d}": {
+            "release_date": "Sun, 09 Aug 2026 16:03:43 +0000",
+            "downloads": [
+                {
+                    "res": str(variant),
+                    "magnet": f"magnet:?xt=urn:btih:{index:036x}{variant:04x}",
+                }
+                for variant in range(per_release)
+            ],
+        }
+        for index in range(1, releases + 1)
+    }
+
+
+def test_subsplease_caps_the_number_of_results():
+    source = subsplease_source()
+    payload = subsplease_payload(MAX_RESULTS + 50, per_release=3)
+    http, session = http_with(json_response(payload))
+    results = source.search("many", Category.ANIME, http)
+
+    assert len(results) == MAX_RESULTS
+    # The cap counts flattened torrents, so it lands mid-release rather than
+    # on a release boundary.
+    assert results[0].info_hash == f"{1:036x}{0:04x}"
+    assert results[-1].info_hash == f"{MAX_RESULTS // 3 + 1:036x}{(MAX_RESULTS % 3) - 1:04x}"
+    # A larger answer never costs a larger number of requests.
+    assert len(session.calls) == 1
+
+
+def test_subsplease_never_paginates_or_follows_a_result():
+    source = subsplease_source()
+    http, session = http_with(FakeResponse(fixture("subsplease_search_results.json")))
+    source.search("example", Category.ANIME, http)
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url == SUBSPLEASE_ENDPOINT
+    # No page, offset or cursor parameter, and no second request keyed off a
+    # result's own `page` field.
+    assert set(kwargs["params"]) == {"f", "tz", "s"}
+
+
+def test_subsplease_never_bypasses_search_http():
+    import inspect
+
+    from cove.search.sources import subsplease as module
+
+    text = inspect.getsource(module)
+    for banned in (
+        "import requests",
+        "urllib.request",
+        "import httpx",
+        "import aiohttp",
+        "import subprocess",
+        "selenium",
+        "playwright",
+        "BeautifulSoup",
+        "lxml",
+    ):
+        assert banned not in text

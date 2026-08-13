@@ -1,0 +1,34 @@
+{
+  "Example Anime - 01": {
+    "release_date": "Sun, 09 Aug 2026 16:03:43 +0000",
+    "downloads": [
+      {
+        "res": "480",
+        "magnet": "magnet:?xt=urn:btih:VKVBCEN3XMRCFTGMGMZ53XKEITXO4VKV&dn=Example+Anime+01+480&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      },
+      {"res": "720", "magnet": null},
+      {"res": "1080", "magnet": "not-a-magnet-at-all"},
+      "a string where an object belongs",
+      {
+        "res": "1080",
+        "magnet": "magnet:?xt=urn:btih:VPG67K6N56V4335LZXX2XTPPVPG67K6N&dn=Example+Anime+01+1080&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      }
+    ]
+  },
+  "Example Broken - 02": {
+    "release_date": "Sat, 08 Aug 2026 09:15:00 +0000",
+    "downloads": "not a list at all"
+  },
+  "Example Missing - 03": {
+    "release_date": "Sat, 08 Aug 2026 09:15:00 +0000"
+  },
+  "Example Wrong Type - 04": "this release is a string",
+  "Example Show - 12": {
+    "release_date": "definitely not a date",
+    "downloads": [
+      {
+        "magnet": "magnet:?xt=urn:btih:VII3WIWMGPOUJ3SV75TKU553RDGJTXIA&dn=Example+Show+12&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      }
+    ]
+  }
+}

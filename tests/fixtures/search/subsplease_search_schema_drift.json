@@ -1,0 +1,24 @@
+{
+  "Example Anime - 01": {
+    "release_date": "Sun, 09 Aug 2026 16:03:43 +0000",
+    "show": "Example Anime",
+    "episode": "01",
+    "torrents": [
+      {
+        "res": "1080",
+        "magnet": "magnet:?xt=urn:btih:VPG67K6N56V4335LZXX2XTPPVPG67K6N&dn=Example+Anime+01+1080&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      }
+    ]
+  },
+  "Example Show - 12": {
+    "release_date": "Sat, 08 Aug 2026 09:15:00 +0000",
+    "show": "Example Show",
+    "episode": "12",
+    "torrents": [
+      {
+        "res": "1080",
+        "magnet": "magnet:?xt=urn:btih:AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH&dn=Example+Show+12&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      }
+    ]
+  }
+}

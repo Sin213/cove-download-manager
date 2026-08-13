@@ -1,0 +1,39 @@
+{
+  "Example Anime - 01": {
+    "time": "08/09/26",
+    "release_date": "Sun, 09 Aug 2026 16:03:43 +0000",
+    "show": "Example Anime",
+    "episode": "01",
+    "page": "example-anime",
+    "image_url": "/wp-content/uploads/example.jpg",
+    "xdcc": [],
+    "downloads": [
+      {
+        "res": "480",
+        "magnet": "magnet:?xt=urn:btih:VKVBCEN3XMRCFTGMGMZ53XKEITXO4VKV&dn=%5BSubsPlease%5D%20Example%20Anime%20-%2001%20%28480p%29.mkv&xl=376124912&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      },
+      {
+        "res": "720",
+        "magnet": "magnet:?xt=urn:btih:CEISEIRTGNCEIVKVMZTHO54IRCMZSAAA&dn=%5BSubsPlease%5D%20Example%20Anime%20-%2001%20%28720p%29.mkv&xl=735534538&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce",
+        "unknown_extra": "ignored"
+      },
+      {
+        "res": "1080",
+        "magnet": "magnet:?xt=urn:btih:VPG67K6N56V4335LZXX2XTPPVPG67K6N&dn=%5BSubsPlease%5D%20Example%20Anime%20-%2001%20%281080p%29.mkv&xl=1435534538&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      }
+    ]
+  },
+  "Example Show - 12": {
+    "time": "08/08/26",
+    "release_date": "Sat, 08 Aug 2026 09:15:00 +0000",
+    "show": "Example Show",
+    "episode": "12",
+    "page": "example-show",
+    "downloads": [
+      {
+        "res": "1080",
+        "magnet": "magnet:?xt=urn:btih:AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH&dn=%5BSubsPlease%5D%20Example%20Show%20-%2012%20%281080p%29.mkv&tr=http%3A%2F%2Ftracker.example%3A7777%2Fannounce"
+      }
+    ]
+  }
+}
