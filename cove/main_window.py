@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
     QSizeGrip,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
     QSystemTrayIcon,
     QTreeWidget,
     QTreeWidgetItem,
@@ -73,6 +74,8 @@ from .dialogs import (
 from .queue import PHASE_METADATA, DownloadTask, QueueManager
 from .scheduler import Scheduler
 from .search.models import SearchResult
+from .search.service import SearchService
+from .search.widget import SearchWidget
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
     configure_speed_spin,
@@ -243,6 +246,28 @@ def _truncate_path(p: str, max_chars: int = 36) -> str:
     if len(s) <= max_chars:
         return s
     return "…" + s[-(max_chars - 1):]
+
+
+def _search_status_text(summary) -> str:
+    """One line describing a finished search, from its summary and nothing else.
+
+    Both counts are read off the SearchSummary rather than tallied as events
+    arrive, so the sentence cannot drift from the search it describes. A source
+    that could not answer is reported only as a count: which one it was, and
+    whether it failed or ran out of time, is a support question rather than
+    something to put in front of someone looking at their results.
+    """
+    count = len(summary.results)
+    if count == 0:
+        text = "No results"
+    elif count == 1:
+        text = "1 result"
+    else:
+        text = f"{count} results"
+    issues = len(summary.failures)
+    if issues:
+        text += f" · {issues} source issue{'' if issues == 1 else 's'}"
+    return text
 
 
 def _platform_label() -> str:
@@ -606,19 +631,19 @@ class MainWindow(QMainWindow):
         self.stats.add_cell("Speed limit", "Off", last=True)
         body_lay.addWidget(self.stats)
 
-        # Downloads label above the two-column area so left/right columns align.
-        dl_label = QLabel("Downloads")
-        dl_label.setProperty("role", "section-label")
-        body_lay.addWidget(dl_label)
-
-        # Two-column area
-        cols = QHBoxLayout()
+        # The two-column downloads area, as its own page. Everything about it
+        # is unchanged - it is simply no longer the only thing the body can
+        # show, so it is a widget the stack can hold rather than a bare layout.
+        downloads = QWidget()
+        cols = QHBoxLayout(downloads)
+        cols.setContentsMargins(0, 0, 0, 0)
         cols.setSpacing(16)
         cols.addLayout(self._build_stage(), 7)
         panel_host = QWidget()
         panel_host.setLayout(self._build_panel())
         cols.addWidget(build_panel_scroll_area(panel_host), 4)
-        body_lay.addLayout(cols, 1)
+
+        body_lay.addWidget(self._build_pages(downloads), 1)
 
         # Bottom action bar
         body_lay.addLayout(self._build_actionbar())
@@ -644,6 +669,128 @@ class MainWindow(QMainWindow):
         self._add_shortcut("Ctrl+P", self._toggle_queue)
         self._add_shortcut("Ctrl+V", self._paste_urls)
         self._add_shortcut("Ctrl+A", self.tree.selectAll)
+
+    def _build_pages(self, downloads: QWidget) -> QWidget:
+        """The body's destinations, behind one nav row.
+
+        Downloads is page 0 and stays the page Cove opens on: Search is an
+        additional destination, not a new front door. The nav row replaces the
+        plain "Downloads" section label that used to sit here, so nothing moves
+        and nothing else in the body changes.
+        """
+        host = QWidget()
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+
+        self.pages = QStackedWidget()
+        self.pages.addWidget(downloads)
+        self.pages.addWidget(self._build_search_page())
+
+        nav = QHBoxLayout()
+        nav.setSpacing(8)
+        self.nav_downloads = QPushButton("Downloads")
+        self.nav_search = QPushButton("Search")
+        for button, page in (
+            (self.nav_downloads, downloads),
+            (self.nav_search, self.search_widget),
+        ):
+            button.setProperty("role", "nav")
+            button.setCheckable(True)
+            # Auto-exclusive rather than a button group: the two buttons share
+            # one parent, so Qt already keeps exactly one of them checked.
+            button.setAutoExclusive(True)
+            button.setCursor(Qt.PointingHandCursor)
+            # Showing a page is all a nav button does. It must never start a
+            # search: opening Search is not asking for one.
+            button.clicked.connect(
+                lambda _checked=False, target=page: self._show_page(target)
+            )
+            nav.addWidget(button)
+        nav.addStretch(1)
+        self._show_page(downloads)
+
+        lay.addLayout(nav)
+        lay.addWidget(self.pages, 1)
+        return host
+
+    def _show_page(self, target: QWidget) -> None:
+        """Show one destination, and mark its nav button as the current one.
+
+        Showing a page is all this does - a destination is not a request for
+        whatever lives on it, so nothing here starts a search.
+
+        The highlight is the existing accent button style rather than a checked
+        state: the theme has no rule for :checked, so a nav that relied on it
+        would leave both buttons looking identical.
+        """
+        self.pages.setCurrentWidget(target)
+        for button, page in (
+            (self.nav_downloads, self.pages.widget(0)),
+            (self.nav_search, self.search_widget),
+        ):
+            current = page is target
+            button.setChecked(current)
+            button.setProperty("kind", "accent" if current else None)
+            # A property the stylesheet selects on only takes effect once the
+            # widget is re-polished.
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _build_search_page(self) -> QWidget:
+        """The Search destination: one durable widget, one service behind it.
+
+        Both are built once and owned for the window's lifetime. The service is
+        parented to the window rather than to the page because its result cache
+        is worth keeping across searches, and because a search left running
+        when the user navigates away is allowed to finish.
+
+        The window adds no Search behaviour of its own. It forwards what the
+        user asked for, and renders what the service reports back.
+        """
+        self.search_widget = SearchWidget()
+        self.search_service = SearchService(self)
+        self.search_widget.search_requested.connect(self._on_search_requested)
+        self.search_service.results_updated.connect(self._on_search_results)
+        self.search_service.search_finished.connect(self._on_search_finished)
+        return self.search_widget
+
+    def _on_search_requested(self, query: str, category) -> None:
+        """The user asked for a search. Hand it straight to the service.
+
+        Every display change happens before start(), and nothing follows it.
+        A search whose sources all answer from cache - or one with a blank
+        query, or a category no source covers - finishes inside start(), so
+        anything set afterwards would undo the final state the service has
+        already published.
+
+        The text is forwarded exactly as typed and the category exactly as
+        chosen: trimming, casefolding and source selection are the service's,
+        and a second opinion here is how the two would drift apart.
+        """
+        self.search_widget.set_results(())
+        self.search_widget.set_status("Searching…")
+        self.search_widget.set_searching(True)
+        self.search_service.start(query, category)
+
+    def _on_search_results(self, generation: int, results) -> None:
+        """Show one search's rows, if it is still the search being shown."""
+        if generation != self.search_service.generation:
+            # A superseded search may not repaint the current one. Ignoring it
+            # is the whole response: clearing rows or touching the searching
+            # state here would let an old search speak after all.
+            return
+        self.search_widget.set_results(results)
+
+    def _on_search_finished(self, summary) -> None:
+        """One search is over. Show what it amounted to, if it is still current."""
+        if summary.generation != self.search_service.generation:
+            return
+        # The summary's rows are the authoritative final snapshot, so they are
+        # rendered rather than whatever the last partial update happened to be.
+        self.search_widget.set_results(summary.results)
+        self.search_widget.set_searching(False)
+        self.search_widget.set_status(_search_status_text(summary))
 
     def _build_stage(self) -> QVBoxLayout:
         stage = QVBoxLayout()
