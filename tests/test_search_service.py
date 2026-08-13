@@ -7,6 +7,7 @@ backfill and ordering rules the UI reads.
 """
 import threading
 import time
+from collections import Counter
 
 import pytest
 from PySide6.QtCore import Qt, QCoreApplication, QRunnable, QThread, QThreadPool
@@ -571,6 +572,21 @@ class _FakeSource(Source):
         if self._raises is not None:
             raise self._raises
         return list(self._rows)
+
+
+def _queries(source) -> Counter:
+    """How many times `source` was asked each query.
+
+    Two generations can be in flight at once, and each worker appends to
+    `calls` from its own pool thread, so which entry lands first is the
+    scheduler's choice and carries no meaning. The query a worker was handed
+    is the request's own identity, and counting rather than ordering keeps a
+    missing call - or a duplicate one, which would be a real regression - just
+    as visible as the list comparison it replaces.
+
+    This is not the calls in execution order, and must not be read as such.
+    """
+    return Counter(call[0] for call in source.calls)
 
 
 def _collect(call) -> list:
@@ -3412,12 +3428,17 @@ def test_a_superseded_searchs_late_answer_is_never_cached(monkeypatch):
         release.set()
     _finish(watch)
     assert _drained(svc)
+    # Both workers have been asked and have finished by now, so what each was
+    # asked is settled - only the order they recorded it in is not.
+    assert _queries(held) == Counter({"dune": 1, "arrakis": 1}), (
+        "the superseded search and the one that replaced it were not both asked"
+    )
 
     watch.finished.clear()
     svc.start("dune")
     _finish(watch)
 
-    assert [call[0] for call in held.calls] == ["dune", "arrakis", "dune"], (
+    assert _queries(held) == Counter({"dune": 2, "arrakis": 1}), (
         "a superseded search's late answer seeded the cache"
     )
 
