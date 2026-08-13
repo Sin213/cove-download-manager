@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from cove.search.models import Category
 from cove.search.sources.base import Source
+from cove.search.sources.fitgirl import FitGirlSource
 from cove.search.sources.nyaa import NyaaSource
 from cove.search.sources.piratebay import PirateBaySource
 from cove.search.sources.yts import YtsSource
@@ -17,6 +18,9 @@ SOURCES: tuple[Source, ...] = (
     YtsSource(),
     PirateBaySource(),
     NyaaSource(),
+    # Appended, not slotted in: this order is the aggregator's tie-break, so a
+    # new source goes last rather than taking precedence from an older one.
+    FitGirlSource(),
 )
 
 

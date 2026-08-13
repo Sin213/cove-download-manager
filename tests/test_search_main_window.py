@@ -420,9 +420,14 @@ def test_a_whitespace_search_does_not_leave_the_page_searching(monkeypatch):
     assert host.search_service.active is False
 
 
-def test_a_category_no_source_covers_does_not_leave_the_page_searching(monkeypatch):
-    """GAMES has no built-in source, and the window must not hang on that."""
-    host = _host(monkeypatch)
+def test_a_search_no_source_covers_does_not_leave_the_page_searching(monkeypatch):
+    """A selection that yields nothing still finishes the page.
+
+    The empty inventory is stated here rather than borrowed from whichever
+    category happens to have no source: that changes as sources are added,
+    and this window rule does not.
+    """
+    host = _host(monkeypatch, [])
     host.search_widget.query.setText("dune")
     host.search_widget.category.setCurrentText("Games")
 

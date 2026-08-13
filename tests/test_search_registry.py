@@ -5,13 +5,32 @@ mechanism: Cove must never gain a search source from the filesystem, an entry
 point or a downloaded config. These tests pin both the order and the absence
 of any registration hook.
 """
+import ast
+
 from cove.search import registry
 from cove.search.models import Category
 from cove.search.sources.base import Source
+from cove.search.sources.fitgirl import FitGirlSource
 
 
 def test_registry_order_is_deterministic():
-    assert [source.id for source in registry.SOURCES] == ["yts", "piratebay", "nyaa"]
+    assert [source.id for source in registry.SOURCES] == [
+        "yts",
+        "piratebay",
+        "nyaa",
+        "fitgirl",
+    ]
+
+
+def test_a_new_source_is_appended_rather_than_given_priority():
+    """Order is the aggregator's tie-break, so an addition must not reorder.
+
+    FitGirl is the newest source and goes last; the three that were already
+    shipped keep the precedence they were approved with.
+    """
+    ids = [source.id for source in registry.SOURCES]
+    assert ids[:3] == ["yts", "piratebay", "nyaa"]
+    assert ids[-1] == "fitgirl"
 
 
 def test_registry_holds_source_instances():
@@ -31,6 +50,7 @@ def test_all_returns_every_enabled_source_in_registry_order():
         "yts",
         "piratebay",
         "nyaa",
+        "fitgirl",
     ]
 
 
@@ -46,8 +66,33 @@ def test_anime_selects_the_anime_sources():
     assert [s.id for s in registry.sources_for(Category.ANIME)] == ["nyaa"]
 
 
-def test_games_has_no_built_in_source_yet():
-    assert registry.sources_for(Category.GAMES) == []
+def test_games_selects_the_games_source():
+    assert [s.id for s in registry.sources_for(Category.GAMES)] == ["fitgirl"]
+
+
+def test_fitgirl_is_the_registered_adapter_and_appears_once():
+    fitgirl = [s for s in registry.SOURCES if s.id == "fitgirl"]
+    assert len(fitgirl) == 1
+    assert isinstance(fitgirl[0], FitGirlSource)
+
+
+def test_fitgirl_stays_out_of_the_categories_it_does_not_serve():
+    for category in (Category.MOVIES, Category.TV, Category.ANIME):
+        ids = [s.id for s in registry.sources_for(category)]
+        assert "fitgirl" not in ids, category
+
+
+def test_fitgirl_arrives_through_a_plain_static_import():
+    """Registration is an ordinary import, not something resolved at runtime."""
+    source = (registry.__file__ or "").replace(".pyc", ".py")
+    tree = ast.parse(open(source, encoding="utf-8").read())
+    imported = {
+        (node.module, alias.name)
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert ("cove.search.sources.fitgirl", "FitGirlSource") in imported
 
 
 def test_sources_for_defaults_to_all():

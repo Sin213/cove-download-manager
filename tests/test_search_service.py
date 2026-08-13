@@ -120,7 +120,7 @@ def test_higher_seeder_row_wins_regardless_of_registry_order():
 
 
 def test_registry_order_breaks_a_seeder_tie():
-    assert [s.id for s in SOURCES] == ["yts", "piratebay", "nyaa"]
+    assert [s.id for s in SOURCES] == ["yts", "piratebay", "nyaa", "fitgirl"]
 
     rows = [
         _result(info_hash=A, source="piratebay", seeders=7),
@@ -885,8 +885,14 @@ def test_a_whitespace_query_leaves_the_service_inactive(monkeypatch):
     assert svc.active is False
 
 
-def test_a_category_no_source_covers_finishes_empty():
-    """GAMES has no built-in source yet, and must not hang on that account."""
+def test_a_search_no_source_covers_finishes_empty(monkeypatch):
+    """A selection that yields nothing must finish, not hang.
+
+    The empty inventory is stated here rather than borrowed from a real
+    category: which categories the registry happens to cover changes as
+    sources are added, and this lifecycle rule does not.
+    """
+    _select(monkeypatch, [])
     factory, made = _counting_http_factory()
     svc = service.SearchService(http_factory=factory)
     watch = _Watch(svc)
@@ -899,6 +905,50 @@ def test_a_category_no_source_covers_finishes_empty():
     assert summary.failures == ()
     assert watch.statuses == []
     assert made == [], "a source ran for a category no source covers"
+    assert svc.active is False
+
+
+# --- K2. the shipped registry, reached the ordinary way -----------------------
+
+
+def test_a_games_search_reaches_the_registered_fitgirl_source(monkeypatch):
+    """Registration is what makes a Games search work - nothing source-specific.
+
+    Selection is the real one here: the registry is not replaced, and the
+    source asked is the very object the registry ships. Only its search is
+    stood in for, so the call is recorded instead of leaving the machine.
+    """
+    (fitgirl,) = [source for source in SOURCES if source.id == "fitgirl"]
+    asked = []
+
+    def _search(query, category, http):
+        asked.append((query, category))
+        return [_result(info_hash=A, name="Example Repack", source="fitgirl")]
+
+    monkeypatch.setattr(fitgirl, "search", _search)
+    # Belt and braces: reaching the seam above is the point, so a real request
+    # from any source fails this test rather than travelling.
+    monkeypatch.setattr(
+        SearchHttp,
+        "get_bytes",
+        lambda *a, **k: pytest.fail("a source made a real request"),
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("  halo  ", Category.GAMES)
+
+    summary = _finish(watch)
+    # The normalised query, the category as asked, exactly once.
+    assert asked == [("halo", Category.GAMES)]
+    assert [(r.source, r.name) for r in summary.results] == [
+        ("fitgirl", "Example Repack")
+    ]
+    assert summary.failures == ()
+    assert watch.states("fitgirl") == [
+        service.SourceState.RUNNING,
+        service.SourceState.COMPLETED,
+    ]
     assert svc.active is False
 
 
@@ -1297,7 +1347,8 @@ def test_a_whitespace_query_still_takes_a_generation(monkeypatch):
     assert svc.active is False
 
 
-def test_a_category_no_source_covers_still_takes_a_generation():
+def test_a_search_no_source_covers_still_takes_a_generation(monkeypatch):
+    _select(monkeypatch, [])
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
     before = svc.generation
@@ -1427,20 +1478,20 @@ def test_a_whitespace_query_supersedes_the_running_search(monkeypatch):
     assert watch.states("alpha") == [service.SourceState.RUNNING]
 
 
-def test_a_category_no_source_covers_supersedes_the_running_search(monkeypatch):
+def test_a_search_no_source_covers_supersedes_the_running_search(monkeypatch):
     release = threading.Event()
     held = _held_source(
         [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
     )
-    real_sources_for = service.sources_for
     _select(monkeypatch, [held])
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
 
     try:
         first = svc.start("dune")
-        # Real selection again, so GAMES genuinely covers no built-in source.
-        monkeypatch.setattr(service, "sources_for", real_sources_for)
+        # An empty selection for the second search: it supersedes the first
+        # without ever reaching a source of its own.
+        _select(monkeypatch, [])
         second = svc.start("halo", Category.GAMES)
         assert second > first
         assert svc.active is False
@@ -1694,7 +1745,8 @@ def test_an_immediate_blank_search_names_its_generation(monkeypatch):
     assert _finish(watch).generation == generation
 
 
-def test_an_immediate_uncovered_category_names_its_generation():
+def test_an_immediate_uncovered_search_names_its_generation(monkeypatch):
+    _select(monkeypatch, [])
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
 
@@ -1878,7 +1930,6 @@ def test_the_generation_only_ever_goes_up(monkeypatch):
         [_result(info_hash=A, source="alpha")], source_id="alpha", release=release
     )
     plain = _FakeSource([_result(info_hash=B, source="beta")], source_id="beta")
-    real_sources_for = service.sources_for
     _select(monkeypatch, [plain])
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
@@ -1895,8 +1946,8 @@ def test_the_generation_only_ever_goes_up(monkeypatch):
         cancelled = svc.cancel()                  # and this one abandons
         idle = svc.cancel()                       # an idle cancel spends none
         blank = svc.start("   ")                  # a blank search
-        monkeypatch.setattr(service, "sources_for", real_sources_for)
-        uncovered = svc.start("halo", Category.GAMES)
+        _select(monkeypatch, [])
+        uncovered = svc.start("halo", Category.GAMES)  # a search nothing covers
     finally:
         release.set()
 
@@ -1972,7 +2023,8 @@ def test_a_whitespace_query_leaves_no_deadline_armed(monkeypatch):
     assert svc._deadline.isActive() is False
 
 
-def test_a_category_no_source_covers_leaves_no_deadline_armed():
+def test_a_search_no_source_covers_leaves_no_deadline_armed(monkeypatch):
+    _select(monkeypatch, [])
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
 
@@ -4335,7 +4387,8 @@ def test_a_whitespace_query_still_records_a_whole_lifecycle(monkeypatch, diag):
     assert finished["failure_count"] == 0
 
 
-def test_a_category_no_source_covers_still_records_a_whole_lifecycle(diag):
+def test_a_search_no_source_covers_still_records_a_whole_lifecycle(diag, monkeypatch):
+    _select(monkeypatch, [])
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
 

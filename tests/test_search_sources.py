@@ -709,11 +709,10 @@ def test_fitgirl_declares_games_only():
     assert source.reports_swarm is False
 
 
-def test_fitgirl_is_a_source_and_is_not_registered_yet():
-    from cove.search.registry import SOURCES
-
+def test_fitgirl_is_a_source():
+    # Whether it is registered is the registry suite's question, not this
+    # one's - this file owns the adapter, not Cove's source inventory.
     assert isinstance(fitgirl_source(), Source)
-    assert "fitgirl" not in {source.id for source in SOURCES}
 
 
 def test_fitgirl_returns_nothing_for_a_category_it_does_not_serve():
