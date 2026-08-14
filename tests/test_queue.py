@@ -7633,3 +7633,309 @@ def test_a_wish_dropped_as_redundant_still_settles_local_state(
     assert rpc.paused == ["gid-1"], "no second pause was necessary"
     assert task.status == "paused", "but the task is paused, and says so"
     assert _persisted_row(db_path, tid)["status"] == "paused"
+
+
+# ---------------------------------------------------------------------------
+# Download progress stability.
+#
+# One stable task identity - one gid, one content scope - must never render a
+# byte count (and so a percentage) lower than one it has already rendered,
+# when the backend's own samples only ever moved forward. Identity changes are
+# a different matter: they are allowed, and required, to start over.
+# ---------------------------------------------------------------------------
+
+def _active_task(**overrides) -> queue_module.DownloadTask:
+    fields = dict(
+        id=1,
+        url="https://example.com/big.zip",
+        out_dir="/dl",
+        gid="gid-a",
+        status="active",
+        total_bytes=1_000_000_000,
+        completed_bytes=535_000_000,
+        download_speed=20_000_000,
+        last_status_at=time.time(),
+    )
+    fields.update(overrides)
+    return queue_module.DownloadTask(**fields)
+
+
+def test_display_does_not_step_back_when_the_next_sample_undershoots():
+    """The average speed aria2 reports is not the instantaneous rate, so the
+    extrapolation regularly lands ahead of where the next real sample says the
+    transfer is. Both samples here move forward; only Cove's own prediction
+    moved backward."""
+    task = _active_task(last_status_at=time.time() - 0.4)
+
+    first = task.interpolated_completed_bytes()
+    # A genuine forward step - 535 MB to 538 MB - that is nevertheless behind
+    # where a 20 MB/s average predicted the row would be by now.
+    task.completed_bytes = 538_000_000
+    task.download_speed = 5_000_000
+    task.last_status_at = time.time()
+    second = task.interpolated_completed_bytes()
+
+    assert second >= first, "displayed bytes went backward for a stable gid"
+    assert (int(second * 100 / task.total_bytes)
+            >= int(first * 100 / task.total_bytes)), "visible percent regressed"
+
+
+def test_extrapolation_never_reaches_beyond_one_poll_period():
+    """Extrapolation exists to bridge the gap to the next sample. Predicting
+    further than that is unfounded, and the overshoot is precisely what the
+    next sample yanks back."""
+    task = _active_task(completed_bytes=100_000_000, download_speed=10_000_000,
+                        last_status_at=time.time() - 5.0)
+
+    ceiling = 100_000_000 + int(10_000_000 * queue_module.POLL_INTERVAL_S)
+    assert task.interpolated_completed_bytes() <= ceiling
+
+
+def test_progress_still_advances_between_two_polls():
+    """Positive control: the fix must not flatten the bar into a 2 Hz step."""
+    task = _active_task(last_status_at=time.time() - 0.2)
+
+    assert task.interpolated_completed_bytes() > task.completed_bytes
+
+
+def test_interpolated_bytes_never_exceed_the_total():
+    task = _active_task(completed_bytes=999_000_000, download_speed=500_000_000,
+                        last_status_at=time.time() - 30.0)
+
+    assert task.interpolated_completed_bytes() <= task.total_bytes
+
+
+def test_an_unknown_total_leaves_the_raw_count_alone():
+    """Characterisation: with no denominator the window renders no percentage,
+    and the byte readout must stay whatever the backend last reported."""
+    task = _active_task(total_bytes=0, completed_bytes=4096, download_speed=0)
+
+    assert task.interpolated_completed_bytes() == 4096
+
+
+def test_a_paused_task_does_not_keep_creeping_forward():
+    task = _active_task(last_status_at=time.time() - 0.3)
+    task.interpolated_completed_bytes()
+
+    task.status = "paused"
+    task.download_speed = 0
+    held = task.interpolated_completed_bytes()
+    assert task.interpolated_completed_bytes() == held
+
+
+def test_a_completed_task_renders_the_whole_total():
+    task = _active_task(status="completed", completed_bytes=1_000_000_000,
+                        download_speed=0)
+
+    assert task.interpolated_completed_bytes() == 1_000_000_000
+
+
+def test_a_new_gid_is_not_held_up_by_the_old_one_s_progress():
+    """A gid change is a new progress identity. Nothing already displayed for
+    the previous one may act as a floor under it."""
+    task = _active_task(completed_bytes=800_000_000)
+    assert task.interpolated_completed_bytes() >= 800_000_000
+
+    task.gid = "gid-b"
+    task.completed_bytes = 50_000_000
+    task.download_speed = 0
+    assert task.interpolated_completed_bytes() == 50_000_000
+
+
+def test_a_changed_total_is_not_held_up_by_the_old_scope_s_progress():
+    task = _active_task(completed_bytes=800_000_000, download_speed=0)
+    assert task.interpolated_completed_bytes() == 800_000_000
+
+    task.total_bytes = 4_000_000_000
+    task.completed_bytes = 20_000_000
+    assert task.interpolated_completed_bytes() == 20_000_000
+
+
+def _capture_polls(queue):
+    """Record the callbacks _poll_active hands to the thread pool, without
+    running anything. Returns (done_callbacks, fail_callbacks)."""
+    done, failed = [], []
+
+    def _fake_spawn(fn, *a, on_done=None, on_fail=None, **kw):
+        done.append(on_done)
+        failed.append(on_fail)
+
+    queue._spawn = _fake_spawn
+    return done, failed
+
+
+def test_only_one_status_request_per_task_is_in_flight(queue_env):
+    """The poll timer fires on a fixed period rather than on the previous
+    answer, so an unguarded poll of a slow daemon puts two tellStatus calls for
+    one gid on the pool at once. They sample aria2 in whatever order they reach
+    it, not the order they were submitted, so the older snapshot can land last
+    and walk the task's byte count backwards."""
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/big.zip")
+    task = queue.tasks[tid]
+    task.gid, task.status = "gid-a", "active"
+    done, _failed = _capture_polls(queue)
+
+    queue._poll_active()
+    queue._poll_active()
+
+    assert len(done) == 1, "a second request started while the first was out"
+
+
+def test_the_next_poll_starts_once_the_answer_lands(queue_env):
+    """Positive control: the guard must not stop polling altogether."""
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/big.zip")
+    task = queue.tasks[tid]
+    task.gid, task.status = "gid-a", "active"
+    done, _failed = _capture_polls(queue)
+
+    queue._poll_active()
+    done[0]({"status": "active", "totalLength": "1000", "completedLength": "590",
+             "downloadSpeed": "10"})
+    assert task.completed_bytes == 590
+
+    queue._poll_active()
+    assert len(done) == 2
+    done[1]({"status": "active", "totalLength": "1000", "completedLength": "600",
+             "downloadSpeed": "10"})
+    assert task.completed_bytes == 600
+
+
+def test_a_failed_status_request_frees_the_slot(queue_env):
+    """An RPC that errors out must not leave the task unpollable for good."""
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/big.zip")
+    task = queue.tasks[tid]
+    task.gid, task.status = "gid-a", "active"
+    done, failed = _capture_polls(queue)
+
+    queue._poll_active()
+    failed[0]("aria2 is not answering")
+
+    queue._poll_active()
+    assert len(done) == 2
+
+
+def test_metadata_size_and_speed_do_not_survive_the_payload_promotion(
+    queue_env, monkeypatch
+):
+    """The metadata gid's length, rate and sample time describe the torrent
+    file, not the payload. Left in place they are the progress bar's
+    denominator and extrapolation anchor until the first payload status lands,
+    which renders a percentage derived from the wrong transfer."""
+    queue, _rpc, _db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "active", "totalLength": "30000",
+                              "completedLength": "12000", "downloadSpeed": "6000"})
+
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    task = queue.tasks[tid]
+    assert task.gid == "gid-child"
+    assert task.completed_bytes == 0
+    assert task.total_bytes == 0, "metadata length became the payload denominator"
+    assert task.download_speed == 0
+    assert task.last_status_at == 0.0
+    assert task.interpolated_completed_bytes() == 0
+
+
+def test_the_payload_s_first_status_supplies_the_real_size(
+    queue_env, monkeypatch
+):
+    """Positive control: clearing the metadata denominator must not leave the
+    row sizeless once the payload reports for itself."""
+    queue, _rpc, _db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    queue._apply_status(tid, {"status": "active", "totalLength": "30000",
+                              "completedLength": "12000", "downloadSpeed": "6000"})
+    queue._apply_status(tid, {"status": "complete", "followedBy": ["gid-child"]})
+
+    queue._apply_status(tid, {"status": "active", "totalLength": "8000000000",
+                              "completedLength": "400000000", "downloadSpeed": "0"})
+
+    task = queue.tasks[tid]
+    assert task.total_bytes == 8_000_000_000
+    assert task.interpolated_completed_bytes() == 400_000_000
+
+
+def test_a_stalling_download_is_not_stranded_at_a_speculative_total():
+    """Completion is aria2's to declare. If a prediction were allowed to
+    assert the total, the display floor would hold the row there for good and
+    a transfer that stalls one byte short would read as finished forever."""
+    task = _active_task(total_bytes=1000, completed_bytes=999,
+                        download_speed=5000, last_status_at=time.time() - 0.5)
+    assert task.interpolated_completed_bytes() < 1000
+
+    task.download_speed = 0
+    task.last_status_at = time.time()
+    assert task.interpolated_completed_bytes() == 999
+
+
+def test_a_raw_count_that_reached_the_total_is_not_shaved():
+    """Positive control: aria2 reports completedLength == totalLength before
+    it reports status "complete" - during the final flush, and during a
+    torrent's hash check. That is a measurement, not a prediction, and holding
+    it back would invent a regression of its own."""
+    task = _active_task(total_bytes=1000, completed_bytes=1000,
+                        download_speed=10, last_status_at=time.time() - 0.5)
+
+    assert task.interpolated_completed_bytes() == 1000
+
+
+def test_a_retry_does_not_inherit_the_failed_attempt_s_displayed_progress(queue_env):
+    """The ffmpeg and yt-dlp backends carry no gid, and a retry reuses the
+    same total, so nothing in the display floor's identity key changes between
+    one attempt and the next. A fresh attempt has to say so itself, or the row
+    sits at the failed attempt's percentage until the new process catches up."""
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/clip.m3u8")
+    task = queue.tasks[tid]
+    task.backend = "ffmpeg"
+    task.gid = None
+    task.status = "active"
+    task.total_bytes = 1000
+    task.completed_bytes = 990
+    task.download_speed = 0
+    task.last_status_at = time.time()
+    assert task.interpolated_completed_bytes() == 990
+
+    # The retry, exactly as production takes it: nothing clears the failed
+    # attempt's raw count, and ffmpeg will not state a position of its own for
+    # seconds yet.
+    task.status = "error"
+    # The process start itself is not what is under test here.
+    queue._launch_hls = lambda t: None
+    queue._launch(task)
+
+    assert task.completed_bytes == 0
+    assert task.interpolated_completed_bytes() == 0
+
+
+def test_relaunching_an_aria2_transfer_keeps_its_raw_count(queue_env):
+    """Positive control: aria2 picks up from its own control file and a status
+    poll corrects the count inside one poll period. Zeroing here would drop the
+    row to 0% for no reason at all."""
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/big.zip")
+    task = queue.tasks[tid]
+    task.total_bytes, task.completed_bytes = 1000, 400
+    task.gid = None
+    queue._spawn = lambda *a, **kw: None
+
+    queue._launch(task)
+
+    assert task.completed_bytes == 400
+
+
+def test_resuming_an_aria2_transfer_keeps_its_displayed_progress(queue_env):
+    """Positive control: an unpause continues the same attempt on the same
+    gid. Clearing the floor there would let the row step backwards on resume."""
+    queue, _rpc, _db = queue_env()
+    tid = queue.add_url("https://example.com/big.zip")
+    task = queue.tasks[tid]
+    task.gid, task.status = "gid-a", "paused"
+    task.total_bytes, task.completed_bytes = 1000, 400
+    assert task.interpolated_completed_bytes() == 400
+
+    queue.resume(tid)
+
+    assert task.interpolated_completed_bytes() == 400

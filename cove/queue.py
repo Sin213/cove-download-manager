@@ -175,6 +175,12 @@ TORRENT_ARIA2_FAILED = "Cove's BitTorrent engine could not download this torrent
 # restart re-derives it.
 PHASE_METADATA = "metadata"
 
+# How often aria2 is asked for the state of every running transfer, in
+# seconds. Also the horizon DownloadTask extrapolates over: the two have to
+# agree, or the progress bar predicts further than the sample it is waiting
+# for and gets pulled back when that sample arrives.
+POLL_INTERVAL_S = 0.5
+
 
 def _torrent_error_text(code) -> str:
     """A torrent failure the user can report, carrying no swarm data.
@@ -318,6 +324,23 @@ class DownloadTask:
     # "metadata" while aria2 is still fetching a magnet's torrent metadata.
     # Transient by design: it is re-derived when the magnet is re-added.
     phase: str = ""
+    # Ephemeral display memory owned by interpolated_completed_bytes: the
+    # highest count already shown, and the progress identity it belongs to.
+    # Never persisted and never reported by the API - the raw fields above
+    # remain the truth about the transfer.
+    shown_bytes: int = 0
+    shown_identity: tuple = ()
+
+    def reset_display_progress(self) -> None:
+        """Forget the byte count already shown for this task.
+
+        A fresh attempt is a new progress identity even when the identity key
+        in interpolated_completed_bytes cannot see it: the ffmpeg and yt-dlp
+        backends carry no gid, and a retry reuses the same total, so the two
+        attempts are indistinguishable from the display's point of view.
+        """
+        self.shown_bytes = 0
+        self.shown_identity = ()
 
     def clear_debrid(self) -> None:
         self.resolved_url = ""
@@ -329,21 +352,50 @@ class DownloadTask:
         return (completed / self.total_bytes) if self.total_bytes else 0.0
 
     def interpolated_completed_bytes(self) -> int:
-        """Predicted byte count between aria2 polls.
+        """Byte count to display between aria2 polls.
 
         We poll aria2 a few times a second, but the UI repaints at ~30 fps;
         between samples we extrapolate `completed_bytes + speed * elapsed`
         so the progress bar moves smoothly instead of stepping.
+
+        Two corrections keep that smoothing from reading as a download going
+        backwards. The speed aria2 reports is an average, not the rate of the
+        next half second, so the prediction routinely lands ahead of the
+        sample that follows it - hence 53% -> 54% -> 53%.
+
+        * The prediction reaches at most one poll period ahead. It exists to
+          bridge the gap to the next sample; past that it is guesswork, and
+          the further it guesses the harder the correction.
+        * Whatever residue is left never renders as a step backwards: the
+          highest count already shown is held as a floor. The floor belongs
+          to one progress identity - one gid, one total - so a gid swap
+          (a retry, a magnet's metadata gid giving way to its payload) or a
+          change of content scope starts it over. It is display memory only;
+          `completed_bytes` stays exactly what aria2 said.
         """
-        if self.status != "active" or self.last_status_at <= 0 or self.download_speed <= 0:
-            return self.completed_bytes
-        elapsed = time.time() - self.last_status_at
-        if elapsed <= 0:
-            return self.completed_bytes
-        predicted = self.completed_bytes + int(self.download_speed * elapsed)
+        predicted = self.completed_bytes
+        if self.status == "active" and self.last_status_at > 0 and self.download_speed > 0:
+            elapsed = min(time.time() - self.last_status_at, POLL_INTERVAL_S)
+            if elapsed > 0:
+                predicted += int(self.download_speed * elapsed)
+                if self.total_bytes > 0:
+                    # A prediction may approach the total but never assert it.
+                    # Completion is aria2's to declare, and the floor below
+                    # would make a speculative 100% permanent - a transfer
+                    # that stalls a byte short would read as finished for
+                    # good. `completed_bytes` reaching the total is a
+                    # measurement, not a prediction, so it is left alone.
+                    predicted = max(self.completed_bytes,
+                                    min(predicted, self.total_bytes - 1))
+        identity = (self.gid, self.total_bytes)
+        if identity != self.shown_identity:
+            self.shown_identity = identity
+            self.shown_bytes = 0
+        shown = max(predicted, self.shown_bytes)
         if self.total_bytes > 0:
-            predicted = min(predicted, self.total_bytes)
-        return predicted
+            shown = min(shown, self.total_bytes)
+        self.shown_bytes = shown
+        return shown
 
 
 class _RpcCall(QRunnable):
@@ -482,8 +534,10 @@ class QueueManager(QObject):
         self._extractor_paused_work: set[int] = set()
         self._extractor_final_path: dict[int, str] = {}
         self._extractor_line_buffer: dict[int, str] = {}
+        # Tasks with a tellStatus outstanding. See _poll_active.
+        self._polling: set[int] = set()
         self._poll = QTimer(self)
-        self._poll.setInterval(500)
+        self._poll.setInterval(int(POLL_INTERVAL_S * 1000))
         self._poll.timeout.connect(self._poll_active)
         self._poll.start()
         self._ext_poll = QTimer(self)
@@ -1709,6 +1763,14 @@ class QueueManager(QObject):
             t.error = None
             t.finished_at = None
             t.completed_bytes = 0
+            # The metadata gid's length, rate and sample time describe the
+            # torrent file, not the payload. Left in place they are the
+            # progress bar's denominator and extrapolation anchor until the
+            # payload's first status lands - a percentage computed from a
+            # thirty-kilobyte transfer that has nothing to do with this one.
+            t.total_bytes = 0
+            t.download_speed = 0
+            t.last_status_at = 0.0
             # The child gid is the actual transfer, and aria2 starts it
             # running. A pause taken during the metadata fetch — by the
             # user, by stop_queue or by the scheduler — has to be re-applied
@@ -3065,6 +3127,25 @@ class QueueManager(QObject):
     def _launch(self, t: DownloadTask) -> None:
         t.status = "active"
         t.error = None
+        # Every fresh attempt - a retry, a force-start, a resume that has to
+        # relaunch - passes through here, and starts its progress over. An
+        # aria2 unpause continues the same attempt and does not come this way,
+        # so resuming a transfer keeps what it has already shown.
+        #
+        # ffmpeg and yt-dlp state an absolute position on their own first
+        # progress line, and nothing else writes their count. Until that line
+        # arrives - seconds, while ffmpeg probes a manifest or yt-dlp resolves
+        # a page - the failed attempt's count is all the row has, and the
+        # task_changed below puts it straight back on screen. Clearing the
+        # anchor as well as the display memory stops the row advertising a
+        # percentage no running process stands behind. aria2 tasks keep
+        # theirs: their gid already tells the attempts apart, and a status
+        # poll corrects the count inside one poll period.
+        if t.backend in ("ffmpeg", "yt-dlp"):
+            t.completed_bytes = 0
+            t.download_speed = 0
+            t.last_status_at = 0.0
+        t.reset_display_progress()
         # Any previously generated debrid link has expired by now; a fresh
         # one is resolved from t.url below.
         t.clear_debrid()
@@ -3461,15 +3542,24 @@ class QueueManager(QObject):
         if not active:
             return
         for t in active:
-            if t.id in self._removing:
+            # One status request per task at a time. The timer fires on a
+            # fixed period rather than on the previous answer, so an unguarded
+            # poll of a busy or slow daemon puts two tellStatus calls for one
+            # gid on the pool at once. They sample aria2 in whatever order
+            # they reach it - which is not the order they were submitted in -
+            # so the older snapshot can land last and walk the task's byte
+            # count backwards. Ordering two concurrent answers after the fact
+            # is guesswork; not making the second call is not.
+            if t.id in self._removing or t.id in self._polling:
                 continue
+            self._polling.add(t.id)
             self._spawn(
                 self.rpc.tell_status,
                 t.gid,
                 on_done=lambda status, tid=t.id, gid=t.gid: self._on_poll_status(
                     tid, gid, status
                 ),
-                on_fail=lambda *_: None,
+                on_fail=lambda *_, tid=t.id: self._polling.discard(tid),
             )
 
     def _on_poll_status(self, tid: int, gid: str, status: dict) -> None:
@@ -3479,7 +3569,12 @@ class QueueManager(QObject):
         still be in flight. The answer is addressed to the task by id, so
         without this check the old transfer's progress, error or completion
         would be written onto its replacement.
+
+        Freeing the slot is unconditional and comes first: _spawn always ends
+        in exactly one of done or failed, so every task added to _polling is
+        removed from it, whatever the answer turns out to say.
         """
+        self._polling.discard(tid)
         t = self.tasks.get(tid)
         if t is None or t.gid != gid:
             return
