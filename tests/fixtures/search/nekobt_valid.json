@@ -1,0 +1,50 @@
+{
+  "error": false,
+  "data": {
+    "results": [
+      {
+        "id": "10000000000001",
+        "uploaded_at": 1785499942639,
+        "title": "[Example] Example Anime 01-12 (BD 1080p)",
+        "infohash": "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "magnet": "magnet:?xt=urn:btih:aaaa1111bbbb2222cccc3333dddd4444eeee5555&dn=Example+Anime&tr=udp%3A%2F%2Ftracker.example%3A451%2Fannounce",
+        "private_magnet": null,
+        "filesize": "16657087194",
+        "category": 1,
+        "seeders": "42",
+        "leechers": "7",
+        "completed": "3",
+        "hidden": false
+      },
+      {
+        "id": "10000000000002",
+        "uploaded_at": 1764126575468,
+        "title": "[Example] Example Show - 12 (WEB 720p)",
+        "infohash": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "magnet": "magnet:?xt=urn:btih:abcdefabcdefabcdefabcdefabcdefabcdefabcd&dn=Example+Show&tr=udp%3A%2F%2Ftracker.example%3A451%2Fannounce",
+        "private_magnet": null,
+        "filesize": "1073741824",
+        "category": 1,
+        "seeders": "0",
+        "leechers": "0",
+        "completed": "0",
+        "hidden": false
+      },
+      {
+        "id": "10000000000003",
+        "uploaded_at": 0,
+        "title": "[Example] Example Movie (BD 2160p)",
+        "infohash": "AA11BB22CC33DD44EE55FF66AA77BB88CC99DD00",
+        "magnet": "magnet:?xt=urn:btih:AA11BB22CC33DD44EE55FF66AA77BB88CC99DD00&dn=Example+Movie&tr=udp%3A%2F%2Ftracker.example%3A451%2Fannounce",
+        "private_magnet": null,
+        "filesize": null,
+        "category": 1,
+        "seeders": "5",
+        "leechers": "1",
+        "completed": "9",
+        "hidden": false
+      }
+    ],
+    "more": false
+  }
+}

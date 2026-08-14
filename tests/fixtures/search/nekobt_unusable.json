@@ -1,0 +1,18 @@
+{
+  "error": false,
+  "data": {
+    "items": [
+      {
+        "id": "30000000000001",
+        "uploaded_at": 1785499942639,
+        "title": "[Example] Renamed Container",
+        "infohash": "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "magnet": "magnet:?xt=urn:btih:aaaa1111bbbb2222cccc3333dddd4444eeee5555&dn=Renamed",
+        "filesize": "1024",
+        "seeders": "3",
+        "leechers": "1"
+      }
+    ],
+    "more": false
+  }
+}

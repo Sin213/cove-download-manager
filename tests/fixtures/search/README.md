@@ -8,6 +8,7 @@ returns. They were trimmed down from single manual captures of
 - Nyaa `/?page=rss`
 - FitGirl `/?s=` and one repack page
 - SubsPlease `/api/?f=search&tz=UTC&s=` (contract verified 2026-08-12)
+- nekoBT `/api/v1/torrents/search?query=` (contract verified 2026-08-14)
 
 and then edited by hand: titles and hashes are invented, and no cookies,
 tokens, headers or other request metadata were kept. Nothing refreshes these
@@ -30,3 +31,11 @@ names, episode numbers and every info hash are invented, the magnets carry a
 single `tracker.example` announce URL rather than the real tracker list, and a
 drift file renames the `downloads` container so the parser must refuse it
 instead of reporting an empty search.
+
+The nekoBT files keep only the envelope the parser reads - `data.results` and
+the fields of a row - not the media, similar-media, uploader or debug blocks
+the API also sends. Titles and info hashes are invented, the magnets carry a
+single `tracker.example` announce URL, `filesize`/`seeders`/`leechers` stay
+strings and `uploaded_at` stays epoch milliseconds because that is what the
+API publishes, and the unusable file renames `results` to `items` so the
+parser must refuse it instead of reporting an empty search.

@@ -1373,3 +1373,364 @@ def test_subsplease_never_bypasses_search_http():
         "lxml",
     ):
         assert banned not in text
+
+
+# --- nekoBT ------------------------------------------------------------------
+
+NEKOBT_ENDPOINT = "https://nekobt.to/api/v1/torrents/search"
+
+
+def nekobt_source():
+    from cove.search.sources.nekobt import NekoBtSource
+
+    return NekoBtSource()
+
+
+# Group A - identity and category
+
+
+def test_nekobt_declares_anime_only():
+    source = nekobt_source()
+    assert source.id == "nekobt"
+    assert source.label == "nekoBT"
+    assert source.categories == (Category.ANIME,)
+    assert source.homepage == "https://nekobt.to"
+    assert source.serves(Category.ANIME)
+    assert source.serves(Category.ALL)
+    assert not source.serves(Category.MOVIES)
+    assert not source.serves(Category.TV)
+    assert not source.serves(Category.GAMES)
+
+
+def test_nekobt_is_a_source():
+    assert isinstance(nekobt_source(), Source)
+
+
+def test_nekobt_reports_swarm_because_the_api_publishes_counts():
+    assert nekobt_source().reports_swarm is True
+
+
+def test_nekobt_returns_nothing_for_a_category_it_does_not_serve():
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    assert source.search("example", Category.MOVIES, http) == []
+    # A category this source cannot answer costs no request at all.
+    assert session.calls == []
+
+
+# Group B - request shape
+
+
+def test_nekobt_queries_the_search_api():
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(fixture("nekobt_empty.json")))
+    source.search("example anime", Category.ANIME, http)
+
+    url, kwargs = session.calls[0]
+    assert url == NEKOBT_ENDPOINT
+    assert kwargs["params"] == {"query": "example anime"}
+
+
+def test_nekobt_hands_awkward_queries_over_as_a_parameter_not_a_url():
+    source = nekobt_source()
+    query = "a/b?c=d&e #1"
+    http, session = http_with(FakeResponse(fixture("nekobt_empty.json")))
+    source.search(query, Category.ANIME, http)
+
+    url, kwargs = session.calls[0]
+    assert url == NEKOBT_ENDPOINT
+    assert kwargs["params"]["query"] == query
+
+
+def test_nekobt_serves_the_all_category():
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    assert source.search("example", Category.ALL, http)
+    assert len(session.calls) == 1
+
+
+# Group C - explicit no results
+
+
+def test_nekobt_returns_empty_for_the_explicit_no_results_payload():
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(fixture("nekobt_empty.json")))
+    assert source.search("nothing", Category.ANIME, http) == []
+    assert len(session.calls) == 1
+
+
+# Group D - malformed responses
+
+
+def test_nekobt_raises_parse_for_malformed_json():
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(b'{"error": false, "data": {'))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+def test_nekobt_raises_parse_when_the_results_container_is_renamed():
+    # An empty search answers with `results: []`, so a payload with no results
+    # container at all is schema drift, not a search that found nothing.
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(fixture("nekobt_unusable.json")))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("example", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not a payload",
+        42,
+        None,
+        True,
+        [],
+        [{"title": "Example Anime"}],
+        {"error": False},
+        {"error": False, "data": None},
+        {"error": False, "data": []},
+        {"error": False, "data": {"results": None}},
+        {"error": False, "data": {"results": {}}},
+        {"error": False, "data": {"results": "none"}},
+    ],
+)
+def test_nekobt_raises_parse_for_a_shape_the_api_does_not_publish(payload):
+    source = nekobt_source()
+    http, _ = http_with(json_response(payload))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+def test_nekobt_does_not_read_a_challenge_page_as_no_results():
+    source = nekobt_source()
+    http, _ = http_with(
+        FakeResponse(b"<!DOCTYPE html><html><body>Checking...</body></html>")
+    )
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+def test_nekobt_does_not_turn_a_transport_failure_into_empty_results():
+    source = nekobt_source()
+    http, _ = http_with(FakeResponse(b"nope", status_code=503))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.ANIME, http)
+    assert excinfo.value.kind is SourceErrorKind.HTTP
+
+
+def test_nekobt_error_details_do_not_echo_the_query_or_the_body():
+    source = nekobt_source()
+    http, _ = http_with(json_response({"error": False, "data": {"items": []}}))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("a secret query", Category.ANIME, http)
+    message = str(excinfo.value)
+    assert "secret" not in message
+    assert "items" not in message
+    assert len(message) < 200
+
+
+# Group E - normalisation, swarm, size and date
+
+
+def test_nekobt_normalises_valid_results():
+    source = nekobt_source()
+    http, session = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    assert len(session.calls) == 1
+    assert [r.name for r in results] == [
+        "[Example] Example Anime 01-12 (BD 1080p)",
+        "[Example] Example Show - 12 (WEB 720p)",
+        "[Example] Example Movie (BD 2160p)",
+    ]
+    assert [r.source for r in results] == ["nekobt", "nekobt", "nekobt"]
+    assert [r.info_hash for r in results] == [
+        "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00",
+    ]
+
+
+def test_nekobt_keeps_the_provider_magnet_verbatim():
+    source = nekobt_source()
+    payload = json.loads(fixture("nekobt_valid.json"))
+    http, _ = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # The API hands out a complete magnet, so it is passed through untouched
+    # and only its hash is normalised for the result identity.
+    assert [r.magnet for r in results] == [
+        row["magnet"] for row in payload["data"]["results"]
+    ]
+
+
+def test_nekobt_keeps_the_swarm_counts_the_api_reports():
+    source = nekobt_source()
+    http, _ = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # The API sends these as strings; a reported zero stays a zero.
+    assert [(r.seeders, r.leechers) for r in results] == [(42, 7), (0, 0), (5, 1)]
+
+
+def test_nekobt_reads_filesize_as_a_byte_count():
+    source = nekobt_source()
+    http, _ = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # `filesize` is a decimal string of bytes, and null means "not reported".
+    assert [r.size_bytes for r in results] == [16657087194, 1073741824, None]
+
+
+def test_nekobt_converts_uploaded_at_from_milliseconds():
+    source = nekobt_source()
+    http, _ = http_with(FakeResponse(fixture("nekobt_valid.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # `uploaded_at` is epoch milliseconds; SearchResult.added is seconds.
+    assert [r.added for r in results] == [1785499942, 1764126575, None]
+
+
+# Group F - torrent identity
+
+
+def test_nekobt_derives_the_hash_from_the_magnet_it_was_given():
+    source = nekobt_source()
+    payload = {
+        "error": False,
+        "data": {
+            "results": [
+                {
+                    "title": "[Example] Disagreeing Fields",
+                    # A provider `infohash` that contradicts the magnet must
+                    # never become the result identity: the magnet Cove hands
+                    # to the torrent path is the one that decides.
+                    "infohash": "1111111111111111111111111111111111111111",
+                    "magnet": (
+                        "magnet:?xt=urn:btih:"
+                        "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+                    ),
+                    "filesize": "1024",
+                    "seeders": "1",
+                    "leechers": "0",
+                    "uploaded_at": 1785499942639,
+                }
+            ]
+        },
+    }
+    http, _ = http_with(json_response(payload))
+    (result,) = source.search("example", Category.ANIME, http)
+
+    assert result.info_hash == "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+    from cove.search.magnet import extract_info_hash
+
+    assert extract_info_hash(result.magnet) == result.info_hash
+
+
+def test_nekobt_drops_malformed_rows_but_keeps_the_good_ones():
+    source = nekobt_source()
+    http, _ = http_with(FakeResponse(fixture("nekobt_malformed_rows.json")))
+    results = source.search("example", Category.ANIME, http)
+
+    # A string in place of a row, a null magnet, an unparseable magnet, a
+    # blank title and the all-zero placeholder hash each cost only themselves.
+    assert [r.info_hash for r in results] == [
+        "cccc1111dddd2222eeee3333ffff44445555aaaa",
+        "dddd1111eeee2222ffff33334444555566667777",
+    ]
+    # Junk in the optional fields does not take a usable torrent down with it,
+    # and it is never replaced with an invented value.
+    junk = results[0]
+    assert junk.size_bytes is None
+    assert junk.added is None
+    assert (junk.seeders, junk.leechers) == (0, 0)
+
+
+# Group G - result cap and request cost
+
+
+def nekobt_payload(rows: int) -> dict:
+    return {
+        "error": False,
+        "data": {
+            "results": [
+                {
+                    "title": f"[Example] Example Anime - {index:04d}",
+                    "infohash": f"{index:040x}",
+                    "magnet": f"magnet:?xt=urn:btih:{index:040x}",
+                    "filesize": "1024",
+                    "seeders": "1",
+                    "leechers": "0",
+                    "uploaded_at": 1785499942639,
+                }
+                for index in range(1, rows + 1)
+            ],
+            "more": True,
+        },
+    }
+
+
+def test_nekobt_caps_the_number_of_results():
+    source = nekobt_source()
+    http, session = http_with(json_response(nekobt_payload(MAX_RESULTS + 50)))
+    results = source.search("many", Category.ANIME, http)
+
+    assert len(results) == MAX_RESULTS
+    assert results[0].info_hash == f"{1:040x}"
+    assert results[-1].info_hash == f"{MAX_RESULTS:040x}"
+    # A larger answer never costs a larger number of requests.
+    assert len(session.calls) == 1
+
+
+def test_nekobt_never_paginates_or_follows_a_result():
+    source = nekobt_source()
+    # `more` is true and every row carries an id, yet neither buys a request.
+    http, session = http_with(json_response(nekobt_payload(3)))
+    source.search("example", Category.ANIME, http)
+
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url == NEKOBT_ENDPOINT
+    assert set(kwargs["params"]) == {"query"}
+
+
+def test_nekobt_never_bypasses_search_http():
+    import inspect
+
+    from cove.search.sources import nekobt as module
+
+    text = inspect.getsource(module)
+    for banned in (
+        "import requests",
+        "urllib.request",
+        "import httpx",
+        "import aiohttp",
+        "import subprocess",
+        "selenium",
+        "playwright",
+        "BeautifulSoup",
+        "lxml",
+    ):
+        assert banned not in text
+
+
+# Group H - the adapter is not registered yet
+
+
+def test_nekobt_is_not_in_the_registry():
+    from cove.search.registry import SOURCES
+
+    assert [source.id for source in SOURCES] == [
+        "yts",
+        "piratebay",
+        "nyaa",
+        "fitgirl",
+        "subsplease",
+    ]

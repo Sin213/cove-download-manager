@@ -1,0 +1,69 @@
+{
+  "error": false,
+  "data": {
+    "results": [
+      "not an object",
+      {
+        "id": "20000000000001",
+        "uploaded_at": 1785499942639,
+        "title": "[Example] No Magnet",
+        "infohash": "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "magnet": null,
+        "filesize": "1024",
+        "seeders": "3",
+        "leechers": "1"
+      },
+      {
+        "id": "20000000000002",
+        "uploaded_at": 1785499942639,
+        "title": "[Example] Broken Magnet",
+        "infohash": "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+        "magnet": "not-a-magnet",
+        "filesize": "1024",
+        "seeders": "3",
+        "leechers": "1"
+      },
+      {
+        "id": "20000000000003",
+        "uploaded_at": 1785499942639,
+        "title": "   ",
+        "infohash": "bbbb1111cccc2222dddd3333eeee4444ffff5555",
+        "magnet": "magnet:?xt=urn:btih:bbbb1111cccc2222dddd3333eeee4444ffff5555&dn=Blank+Title",
+        "filesize": "1024",
+        "seeders": "3",
+        "leechers": "1"
+      },
+      {
+        "id": "20000000000004",
+        "uploaded_at": 1785499942639,
+        "title": "[Example] Placeholder Hash",
+        "infohash": "0000000000000000000000000000000000000000",
+        "magnet": "magnet:?xt=urn:btih:0000000000000000000000000000000000000000&dn=Placeholder",
+        "filesize": "1024",
+        "seeders": "3",
+        "leechers": "1"
+      },
+      {
+        "id": "20000000000005",
+        "uploaded_at": "not a timestamp",
+        "title": "[Example] Survivor With Junk Fields",
+        "infohash": "cccc1111dddd2222eeee3333ffff44445555aaaa",
+        "magnet": "magnet:?xt=urn:btih:cccc1111dddd2222eeee3333ffff44445555aaaa&dn=Survivor&tr=udp%3A%2F%2Ftracker.example%3A451%2Fannounce",
+        "filesize": "about a gigabyte",
+        "seeders": "many",
+        "leechers": null
+      },
+      {
+        "id": "20000000000006",
+        "uploaded_at": 1785499942639,
+        "title": "[Example] Healthy Peer",
+        "infohash": "dddd1111eeee2222ffff33334444555566667777",
+        "magnet": "magnet:?xt=urn:btih:dddd1111eeee2222ffff33334444555566667777&dn=Healthy&tr=udp%3A%2F%2Ftracker.example%3A451%2Fannounce",
+        "filesize": "2048",
+        "seeders": "8",
+        "leechers": "2"
+      }
+    ],
+    "more": false
+  }
+}
