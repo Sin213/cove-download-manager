@@ -13,7 +13,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, Signal
+from PySide6.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QObject,
+    QPoint,
+    QRect,
+    QSize,
+    Qt,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QGuiApplication,
@@ -307,6 +316,9 @@ class Titlebar(QFrame):
         # Theme toggle + window controls form one tight button cluster
         # (matches Cove Universal Converter's titlebar control grouping).
         controls = QWidget(self)
+        # These sit against the top window edge, inside the resize grab band;
+        # their clicks must reach the buttons, not start a window resize.
+        controls.setProperty(FramelessResizer.NO_RESIZE_PROPERTY, True)
         ctrl_lay = QHBoxLayout(controls)
         ctrl_lay.setContentsMargins(0, 0, 0, 0)
         ctrl_lay.setSpacing(2)
@@ -378,12 +390,27 @@ class FramelessResizer(QObject):
     `startSystemResize()`. Cross-platform; no WM-specific glue."""
 
     BORDER = 18
+    # Widgets carrying this dynamic property (or any of their children) keep
+    # their own clicks even inside the grab band. The titlebar controls need
+    # it: they sit at the very top of the window, so their upper half would
+    # otherwise start a resize instead of minimizing or closing.
+    NO_RESIZE_PROPERTY = "coveNoWindowResize"
 
     def __init__(self, window: QMainWindow):
         super().__init__(window)
         self._w = window
         window.setMouseTracking(True)
-        window.installEventFilter(self)
+        # The chrome fills the window edge to edge, so a press inside the grab
+        # band almost always lands on a child widget - and an interactive child
+        # accepts it, so it never reaches a filter installed on the window
+        # alone. Filtering at the application level sees the press wherever it
+        # is delivered; eventFilter() then ignores anything that does not
+        # belong to this window.
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        else:  # pragma: no cover - Qt always has an application by then
+            window.installEventFilter(self)
 
     def _edge_for(self, pos: QPoint) -> Qt.Edges:
         w = self._w
@@ -418,11 +445,27 @@ class FramelessResizer(QObject):
             return Qt.SizeVerCursor
         return None
 
+    def _window_pos(self, obj, event) -> QPoint | None:
+        """Position of `event` in target-window coordinates, or None if the
+        event belongs to some other window (a dialog, another top level)."""
+        if not isinstance(obj, QWidget):
+            return None
+        if obj is not self._w and obj.window() is not self._w:
+            return None
+        node = obj
+        while node is not None and node is not self._w:
+            if node.property(self.NO_RESIZE_PROPERTY):
+                return None
+            node = node.parentWidget()
+        return self._w.mapFromGlobal(event.globalPosition().toPoint())
+
     def eventFilter(self, obj, event):
-        if obj is not self._w:
-            return False
         et = event.type()
         if et == QEvent.MouseMove and not (event.buttons() & Qt.LeftButton):
+            # Cursor feedback stays on the window itself: overriding a child's
+            # own cursor would clobber the shapes it sets for its own content.
+            if obj is not self._w:
+                return False
             edges = self._edge_for(event.position().toPoint())
             shape = self._cursor_for(edges)
             if shape is not None:
@@ -430,13 +473,16 @@ class FramelessResizer(QObject):
             else:
                 self._w.unsetCursor()
         elif et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-            edges = self._edge_for(event.position().toPoint())
+            pos = self._window_pos(obj, event)
+            if pos is None:
+                return False
+            edges = self._edge_for(pos)
             if edges:
                 handle = self._w.windowHandle()
                 if handle is not None:
                     handle.startSystemResize(edges)
                     return True
-        elif et == QEvent.Leave:
+        elif et == QEvent.Leave and obj is self._w:
             self._w.unsetCursor()
         return False
 
