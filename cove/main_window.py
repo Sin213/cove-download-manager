@@ -749,7 +749,16 @@ class MainWindow(QMainWindow):
         user asked for, and renders what the service reports back.
         """
         self.search_widget = SearchWidget()
-        self.search_service = SearchService(self)
+        # Search traffic is Cove's traffic: it leaves through the interface the
+        # user chose in Settings, the same as aria2's downloads, debrid
+        # resolution and update checks. Read once here, because that setting
+        # applies on restart everywhere else it is used too.
+        self.search_service = SearchService(
+            self,
+            interface=str(
+                getattr(self.settings, "torrent_network_interface", "") or ""
+            ),
+        )
         self.search_widget.search_requested.connect(self._on_search_requested)
         self.search_widget.download_requested.connect(
             self._on_search_download_requested

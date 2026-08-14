@@ -16,6 +16,7 @@ here and there must never be.
 """
 from __future__ import annotations
 
+import functools
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -404,14 +405,26 @@ class SearchService(QObject):
         self,
         parent: QObject | None = None,
         *,
-        http_factory=SearchHttp,
+        interface: str = "",
+        http_factory=None,
         deadline_ms: int = _SEARCH_DEADLINE_MS,
         cache=None,
     ):
         super().__init__(parent)
+        # Which interface Search leaves through is the service's business and
+        # no source's: the adapters are handed a facility and never learn where
+        # its socket originates. Empty is the shipped state and binds nothing,
+        # exactly as it does for aria2 and for Cove's other direct HTTP calls.
+        self._interface = interface
         # The one seam a test needs: the workers build their own HTTP, so the
-        # service never touches a session itself.
-        self._http_factory = http_factory
+        # service never touches a session itself. A caller that supplies the
+        # factory owns the whole decision, interface included - which is why
+        # the binding lives in the default rather than in the worker.
+        self._http_factory = (
+            functools.partial(SearchHttp, interface=interface)
+            if http_factory is None
+            else http_factory
+        )
         # One cache for the service, not one per search: an answer is worth
         # reusing precisely because the search that stored it is over. Nothing
         # here empties it when a search finishes, is superseded or is

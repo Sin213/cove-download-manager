@@ -4473,3 +4473,118 @@ def test_a_search_no_source_covers_still_records_a_whole_lifecycle(diag, monkeyp
     assert started["source_count"] == 0
     assert started["query_length"] == 4
     assert _fields(_one_event(diag, "search_finished"))["result_count"] == 0
+
+
+# --- Z. the configured network interface -------------------------------------
+#
+# Cove binds its traffic to the interface chosen in Settings, and Search is not
+# an exception: a user who picked a VPN adapter did not agree to let indexer
+# requests leave over the default route instead. The service is the only place
+# that knows the choice, so these pin that every source's HTTP facility is
+# built with it - and that no choice still means no binding.
+
+
+def _interface_recorder(monkeypatch):
+    """Record the interface every SearchHttp the service builds is given."""
+    seen = []
+
+    class _Recorder(_FakeHttp):
+        def __init__(self, interface="", *, session=None):
+            super().__init__()
+            seen.append(interface)
+
+    monkeypatch.setattr(service, "SearchHttp", _Recorder)
+    return seen
+
+
+def test_the_configured_interface_reaches_the_source_transport(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()])])
+    seen = _interface_recorder(monkeypatch)
+    svc = service.SearchService(interface="cove-test0")
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert seen == ["cove-test0"]
+
+
+def test_every_source_in_one_search_gets_the_same_configured_interface(monkeypatch):
+    """The binding belongs to the service, not to any one adapter.
+
+    Two sources are enough: the transport is built per call, so a search whose
+    sources shared nothing would show it here.
+    """
+    _select(
+        monkeypatch,
+        [
+            _FakeSource([_result(info_hash=A)], source_id="alpha"),
+            _FakeSource([_result(info_hash=B)], source_id="beta"),
+        ],
+    )
+    seen = _interface_recorder(monkeypatch)
+    svc = service.SearchService(interface="cove-test0")
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert seen == ["cove-test0", "cove-test0"]
+
+
+def test_no_configured_interface_leaves_the_transport_unbound(monkeypatch):
+    """Characterisation: the default route stays the default behaviour.
+
+    An empty setting is the shipped state, and it must reach SearchHttp as the
+    empty interface it already treats as "do not bind" - not as some stand-in
+    address the service invented.
+    """
+    _select(monkeypatch, [_FakeSource([_result()])])
+    seen = _interface_recorder(monkeypatch)
+    svc = service.SearchService()
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert seen == [""]
+
+
+def test_an_injected_factory_still_owns_the_whole_transport_decision(monkeypatch):
+    """Characterisation: the test seam is unchanged, and takes no arguments.
+
+    Every existing caller passes a zero-argument factory. The interface is the
+    service's business only when it is the one building the facility.
+    """
+    _select(monkeypatch, [_FakeSource([_result()])])
+    factory, made = _counting_http_factory()
+    svc = service.SearchService(interface="cove-test0", http_factory=factory)
+    watch = _Watch(svc)
+
+    svc.start("dune")
+
+    _finish(watch)
+    assert len(made) == 1
+
+
+def test_search_http_binds_its_session_to_the_interface_it_was_given(monkeypatch):
+    """Characterisation: the far end of the wiring already works.
+
+    SearchHttp defers to the same netiface helper every other direct HTTP call
+    in Cove uses, so the service only has to supply the name - there is no
+    Search-specific binding to write.
+    """
+    from cove.search.sources import base
+
+    asked = []
+
+    def _bound(name):
+        asked.append(name)
+        return object()
+
+    monkeypatch.setattr("cove.netiface.bound_requests_session", _bound)
+
+    session = base.SearchHttp("cove-test0").session()
+
+    assert asked == ["cove-test0"]
+    assert session is not None

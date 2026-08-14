@@ -22,6 +22,7 @@ import inspect
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QCoreApplication
@@ -110,10 +111,15 @@ class Host(mw.MainWindow):
     The same seam tests/test_search_intake.py already uses: the Search page is
     built by its own production method, so a test gets the real composition
     without a queue, a scheduler or a tray.
+
+    Settings are stood up here because the real MainWindow has them long
+    before it builds any page, and the Search page reads the one setting that
+    decides which network interface its traffic leaves through.
     """
 
-    def __init__(self):
+    def __init__(self, interface=""):
         QMainWindow.__init__(self)
+        self.settings = SimpleNamespace(torrent_network_interface=interface)
 
 
 def _wire(host):
@@ -156,10 +162,12 @@ def _offline_service(monkeypatch):
 
     The service's own http_factory seam, reached the way the window builds its
     service: the symbol the main window imported is replaced, so the window
-    still constructs its own single service on its own terms.
+    still constructs its own single service on its own terms - including
+    whatever else it passes, which is forwarded untouched.
     """
-    def factory(parent=None):
-        return SearchService(parent, http_factory=_FakeHttp)
+    def factory(parent=None, **kwargs):
+        kwargs["http_factory"] = _FakeHttp
+        return SearchService(parent, **kwargs)
 
     monkeypatch.setattr(mw, "SearchService", factory)
 
@@ -319,8 +327,8 @@ def test_navigating_away_and_back_keeps_the_same_search_widget(monkeypatch):
 class _SpySearchService(SearchService):
     """The real service, plus a record of what start() saw when it was called."""
 
-    def __init__(self, parent=None):
-        super().__init__(parent, http_factory=_FakeHttp)
+    def __init__(self, parent=None, **kwargs):
+        super().__init__(parent, http_factory=_FakeHttp, **kwargs)
         self.starts = []
         self.ui_at_start = []
         self.widget = None
@@ -949,8 +957,8 @@ def test_a_partial_result_is_downloadable_while_the_search_runs(monkeypatch):
 class _LifecycleSpy(SearchService):
     """The real service, plus a record of every lifecycle call it was given."""
 
-    def __init__(self, parent=None):
-        super().__init__(parent, http_factory=_FakeHttp)
+    def __init__(self, parent=None, **kwargs):
+        super().__init__(parent, http_factory=_FakeHttp, **kwargs)
         self.starts = []
         self.cancels = 0
 
@@ -1040,3 +1048,48 @@ def test_the_download_handler_never_opens_a_second_intake_path():
         "aria2",
     ):
         assert forbidden not in attributes
+
+
+# --- Group H: the configured network interface reaches Search ----------------
+#
+# The window is the only place that holds both the user's settings and the
+# service, so it is the only place that can tell Search which interface Cove
+# was told to use. These run the real service and the real worker, and stand
+# in only for the HTTP facility itself - so what they prove is the production
+# path from the stored setting to the transport a source is handed.
+
+
+def _interface_recorder(monkeypatch):
+    """Record the interface every SearchHttp the window's service builds."""
+    seen = []
+
+    class _Recorder(_FakeHttp):
+        def __init__(self, interface="", *, session=None):
+            super().__init__()
+            seen.append(interface)
+
+    monkeypatch.setattr(search_service, "SearchHttp", _Recorder)
+    return seen
+
+
+def test_the_window_binds_search_traffic_to_the_configured_interface(monkeypatch):
+    _select(monkeypatch, [_FakeSource([_result()])])
+    seen = _interface_recorder(monkeypatch)
+    host = _wire(Host(interface="cove-test0"))
+
+    host._on_search_requested("dune", Category.MOVIES)
+
+    assert _pump(lambda: bool(seen)), "no source transport was ever built"
+    assert seen == ["cove-test0"]
+
+
+def test_the_window_leaves_search_unbound_when_no_interface_is_configured(monkeypatch):
+    """Characterisation: the shipped default keeps the default route."""
+    _select(monkeypatch, [_FakeSource([_result()])])
+    seen = _interface_recorder(monkeypatch)
+    host = _wire(Host())
+
+    host._on_search_requested("dune", Category.MOVIES)
+
+    assert _pump(lambda: bool(seen)), "no source transport was ever built"
+    assert seen == [""]
