@@ -160,6 +160,10 @@ TORRENT_CANCELLED_UNCACHED = (
     "download was cancelled."
 )
 TORRENT_METADATA_FAILED = "Cove could not read this torrent's metadata."
+TORRENT_SUPPORT_DISABLED = (
+    "BitTorrent support is turned off in Settings, so this magnet link was "
+    "not added."
+)
 # aria2's own message for a failed torrent may quote the magnet it was
 # given, a tracker announce URL (and therefore a private-tracker passkey)
 # or a peer address, and a task error is persisted and shown in the UI. Only
@@ -898,11 +902,23 @@ class QueueManager(QObject):
             return None
         if not URL_RE.match(url):
             return None
-        if source_type == SOURCE_PLAIN and torrent.is_magnet(url) and self._torrent_enabled():
-            return self._add_magnet(
-                url, out_dir=out_dir, speed_limit_kbps=speed_limit_kbps,
-                intake=intake,
-            )
+        if torrent.is_magnet(url):
+            # A magnet is torrent work whatever the settings say. aria2
+            # accepts one through addUri and answers with the *metadata*
+            # download, which reports itself complete at 100% under a
+            # "[METADATA]<hash>" file name with none of the torrent on
+            # disk - indistinguishable, in the plain lifecycle, from a
+            # finished file. So a magnet never reaches that lifecycle:
+            # with BitTorrent support off there is nothing to route it to,
+            # and the add is refused before any aria2 job exists.
+            if not self._torrent_enabled():
+                self.error.emit(TORRENT_SUPPORT_DISABLED)
+                return None
+            if source_type == SOURCE_PLAIN:
+                return self._add_magnet(
+                    url, out_dir=out_dir, speed_limit_kbps=speed_limit_kbps,
+                    intake=intake,
+                )
         import posixpath
         from urllib.parse import unquote, urlparse
         from .config import categorize

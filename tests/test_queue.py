@@ -756,6 +756,7 @@ from cove.queue import (                          # noqa: E402
     TORRENT_CANCELLED_UNCACHED,
     TORRENT_NO_BITTORRENT,
     TORRENT_METADATA_FAILED,
+    TORRENT_SUPPORT_DISABLED,
     TORRENT_PROXY_BLOCKED,
     TorrentError,
 )
@@ -823,22 +824,51 @@ def _rows(db_path):
 # --- feature flag ----------------------------------------------------------
 
 
-def test_magnet_keeps_head_behaviour_while_the_flag_is_off(queue_env, monkeypatch):
+def test_magnet_never_enters_the_plain_download_lifecycle_while_the_flag_is_off(
+    queue_env, monkeypatch
+):
+    """A magnet is torrent work whether or not torrent support is on.
+
+    aria2 accepts a magnet through addUri and answers with the *metadata*
+    download: it completes at 100% with a `[METADATA]<hash>` file name and
+    nothing of the torrent itself on disk. Routed as an ordinary download
+    that is indistinguishable from a finished file, which is exactly the
+    false "Done / 100%" the user sees. So the magnet is refused outright
+    instead, and no aria2 job is created for it.
+    """
     queue, rpc, db_path = queue_env(**_debrid_settings())
+    _sync_spawn(queue)
+    _running(queue)
     called = []
     monkeypatch.setattr(
         debrid, "resolve_torrent",
         lambda *a, **k: called.append(a) or None,
     )
-    tid = queue.add_url(MAGNET)
-    task = queue.tasks[tid]
+    errors = []
+    queue.error.connect(errors.append)
 
-    assert task.source_type == ""
-    assert task.info_hash == ""
-    assert task.url == MAGNET
-    assert task.backend == "aria2"
-    assert _persisted_row(db_path, tid)["source_type"] == ""
+    assert queue.add_url(MAGNET) is None
+
+    assert queue.tasks == {}
+    assert _rows(db_path) == []
+    assert rpc.added == []
+    assert rpc.magnets == []
     assert called == []
+    # The reason is shown, and it never quotes the magnet's passkey.
+    assert errors == [TORRENT_SUPPORT_DISABLED]
+    assert "SECRETPASS" not in errors[0]
+
+
+def test_magnet_refusal_survives_a_torrent_source_type_argument(queue_env):
+    """The internal source_type kwarg is not a way around the gate."""
+    queue, rpc, db_path = queue_env(**_debrid_settings())
+    _sync_spawn(queue)
+    _running(queue)
+
+    assert queue.add_url(MAGNET, source_type=SOURCE_TORRENT) is None
+    assert _rows(db_path) == []
+    assert rpc.added == []
+    assert rpc.magnets == []
 
 
 def test_magnet_becomes_a_torrent_source_task_when_enabled(queue_env):
@@ -1921,6 +1951,71 @@ def test_torrent_child_gid_is_never_adopted_as_an_external_download(queue_env, m
     queue._check_external()
 
     assert len(queue.tasks) == before
+    assert len(_rows(db_path)) == 1
+
+
+def test_cove_metadata_gid_is_not_adopted_while_its_callback_is_in_flight(
+    queue_env, monkeypatch
+):
+    """Characterisation (green before this slice, and it must stay green).
+
+    There is a real ownership window: aria2 has answered `add_magnet` on a
+    worker, but `_on_local_torrent_gid` has not yet run on the GUI thread,
+    so the gid is in aria2's snapshot before it is in `_seen_gids`. What
+    closes it is not ownership but identification - aria2 reports a
+    magnet's metadata download with the info hash and bittorrent block
+    from the moment the group exists, and `_check_external` skips any job
+    carrying those. This test pins that guard to the window, because
+    adopting there would produce exactly the reported ghost row:
+    `[METADATA]<hash>`, complete, 100%.
+    """
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    deferred = []
+
+    def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
+        try:
+            result = fn(*args, **kwargs)
+        except (Aria2Error, DebridError, TorrentError) as exc:
+            if on_fail is not None:
+                on_fail(str(exc))
+            return
+        if getattr(fn, "__name__", "") == "_add_local_magnet":
+            # aria2 owns the metadata job and has returned its gid; Cove's
+            # callback is still queued. Hold it to open the window.
+            deferred.append((on_done, result))
+            return
+        if on_done is not None:
+            on_done(result)
+
+    queue._spawn = spawn
+    tid = queue.add_url(MAGNET)
+    queue._launch(queue.tasks[tid])
+    assert deferred, "the magnet add must still be in flight"
+    assert not queue.tasks[tid].gid
+
+    # aria2's own report of a magnet's metadata download: it carries the
+    # info hash and the bittorrent block from the moment the group exists,
+    # and its single file is the metadata placeholder.
+    rpc.tell_external_snapshot = lambda: [
+        {"gid": "gid-meta", "status": "complete", "infoHash": INFO_HASH,
+         "bittorrent": {"announceList": [["http://tracker.example/announce"]]},
+         "totalLength": "31000", "completedLength": "31000",
+         "downloadSpeed": "0",
+         "files": [{"path": f"/dl/[METADATA]{INFO_HASH}", "uris": []}]},
+    ]
+    queue._check_external()
+
+    assert len(queue.tasks) == 1, "Cove's own metadata gid was adopted as a download"
+    assert len(_rows(db_path)) == 1
+    assert queue.tasks[tid].status != "completed"
+
+    # The callback lands afterwards and still claims the gid exactly once.
+    on_done, gid = deferred.pop()
+    on_done(gid)
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert len(queue.tasks) == 1
     assert len(_rows(db_path)) == 1
 
 
