@@ -120,7 +120,13 @@ def test_higher_seeder_row_wins_regardless_of_registry_order():
 
 
 def test_registry_order_breaks_a_seeder_tie():
-    assert [s.id for s in SOURCES] == ["yts", "piratebay", "nyaa", "fitgirl"]
+    assert [s.id for s in SOURCES] == [
+        "yts",
+        "piratebay",
+        "nyaa",
+        "fitgirl",
+        "subsplease",
+    ]
 
     rows = [
         _result(info_hash=A, source="piratebay", seeders=7),
@@ -130,6 +136,19 @@ def test_registry_order_breaks_a_seeder_tie():
     (winner,) = aggregate(rows).results
 
     assert winner.source == "yts"
+
+
+def test_nyaa_keeps_its_precedence_over_the_newer_anime_source():
+    """Adding SubsPlease must not change which anime row wins a tie."""
+    rows = [
+        _result(info_hash=A, source="subsplease", seeders=7, name="From SubsPlease"),
+        _result(info_hash=A, source="nyaa", seeders=7, name="From Nyaa"),
+    ]
+
+    (winner,) = aggregate(rows).results
+
+    assert winner.source == "nyaa"
+    assert winner.name == "From Nyaa"
 
 
 def test_registry_order_breaks_a_seeder_tie_further_down_the_registry():
@@ -949,6 +968,58 @@ def test_a_games_search_reaches_the_registered_fitgirl_source(monkeypatch):
         service.SourceState.RUNNING,
         service.SourceState.COMPLETED,
     ]
+    assert svc.active is False
+
+
+def test_an_anime_search_reaches_both_registered_anime_sources(monkeypatch):
+    """Generic selection hands an Anime search to Nyaa and SubsPlease alike.
+
+    Selection is the real one: the registry is not replaced, and the sources
+    asked are the very objects it ships. Only their searches are stood in for.
+    """
+    anime = {
+        source.id: source
+        for source in SOURCES
+        if source.id in ("nyaa", "subsplease")
+    }
+    assert sorted(anime) == ["nyaa", "subsplease"]
+    asked = []
+
+    def _stub(source_id):
+        def _search(query, category, http):
+            asked.append((source_id, query, category))
+            return [_result(info_hash=A, name=f"From {source_id}", source=source_id)]
+
+        return _search
+
+    for source_id, source in anime.items():
+        monkeypatch.setattr(source, "search", _stub(source_id))
+    # Belt and braces: reaching the seams above is the point, so a real request
+    # from any source fails this test rather than travelling.
+    monkeypatch.setattr(
+        SearchHttp,
+        "get_bytes",
+        lambda *a, **k: pytest.fail("a source made a real request"),
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("  bleach  ", Category.ANIME)
+
+    summary = _finish(watch)
+    # The normalised query, the category as asked, once per source.
+    assert sorted(asked) == [
+        ("nyaa", "bleach", Category.ANIME),
+        ("subsplease", "bleach", Category.ANIME),
+    ]
+    # One info hash, so the two rows merge and Nyaa's precedence decides.
+    assert [(r.source, r.name) for r in summary.results] == [("nyaa", "From nyaa")]
+    assert summary.failures == ()
+    for source_id in ("nyaa", "subsplease"):
+        assert watch.states(source_id) == [
+            service.SourceState.RUNNING,
+            service.SourceState.COMPLETED,
+        ], source_id
     assert svc.active is False
 
 
