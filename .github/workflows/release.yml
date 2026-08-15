@@ -342,37 +342,25 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.5.2
+          ## What's new in 3.6.0
 
-          A correctness release. An audit of the codebase turned up twenty-one confirmed defects, and this fixes all of them, along with a contributed fix for Real-Debrid share links. Nothing here is a new feature; several are problems you could hit without ever knowing why, which is the reason for shipping them on their own rather than folding them into the next feature release.
+          Cove can now find torrents itself. Search is built in, it goes through the same network interface as your downloads, and what you pick lands in the ordinary queue - no external site, no external client, no account anywhere.
+
+          ### Added
+
+          - **Built-in Search for Movies, TV, Anime and Games.** Type a query, pick a category, and every source that covers it is queried at once; the results come back merged, de-duplicated and sorted together, and adding one queues it like any other download.
+          - **Seven active Search sources: YTS, Nyaa, FitGirl, SubsPlease, nekoBT, GOG Games and Rutor.** Movies come from YTS and Rutor, TV from Rutor, Anime from Nyaa, SubsPlease and nekoBT, and Games from FitGirl and GOG Games. The list is fixed at build time - nothing is loaded from disk or the network to decide what runs, and there is no indexer to configure.
+          - **Search requests use the network interface selected in Cove's Settings**, the same interface downloads are already bound to, rather than going out over whatever adapter happens to be default.
 
           ### Fixed
 
-          - **Real-Debrid `/d/` links now download instead of being refused.** These are the standard unrestricted-link format Real-Debrid's own API hands back, and the API will unlock them again for the account that owns them - the same call Cove already makes for ordinary hoster links. Cove was turning them away with the message meant for account-bound share links. With a Real-Debrid account configured they now resolve and download; without one the refusal is unchanged, and AllDebrid `/f/` links still always refuse, because no API unlock exists for those. Direct delivery links are unaffected. Thanks to @kraibse.
-          - **A removed download can no longer come back.** Cancelling an unfinished download asks aria2 to let go of it first, and only then clears the row - so a cancellation aria2 refuses leaves the download intact instead of losing track of a transfer that is still running. Quitting or crashing inside that window used to restore the download on the next launch and start it again; the row now records that it is on its way out, and startup finishes the job.
-          - **Pause and resume no longer drift out of step with aria2.** Cove sends one pause or resume per download at a time and waits for the answer before sending another. Two commands issued together could be applied by aria2 in the opposite order to the one they were sent in, leaving a download running while Cove showed it paused, or paused while Cove showed it running, with nothing to correct it. Cove now compares what you asked for against what aria2 last reported and re-sends the difference.
-          - **A download you paused stays paused across a restart.** Startup restored paused downloads as queued, so they resumed on their own.
-          - **Video download progress no longer stalls.** ffmpeg ends each progress line with a carriage return rather than a newline, and the reader was waiting for a newline that only arrived with unrelated output - so the bar sat still and then jumped, reporting an old position when it did move.
-          - **Cancelling an update no longer freezes Cove.** Cancel closed the network response directly from the interface thread, which then waited on the download thread's read for up to twenty seconds - the exact hang Cancel is there to end. It now interrupts the transfer without blocking the interface.
-          - **Cancelling an update no longer installs it anyway.** A Cancel arriving as the final chunk of the download completed was not noticed, and Cove replaced the executable and relaunched into the update you had just called off. Cancellation is now checked again before the download reports success, and once more before anything is replaced.
-          - **A corrupted settings file no longer crashes Cove or silently inverts a setting.** Values loaded from disk are type-checked at the boundary, including category directories and the schedule window. Recognising a key was previously all the loader did, and a non-empty `"false"` read as true.
-          - **Torrent files are written safely when two saves overlap.** Each save uses its own scratch file rather than a shared one two writers could truncate, and every byte is written rather than assuming a single write suffices.
-          - **Failed TorBox jobs are released.** Only a poll timeout freed the job, so failed attempts accumulated on your account.
-
-          ### Also in this release
-
-          - **Browsers installed only as Flatpaks now get a native-messaging manifest.** They have no conventional config directory, so they were previously skipped entirely and the browser extension could not reach Cove at all.
-          - **The extension badge shows OFF when Cove is disabled**, rather than being overwritten by a media count.
-          - **Support logs respect their size cap** with non-ASCII text. Rotation counted characters rather than bytes, so a log could grow well past its limit.
-          - **The single-instance lock lives in a private per-user directory**, checked before use so it cannot be redirected through a planted symlink, and an unusable lock file is reported as such instead of as an already-running Cove.
-          - **Checking whether Cove is your magnet handler no longer briefly freezes the window.** It runs off the interface thread, as the account test already did.
-          - **An installed copy has its icons.** They were staged only in the source checkout, so a wheel installed from PyPI had none. Python 3.10 is now declared as the minimum, which is what the code has required since it started using newer type syntax.
+          - **The frameless window is easier to grab by its edges.** The resize hit area was tight enough that a corner drag often missed and moved the window instead.
+          - **Magnet links that are still fetching metadata behave properly when you remove or restart them.** The metadata task is now tracked through its whole life, so cancelling one during that stage no longer leaves work behind.
+          - **Displayed download progress no longer jumps around.** Progress is reported steadily rather than briefly showing a stale or out-of-order position.
 
           ### Notes
 
-          - Two audit findings were examined and rejected rather than fixed. The Windows native-messaging `.bat` wrapper is the documented approach for Firefox on Windows, and Debian handler detection does query the desktop association - the reported causes were not real.
-          - One known limit is deliberate: if Cove is killed during the moment between asking aria2 to cancel a download and aria2 confirming it, the partial file is left on disk. Cleaning it up blindly at startup risks deleting a file a still-running transfer would immediately recreate.
-          - Browser extension: unchanged at Firefox 1.4.6 and Chrome 1.3.7. The extension fixes above are in the source but not yet in a published store build; they ship with the next store submission, which is manual and separate from this release.
+          - The browser extension is published separately, on its own schedule and through the two stores; this desktop release neither contains nor updates it.
 
           ## Downloads
 
