@@ -1734,3 +1734,416 @@ def test_nekobt_is_not_in_the_registry():
         "fitgirl",
         "subsplease",
     ]
+
+
+# --- GOG Games ---------------------------------------------------------------
+
+GOGGAMES_ENDPOINT = "https://gog-games.to/search"
+
+
+def goggames_source():
+    from cove.search.sources.goggames import GogGamesSource
+
+    return GogGamesSource()
+
+
+# Group A - identity and category
+
+
+def test_goggames_declares_games_only():
+    source = goggames_source()
+    assert source.id == "goggames"
+    assert source.label == "GOG Games"
+    assert source.categories == (Category.GAMES,)
+    assert source.homepage == "https://gog-games.to"
+    assert source.serves(Category.GAMES)
+    assert source.serves(Category.ALL)
+    assert not source.serves(Category.MOVIES)
+    assert not source.serves(Category.TV)
+    assert not source.serves(Category.ANIME)
+
+
+def test_goggames_is_a_source():
+    assert isinstance(goggames_source(), Source)
+
+
+def test_goggames_does_not_report_swarm_because_the_api_publishes_no_counts():
+    assert goggames_source().reports_swarm is False
+
+
+def test_goggames_returns_nothing_for_a_category_it_does_not_serve():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_valid.json")))
+    assert source.search("example", Category.MOVIES, http) == []
+    # A category this source cannot answer costs no request at all.
+    assert session.calls == []
+
+
+# Group B - request shape
+#
+# The live endpoint filters on `search`. `query` - the parameter the planning
+# sketch recorded - is accepted and silently ignored, and the paginator echoes
+# it back in `links`/`meta`, which is what makes the mistake look right. Sending
+# `query` returns the whole catalogue in reverse-alphabetical order rather than
+# the user's matches, so this is a correctness test, not a style one.
+
+
+def test_goggames_filters_on_the_search_parameter_not_query():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_empty.json")))
+    source.search("example game", Category.GAMES, http)
+
+    url, kwargs = session.calls[0]
+    assert url == GOGGAMES_ENDPOINT
+    assert kwargs["params"] == {"search": "example game", "page": 1}
+    # `query` is the ignored parameter: sending it would return the unfiltered
+    # catalogue while still looking like a successful search.
+    assert "query" not in kwargs["params"]
+
+
+def test_goggames_hands_awkward_queries_over_as_a_parameter_not_a_url():
+    source = goggames_source()
+    query = "a/b?c=d&e #1"
+    http, session = http_with(FakeResponse(fixture("goggames_empty.json")))
+    source.search(query, Category.GAMES, http)
+
+    url, kwargs = session.calls[0]
+    assert url == GOGGAMES_ENDPOINT
+    assert kwargs["params"]["search"] == query
+
+
+def test_goggames_serves_the_all_category():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_valid.json")))
+    assert source.search("example", Category.ALL, http)
+    assert len(session.calls) == 1
+
+
+# Group C - explicit no results
+
+
+def test_goggames_returns_empty_for_the_explicit_no_results_payload():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_empty.json")))
+    assert source.search("nothing", Category.GAMES, http) == []
+    assert len(session.calls) == 1
+
+
+# Group D - malformed responses
+
+
+def test_goggames_raises_parse_for_malformed_json():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(b'{"data": [{'))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+def test_goggames_raises_parse_when_the_results_container_is_renamed():
+    # A search that matched nothing still answers with `data: []`, so a payload
+    # with no `data` list at all is schema drift, not an empty search.
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_unusable.json")))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("example", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not a payload",
+        42,
+        None,
+        True,
+        [],
+        [{"title": "Example Game"}],
+        {},
+        {"data": None},
+        {"data": {}},
+        {"data": "none"},
+        {"meta": {"total": 0}},
+    ],
+)
+def test_goggames_raises_parse_for_a_shape_the_api_does_not_publish(payload):
+    source = goggames_source()
+    http, _ = http_with(json_response(payload))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+def test_goggames_does_not_read_a_challenge_page_as_no_results():
+    source = goggames_source()
+    http, _ = http_with(
+        FakeResponse(b"<!DOCTYPE html><html><body>Checking...</body></html>")
+    )
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.PARSE
+
+
+def test_goggames_does_not_turn_a_transport_failure_into_empty_results():
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(b"nope", status_code=503))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("x", Category.GAMES, http)
+    assert excinfo.value.kind is SourceErrorKind.HTTP
+
+
+def test_goggames_error_details_do_not_echo_the_query_or_the_body():
+    source = goggames_source()
+    http, _ = http_with(json_response({"items": []}))
+    with pytest.raises(SourceError) as excinfo:
+        source.search("a secret query", Category.GAMES, http)
+    message = str(excinfo.value)
+    assert "secret" not in message
+    assert "items" not in message
+    assert len(message) < 200
+
+
+# Group E - normalisation, swarm, size and date
+
+
+def test_goggames_normalises_valid_results():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    assert len(session.calls) == 1
+    # The fourth fixture row has a null infohash - a catalogue entry with no
+    # release behind it yet - so it never becomes a result.
+    assert [r.name for r in results] == [
+        "Example Quest - Definitive Edition",
+        "Sons & Daughters + Extra Content",
+        "黎明为歌 - Example Melody",
+    ]
+    assert [r.source for r in results] == ["goggames", "goggames", "goggames"]
+    # The second row's hash arrives upper-case and is normalised down.
+    assert [r.info_hash for r in results] == [
+        "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+        "bbbb1111cccc2222dddd3333eeee4444ffff5555",
+        "cccc1111dddd2222eeee3333ffff44445555aaaa",
+    ]
+
+
+def test_goggames_reports_no_swarm_counts_rather_than_inventing_them():
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    # The API publishes no seeder or leecher counts at all. SearchResult needs
+    # integers, so they are 0 - and `reports_swarm=False` is what tells callers
+    # that the 0 means "not reported" rather than "nobody is seeding".
+    assert [(r.seeders, r.leechers) for r in results] == [(0, 0), (0, 0), (0, 0)]
+    assert source.reports_swarm is False
+
+
+def test_goggames_leaves_size_unknown_rather_than_calling_it_zero():
+    source = goggames_source()
+    http, session = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    # No row carries a byte count and no detail page is fetched to find one.
+    assert [r.size_bytes for r in results] == [None, None, None]
+    assert len(session.calls) == 1
+
+
+def test_goggames_dates_a_result_by_last_update():
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    # `last_update` is when the release itself last changed, which is what
+    # SearchResult.added means here. `release_timestamp` is the game's original
+    # store date - 2014 for the first row - and dating a 2025 repack by it would
+    # be wrong, so it is never read. A null `last_update` stays unknown.
+    assert [r.added for r in results] == [1754544686, 1779671651, None]
+
+
+def test_goggames_ignores_release_timestamp_even_when_last_update_is_missing():
+    source = goggames_source()
+    payload = {
+        "data": [
+            {
+                "slug": "example",
+                "title": "Example Game",
+                "release_timestamp": 1417039200,
+                "last_update": None,
+                "infohash": "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
+            }
+        ]
+    }
+    http, _ = http_with(json_response(payload))
+    (result,) = source.search("example", Category.GAMES, http)
+    assert result.added is None
+
+
+# Group F - torrent identity and the magnet Cove builds
+
+
+def test_goggames_builds_the_magnet_from_the_validated_hash_and_title():
+    from cove.search.magnet import build_magnet
+
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    # The API hands out a bare info hash and no magnet, so Cove synthesises one
+    # exactly the way it does for every other hash-only source.
+    assert [r.magnet for r in results] == [
+        build_magnet(r.info_hash, r.name) for r in results
+    ]
+
+
+def test_goggames_magnet_round_trips_to_the_result_hash():
+    from cove.search.magnet import extract_info_hash
+
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    assert results
+    for result in results:
+        assert extract_info_hash(result.magnet) == result.info_hash
+
+
+def test_goggames_encodes_the_display_name_without_changing_the_title():
+    from urllib.parse import parse_qs, urlparse
+
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    awkward = results[1]
+    # The title needs encoding to survive a magnet query string, but the name
+    # the user sees is the provider's, unencoded.
+    assert awkward.name == "Sons & Daughters + Extra Content"
+    fields = parse_qs(urlparse(awkward.magnet).query)
+    assert fields["dn"] == ["Sons & Daughters + Extra Content"]
+    assert "Sons+%26+Daughters" in awkward.magnet
+
+
+def test_goggames_uses_coves_own_tracker_list_and_adds_nothing_else():
+    from urllib.parse import parse_qs, urlparse
+
+    from cove.search.magnet import TRACKERS
+
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_valid.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    for result in results:
+        fields = parse_qs(urlparse(result.magnet).query)
+        # Cove's fixed list, and only it: no announce URL is carried over from
+        # anywhere else, and no field beyond the three Cove builds appears.
+        assert fields["tr"] == list(TRACKERS)
+        assert set(fields) == {"xt", "dn", "tr"}
+
+
+def test_goggames_drops_rows_it_cannot_give_a_torrent_identity():
+    source = goggames_source()
+    http, _ = http_with(FakeResponse(fixture("goggames_malformed_rows.json")))
+    results = source.search("example", Category.GAMES, http)
+
+    # A string in place of a row, a missing hash, a non-hex hash, a short hash,
+    # the all-zero placeholder and a blank title each cost only themselves.
+    assert [r.name for r in results] == [
+        "Example Unparseable Date",
+        "Example Usable Repack",
+    ]
+    assert [r.info_hash for r in results] == [
+        "cccc1111dddd2222eeee3333ffff44445555aaaa",
+        "dddd1111eeee2222ffff33334444555566667777",
+    ]
+    # An unparseable date is not worth discarding a usable torrent over, and it
+    # is never replaced with an invented one.
+    assert results[0].added is None
+    assert results[1].added == 1684431016
+
+
+# Group G - result cap and request cost
+
+
+def goggames_payload(rows: int) -> dict:
+    return {
+        "data": [
+            {
+                "id": str(index),
+                "slug": f"example_game_{index:04d}",
+                "title": f"Example Game {index:04d}",
+                "release_timestamp": 1417039200,
+                "last_update": "2025-08-07T05:31:26.000000Z",
+                "infohash": f"{index:040x}",
+            }
+            for index in range(1, rows + 1)
+        ],
+        "links": {"next": "https://gog-games.to/search?query=&page=2"},
+        "meta": {"current_page": 1, "last_page": 178, "per_page": 36, "total": rows},
+    }
+
+
+def test_goggames_caps_the_number_of_results():
+    source = goggames_source()
+    http, session = http_with(json_response(goggames_payload(MAX_RESULTS + 50)))
+    results = source.search("many", Category.GAMES, http)
+
+    assert len(results) == MAX_RESULTS
+    assert results[0].info_hash == f"{1:040x}"
+    assert results[-1].info_hash == f"{MAX_RESULTS:040x}"
+    # A larger answer never costs a larger number of requests.
+    assert len(session.calls) == 1
+
+
+def test_goggames_never_paginates_or_follows_a_slug():
+    source = goggames_source()
+    # `meta.last_page` is 178, `links.next` is populated and every row carries a
+    # slug that resolves to a detail page. None of that buys a second request.
+    http, session = http_with(json_response(goggames_payload(3)))
+    source.search("example", Category.GAMES, http)
+
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url == GOGGAMES_ENDPOINT
+    assert set(kwargs["params"]) == {"search", "page"}
+    assert kwargs["params"]["page"] == 1
+
+
+def test_goggames_never_bypasses_search_http():
+    import inspect
+
+    from cove.search.sources import goggames as module
+
+    text = inspect.getsource(module)
+    for banned in (
+        "import requests",
+        "urllib.request",
+        "import httpx",
+        "import aiohttp",
+        "import subprocess",
+        "selenium",
+        "playwright",
+        "BeautifulSoup",
+        "lxml",
+    ):
+        assert banned not in text
+
+
+# Group H - the adapter is not registered yet
+
+
+def test_goggames_is_not_in_the_registry():
+    from cove.search.registry import SOURCES
+
+    assert [source.id for source in SOURCES] == [
+        "yts",
+        "piratebay",
+        "nyaa",
+        "fitgirl",
+        "subsplease",
+    ]
+    assert "goggames" not in {source.id for source in SOURCES}
+    assert "nekobt" not in {source.id for source in SOURCES}

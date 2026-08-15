@@ -1,0 +1,49 @@
+{
+  "data": [
+    {
+      "id": "1000000001",
+      "slug": "example_quest_definitive_edition",
+      "title": "Example Quest - Definitive Edition",
+      "release_timestamp": 1417039200,
+      "last_update": "2025-08-07T05:31:26.000000Z",
+      "infohash": "aaaa1111bbbb2222cccc3333dddd4444eeee5555"
+    },
+    {
+      "id": "1000000002",
+      "slug": "sons_and_daughters",
+      "title": "Sons & Daughters + Extra Content",
+      "release_timestamp": 1540242000,
+      "last_update": "2026-05-25T01:14:11.000000Z",
+      "infohash": "BBBB1111CCCC2222DDDD3333EEEE4444FFFF5555"
+    },
+    {
+      "id": "1000000003",
+      "slug": "example_melody",
+      "title": "黎明为歌 - Example Melody",
+      "release_timestamp": 1647036000,
+      "last_update": null,
+      "infohash": "cccc1111dddd2222eeee3333ffff44445555aaaa"
+    },
+    {
+      "id": "1000000004",
+      "slug": "example_without_a_torrent",
+      "title": "Example Without A Torrent",
+      "release_timestamp": 1712264400,
+      "last_update": "2024-11-18T05:57:46.000000Z",
+      "infohash": null
+    }
+  ],
+  "links": {
+    "first": "https://gog-games.to/search?query=&page=1",
+    "last": "https://gog-games.to/search?query=&page=1",
+    "prev": null,
+    "next": null
+  },
+  "meta": {
+    "current_page": 1,
+    "last_page": 1,
+    "path": "https://gog-games.to/search",
+    "per_page": 36,
+    "total": 4
+  }
+}

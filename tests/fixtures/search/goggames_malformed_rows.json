@@ -1,0 +1,66 @@
+{
+  "data": [
+    "not a row at all",
+    {
+      "id": "2000000001",
+      "slug": "no_infohash",
+      "title": "Example Missing Hash",
+      "release_timestamp": 1417039200,
+      "last_update": "2025-08-07T05:31:26.000000Z"
+    },
+    {
+      "id": "2000000002",
+      "slug": "bad_infohash",
+      "title": "Example Non Hex Hash",
+      "release_timestamp": 1417039200,
+      "last_update": "2025-08-07T05:31:26.000000Z",
+      "infohash": "not-a-hash-at-all-not-a-hash-at-all-nope"
+    },
+    {
+      "id": "2000000003",
+      "slug": "short_infohash",
+      "title": "Example Short Hash",
+      "release_timestamp": 1417039200,
+      "last_update": "2025-08-07T05:31:26.000000Z",
+      "infohash": "aaaa1111bbbb2222"
+    },
+    {
+      "id": "2000000004",
+      "slug": "zero_infohash",
+      "title": "Example Placeholder Hash",
+      "release_timestamp": 1417039200,
+      "last_update": "2025-08-07T05:31:26.000000Z",
+      "infohash": "0000000000000000000000000000000000000000"
+    },
+    {
+      "id": "2000000005",
+      "slug": "blank_title",
+      "title": "   ",
+      "release_timestamp": 1417039200,
+      "last_update": "2025-08-07T05:31:26.000000Z",
+      "infohash": "eeee1111ffff2222aaaa3333bbbb4444cccc5555"
+    },
+    {
+      "id": "2000000006",
+      "slug": "junk_last_update",
+      "title": "Example Unparseable Date",
+      "release_timestamp": 1417039200,
+      "last_update": "not a date",
+      "infohash": "cccc1111dddd2222eeee3333ffff44445555aaaa"
+    },
+    {
+      "id": "2000000007",
+      "slug": "good_row",
+      "title": "Example Usable Repack",
+      "release_timestamp": 1646085600,
+      "last_update": "2023-05-18T17:30:16.000000Z",
+      "infohash": "dddd1111eeee2222ffff33334444555566667777"
+    }
+  ],
+  "meta": {
+    "current_page": 1,
+    "last_page": 1,
+    "per_page": 36,
+    "total": 8
+  }
+}

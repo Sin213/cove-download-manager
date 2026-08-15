@@ -9,6 +9,7 @@ returns. They were trimmed down from single manual captures of
 - FitGirl `/?s=` and one repack page
 - SubsPlease `/api/?f=search&tz=UTC&s=` (contract verified 2026-08-12)
 - nekoBT `/api/v1/torrents/search?query=` (contract verified 2026-08-14)
+- GOG Games `/search?search=` (contract verified 2026-08-14)
 
 and then edited by hand: titles and hashes are invented, and no cookies,
 tokens, headers or other request metadata were kept. Nothing refreshes these
@@ -39,3 +40,14 @@ single `tracker.example` announce URL, `filesize`/`seeders`/`leechers` stay
 strings and `uploaded_at` stays epoch milliseconds because that is what the
 API publishes, and the unusable file renames `results` to `items` so the
 parser must refuse it instead of reporting an empty search.
+
+The GOG Games files keep the `data` list the parser reads plus a trimmed
+`links`/`meta` paginator, because the paginator is the reason the endpoint is
+easy to get wrong: it echoes a `query=` parameter the API ignores, while the
+parameter that actually filters is `search=`. Titles, slugs and info hashes are
+invented, `last_update` stays an ISO 8601 instant with a `Z` offset and
+`release_timestamp` stays epoch seconds because that is what the API publishes,
+one valid row carries a null `infohash` (a catalogue entry with no release
+behind it yet, which the parser must skip rather than fail on), and the unusable
+file renames `data` to `items` so the parser must refuse it instead of
+reporting an empty search.

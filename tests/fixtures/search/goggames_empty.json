@@ -1,0 +1,16 @@
+{
+  "data": [],
+  "links": {
+    "first": "https://gog-games.to/search?query=&page=1",
+    "last": "https://gog-games.to/search?query=&page=1",
+    "prev": null,
+    "next": null
+  },
+  "meta": {
+    "current_page": 1,
+    "last_page": 1,
+    "path": "https://gog-games.to/search",
+    "per_page": 36,
+    "total": 0
+  }
+}
