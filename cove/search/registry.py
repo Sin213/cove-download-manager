@@ -10,8 +10,11 @@ from __future__ import annotations
 from cove.search.models import Category
 from cove.search.sources.base import Source
 from cove.search.sources.fitgirl import FitGirlSource
+from cove.search.sources.goggames import GogGamesSource
+from cove.search.sources.nekobt import NekoBtSource
 from cove.search.sources.nyaa import NyaaSource
 from cove.search.sources.piratebay import PirateBaySource
+from cove.search.sources.rutor import RutorSource
 from cove.search.sources.subsplease import SubsPleaseSource
 from cove.search.sources.yts import YtsSource
 
@@ -25,6 +28,13 @@ SOURCES: tuple[Source, ...] = (
     # Anime's second source. It goes after Nyaa for the same reason: Nyaa was
     # shipped first and keeps the tie-break it was approved with.
     SubsPleaseSource(),
+    # The provider expansion, appended in the order the three were reviewed.
+    # Each goes behind every source already shipped for the same reason as the
+    # two above: the sources Cove was released with keep the tie-break they
+    # were approved with, and an addition earns no precedence over them.
+    NekoBtSource(),
+    GogGamesSource(),
+    RutorSource(),
 )
 
 

@@ -120,13 +120,10 @@ def test_higher_seeder_row_wins_regardless_of_registry_order():
 
 
 def test_registry_order_breaks_a_seeder_tie():
-    assert [s.id for s in SOURCES] == [
-        "yts",
-        "piratebay",
-        "nyaa",
-        "fitgirl",
-        "subsplease",
-    ]
+    # The premise, stated as the prefix it depends on: YTS is ahead of Pirate
+    # Bay. Sources added behind them cannot affect this tie, so the assertion
+    # is not restated every time the registry grows.
+    assert [s.id for s in SOURCES][:2] == ["yts", "piratebay"]
 
     rows = [
         _result(info_hash=A, source="piratebay", seeders=7),
@@ -944,14 +941,22 @@ def test_a_games_search_reaches_the_registered_fitgirl_source(monkeypatch):
     source asked is the very object the registry ships. Only its search is
     stood in for, so the call is recorded instead of leaving the machine.
     """
-    (fitgirl,) = [source for source in SOURCES if source.id == "fitgirl"]
     asked = []
 
-    def _search(query, category, http):
-        asked.append((query, category))
-        return [_result(info_hash=A, name="Example Repack", source="fitgirl")]
+    def _stub(source_id):
+        def _search(query, category, http):
+            if source_id == "fitgirl":
+                asked.append((query, category))
+                return [_result(info_hash=A, name="Example Repack", source="fitgirl")]
+            return []
 
-    monkeypatch.setattr(fitgirl, "search", _search)
+        return _search
+
+    # Every source is stood in for, not just the one under test: a peer left
+    # live would answer with whatever it makes of a fake facility, and this
+    # test would be reading that rather than registration.
+    for source in SOURCES:
+        monkeypatch.setattr(source, "search", _stub(source.id))
     # Belt and braces: reaching the seam above is the point, so a real request
     # from any source fails this test rather than travelling.
     monkeypatch.setattr(
@@ -979,7 +984,7 @@ def test_a_games_search_reaches_the_registered_fitgirl_source(monkeypatch):
 
 
 def test_an_anime_search_reaches_both_registered_anime_sources(monkeypatch):
-    """Generic selection hands an Anime search to Nyaa and SubsPlease alike.
+    """Generic selection hands an Anime search to every anime source alike.
 
     Selection is the real one: the registry is not replaced, and the sources
     asked are the very objects it ships. Only their searches are stood in for.
@@ -987,9 +992,9 @@ def test_an_anime_search_reaches_both_registered_anime_sources(monkeypatch):
     anime = {
         source.id: source
         for source in SOURCES
-        if source.id in ("nyaa", "subsplease")
+        if source.id in ("nyaa", "subsplease", "nekobt")
     }
-    assert sorted(anime) == ["nyaa", "subsplease"]
+    assert sorted(anime) == ["nekobt", "nyaa", "subsplease"]
     asked = []
 
     def _stub(source_id):
@@ -1016,18 +1021,259 @@ def test_an_anime_search_reaches_both_registered_anime_sources(monkeypatch):
     summary = _finish(watch)
     # The normalised query, the category as asked, once per source.
     assert sorted(asked) == [
+        ("nekobt", "bleach", Category.ANIME),
         ("nyaa", "bleach", Category.ANIME),
         ("subsplease", "bleach", Category.ANIME),
     ]
-    # One info hash, so the two rows merge and Nyaa's precedence decides.
+    # One info hash, so the rows merge and Nyaa's precedence decides.
     assert [(r.source, r.name) for r in summary.results] == [("nyaa", "From nyaa")]
     assert summary.failures == ()
-    for source_id in ("nyaa", "subsplease"):
+    for source_id in ("nyaa", "subsplease", "nekobt"):
         assert watch.states(source_id) == [
             service.SourceState.RUNNING,
             service.SourceState.COMPLETED,
         ], source_id
     assert svc.active is False
+
+
+def _stub_every_source(monkeypatch, rows_for=None, fails=()):
+    """Stand in for every registered source's search, recording who was asked.
+
+    Selection stays the real one: the registry is not replaced and the objects
+    asked are the very ones it ships. Only the outermost call each source makes
+    is stood in for, so a search is observed rather than travelling.
+    """
+    asked = []
+
+    def _stub(source_id):
+        def _search(query, category, http):
+            asked.append((source_id, query, category))
+            if source_id in fails:
+                raise SourceError(SourceErrorKind.NETWORK, "stubbed failure")
+            if rows_for is None:
+                return []
+            return list(rows_for(source_id))
+
+        return _search
+
+    for source in SOURCES:
+        monkeypatch.setattr(source, "search", _stub(source.id))
+    # Belt and braces: reaching the seams above is the point, so a real request
+    # from any source fails this test rather than travelling.
+    monkeypatch.setattr(
+        SearchHttp,
+        "get_bytes",
+        lambda *a, **k: pytest.fail("a source made a real request"),
+    )
+    return asked
+
+
+def test_an_all_search_dispatches_work_to_every_registered_source(monkeypatch):
+    """Registration is what puts a source in a search - nothing more.
+
+    Static registry membership is not the claim here: this goes through the
+    production selection path into the pool, so a source that the registry
+    lists but the service never schedules fails it.
+    """
+    asked = _stub_every_source(monkeypatch)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("  dune  ", Category.ALL)
+
+    _finish(watch)
+    assert [entry[0] for entry in sorted(asked)] == [
+        "fitgirl",
+        "goggames",
+        "nekobt",
+        "nyaa",
+        "piratebay",
+        "rutor",
+        "subsplease",
+        "yts",
+    ]
+    assert {entry[1:] for entry in asked} == {("dune", Category.ALL)}
+    for source_id, _, _ in asked:
+        assert watch.states(source_id) == [
+            service.SourceState.RUNNING,
+            service.SourceState.COMPLETED,
+        ], source_id
+    assert svc.active is False
+
+
+@pytest.mark.parametrize(
+    "category, expected",
+    [
+        (Category.MOVIES, ["piratebay", "rutor", "yts"]),
+        (Category.TV, ["piratebay", "rutor"]),
+        (Category.ANIME, ["nekobt", "nyaa", "subsplease"]),
+        (Category.GAMES, ["fitgirl", "goggames"]),
+    ],
+)
+def test_a_category_search_dispatches_to_exactly_that_category(
+    monkeypatch, category, expected
+):
+    """Category membership has to reach the pool, not just the registry tuple."""
+    asked = _stub_every_source(monkeypatch)
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune", category)
+
+    _finish(watch)
+    assert sorted(entry[0] for entry in asked) == expected
+    assert {entry[1:] for entry in asked} == {("dune", category)}
+
+
+def test_one_activated_source_failing_leaves_another_activated_one_untouched(
+    monkeypatch,
+):
+    """A wider registry must not widen the blast radius of one bad source.
+
+    The generic isolation rule is already pinned with fakes elsewhere; what is
+    new here is that two of the sources involved are activated adapters reached
+    through the real registry.
+    """
+    rows = {"rutor": [_result(info_hash=A, name="From rutor", source="rutor")]}
+    asked = _stub_every_source(
+        monkeypatch, rows_for=lambda sid: rows.get(sid, []), fails={"nekobt"}
+    )
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("dune", Category.ALL)
+
+    summary = _finish(watch)
+    assert sorted(entry[0] for entry in asked) == [
+        "fitgirl",
+        "goggames",
+        "nekobt",
+        "nyaa",
+        "piratebay",
+        "rutor",
+        "subsplease",
+        "yts",
+    ]
+    assert [(r.source, r.name) for r in summary.results] == [("rutor", "From rutor")]
+    assert [(f.source_id, f.error_kind) for f in summary.failures] == [
+        ("nekobt", SourceErrorKind.NETWORK.value)
+    ]
+    assert watch.states("nekobt")[-1] == service.SourceState.FAILED
+    assert watch.states("rutor")[-1] == service.SourceState.COMPLETED
+    assert svc.active is False
+
+
+class _RecordingPool:
+    """A pool that records what the service asks of it, in order.
+
+    Same shape as the one in test_search_pool_capacity, and for the same
+    reason: what is under test is the order the service configures and submits
+    in, so it never runs a runnable. Here it is driven by the real registry
+    rather than a stubbed fanout.
+    """
+
+    def __init__(self, width):
+        self._max = width
+        self.events = []
+
+    def maxThreadCount(self):
+        return self._max
+
+    def setMaxThreadCount(self, count):
+        self._max = count
+        self.events.append(("configure", count))
+
+    def start(self, runnable):
+        self.events.append(("start", runnable._source_id))
+
+    @property
+    def kinds(self):
+        return [kind for kind, _ in self.events]
+
+
+def _activated_width(default_width):
+    """The width a `default_width` pool is configured to by the real registry.
+
+    No fanout stub: production selection is what sizes this, so the number on
+    the right of every assertion below is the activated registry's own.
+    """
+    pool = QThreadPool()
+    pool.setMaxThreadCount(default_width)
+
+    service._configure_pool(pool)
+
+    return pool.maxThreadCount()
+
+
+def test_the_activated_registry_is_the_fanout_a_search_has_to_fit():
+    """The premise the widths below are stated against."""
+    assert len(service.sources_for(Category.ALL)) == 8
+
+
+@pytest.mark.parametrize("default_width", [5, 6, 7])
+def test_a_machine_narrower_than_the_activated_registry_is_widened_to_it(
+    default_width,
+):
+    """The band activation exposes, proven on the registry it actually ships.
+
+    The capacity slice pins this mechanism against a stubbed eight-source
+    fanout; what is new here is that the eight are the real activated sources.
+    A machine with five, six or seven threads must still be able to start every
+    one of them, because one deadline covers the whole generation and a source
+    queued behind its peers spends a window it never got to use.
+    """
+    assert _activated_width(default_width) == 8
+
+
+def test_a_machine_that_already_fits_the_activated_registry_is_left_alone():
+    assert _activated_width(8) == 8
+
+
+def test_a_machine_wider_than_the_activated_registry_keeps_its_own_width():
+    """Widened to what a search needs, never past it."""
+    assert _activated_width(10) == 10
+
+
+def test_the_ceiling_still_bounds_a_wide_machine_after_activation():
+    """Characterization / ceiling guard. Activation buys no extra threads."""
+    assert service._MAX_POOL_THREADS == 12
+    assert _activated_width(16) == 12
+
+
+def test_the_activated_registry_still_fits_under_the_ceiling():
+    """Characterization. Eight sources need no queueing on a wide machine."""
+    assert len(service.sources_for(Category.ALL)) <= service._MAX_POOL_THREADS
+
+
+def test_all_eight_activated_sources_start_on_a_five_thread_machine(
+    monkeypatch, _fresh_pool
+):
+    """Configuration first, then eight submissions - through the real registry.
+
+    Resizing after submission would leave the sources it was meant to free
+    queued, so the order is the assertion. The eight source ids are the
+    registry's own: nothing here stands in for selection.
+    """
+    pool = _RecordingPool(5)
+    monkeypatch.setattr(service, "QThreadPool", lambda: pool)
+    svc = service.SearchService(http_factory=_FakeHttp)
+
+    svc.start("dune", Category.ALL)
+
+    assert pool.events[0] == ("configure", 8)
+    assert pool.kinds.index("configure") < pool.kinds.index("start")
+    assert sorted(source_id for kind, source_id in pool.events if kind == "start") == [
+        "fitgirl",
+        "goggames",
+        "nekobt",
+        "nyaa",
+        "piratebay",
+        "rutor",
+        "subsplease",
+        "yts",
+    ]
+    assert pool.maxThreadCount() == 8
+    svc.cancel()
 
 
 # --- L. one source, start to finish ------------------------------------------

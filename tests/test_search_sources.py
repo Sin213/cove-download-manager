@@ -1721,19 +1721,9 @@ def test_nekobt_never_bypasses_search_http():
         assert banned not in text
 
 
-# Group H - the adapter is not registered yet
-
-
-def test_nekobt_is_not_in_the_registry():
-    from cove.search.registry import SOURCES
-
-    assert [source.id for source in SOURCES] == [
-        "yts",
-        "piratebay",
-        "nyaa",
-        "fitgirl",
-        "subsplease",
-    ]
+# Group H - registration. The adapter is now a shipped source; which position
+# and category it holds is pinned in tests/test_search_registry.py, where the
+# whole registry is stated in one place rather than per adapter.
 
 
 # --- GOG Games ---------------------------------------------------------------
@@ -2132,21 +2122,7 @@ def test_goggames_never_bypasses_search_http():
         assert banned not in text
 
 
-# Group H - the adapter is not registered yet
-
-
-def test_goggames_is_not_in_the_registry():
-    from cove.search.registry import SOURCES
-
-    assert [source.id for source in SOURCES] == [
-        "yts",
-        "piratebay",
-        "nyaa",
-        "fitgirl",
-        "subsplease",
-    ]
-    assert "goggames" not in {source.id for source in SOURCES}
-    assert "nekobt" not in {source.id for source in SOURCES}
+# Group H - registration. See tests/test_search_registry.py.
 
 
 # --- Rutor -----------------------------------------------------------------
@@ -2570,19 +2546,4 @@ def test_rutor_never_bypasses_search_http():
         assert banned not in text
 
 
-# Group L - the adapter is not registered yet
-
-
-def test_rutor_is_not_in_the_registry():
-    from cove.search.registry import SOURCES
-
-    assert [source.id for source in SOURCES] == [
-        "yts",
-        "piratebay",
-        "nyaa",
-        "fitgirl",
-        "subsplease",
-    ]
-    assert {"rutor", "goggames", "nekobt"}.isdisjoint(
-        {source.id for source in SOURCES}
-    )
+# Group L - registration. See tests/test_search_registry.py.
