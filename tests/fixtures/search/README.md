@@ -10,6 +10,7 @@ returns. They were trimmed down from single manual captures of
 - SubsPlease `/api/?f=search&tz=UTC&s=` (contract verified 2026-08-12)
 - nekoBT `/api/v1/torrents/search?query=` (contract verified 2026-08-14)
 - GOG Games `/search?search=` (contract verified 2026-08-14)
+- Rutor `/search/0/0/000/0/<query>` (contract verified 2026-08-15)
 
 and then edited by hand: titles and hashes are invented, and no cookies,
 tokens, headers or other request metadata were kept. Nothing refreshes these
@@ -51,3 +52,19 @@ one valid row carries a null `infohash` (a catalogue entry with no release
 behind it yet, which the parser must skip rather than fail on), and the unusable
 file renames `data` to `items` so the parser must refuse it instead of
 reporting an empty search.
+
+The Rutor files are HTML and keep only the `id="index"` region: the results
+header row the parser recognises the page by, and the result rows under it.
+Rutor's page is one table with no per-cell classes, so the fixtures preserve
+the two row shapes it actually emits - five cells when a torrent has comments
+and four when it does not, the title cell absorbing the difference with a
+colspan - because the comment cell is shaped exactly like the size cell and a
+parser reading cells by position would confuse them. Titles and info hashes are
+invented but one stays Cyrillic so the UTF-8 decode is pinned, the magnets keep
+Rutor's own `dn=rutor.info` and two announce URLs (rewritten to `tracker.example`
+and `retracker.local`) because the adapter forwards the provider's magnet rather
+than rebuilding it, and `265.94&nbsp;GB` / `09&nbsp;Июл&nbsp;26` keep the
+non-breaking spaces and the abbreviated Russian month the page publishes. The
+unusable file is a page with no results header that still carries a magnet in a
+table of the right shape, so zero parsed rows must raise instead of passing for
+an empty search.
