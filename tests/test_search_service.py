@@ -120,13 +120,13 @@ def test_higher_seeder_row_wins_regardless_of_registry_order():
 
 
 def test_registry_order_breaks_a_seeder_tie():
-    # The premise, stated as the prefix it depends on: YTS is ahead of Pirate
-    # Bay. Sources added behind them cannot affect this tie, so the assertion
-    # is not restated every time the registry grows.
-    assert [s.id for s in SOURCES][:2] == ["yts", "piratebay"]
+    # The premise, stated as the prefix it depends on: YTS is ahead of Nyaa.
+    # Sources added behind them cannot affect this tie, so the assertion is not
+    # restated every time the registry grows.
+    assert [s.id for s in SOURCES][:2] == ["yts", "nyaa"]
 
     rows = [
-        _result(info_hash=A, source="piratebay", seeders=7),
+        _result(info_hash=A, source="nyaa", seeders=7),
         _result(info_hash=A, source="yts", seeders=7),
     ]
 
@@ -150,13 +150,13 @@ def test_nyaa_keeps_its_precedence_over_the_newer_anime_source():
 
 def test_registry_order_breaks_a_seeder_tie_further_down_the_registry():
     rows = [
-        _result(info_hash=A, source="nyaa", seeders=7),
-        _result(info_hash=A, source="piratebay", seeders=7),
+        _result(info_hash=A, source="subsplease", seeders=7),
+        _result(info_hash=A, source="fitgirl", seeders=7),
     ]
 
     (winner,) = aggregate(rows).results
 
-    assert winner.source == "piratebay"
+    assert winner.source == "fitgirl"
 
 
 def test_same_source_seeder_tie_keeps_the_first_occurrence():
@@ -233,17 +233,17 @@ def test_backfill_donor_follows_registry_priority_not_arrival_order():
     winner = _result(
         info_hash=A, source="nyaa", seeders=99, size_bytes=None, added=None
     )
-    from_piratebay = _result(
-        info_hash=A, source="piratebay", seeders=1, size_bytes=2048, added=1500000000
+    from_nekobt = _result(
+        info_hash=A, source="nekobt", seeders=1, size_bytes=2048, added=1500000000
     )
     from_yts = _result(
         info_hash=A, source="yts", seeders=1, size_bytes=4096, added=1600000000
     )
 
     for rows in (
-        [winner, from_piratebay, from_yts],
-        [from_yts, winner, from_piratebay],
-        [from_piratebay, from_yts, winner],
+        [winner, from_nekobt, from_yts],
+        [from_yts, winner, from_nekobt],
+        [from_nekobt, from_yts, winner],
     ):
         (merged,) = aggregate(rows).results
         assert merged.source == "nyaa"
@@ -256,7 +256,7 @@ def test_backfill_takes_each_field_from_the_first_donor_that_has_it():
         _result(info_hash=A, source="nyaa", seeders=99, size_bytes=None, added=None),
         _result(info_hash=A, source="yts", seeders=1, size_bytes=None, added=1600000000),
         _result(
-            info_hash=A, source="piratebay", seeders=1, size_bytes=2048, added=1500000000
+            info_hash=A, source="nekobt", seeders=1, size_bytes=2048, added=1500000000
         ),
     ]
 
@@ -353,9 +353,11 @@ def test_result_is_identical_whatever_order_the_sources_finish_in():
         _result(info_hash=A, source="yts", seeders=10, name="Shared"),
         _result(info_hash=B, source="yts", seeders=3, name="Yts only"),
     ]
-    from_piratebay = [
-        _result(info_hash=A, source="piratebay", seeders=10, name="Shared"),
-        _result(info_hash=C, source="piratebay", seeders=3, name="Bay only", added=None),
+    from_fitgirl = [
+        _result(info_hash=A, source="fitgirl", seeders=10, name="Shared"),
+        _result(
+            info_hash=C, source="fitgirl", seeders=3, name="Repack only", added=None
+        ),
     ]
     from_nyaa = [
         _result(info_hash=D, source="nyaa", seeders=3, name="Anime only"),
@@ -363,10 +365,10 @@ def test_result_is_identical_whatever_order_the_sources_finish_in():
     ]
 
     orders = [
-        from_yts + from_piratebay + from_nyaa,
-        from_nyaa + from_yts + from_piratebay,
-        from_piratebay + from_nyaa + from_yts,
-        from_nyaa + from_piratebay + from_yts,
+        from_yts + from_fitgirl + from_nyaa,
+        from_nyaa + from_yts + from_fitgirl,
+        from_fitgirl + from_nyaa + from_yts,
+        from_nyaa + from_fitgirl + from_yts,
     ]
     merged = [aggregate(rows) for rows in orders]
 
@@ -430,7 +432,7 @@ def test_dedupe_count_is_zero_when_nothing_is_duplicated():
 def test_dedupe_count_reports_every_dropped_row():
     rows = [
         _result(info_hash=A, source="yts"),
-        _result(info_hash=A, source="piratebay"),
+        _result(info_hash=A, source="nekobt"),
         _result(info_hash=A, source="nyaa"),
         _result(info_hash=B, source="yts"),
         _result(info_hash=C, source="yts"),
@@ -1081,13 +1083,16 @@ def test_an_all_search_dispatches_work_to_every_registered_source(monkeypatch):
 
     svc.start("  dune  ", Category.ALL)
 
-    _finish(watch)
+    summary = _finish(watch)
+    # Only registered sources are stood in for, so a source scheduled from
+    # outside the registry - a deactivated one the service still reaches for -
+    # would try to travel, hit the guard and land here as a failure.
+    assert summary.failures == ()
     assert [entry[0] for entry in sorted(asked)] == [
         "fitgirl",
         "goggames",
         "nekobt",
         "nyaa",
-        "piratebay",
         "rutor",
         "subsplease",
         "yts",
@@ -1104,8 +1109,8 @@ def test_an_all_search_dispatches_work_to_every_registered_source(monkeypatch):
 @pytest.mark.parametrize(
     "category, expected",
     [
-        (Category.MOVIES, ["piratebay", "rutor", "yts"]),
-        (Category.TV, ["piratebay", "rutor"]),
+        (Category.MOVIES, ["rutor", "yts"]),
+        (Category.TV, ["rutor"]),
         (Category.ANIME, ["nekobt", "nyaa", "subsplease"]),
         (Category.GAMES, ["fitgirl", "goggames"]),
     ],
@@ -1113,14 +1118,22 @@ def test_an_all_search_dispatches_work_to_every_registered_source(monkeypatch):
 def test_a_category_search_dispatches_to_exactly_that_category(
     monkeypatch, category, expected
 ):
-    """Category membership has to reach the pool, not just the registry tuple."""
+    """Category membership has to reach the pool, not just the registry tuple.
+
+    Movies and TV are the categories Pirate Bay's deactivation emptied out of,
+    so `expected` is exhaustive in both directions: only registered sources are
+    stood in for, and a source scheduled from outside the registry would try to
+    travel, hit the guard and surface as a failure rather than silently missing
+    from `asked`.
+    """
     asked = _stub_every_source(monkeypatch)
     svc = service.SearchService(http_factory=_FakeHttp)
     watch = _Watch(svc)
 
     svc.start("dune", category)
 
-    _finish(watch)
+    summary = _finish(watch)
+    assert summary.failures == ()
     assert sorted(entry[0] for entry in asked) == expected
     assert {entry[1:] for entry in asked} == {("dune", category)}
 
@@ -1149,7 +1162,6 @@ def test_one_activated_source_failing_leaves_another_activated_one_untouched(
         "goggames",
         "nekobt",
         "nyaa",
-        "piratebay",
         "rutor",
         "subsplease",
         "yts",
@@ -1207,7 +1219,7 @@ def _activated_width(default_width):
 
 def test_the_activated_registry_is_the_fanout_a_search_has_to_fit():
     """The premise the widths below are stated against."""
-    assert len(service.sources_for(Category.ALL)) == 8
+    assert len(service.sources_for(Category.ALL)) == 7
 
 
 @pytest.mark.parametrize("default_width", [5, 6, 7])
@@ -1216,16 +1228,18 @@ def test_a_machine_narrower_than_the_activated_registry_is_widened_to_it(
 ):
     """The band activation exposes, proven on the registry it actually ships.
 
-    The capacity slice pins this mechanism against a stubbed eight-source
-    fanout; what is new here is that the eight are the real activated sources.
-    A machine with five, six or seven threads must still be able to start every
-    one of them, because one deadline covers the whole generation and a source
-    queued behind its peers spends a window it never got to use.
+    The capacity slice pins this mechanism against a stubbed fanout; what is
+    new here is that the fanout is the real activated registry's own, and that
+    it follows the registry down when a source is deactivated. A machine with
+    five, six or seven threads must still be able to start every source,
+    because one deadline covers the whole generation and a source queued behind
+    its peers spends a window it never got to use.
     """
-    assert _activated_width(default_width) == 8
+    assert _activated_width(default_width) == 7
 
 
 def test_a_machine_that_already_fits_the_activated_registry_is_left_alone():
+    """Eight threads for seven sources is already enough: no narrowing."""
     assert _activated_width(8) == 8
 
 
@@ -1241,18 +1255,19 @@ def test_the_ceiling_still_bounds_a_wide_machine_after_activation():
 
 
 def test_the_activated_registry_still_fits_under_the_ceiling():
-    """Characterization. Eight sources need no queueing on a wide machine."""
+    """Characterization. The active sources need no queueing on a wide machine."""
     assert len(service.sources_for(Category.ALL)) <= service._MAX_POOL_THREADS
 
 
-def test_all_eight_activated_sources_start_on_a_five_thread_machine(
+def test_every_active_source_starts_on_a_five_thread_machine(
     monkeypatch, _fresh_pool
 ):
-    """Configuration first, then eight submissions - through the real registry.
+    """Configuration first, then one submission each - through the real registry.
 
     Resizing after submission would leave the sources it was meant to free
-    queued, so the order is the assertion. The eight source ids are the
-    registry's own: nothing here stands in for selection.
+    queued, so the order is the assertion. The source ids are the registry's
+    own: nothing here stands in for selection, so a deactivated source that the
+    service still scheduled would fail this.
     """
     pool = _RecordingPool(5)
     monkeypatch.setattr(service, "QThreadPool", lambda: pool)
@@ -1260,19 +1275,18 @@ def test_all_eight_activated_sources_start_on_a_five_thread_machine(
 
     svc.start("dune", Category.ALL)
 
-    assert pool.events[0] == ("configure", 8)
+    assert pool.events[0] == ("configure", 7)
     assert pool.kinds.index("configure") < pool.kinds.index("start")
     assert sorted(source_id for kind, source_id in pool.events if kind == "start") == [
         "fitgirl",
         "goggames",
         "nekobt",
         "nyaa",
-        "piratebay",
         "rutor",
         "subsplease",
         "yts",
     ]
-    assert pool.maxThreadCount() == 8
+    assert pool.maxThreadCount() == 7
     svc.cancel()
 
 
@@ -3048,7 +3062,7 @@ def test_two_sources_answering_the_same_query_do_not_share_an_entry():
 
     cache.put(_key(source_id="yts"), rows)
 
-    assert cache.get(_key(source_id="piratebay")) is None
+    assert cache.get(_key(source_id="nyaa")) is None
     assert cache.get(_key(source_id="yts")) == rows
 
 
@@ -3088,7 +3102,7 @@ def test_a_cache_key_is_hashable_and_compares_by_its_three_parts():
     assert _key() == _key()
     assert hash(_key()) == hash(_key())
     assert len({_key(), _key()}) == 1
-    assert _key(source_id="piratebay") != _key(source_id="yts")
+    assert _key(source_id="nyaa") != _key(source_id="yts")
 
 
 # --- Z.C. time to live --------------------------------------------------------

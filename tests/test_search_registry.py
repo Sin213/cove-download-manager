@@ -19,14 +19,23 @@ from cove.search.sources.nekobt import NekoBtSource
 from cove.search.sources.rutor import RutorSource
 from cove.search.sources.subsplease import SubsPleaseSource
 
-# The five sources Cove shipped before the provider expansion, in the order
-# they were approved with. This prefix is a product invariant: registry order
-# is the aggregator's tie-break, so reordering it changes which row wins.
-_ORIGINAL_FIVE = ["yts", "piratebay", "nyaa", "fitgirl", "subsplease"]
+# The sources Cove shipped before the provider expansion that are still active,
+# in the order they were approved with. Pirate Bay sat second here until 3.6.0
+# temporarily deactivated it; the four that remain keep their relative order,
+# because registry order is the aggregator's tie-break and reordering it
+# changes which row wins.
+_ORIGINAL_ACTIVE = ["yts", "nyaa", "fitgirl", "subsplease"]
 
-# The whole registry after the expansion: the original five untouched, then the
-# three reviewed adapters in the order they were implemented and approved.
-_EXPECTED_IDS = _ORIGINAL_FIVE + ["nekobt", "goggames", "rutor"]
+# The whole active registry: the surviving pre-expansion prefix untouched, then
+# the three reviewed adapters in the order they were implemented and approved.
+_EXPECTED_IDS = _ORIGINAL_ACTIVE + ["nekobt", "goggames", "rutor"]
+
+# Deactivated for 3.6.0, not removed: apibay.org stopped answering Cove, curl
+# and a browser User-Agent alike, with DNS, TCP and TLS all succeeding and no
+# successor host documented. No Cove defect was ever proven, so the adapter and
+# its deterministic tests stay for a later reactivation - only the production
+# registration goes.
+_DEACTIVATED = "piratebay"
 
 
 def test_registry_order_is_deterministic():
@@ -36,22 +45,48 @@ def test_registry_order_is_deterministic():
 def test_a_new_source_is_appended_rather_than_given_priority():
     """Order is the aggregator's tie-break, so an addition must not reorder.
 
-    The five sources that shipped first keep the precedence they were approved
-    with, and the expansion's three go after them.
+    The pre-expansion sources still active keep the precedence they were
+    approved with, and the expansion's three go after them.
     """
     ids = [source.id for source in registry.SOURCES]
-    assert ids[:5] == _ORIGINAL_FIVE
-    assert ids[5:] == ["nekobt", "goggames", "rutor"]
+    assert ids[:4] == _ORIGINAL_ACTIVE
+    assert ids[4:] == ["nekobt", "goggames", "rutor"]
 
 
-def test_the_original_five_keep_their_exact_precedence():
-    """Characterisation guard: the pre-expansion prefix may never move.
+def test_the_surviving_original_sources_keep_their_exact_precedence():
+    """Characterisation guard: the pre-expansion prefix may never be reordered.
 
-    Green before the expansion and green after - that is the point. It fails
-    only if an addition is slotted in among the sources already shipped.
+    Deactivating Pirate Bay closes the gap it left; it must not shuffle the
+    sources around it. This fails if an addition is slotted in among the
+    sources already shipped, or if a survivor changes places.
     """
     ids = [source.id for source in registry.SOURCES]
-    assert ids[:5] == _ORIGINAL_FIVE
+    assert ids[:4] == _ORIGINAL_ACTIVE
+
+
+def test_pirate_bay_is_not_an_active_source():
+    """The 3.6.0 product decision, stated where the registry is stated.
+
+    Deactivation is registry-only: nothing here says the adapter is gone, and
+    the guard below says the opposite.
+    """
+    assert _DEACTIVATED not in [source.id for source in registry.SOURCES]
+    for category in Category:
+        ids = [s.id for s in registry.sources_for(category)]
+        assert _DEACTIVATED not in ids, category
+
+
+def test_the_pirate_bay_adapter_survives_its_deactivation():
+    """Reactivation guard: deactivated is not deleted.
+
+    The adapter and its deterministic fixture tests stay in the tree so 3.6.0's
+    decision can be reversed by re-registering it, not re-implementing it.
+    """
+    from cove.search.sources.piratebay import PirateBaySource
+
+    source = PirateBaySource()
+    assert source.id == _DEACTIVATED
+    assert source.categories == (Category.MOVIES, Category.TV)
 
 
 def test_registry_holds_source_instances():
@@ -71,15 +106,12 @@ def test_all_returns_every_enabled_source_in_registry_order():
 
 
 def test_movies_selects_the_movie_sources():
-    assert [s.id for s in registry.sources_for(Category.MOVIES)] == [
-        "yts",
-        "piratebay",
-        "rutor",
-    ]
+    assert [s.id for s in registry.sources_for(Category.MOVIES)] == ["yts", "rutor"]
 
 
 def test_tv_selects_the_tv_sources():
-    assert [s.id for s in registry.sources_for(Category.TV)] == ["piratebay", "rutor"]
+    """Rutor is the sole TV source for 3.6.0, so TV must not come back empty."""
+    assert [s.id for s in registry.sources_for(Category.TV)] == ["rutor"]
 
 
 def test_anime_selects_the_anime_sources():
@@ -246,12 +278,12 @@ def test_the_registry_does_not_outgrow_the_search_ceiling():
 
     This is the ceiling, not the width a pool actually gets. The service sizes
     its pool to the fanout while the fanout fits under the ceiling, and lets
-    the ceiling win past it, so what is pinned here is that eight sources stay
-    inside the ceiling and activation therefore introduces no queueing of its
-    own. The widths that follow from this are pinned in
+    the ceiling win past it, so what is pinned here is that the seven active
+    sources stay inside the ceiling and activation therefore introduces no
+    queueing of its own. The widths that follow from this are pinned in
     tests/test_search_service.py and tests/test_search_pool_capacity.py.
     """
-    assert len(registry.sources_for(Category.ALL)) == 8
+    assert len(registry.sources_for(Category.ALL)) == 7
     assert len(registry.SOURCES) <= _MAX_POOL_THREADS
 
 

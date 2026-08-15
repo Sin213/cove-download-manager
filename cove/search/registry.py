@@ -13,14 +13,18 @@ from cove.search.sources.fitgirl import FitGirlSource
 from cove.search.sources.goggames import GogGamesSource
 from cove.search.sources.nekobt import NekoBtSource
 from cove.search.sources.nyaa import NyaaSource
-from cove.search.sources.piratebay import PirateBaySource
 from cove.search.sources.rutor import RutorSource
 from cove.search.sources.subsplease import SubsPleaseSource
 from cove.search.sources.yts import YtsSource
 
+# Pirate Bay shipped second here and is temporarily deactivated for 3.6.0: its
+# documented API host stopped answering Cove entirely - no response bytes at
+# all - while DNS, TCP and TLS to it all still succeed, and curl and a browser
+# User-Agent stall the same way. No Cove defect was found and no successor host
+# is documented, so cove/search/sources/piratebay.py and its tests stay put;
+# re-registering it here is all a reactivation takes.
 SOURCES: tuple[Source, ...] = (
     YtsSource(),
-    PirateBaySource(),
     NyaaSource(),
     # Appended, not slotted in: this order is the aggregator's tie-break, so a
     # new source goes last rather than taking precedence from an older one.
