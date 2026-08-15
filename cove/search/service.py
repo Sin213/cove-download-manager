@@ -39,9 +39,10 @@ _DIAG_COMPONENT = "search"
 # the global pool is where downloads, RPC calls and hashing already queue, and
 # a handful of slow indexers must never take those slots.
 #
-# 12 is a ceiling, not a target. A machine whose default pool is narrower
-# keeps its own width - Search has no business widening a small machine's
-# concurrency - so the rule is a clamp, never a max().
+# 12 is a ceiling, not a target. A machine whose default pool is wider keeps
+# only the ceiling, and a machine whose default pool is already enough for the
+# sources keeps its own width - Search widens a small machine to what one
+# search needs and never past it.
 _MAX_POOL_THREADS = 12
 
 _POOL: QThreadPool | None = None
@@ -186,23 +187,49 @@ def aggregate(results: Iterable[SearchResult]) -> Aggregation:
 
 
 def _configure_pool(pool: QThreadPool) -> QThreadPool:
-    """Clamp `pool` to Cove's Search ceiling and return it.
+    """Size `pool` for one whole search, within Cove's ceiling, and return it.
 
     A freshly constructed QThreadPool already defaults to the machine's core
     count, which is commonly above the ceiling, so the clamp has to happen at
     creation - reading the default and calling it configured would let a
     16-thread pool describe itself as capped at 12.
+
+    The floor is why this is not just a clamp. One search is bound by one
+    deadline, so a source that cannot start is already spending a window it
+    never got to use: on a machine with fewer threads than the registry has
+    sources, the last few would be queued behind peers while the clock they
+    share is running, and could be reported as timed out without ever having
+    been asked anything. While the fanout fits under the ceiling, the pool is
+    therefore made wide enough for a whole search at once. Past the ceiling the
+    ceiling wins and the queueing is deliberate - 12 concurrent indexers is
+    already more than Cove is willing to spend on one search.
+
+    Wide enough for one search, not for two: superseding a search suppresses
+    it without terminating it, so a slow provider from the previous search
+    still holds its thread and the new search can still queue behind it. That
+    is the pinning documented on SearchService, unchanged and untouched here -
+    widening the pool cannot fix it, because the fix is either abandoning a
+    runnable Qt still owns or paying for every overlapping search at once.
+    What this sizing removes is the case a machine's width alone caused: a
+    search whose own sources could not all start on an idle pool.
+
+    The fanout is read from the registry here rather than remembered from
+    import, so a registry that gains a source needs no second edit.
     """
-    pool.setMaxThreadCount(min(pool.maxThreadCount(), _MAX_POOL_THREADS))
+    fanout = len(sources_for())
+    pool.setMaxThreadCount(min(_MAX_POOL_THREADS, max(pool.maxThreadCount(), fanout)))
     return pool
 
 
 def _pool() -> QThreadPool:
     """The one pool Search executes sources on, created on first use.
 
-    Its width is fixed at creation: nothing here resizes the pool to match how
-    many sources a search happens to use. Work beyond the ceiling waits in
-    Qt's queue, which is the whole point of having one.
+    Its width is fixed at creation, and creation happens on the first search -
+    before that search submits anything, because this is what hands it the
+    pool. Nothing here resizes the pool afterwards to match how many sources a
+    later search happens to use: the width already covers the whole registry,
+    and a search that uses fewer sources needs less. Work beyond the ceiling
+    waits in Qt's queue, which is the whole point of having one.
     """
     global _POOL
     if _POOL is None:

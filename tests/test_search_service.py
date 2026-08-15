@@ -477,13 +477,20 @@ def test_a_pool_just_above_the_ceiling_is_clamped():
     assert pool.maxThreadCount() == 12
 
 
-def test_a_narrow_pool_is_left_alone(_fresh_pool):
+def test_a_narrow_pool_is_widened_to_the_fanout(_fresh_pool):
+    """A machine with fewer threads than sources still starts all of them.
+
+    One deadline covers the whole search, so a source queued behind its peers
+    spends a window it never got to use. Stated against the registry rather
+    than a number, so adding a source does not make this a lie. The width
+    tests either side of this one pin the ceiling that bounds it.
+    """
     pool = QThreadPool()
     pool.setMaxThreadCount(4)
 
     service._configure_pool(pool)
 
-    assert pool.maxThreadCount() == 4
+    assert pool.maxThreadCount() == len(service.sources_for())
 
 
 def test_a_pool_at_eight_is_not_widened_towards_the_ceiling():
