@@ -11,19 +11,33 @@ ARCH="$(uname -m)"
 OUT_NAME="Cove-Download-Manager-${VERSION}-${ARCH}.AppImage"
 OUT="release/${OUT_NAME}"
 
-# Regenerate the python-appimage requirements file with this checkout's
-# absolute path. We rewrite it every run so the committed copy stays
-# portable (no developer's home directory baked in).
-cat > build/recipe/requirements.txt <<EOF
+# build/recipe/ is a committed, read-only template. The recipe python-appimage
+# actually consumes carries per-build state (this checkout's absolute path, the
+# AppImage icon), so we stage a throwaway copy outside the source tree and
+# generate into that. The build must never write to tracked source.
+TEMPLATE_RECIPE="build/recipe"
+STAGED_RECIPE="$(mktemp -d "${TMPDIR:-/tmp}/cove-appimage-recipe.XXXXXXXX")"
+cleanup_staged_recipe() {
+    if [ -n "${STAGED_RECIPE:-}" ] && [ -d "${STAGED_RECIPE:-}" ]; then
+        rm -rf -- "$STAGED_RECIPE"
+    fi
+}
+trap cleanup_staged_recipe EXIT
+cp -a "$TEMPLATE_RECIPE/." "$STAGED_RECIPE/"
+# The template may be checked out read-only; the staged copy must be writable.
+chmod -R u+w "$STAGED_RECIPE"
+
+# Point python-appimage's requirements at this checkout by absolute path.
+cat > "$STAGED_RECIPE/requirements.txt" <<EOF
 PySide6>=6.5
 requests>=2.31
 yt-dlp>=2025.1.0
 ${HERE}
 EOF
-# Refresh bundled icon — once into build/recipe (for python-appimage's
+# Refresh bundled icon — once into the staged recipe (for python-appimage's
 # .desktop integration) and once into the package itself (so the running
 # app can find it via importlib's package data search).
-cp -f cove_dm_icon.png build/recipe/cove.png
+cp -f cove_dm_icon.png "$STAGED_RECIPE/cove.png"
 cp -f cove_dm_icon.png cove/cove_dm_icon.png
 # The suite icon stays bundled as find_icon()'s fallback.
 cp -f cove_icon.png cove/cove_icon.png
@@ -32,7 +46,7 @@ cp -f cove_icon.png cove/cove_icon.png
 rm -rf "Cove Download Manager-${ARCH}" Cove.AppDir "Cove-${ARCH}.AppImage" cove.egg-info build/__pycache__ AppDir
 
 PYAPPIMG="${PYAPPIMG:-$HOME/.local/bin/python-appimage}"
-"$PYAPPIMG" build app --no-packaging -p 3.13 build/recipe
+"$PYAPPIMG" build app --no-packaging -p 3.13 "$STAGED_RECIPE"
 
 # python-appimage names the AppDir from the .desktop's Name= field.
 SRC_DIR="Cove Download Manager-${ARCH}"

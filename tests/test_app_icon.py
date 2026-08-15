@@ -62,7 +62,10 @@ def test_an_installed_appimage_icon_is_still_found(tmp_path, monkeypatch):
 def test_every_packaging_path_installs_the_download_manager_icon():
     """The icon only distinguishes the app if the packaging ships it."""
     installs = {
-        "build.sh": "cp -f cove_dm_icon.png build/recipe/cove.png",
+        # build.sh stages the recipe outside the tracked template; the icon
+        # lands in the staged copy. See tests/test_appimage_build_script.py
+        # for the behavioural proof that the staged recipe gets this icon.
+        "build.sh": 'cp -f cove_dm_icon.png "$STAGED_RECIPE/cove.png"',
         "scripts/build-deb.sh": 'ICON_SRC="$ROOT/cove_dm_icon.png"',
         "packaging/installer.iss": '#define IconFile "..\\cove_dm_icon.ico"',
         ".github/workflows/release.yml": "--icon cove_dm_icon.ico",
