@@ -20,8 +20,13 @@ from cove.search.sources.base import (
 )
 
 # Mirrors, tried in this order. A fixed, short list: failover is a fallback,
-# not a retry loop.
-HOSTS = ("yts.mx", "yts.am", "yts.rs")
+# not a retry loop. Both were verified to answer the API directly, on their
+# own hostname, with no redirect; the second is the successor base URL the API
+# itself announces. Hosts that stop answering directly come out of this tuple
+# rather than staying on as a fallback that only spends the timeout budget -
+# yts.mx (gone from DNS), yts.am (redirects cross-host, which Search refuses by
+# design), and yts.rs (500s out of the API) were retired for exactly that.
+HOSTS = ("yts.gg", "movies-api.accel.li")
 
 # The API's own per-page maximum.
 _PAGE_LIMIT = 50
@@ -31,7 +36,7 @@ class YtsSource(Source):
     id = "yts"
     label = "YTS"
     categories = (Category.MOVIES,)
-    homepage = "https://yts.mx"
+    homepage = "https://yts.gg"
     reports_swarm = True
 
     def search(

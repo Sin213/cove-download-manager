@@ -276,7 +276,11 @@ def test_source_contract_is_abstract():
 
 # --- YTS -------------------------------------------------------------------
 
-YTS_HOSTS = ("yts.mx", "yts.am", "yts.rs")
+YTS_HOSTS = ("yts.gg", "movies-api.accel.li")
+
+# Hosts that live verification retired: yts.mx no longer resolves, yts.am only
+# redirects cross-host, and yts.rs answers the API with a 500.
+YTS_DEAD_HOSTS = ("yts.mx", "yts.am", "yts.rs")
 
 
 def yts_source():
@@ -327,8 +331,40 @@ def test_yts_sends_the_query_to_the_first_host():
     http, session = http_with(FakeResponse(fixture("yts_valid.json")))
     source.search("harbour lights", Category.MOVIES, http)
     url, kwargs = session.calls[0]
-    assert url.startswith("https://yts.mx/api/v2/list_movies.json")
+    assert url.startswith("https://yts.gg/api/v2/list_movies.json")
     assert kwargs["params"]["query_term"] == "harbour lights"
+
+
+def test_yts_search_that_succeeds_costs_one_request_to_the_live_host():
+    """A healthy search spends nothing on preflight or on dead mirrors."""
+    source = yts_source()
+    http, session = http_with(FakeResponse(fixture("yts_valid.json")))
+    assert source.search("harbour", Category.MOVIES, http)
+    assert len(session.calls) == 1
+    assert session.calls[0][0].split("/")[2] == "yts.gg"
+
+
+def test_yts_never_routes_to_a_retired_host():
+    """Dead, redirect-only, and broken mirrors must not come back.
+
+    A host that reliably fails is not redundancy; it just burns the timeout
+    budget of every search that reaches it.
+    """
+    from cove.search.sources import yts as yts_module
+
+    source = yts_source()
+    for host in YTS_DEAD_HOSTS:
+        assert host not in yts_module.HOSTS
+    assert source.homepage.split("/")[2] not in YTS_DEAD_HOSTS
+
+    # Not just the constant: no request may reach a retired host either.
+    responses = [FakeResponse(b"nope", status_code=503) for _ in range(8)]
+    http, session = http_with(*responses)
+    with pytest.raises(SourceError):
+        source.search("harbour", Category.MOVIES, http)
+    hosts = [url.split("/")[2] for url, _ in session.calls]
+    assert hosts
+    assert not set(hosts) & set(YTS_DEAD_HOSTS)
 
 
 def test_yts_drops_malformed_rows_but_keeps_the_good_one():
@@ -374,7 +410,7 @@ def test_yts_fails_over_to_the_next_host():
     )
     results = source.search("harbour", Category.MOVIES, http)
     assert results
-    assert [url.split("/")[2] for url, _ in session.calls] == ["yts.mx", "yts.am"]
+    assert [url.split("/")[2] for url, _ in session.calls] == list(YTS_HOSTS[:2])
 
 
 def test_yts_failover_is_bounded_to_the_known_hosts():
