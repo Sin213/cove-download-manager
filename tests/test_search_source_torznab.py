@@ -993,3 +993,80 @@ def test_search_flows_through_searchhttp():
     results, session = run(make_source(), "x", Category.TV, caps_response(), FakeResponse(feed(item("<title>One</title>" + attr("infohash", HEX)))))
     assert len(results) == 1
     assert len(session.calls) >= 2  # caps + search page, both via SearchHttp
+
+
+# --- probe_caps (Test Connection backend, S6) -------------------------------
+
+
+def _probe(source, monkeypatch, *outcomes):
+    """Run probe_caps against a fake SearchHttp factory wrapping FakeSession."""
+    session = FakeSession(*outcomes)
+    monkeypatch.setattr(
+        "cove.search.sources.torznab.SearchHttp",
+        lambda interface: SearchHttp(interface, session=session),
+    )
+    return source.probe_caps(), session
+
+
+def test_probe_caps_performs_exactly_one_caps_request(monkeypatch):
+    caps, session = _probe(make_source(api_key=SECRET), monkeypatch, caps_response())
+    assert caps.search_modes == ("search", "tv-search", "movie-search")
+    assert len(session.calls) == 1
+    assert url_of(session, 0) == ENDPOINT
+    params = params_of(session, 0)
+    assert ("t", "caps") in params
+    assert ("apikey", SECRET) in params
+    # Zero content-search requests: no q/limit/offset ever appears.
+    assert values(params, "q") == []
+    assert values(params, "limit") == []
+    assert values(params, "offset") == []
+
+
+def test_probe_caps_passes_the_requested_interface(monkeypatch):
+    seen = {}
+    session = FakeSession(caps_response())
+
+    def factory(interface):
+        seen["interface"] = interface
+        return SearchHttp(interface, session=session)
+
+    monkeypatch.setattr("cove.search.sources.torznab.SearchHttp", factory)
+    make_source().probe_caps(interface="eth0")
+    assert seen["interface"] == "eth0"
+
+
+def test_probe_caps_rejects_public_http_before_transport(monkeypatch):
+    session = FakeSession()
+    monkeypatch.setattr(
+        "cove.search.sources.torznab.SearchHttp",
+        lambda interface: SearchHttp(interface, session=session),
+    )
+    source = make_source(url="http://example.com/api", api_key=SECRET)
+    with pytest.raises(SourceError) as excinfo:
+        source.probe_caps()
+    assert "HTTPS" in str(excinfo.value)
+    assert SECRET not in str(excinfo.value)
+    assert session.calls == []  # rejected before any request
+
+
+def test_probe_caps_allows_public_https(monkeypatch):
+    caps, session = _probe(
+        make_source(url="https://example.com/api"), monkeypatch, caps_response()
+    )
+    assert len(session.calls) == 1
+
+
+def test_probe_caps_sanitizes_auth_failure(monkeypatch):
+    source = make_source(api_key=SECRET)
+    with pytest.raises(SourceError) as excinfo:
+        _probe(source, monkeypatch, LeakingResponse(status_code=401))
+    assert str(excinfo.value) == "Torznab authentication failed"
+    assert SECRET not in str(excinfo.value)
+
+
+def test_probe_caps_sanitizes_malformed_caps(monkeypatch):
+    source = make_source(api_key=SECRET)
+    with pytest.raises(SourceError) as excinfo:
+        _probe(source, monkeypatch, FakeResponse(b"<caps><nope/></caps>"))
+    assert "caps is not usable" in str(excinfo.value)
+    assert SECRET not in str(excinfo.value)

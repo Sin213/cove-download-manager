@@ -6,6 +6,7 @@ from __future__ import annotations
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTime, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -17,6 +18,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -27,6 +29,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QSystemTrayIcon,
+    QTableWidget,
+    QTableWidgetItem,
     QTimeEdit,
     QVBoxLayout,
     QWidget,
@@ -46,7 +50,9 @@ from .config import (
     Settings,
 )
 from .debrid import DebridError
+from .indexer_editor import IndexerEditorDialog
 from .netiface import ANY_INTERFACE, ANY_INTERFACE_LABEL, list_interfaces
+from .search.indexers import CustomTorznabIndexer, new_custom_indexer_id
 from .source_info import redact_url, source_details
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
@@ -935,6 +941,58 @@ class SettingsDialog(QDialog):
         scroll_layout.addWidget(self.torrent_group)
         self._on_torrent_toggled()
 
+        # Custom Torznab indexers (Search v2). A draft list kept separate from
+        # the live Settings object: every row operation edits this draft, and
+        # only _on_accept copies it onto Settings. Cancel therefore discards
+        # every add/edit/remove/toggle with no rollback bookkeeping.
+        self._indexer_draft = [
+            CustomTorznabIndexer(
+                id=record.id,
+                enabled=record.enabled,
+                name=record.name,
+                url=record.url,
+                api_key=record.api_key,
+            )
+            for record in settings.custom_indexers
+        ]
+        indexer_group = QGroupBox("Custom Torznab indexers")
+        indexer_lay = QVBoxLayout(indexer_group)
+        indexer_lay.setSpacing(8)
+        self.indexer_table = QTableWidget(0, 3)
+        self.indexer_table.setHorizontalHeaderLabels(["Enabled", "Name", "Endpoint"])
+        self.indexer_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.indexer_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.indexer_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.indexer_table.verticalHeader().setVisible(False)
+        self.indexer_table.setSortingEnabled(False)
+        header = self.indexer_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self.indexer_table.itemSelectionChanged.connect(self._refresh_indexer_buttons)
+        indexer_lay.addWidget(self.indexer_table)
+        indexer_buttons = QHBoxLayout()
+        self.indexer_add_btn = QPushButton("Add")
+        self.indexer_edit_btn = QPushButton("Edit")
+        self.indexer_remove_btn = QPushButton("Remove")
+        self.indexer_add_btn.clicked.connect(self._add_indexer)
+        self.indexer_edit_btn.clicked.connect(self._edit_indexer)
+        self.indexer_remove_btn.clicked.connect(self._remove_indexer)
+        indexer_buttons.addWidget(self.indexer_add_btn)
+        indexer_buttons.addWidget(self.indexer_edit_btn)
+        indexer_buttons.addWidget(self.indexer_remove_btn)
+        indexer_buttons.addStretch(1)
+        indexer_lay.addLayout(indexer_buttons)
+        indexer_note = QLabel(
+            "Add, edit, remove or enable/disable your Torznab indexers here. "
+            "Changes apply to the next search."
+        )
+        indexer_note.setProperty("role", "muted")
+        indexer_note.setWordWrap(True)
+        indexer_lay.addWidget(indexer_note)
+        scroll_layout.addWidget(indexer_group)
+        self._refresh_indexer_table()
+
         # Category folders
         cat_group = QGroupBox("Category folders")
         cat_lay = QFormLayout(cat_group)
@@ -1218,6 +1276,85 @@ class SettingsDialog(QDialog):
             return
         self.magnet_repair_check.setChecked(False)
 
+    def _refresh_indexer_table(self) -> None:
+        """Rebuild the table from ``self._indexer_draft`` in draft order.
+
+        Table rows mirror the draft list 1:1 and sorting is disabled, so a row
+        index is the draft position and no display reordering can mutate the
+        persisted order S5 uses as its deterministic tie-break.
+        """
+        self.indexer_table.setRowCount(0)
+        for record in self._indexer_draft:
+            row = self.indexer_table.rowCount()
+            self.indexer_table.insertRow(row)
+            checkbox = QCheckBox()
+            checkbox.setChecked(record.enabled)
+            checkbox.toggled.connect(
+                lambda checked, rec=record: self._on_indexer_toggled(rec, checked)
+            )
+            self.indexer_table.setCellWidget(row, 0, checkbox)
+            name_item = QTableWidgetItem(record.name)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.indexer_table.setItem(row, 1, name_item)
+            url_item = QTableWidgetItem(redact_url(record.url))
+            url_item.setFlags(url_item.flags() & ~Qt.ItemIsEditable)
+            self.indexer_table.setItem(row, 2, url_item)
+        self._refresh_indexer_buttons()
+
+    def _refresh_indexer_buttons(self) -> None:
+        has_selection = self.indexer_table.currentRow() >= 0
+        self.indexer_edit_btn.setEnabled(has_selection)
+        self.indexer_remove_btn.setEnabled(has_selection)
+
+    def _on_indexer_toggled(self, record: CustomTorznabIndexer, checked: bool) -> None:
+        # Mutate the draft record in place: id, name, url, key and position are
+        # all untouched, so a toggle never reorders or re-identifies the row.
+        record.enabled = checked
+
+    def _indexer_interface(self) -> str:
+        return self.torrent_interface.currentData() or ""
+
+    def _add_indexer(self) -> None:
+        indexer = CustomTorznabIndexer(
+            id=new_custom_indexer_id(), enabled=True, name="", url="", api_key=""
+        )
+        editor = IndexerEditorDialog(
+            indexer, interface=self._indexer_interface(), is_new=True, parent=self
+        )
+        if editor.exec() == QDialog.Accepted:
+            result = editor.result()
+            if result is not None:
+                self._indexer_draft.append(result)
+                self._refresh_indexer_table()
+                self.indexer_table.setCurrentCell(
+                    self.indexer_table.rowCount() - 1, 0
+                )
+
+    def _edit_indexer(self) -> None:
+        row = self.indexer_table.currentRow()
+        if row < 0 or row >= len(self._indexer_draft):
+            return
+        editor = IndexerEditorDialog(
+            self._indexer_draft[row],
+            interface=self._indexer_interface(),
+            is_new=False,
+            parent=self,
+        )
+        if editor.exec() == QDialog.Accepted:
+            result = editor.result()
+            if result is not None:
+                # Replace in place: id and position are preserved by design.
+                self._indexer_draft[row] = result
+                self._refresh_indexer_table()
+                self.indexer_table.setCurrentCell(row, 0)
+
+    def _remove_indexer(self) -> None:
+        row = self.indexer_table.currentRow()
+        if row < 0 or row >= len(self._indexer_draft):
+            return
+        del self._indexer_draft[row]
+        self._refresh_indexer_table()
+
     def _on_accept(self) -> None:
         self.settings.download_dir = self.dir_edit.text().strip() or self.settings.download_dir
         self.settings.connections_per_server = self.connections.currentData()
@@ -1264,5 +1401,9 @@ class SettingsDialog(QDialog):
         # must neither grant nor revoke that consent.
         for name, edit in self._cat_edits.items():
             setattr(self.settings.category_dirs, name, edit.text().strip())
+        # Copy the draft custom-indexer list onto the shared Settings object
+        # MainWindow already holds, so the S5 live provider sees the change on
+        # the next Search generation. Saving stays the canonical Settings path.
+        self.settings.custom_indexers = list(self._indexer_draft)
         self.settings.save()
         self.accept()

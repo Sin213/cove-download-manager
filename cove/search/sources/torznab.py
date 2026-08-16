@@ -26,6 +26,7 @@ from cove.search.indexers import CustomTorznabIndexer
 from cove.search.models import Category, SearchResult, SourceError, SourceErrorKind
 from cove.search.sources.base import MAX_RESULTS, SearchHttp, Source
 from cove.search.torznab import (
+    TorznabCaps,
     TorznabIdentity,
     TorznabParseError,
     map_torznab_category,
@@ -118,13 +119,7 @@ class TorznabSource(Source):
         and on an endpoint the custom-endpoint security policy rejects before
         transport.
         """
-        policy = resolve_custom_torznab_transport(self._endpoint, http.interface)
-        if not policy.allowed:
-            raise SourceError(SourceErrorKind.PARSE, policy.reason)
-        http.apply_routing(
-            policy.effective_interface if policy.effective_interface is not None else "",
-            suppress_env_proxy=policy.suppress_env_proxy,
-        )
+        self._route(http)
         caps = self._discover_caps(http)
         token = self._select_search_token(caps, category)
         if token is None:
@@ -133,6 +128,40 @@ class TorznabSource(Source):
         if category is not Category.ALL and not category_ids:
             return []
         return self._paginate(http, query, token, category_ids, self._page_limit(caps))
+
+    def _route(self, http: SearchHttp) -> None:
+        """Apply the S4 custom-endpoint policy to ``http`` before any request.
+
+        Rejects public/unresolved non-HTTPS endpoints and URL userinfo before
+        transport, and resolves the effective local/private routing. This is the
+        single routing gate shared by ``search`` and :meth:`probe_caps`, so a
+        Test Connection inherits exactly the network behaviour a real search
+        uses.
+        """
+        policy = resolve_custom_torznab_transport(self._endpoint, http.interface)
+        if not policy.allowed:
+            raise SourceError(SourceErrorKind.PARSE, policy.reason)
+        http.apply_routing(
+            policy.effective_interface if policy.effective_interface is not None else "",
+            suppress_env_proxy=policy.suppress_env_proxy,
+        )
+
+    def probe_caps(self, interface: str = "") -> TorznabCaps:
+        """Fetch and parse this endpoint's capabilities with exactly one request.
+
+        This is the Test Connection backend: one ``t=caps`` request through the
+        ordinary S4 routing and :class:`SearchHttp` transport, parsed by the S1
+        parser. It performs no content search, no paging, no cache writes and no
+        persistence. It owns a short-lived ``SearchHttp`` so the UI never needs
+        to construct one. Raises :class:`SourceError` with the same
+        secret-safe outward messages as ``search``.
+        """
+        http = SearchHttp(interface)
+        try:
+            self._route(http)
+            return self._discover_caps(http)
+        finally:
+            http.close()
 
     def _discover_caps(self, http: SearchHttp):
         raw = self._get_bytes(http, [("t", "caps")])
