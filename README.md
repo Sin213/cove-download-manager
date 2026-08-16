@@ -534,8 +534,8 @@ sends it to the same queue as any other download.
 
 | Category | Sources |
 |---|---|
-| Movies | YTS, Rutor |
-| TV | Rutor |
+| Movies | YTS, Torrents-CSV |
+| TV | Torrents-CSV |
 | Anime | Nyaa, SubsPlease, nekoBT |
 | Games | FitGirl, GOG Games |
 
@@ -543,6 +543,11 @@ Search requests use the network interface selected in Settings, the same one
 downloads are bound to. The source list is fixed at build time - there is no
 indexer to configure, nothing is loaded from disk or the network to decide
 what runs, and no source needs an account.
+
+Torrents-CSV carries no category of its own, so Movies and TV run the same
+query against it; the release titles carry the season and episode markers that
+tell them apart. It publishes no magnet either, so Cove builds one from the
+info hash it validated, the same way it already does for GOG Games.
 
 ### Current limits
 

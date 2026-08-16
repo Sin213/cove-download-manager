@@ -2161,411 +2161,236 @@ def test_goggames_never_bypasses_search_http():
 # Group H - registration. See tests/test_search_registry.py.
 
 
-# --- Rutor -----------------------------------------------------------------
+# --- Torrents-CSV -----------------------------------------------------------
 #
-# Rutor publishes no API: a search is one ordinary HTML page and the magnets
-# live in the list itself, so these tests pin the markup the parser keys on.
-# The contract below was captured from https://rutor.info on 2026-08-15.
+# The index publishes no magnet and no category: Cove builds the magnet from
+# the hash it validated, and one query answers both Movies and TV.
 
 
-def rutor_source():
-    from cove.search.sources.rutor import RutorSource
+def torrentscsv_source():
+    from cove.search.sources.torrentscsv import TorrentsCsvSource
 
-    return RutorSource()
-
-
-# Group A - source metadata
+    return TorrentsCsvSource()
 
 
-def test_rutor_declares_movies_and_tv():
-    source = rutor_source()
+def torrentscsv_payload(rows: int) -> bytes:
+    """A response carrying `rows` rows, seeders ascending.
 
-    assert source.id == "rutor"
-    assert source.label == "Rutor"
-    assert set(source.categories) == {Category.MOVIES, Category.TV}
+    Ascending on purpose: the adapter imposes its own descending order, so a
+    fixture already in that order could not tell sorting from coincidence.
+    """
+    return json.dumps(
+        {
+            "torrents": [
+                {
+                    "infohash": f"{index:040x}",
+                    "name": f"Invented Row {index}",
+                    "size_bytes": 1024,
+                    "created_unix": 1649403463,
+                    "seeders": index,
+                    "leechers": 0,
+                }
+                for index in range(1, rows + 1)
+            ],
+            "next": None,
+        }
+    ).encode()
+
+
+def test_torrentscsv_serves_movies_and_tv_only():
+    source = torrentscsv_source()
+
     assert source.serves(Category.MOVIES)
     assert source.serves(Category.TV)
     assert not source.serves(Category.GAMES)
     assert not source.serves(Category.ANIME)
-    # The list page carries a seeder and a leecher count for every row, so the
-    # aggregator gets real swarm data rather than an invented zero.
-    assert source.reports_swarm is True
 
 
-# Group B - a successful parse of the list page
-
-
-def test_rutor_normalises_valid_rows():
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    assert len(session.calls) == 1
-    assert [r.source for r in results] == ["rutor", "rutor", "rutor"]
-    assert [r.name for r in results] == [
-        # Cyrillic survives the decode: the page is UTF-8 and the title is the
-        # provider's own text, trimmed but not transliterated or re-encoded.
-        "Пример. Квадрология / Example Quadrology / 1999-2021 / UHD BDRemux 2160p",
-        "VA - Example Synth & Matrix (2026) MP3",
-        "Пример сериала / Example Series / S01 / 2025 / WEB-DL 1080p",
-    ]
-    assert [r.info_hash for r in results] == [
-        "aaaa1111bbbb2222cccc3333dddd4444eeee5555",
-        "bbbb1111cccc2222dddd3333eeee4444ffff5555",
-        "cccc1111dddd2222eeee3333ffff44445555aaaa",
-    ]
-
-
-def test_rutor_reads_rows_whether_or_not_they_carry_a_comment_count():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    # A row with comments has five cells and a row without has four, because
-    # the title cell absorbs the missing one with colspan="2". Both shapes are
-    # ordinary, so neither may be read by cell position alone - and the comment
-    # count is not a swarm number.
-    assert [r.seeders for r in results] == [12, 6, 0]
-    assert [r.leechers for r in results] == [3, 0, 7]
-
-
-# Group C - the request contract
-
-
-def test_rutor_puts_the_query_in_the_path_and_asks_for_nothing_else():
-    from cove.search.sources.rutor import ENDPOINT
-
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_valid.html")))
-    source.search("example", Category.MOVIES, http)
-
-    (url, kwargs) = session.calls[0]
-    # Rutor takes its query as a path segment, not a query parameter: page 0,
-    # any category, default search method, default sort, then the term.
-    assert url == f"{ENDPOINT}/search/0/0/000/0/example"
-    assert kwargs.get("params") is None
-
-
-def test_rutor_encodes_the_query_segment_exactly_once():
-    from cove.search.sources.rutor import ENDPOINT
-
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_empty.html")))
-    source.search("the matrix & co/100%", Category.MOVIES, http)
-
-    (url, _) = session.calls[0]
-    # Everything that would otherwise change the shape of the path - a space, a
-    # separator, a slash, a percent - is escaped once and only once. A second
-    # pass would turn the % of %20 into %2520 and search for the wrong term.
-    assert url == f"{ENDPOINT}/search/0/0/000/0/the%20matrix%20%26%20co%2F100%25"
-    assert "%25" in url and "%2520" not in url
-
-
-def test_rutor_encodes_a_non_ascii_query_as_utf8():
-    from cove.search.sources.rutor import ENDPOINT
-
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_empty.html")))
-    source.search("матрица", Category.MOVIES, http)
-
-    (url, _) = session.calls[0]
-    assert url == f"{ENDPOINT}/search/0/0/000/0/%D0%BC%D0%B0%D1%82%D1%80%D0%B8%D1%86%D0%B0"
-
-
-# Group D - the provider's own magnet is what Cove hands on
-
-
-def test_rutor_preserves_the_provider_magnet_verbatim():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    # Rutor publishes a complete magnet, so Cove forwards that one rather than
-    # rebuilding it: the provider's display name and its two announce URLs
-    # survive untouched, and none of Cove's own trackers are added.
-    assert results[0].magnet == (
-        "magnet:?xt=urn:btih:aaaa1111bbbb2222cccc3333dddd4444eeee5555"
-        "&dn=rutor.info"
-        "&tr=udp://tracker.example:6969"
-        "&tr=http://retracker.local/announce"
-    )
-
-
-def test_rutor_adds_none_of_coves_own_trackers():
-    from urllib.parse import parse_qs, urlparse
-
-    from cove.search.magnet import TRACKERS
-
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    assert results
-    for result in results:
-        fields = parse_qs(urlparse(result.magnet).query)
-        # The announce list is Rutor's, exactly, and the display name is the
-        # one Rutor wrote - not the title, and not Cove's tracker list.
-        assert fields["tr"] == [
-            "udp://tracker.example:6969",
-            "http://retracker.local/announce",
-        ]
-        assert fields["dn"] == ["rutor.info"]
-        assert not set(fields["tr"]).intersection(TRACKERS)
-
-
-# Group E - torrent identity comes from that magnet
-
-
-def test_rutor_derives_the_hash_from_the_preserved_magnet():
-    from cove.search.magnet import extract_info_hash
-
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    assert results
-    for result in results:
-        # The magnet is the only identity authority here. The row also carries
-        # a numeric torrent id in two hrefs; neither is a BitTorrent hash.
-        assert extract_info_hash(result.magnet) == result.info_hash
-        assert result.info_hash not in ("", None)
-
-
-# Group F - size
-
-
-def test_rutor_converts_the_size_units_it_publishes():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    # Rutor labels its sizes GB/MB while dividing by 1024, the way every
-    # torrent index of its generation does.
-    assert [r.size_bytes for r in results] == [
-        285550900674,  # 265.94 GB
-        2093796556,  # 1.95 GB
-        734003200,  # 700 MB
-    ]
-
-
-# Group G - date
-
-
-def test_rutor_converts_its_russian_list_dates():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    # "09 Июл 26" is a day, an abbreviated Russian month and a two-digit year.
-    # The page states no time and no offset, so the day is read at UTC midnight
-    # rather than dressed up with an hour Rutor never published.
-    assert [r.added for r in results] == [1783555200, 1778889600, 1735862400]
-
-
-# Group H - an honest empty search
-
-
-def test_rutor_returns_empty_for_a_search_that_matched_nothing():
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_empty.html")))
-
-    # The page is a real search page - it still renders the results header -
-    # and it simply has no rows under it.
-    assert source.search("nothing", Category.MOVIES, http) == []
-    assert len(session.calls) == 1
-
-
-# Group I - contract drift must not look like an empty search
-
-
-def test_rutor_raises_parse_for_a_page_that_is_not_a_search_page():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_unusable.html")))
-
-    # Zero parsed rows is not proof of zero matches. This page even carries a
-    # magnet in a table of the right shape, but no results header, so it is
-    # drift and must be reported rather than passed off as "no matches".
-    with pytest.raises(SourceError) as error:
-        source.search("example", Category.MOVIES, http)
-    assert error.value.kind is SourceErrorKind.PARSE
-
-
-def test_rutor_raises_parse_when_the_results_header_is_renamed():
-    source = rutor_source()
-    drifted = fixture("rutor_valid.html").replace(
-        "Название".encode(), "Name".encode()
-    )
-    http, _ = http_with(FakeResponse(drifted))
-
-    with pytest.raises(SourceError) as error:
-        source.search("example", Category.MOVIES, http)
-    assert error.value.kind is SourceErrorKind.PARSE
-
-
-def test_rutor_reads_only_the_table_the_results_header_belongs_to():
-    source = rutor_source()
-    # `gai`/`tum` are generic alternating-row classes, not result markers, and
-    # the page renders other tables (the tracker-news block, for one). A row
-    # outside the table the header validated is not a search result, whether
-    # the search matched something or nothing.
-    stray = (
-        '<table><tr class="gai"><td>09&nbsp;Июл&nbsp;26</td>'
-        '<td colspan = "2"><a href="magnet:?xt=urn:btih:'
-        'ffffaaaa1111bbbb2222cccc3333dddd4444eeee&dn=rutor.info'
-        '&tr=udp://tracker.example:6969"><img alt="M" /></a>'
-        '<a href="/torrent/9/stray">Stray Row </a></td>'
-        '<td align="right">1.00&nbsp;GB</td>'
-        '<td align="center"><span class="green">&nbsp;9</span>'
-        '<span class="red">&nbsp;9</span></td></tr></table>'
-    ).encode()
-
-    http, _ = http_with(FakeResponse(fixture("rutor_empty.html") + stray))
-    assert source.search("nothing", Category.MOVIES, http) == []
-
-    http, _ = http_with(FakeResponse(stray + fixture("rutor_valid.html")))
-    results = source.search("example", Category.MOVIES, http)
-    assert "Stray Row" not in [r.name for r in results]
-    assert len(results) == 3
-
-
-def test_rutor_errors_never_leak_the_page_or_a_magnet():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_unusable.html")))
-
-    with pytest.raises(SourceError) as error:
-        source.search("example", Category.MOVIES, http)
-    message = str(error.value)
-    assert "magnet:" not in message
-    assert "<" not in message
-
-
-# Group J - one bad row costs only itself
-
-
-def test_rutor_drops_malformed_rows_but_keeps_the_good_ones():
-    source = rutor_source()
-    http, _ = http_with(FakeResponse(fixture("rutor_malformed_rows.html")))
-    results = source.search("example", Category.MOVIES, http)
-
-    # A row with no magnet, a non-hex hash, the all-zero placeholder and a
-    # blank title have no torrent identity, so they are dropped. An unusable
-    # size, an unusable date and a missing peers cell degrade their own field
-    # and nothing else - they are not worth discarding a real torrent over.
-    assert [r.name for r in results] == [
-        "Example First Good",
-        "Example Unusable Size",
-        "Example Unusable Date",
-        "Example No Peers Cell",
-        "Example Last Good",
-    ]
-    assert [r.size_bytes for r in results] == [
-        2684354560,
-        None,
-        3221225472,
-        None,
-        536870912,
-    ]
-    # An unparseable date is never replaced with an invented one.
-    assert [r.added for r in results] == [
-        1783555200,
-        1783123200,
-        None,
-        1783036800,
-        1782950400,
-    ]
-    assert [(r.seeders, r.leechers) for r in results] == [
-        (9, 2),
-        (4, 1),
-        (4, 1),
-        (0, 0),
-        (15, 8),
-    ]
-
-
-# Group K - result cap and request cost
-
-
-def rutor_page(rows: int) -> bytes:
-    header = (
-        '<div id="index"><table width="100%">'
-        '<tr class="backgr"><td width="10px">Добавлен</td>'
-        '<td colspan="2">Название</td><td width="1px">Размер</td>'
-        '<td width="1px">Пиры</td></tr>'
-    )
-    body = "".join(
-        '<tr class="{cls}"><td>09&nbsp;Июл&nbsp;26</td><td colspan = "2">'
-        '<a href="magnet:?xt=urn:btih:{hash}&dn=rutor.info'
-        '&tr=udp://tracker.example:6969"><img alt="M" /></a>'
-        '<a href="/torrent/{index}/example">Example Row {index:04d} </a></td>'
-        '<td align="right">1.00&nbsp;GB</td>'
-        '<td align="center"><span class="green">&nbsp;1</span>'
-        '<span class="red">&nbsp;0</span></td></tr>'.format(
-            cls="gai" if index % 2 else "tum", hash=f"{index:040x}", index=index
-        )
-        for index in range(1, rows + 1)
-    )
-    return (header + body + "</table></div>").encode()
-
-
-def test_rutor_caps_the_number_of_results():
-    source = rutor_source()
-    http, session = http_with(FakeResponse(rutor_page(MAX_RESULTS + 50)))
-    results = source.search("many", Category.MOVIES, http)
-
-    assert len(results) == MAX_RESULTS
-    assert results[0].info_hash == f"{1:040x}"
-    assert results[-1].info_hash == f"{MAX_RESULTS:040x}"
-    # A larger page never costs a larger number of requests.
-    assert len(session.calls) == 1
-
-
-def test_rutor_never_paginates_or_opens_a_torrent_page():
-    source = rutor_source()
-    # The valid fixture carries the paginator Rutor renders above and below the
-    # table, a `/torrent/...` link per row and a `d.rutor.info` .torrent link
-    # per row. None of that buys a second request.
-    http, session = http_with(FakeResponse(fixture("rutor_valid.html")))
-    source.search("example", Category.MOVIES, http)
-
-    assert len(session.calls) == 1
-
-
-def test_rutor_returns_nothing_for_a_category_it_does_not_serve():
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_valid.html")))
+def test_torrentscsv_returns_nothing_for_a_category_it_does_not_serve():
+    source = torrentscsv_source()
+    http, session = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
 
     assert source.search("example", Category.GAMES, http) == []
     assert source.search("example", Category.ANIME, http) == []
-    # A category Rutor does not serve costs the indexer nothing at all.
+    # A category it does not serve costs the index nothing at all.
     assert session.calls == []
 
 
-def test_rutor_serves_the_all_category():
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_valid.html")))
+def test_torrentscsv_asks_once_with_the_query_as_a_parameter():
+    from cove.search.sources.torrentscsv import ENDPOINT, PAGE_SIZE
+
+    source = torrentscsv_source()
+    http, session = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    source.search("breaking bad", Category.TV, http)
+
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url == ENDPOINT
+    assert kwargs["params"] == {"q": "breaking bad", "size": PAGE_SIZE}
+
+
+def test_torrentscsv_answers_movies_and_tv_with_the_same_one_request():
+    source = torrentscsv_source()
+    http, session = http_with(
+        FakeResponse(fixture("torrentscsv_valid.json")),
+        FakeResponse(fixture("torrentscsv_valid.json")),
+    )
+    movies = source.search("example", Category.MOVIES, http)
+    tv = source.search("example", Category.TV, http)
+
+    # The index has no category field, so neither category is a special case.
+    assert [r.info_hash for r in movies] == [r.info_hash for r in tv]
+    assert session.calls[0][1]["params"] == session.calls[1][1]["params"]
+
+
+def test_torrentscsv_serves_the_all_category():
+    source = torrentscsv_source()
+    http, session = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
 
     assert len(source.search("example", Category.ALL, http)) == 3
     assert len(session.calls) == 1
 
 
-def test_rutor_stays_on_its_one_canonical_host():
-    from cove.search.sources.rutor import ENDPOINT
+def test_torrentscsv_orders_by_seeders_rather_than_trusting_the_index():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    results = source.search("example", Category.MOVIES, http)
 
-    source = rutor_source()
-    http, session = http_with(FakeResponse(fixture("rutor_valid.html")))
+    assert [r.seeders for r in results] == [879, 588, 12]
+
+
+def test_torrentscsv_builds_a_magnet_carrying_the_validated_hash():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    results = source.search("example", Category.MOVIES, http)
+
+    best = results[0]
+    assert best.info_hash == "34ff1fae9661d72152fb1fc31e27c15297072654"
+    assert best.magnet.startswith(f"magnet:?xt=urn:btih:{best.info_hash}")
+    assert "dn=" in best.magnet
+
+
+def test_torrentscsv_normalises_an_upper_case_hash():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    results = source.search("example", Category.MOVIES, http)
+
+    hashes = [r.info_hash for r in results]
+    assert "959ed8be27cffcb61603eff33d393c94df2be2d7" in hashes
+    for value in hashes:
+        assert value == value.lower()
+
+
+def test_torrentscsv_reads_the_creation_date_not_the_scrape_date():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    results = source.search("example", Category.MOVIES, http)
+
+    # scraped_date moves on every crawl and would date every row to roughly
+    # now; created_unix is when the torrent itself was made.
+    assert results[0].added == 1649403463
+    assert all(r.added != 1783758257 for r in results)
+
+
+def test_torrentscsv_keeps_the_sizes_the_index_publishes():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    results = source.search("example", Category.MOVIES, http)
+
+    assert results[0].size_bytes == 10575330041
+
+
+def test_torrentscsv_returns_empty_for_a_search_that_matched_nothing():
+    source = torrentscsv_source()
+    http, session = http_with(FakeResponse(fixture("torrentscsv_empty.json")))
+
+    # An honest "no results" is not a failure and costs no second request.
+    assert source.search("nothing", Category.MOVIES, http) == []
+    assert len(session.calls) == 1
+
+
+def test_torrentscsv_raises_parse_for_a_structurally_unusable_payload():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_unusable.json")))
+
+    # `torrents` renamed is schema drift, not an empty search - reporting it as
+    # "no matches" would hide the break behind a normal-looking result.
+    with pytest.raises(SourceError) as error:
+        source.search("example", Category.MOVIES, http)
+    assert error.value.kind is SourceErrorKind.PARSE
+
+
+def test_torrentscsv_raises_parse_when_the_payload_is_not_an_object():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(b"[]"))
+
+    with pytest.raises(SourceError) as error:
+        source.search("example", Category.MOVIES, http)
+    assert error.value.kind is SourceErrorKind.PARSE
+
+
+def test_torrentscsv_drops_malformed_rows_but_keeps_the_good_ones():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_malformed_rows.json")))
+    results = source.search("example", Category.MOVIES, http)
+
+    names = [r.name for r in results]
+    assert names == ["Invented Good Row 1080p", "Invented Row With Unusable Numbers"]
+    # An unusable swarm count, size or date costs the row only those fields.
+    bad = results[1]
+    assert (bad.seeders, bad.leechers) == (0, 0)
+    assert bad.size_bytes is None
+    assert bad.added is None
+
+
+def test_torrentscsv_caps_the_number_of_results():
+    source = torrentscsv_source()
+    http, session = http_with(FakeResponse(torrentscsv_payload(MAX_RESULTS + 50)))
+    results = source.search("many", Category.MOVIES, http)
+
+    assert len(results) == MAX_RESULTS
+    # A larger payload never costs a larger number of requests.
+    assert len(session.calls) == 1
+
+
+def test_torrentscsv_never_paginates():
+    source = torrentscsv_source()
+    # The envelope carries a `next` cursor; reading it would multiply what a
+    # search costs the index for results the cap would mostly discard.
+    payload = json.loads(fixture("torrentscsv_valid.json"))
+    payload["next"] = 25
+    http, session = http_with(FakeResponse(json.dumps(payload).encode()))
     source.search("example", Category.MOVIES, http)
 
-    # One verified origin, over HTTPS. There is no mirror list and no fallback
-    # domain: SearchHttp refuses redirects, so a host that moved is a failure
-    # Cove reports, not a hop it guesses at.
-    assert ENDPOINT == "https://rutor.info"
-    assert session.calls[0][0].startswith("https://rutor.info/")
+    assert len(session.calls) == 1
 
 
-def test_rutor_never_bypasses_search_http():
+def test_torrentscsv_stays_on_its_one_canonical_host():
+    from cove.search.sources.torrentscsv import ENDPOINT
+
+    source = torrentscsv_source()
+    http, session = http_with(FakeResponse(fixture("torrentscsv_valid.json")))
+    source.search("example", Category.MOVIES, http)
+
+    assert ENDPOINT == "https://torrents-csv.com/service/search"
+    assert session.calls[0][0].startswith("https://torrents-csv.com/")
+
+
+def test_torrentscsv_errors_never_leak_the_payload_or_a_magnet():
+    source = torrentscsv_source()
+    http, _ = http_with(FakeResponse(fixture("torrentscsv_unusable.json")))
+
+    with pytest.raises(SourceError) as error:
+        source.search("example", Category.MOVIES, http)
+    text = str(error.value)
+    assert "magnet:" not in text
+    assert "infohash" not in text
+
+
+def test_torrentscsv_never_bypasses_search_http():
     import inspect
 
-    from cove.search.sources import rutor as module
+    from cove.search.sources import torrentscsv as module
 
     text = inspect.getsource(module)
     for banned in (

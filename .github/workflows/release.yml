@@ -349,7 +349,7 @@ jobs:
           ### Added
 
           - **Built-in Search for Movies, TV, Anime and Games.** Type a query, pick a category, and every source that covers it is queried at once; the results come back merged, de-duplicated and sorted together, and adding one queues it like any other download.
-          - **Seven active Search sources: YTS, Nyaa, FitGirl, SubsPlease, nekoBT, GOG Games and Rutor.** Movies come from YTS and Rutor, TV from Rutor, Anime from Nyaa, SubsPlease and nekoBT, and Games from FitGirl and GOG Games. The list is fixed at build time - nothing is loaded from disk or the network to decide what runs, and there is no indexer to configure.
+          - **Seven active Search sources: YTS, Nyaa, FitGirl, SubsPlease, nekoBT, GOG Games and Torrents-CSV.** Movies come from YTS and Torrents-CSV, TV from Torrents-CSV, Anime from Nyaa, SubsPlease and nekoBT, and Games from FitGirl and GOG Games. The list is fixed at build time - nothing is loaded from disk or the network to decide what runs, and there is no indexer to configure.
           - **Search requests use the network interface selected in Cove's Settings**, the same interface downloads are already bound to, rather than going out over whatever adapter happens to be default.
 
           ### Fixed

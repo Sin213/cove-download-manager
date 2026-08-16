@@ -1093,8 +1093,8 @@ def test_an_all_search_dispatches_work_to_every_registered_source(monkeypatch):
         "goggames",
         "nekobt",
         "nyaa",
-        "rutor",
         "subsplease",
+        "torrents-csv",
         "yts",
     ]
     assert {entry[1:] for entry in asked} == {("dune", Category.ALL)}
@@ -1109,8 +1109,8 @@ def test_an_all_search_dispatches_work_to_every_registered_source(monkeypatch):
 @pytest.mark.parametrize(
     "category, expected",
     [
-        (Category.MOVIES, ["rutor", "yts"]),
-        (Category.TV, ["rutor"]),
+        (Category.MOVIES, ["torrents-csv", "yts"]),
+        (Category.TV, ["torrents-csv"]),
         (Category.ANIME, ["nekobt", "nyaa", "subsplease"]),
         (Category.GAMES, ["fitgirl", "goggames"]),
     ],
@@ -1147,7 +1147,7 @@ def test_one_activated_source_failing_leaves_another_activated_one_untouched(
     new here is that two of the sources involved are activated adapters reached
     through the real registry.
     """
-    rows = {"rutor": [_result(info_hash=A, name="From rutor", source="rutor")]}
+    rows = {"torrents-csv": [_result(info_hash=A, name="From torrents-csv", source="torrents-csv")]}
     asked = _stub_every_source(
         monkeypatch, rows_for=lambda sid: rows.get(sid, []), fails={"nekobt"}
     )
@@ -1162,16 +1162,16 @@ def test_one_activated_source_failing_leaves_another_activated_one_untouched(
         "goggames",
         "nekobt",
         "nyaa",
-        "rutor",
         "subsplease",
+        "torrents-csv",
         "yts",
     ]
-    assert [(r.source, r.name) for r in summary.results] == [("rutor", "From rutor")]
+    assert [(r.source, r.name) for r in summary.results] == [("torrents-csv", "From torrents-csv")]
     assert [(f.source_id, f.error_kind) for f in summary.failures] == [
         ("nekobt", SourceErrorKind.NETWORK.value)
     ]
     assert watch.states("nekobt")[-1] == service.SourceState.FAILED
-    assert watch.states("rutor")[-1] == service.SourceState.COMPLETED
+    assert watch.states("torrents-csv")[-1] == service.SourceState.COMPLETED
     assert svc.active is False
 
 
@@ -1282,8 +1282,8 @@ def test_every_active_source_starts_on_a_five_thread_machine(
         "goggames",
         "nekobt",
         "nyaa",
-        "rutor",
         "subsplease",
+        "torrents-csv",
         "yts",
     ]
     assert pool.maxThreadCount() == 7

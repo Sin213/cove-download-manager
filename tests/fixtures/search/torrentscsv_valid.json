@@ -1,0 +1,38 @@
+{
+  "torrents": [
+    {
+      "infohash": "34ff1fae9661d72152fb1fc31e27c15297072654",
+      "name": "Invented Show - Season 1 - Mp4 x264 AC3 1080p",
+      "size_bytes": 10575330041,
+      "created_unix": 1649403463,
+      "seeders": 879,
+      "leechers": 88,
+      "completed": 10753,
+      "scraped_date": 1783758257,
+      "id": 1150
+    },
+    {
+      "infohash": "959ED8BE27CFFCB61603EFF33D393C94DF2BE2D7",
+      "name": "Invented Show Season 2 Mp4 1080p",
+      "size_bytes": 12246342176,
+      "created_unix": 1743514354,
+      "seeders": 12,
+      "leechers": 382,
+      "completed": 9146,
+      "scraped_date": 1783929568,
+      "id": 1273
+    },
+    {
+      "infohash": "75175a559fe56d7b83dbc19a71b1aaeebce1913b",
+      "name": "Invented Film 1999 1080p WEBRip x265",
+      "size_bytes": 7269232148,
+      "created_unix": 1649494212,
+      "seeders": 588,
+      "leechers": 40,
+      "completed": 4211,
+      "scraped_date": 1783758257,
+      "id": 1301
+    }
+  ],
+  "next": null
+}

@@ -13,8 +13,8 @@ from cove.search.sources.fitgirl import FitGirlSource
 from cove.search.sources.goggames import GogGamesSource
 from cove.search.sources.nekobt import NekoBtSource
 from cove.search.sources.nyaa import NyaaSource
-from cove.search.sources.rutor import RutorSource
 from cove.search.sources.subsplease import SubsPleaseSource
+from cove.search.sources.torrentscsv import TorrentsCsvSource
 from cove.search.sources.yts import YtsSource
 
 # Pirate Bay shipped second here and is temporarily deactivated for 3.6.0: its
@@ -38,7 +38,13 @@ SOURCES: tuple[Source, ...] = (
     # were approved with, and an addition earns no precedence over them.
     NekoBtSource(),
     GogGamesSource(),
-    RutorSource(),
+    # Rutor was removed outright rather than deactivated - adapter, fixtures
+    # and tests all deleted - and Torrents-CSV takes its Movies/TV seat, so the
+    # active count is unchanged. A 1337x adapter was written for this seat and
+    # then removed unshipped: 1337x's own domains answer any non-browser client
+    # with a Cloudflare managed challenge, and the mirrors that do answer match
+    # only the last word of a query. Neither was fixable from an HTTP client.
+    TorrentsCsvSource(),
 )
 
 

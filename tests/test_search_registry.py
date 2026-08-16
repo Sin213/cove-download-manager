@@ -16,8 +16,8 @@ from cove.search.sources.base import Source
 from cove.search.sources.fitgirl import FitGirlSource
 from cove.search.sources.goggames import GogGamesSource
 from cove.search.sources.nekobt import NekoBtSource
-from cove.search.sources.rutor import RutorSource
 from cove.search.sources.subsplease import SubsPleaseSource
+from cove.search.sources.torrentscsv import TorrentsCsvSource
 
 # The sources Cove shipped before the provider expansion that are still active,
 # in the order they were approved with. Pirate Bay sat second here until 3.6.0
@@ -28,7 +28,7 @@ _ORIGINAL_ACTIVE = ["yts", "nyaa", "fitgirl", "subsplease"]
 
 # The whole active registry: the surviving pre-expansion prefix untouched, then
 # the three reviewed adapters in the order they were implemented and approved.
-_EXPECTED_IDS = _ORIGINAL_ACTIVE + ["nekobt", "goggames", "rutor"]
+_EXPECTED_IDS = _ORIGINAL_ACTIVE + ["nekobt", "goggames", "torrents-csv"]
 
 # Deactivated for 3.6.0, not removed: apibay.org stopped answering Cove, curl
 # and a browser User-Agent alike, with DNS, TCP and TLS all succeeding and no
@@ -50,7 +50,7 @@ def test_a_new_source_is_appended_rather_than_given_priority():
     """
     ids = [source.id for source in registry.SOURCES]
     assert ids[:4] == _ORIGINAL_ACTIVE
-    assert ids[4:] == ["nekobt", "goggames", "rutor"]
+    assert ids[4:] == ["nekobt", "goggames", "torrents-csv"]
 
 
 def test_the_surviving_original_sources_keep_their_exact_precedence():
@@ -89,6 +89,21 @@ def test_the_pirate_bay_adapter_survives_its_deactivation():
     assert source.categories == (Category.MOVIES, Category.TV)
 
 
+def test_rutor_is_gone_from_the_tree_entirely():
+    """Removed outright, not deactivated - so there is nothing to re-register.
+
+    Pirate Bay above is the deactivation pattern: adapter and tests kept, only
+    the registration dropped. Rutor is the other decision, and this pins the
+    difference so a later reader does not go looking for an adapter to switch
+    back on.
+    """
+    import importlib
+
+    assert "rutor" not in [source.id for source in registry.SOURCES]
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("cove.search.sources.rutor")
+
+
 def test_registry_holds_source_instances():
     for source in registry.SOURCES:
         assert isinstance(source, Source)
@@ -106,12 +121,21 @@ def test_all_returns_every_enabled_source_in_registry_order():
 
 
 def test_movies_selects_the_movie_sources():
-    assert [s.id for s in registry.sources_for(Category.MOVIES)] == ["yts", "rutor"]
+    assert [s.id for s in registry.sources_for(Category.MOVIES)] == [
+        "yts",
+        "torrents-csv",
+    ]
 
 
 def test_tv_selects_the_tv_sources():
-    """Rutor is the sole TV source for 3.6.0, so TV must not come back empty."""
-    assert [s.id for s in registry.sources_for(Category.TV)] == ["rutor"]
+    """Torrents-CSV is the sole TV source, so TV must not come back empty.
+
+    It took this seat from Rutor, which was deleted outright, by way of a 1337x
+    adapter that was written and then removed unshipped. Dropping this one
+    without a TV-capable replacement would empty the category, which is what
+    this pins.
+    """
+    assert [s.id for s in registry.sources_for(Category.TV)] == ["torrents-csv"]
 
 
 def test_anime_selects_the_anime_sources():
@@ -215,7 +239,7 @@ def _imported_names():
 _ACTIVATED = (
     ("nekobt", NekoBtSource, "cove.search.sources.nekobt", "NekoBtSource"),
     ("goggames", GogGamesSource, "cove.search.sources.goggames", "GogGamesSource"),
-    ("rutor", RutorSource, "cove.search.sources.rutor", "RutorSource"),
+    ("torrents-csv", TorrentsCsvSource, "cove.search.sources.torrentscsv", "TorrentsCsvSource"),
 )
 
 
@@ -248,7 +272,7 @@ def test_an_activated_source_arrives_through_a_plain_static_import(
     [
         ("nekobt", (Category.ANIME,)),
         ("goggames", (Category.GAMES,)),
-        ("rutor", (Category.MOVIES, Category.TV)),
+        ("torrents-csv", (Category.MOVIES, Category.TV)),
     ],
 )
 def test_an_activated_source_stays_out_of_the_categories_it_does_not_serve(
