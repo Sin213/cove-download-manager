@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from cove import config
+from cove.search.indexers import CustomTorznabIndexer
 
 
 def _load_close_to_tray(tmp_path, raw: dict):
@@ -471,8 +472,211 @@ def test_every_persisted_field_is_one_the_validator_can_check():
     """
     for klass in (config.Settings, config.ScheduleWindow, config.CategoryDirs):
         for name, annotation in klass.__annotations__.items():
-            # The two nested dataclasses are removed from the payload before
-            # validation runs and are constructed separately.
-            if klass is config.Settings and name in ("category_dirs", "schedule"):
+            # Nested collections are removed from the payload before validation
+            # runs and are constructed separately (custom_indexers is parsed
+            # by cove.search.indexers.parse_custom_indexers).
+            if klass is config.Settings and name in (
+                "category_dirs",
+                "schedule",
+                "custom_indexers",
+            ):
                 continue
             assert config.understands(annotation), f"{klass.__name__}.{name}"
+
+
+# --- custom Torznab indexer persistence -------------------------------------
+#
+# S2: user-configured generic Torznab indexers persist as an ordered list of
+# records with a stable custom id, enabled state, display name, full endpoint
+# url and optional api_key. All of these run through the real Settings
+# save/load path against an isolated temp config, never the user's live file.
+
+ID_ONE = "custom:00000000-0000-0000-0000-000000000001"
+ID_TWO = "custom:00000000-0000-0000-0000-000000000002"
+ENDPOINT = "http://127.0.0.1:9696/some/per-indexer/torznab/api"
+
+
+def test_custom_indexers_default_empty_for_old_config(tmp_path, monkeypatch):
+    # Backward compatibility: an existing config with no custom-indexer field
+    # loads with an empty collection and no migration path is required.
+    _write(tmp_path, monkeypatch, {"download_dir": "/srv/dl", "theme": "light"})
+
+    loaded = config.Settings.load()
+
+    assert loaded.custom_indexers == []
+    assert loaded.download_dir == "/srv/dl"
+    assert loaded.theme == "light"
+    # A normal save/reload of an old config remains a no-op for indexers.
+    loaded.save()
+    assert config.Settings.load().custom_indexers == []
+
+
+def test_custom_indexer_roundtrips_through_save_and_reload(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {})
+
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(
+            id=ID_ONE,
+            enabled=True,
+            name="My Torznab",
+            url=ENDPOINT,
+            api_key="super-secret-test-key",
+        )
+    ]
+    loaded.save()
+
+    reloaded = config.Settings.load()
+    assert len(reloaded.custom_indexers) == 1
+    (record,) = reloaded.custom_indexers
+    assert record.id == ID_ONE
+    assert record.enabled is True
+    assert record.name == "My Torznab"
+    assert record.url == ENDPOINT
+    assert record.api_key == "super-secret-test-key"
+
+
+def test_custom_indexer_endpoint_path_is_not_normalized(tmp_path, monkeypatch):
+    # A multi-component per-indexer path must round-trip byte-for-byte; S2 must
+    # not collapse it to a generic /api.
+    _write(tmp_path, monkeypatch, {})
+
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(id=ID_ONE, name="n", url=ENDPOINT)
+    ]
+    loaded.save()
+
+    (record,) = config.Settings.load().custom_indexers
+    assert record.url == ENDPOINT
+
+
+def test_custom_indexer_order_is_preserved(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {})
+
+    ids = [
+        "custom:00000000-0000-0000-0000-000000000003",
+        "custom:00000000-0000-0000-0000-000000000001",
+        "custom:00000000-0000-0000-0000-000000000002",
+    ]
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(id=i, name=f"n{i[-1]}", url="http://x/api")
+        for i in ids
+    ]
+    loaded.save()
+
+    assert [r.id for r in config.Settings.load().custom_indexers] == ids
+
+
+def test_custom_indexer_id_survives_field_edits(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {})
+
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(
+            id=ID_ONE, name="old", url="http://old/api", api_key="old-key"
+        )
+    ]
+    loaded.save()
+
+    reloaded = config.Settings.load()
+    (record,) = reloaded.custom_indexers
+    record.name = "new name"
+    record.url = "http://new/per-indexer/api"
+    record.api_key = "new-key"
+    record.enabled = False
+    reloaded.save()
+
+    (final,) = config.Settings.load().custom_indexers
+    assert final.id == ID_ONE
+    assert final.name == "new name"
+    assert final.url == "http://new/per-indexer/api"
+    assert final.api_key == "new-key"
+    assert final.enabled is False
+
+
+def test_duplicate_persisted_ids_are_dropped(tmp_path, monkeypatch):
+    _write(
+        tmp_path,
+        monkeypatch,
+        {
+            "custom_indexers": [
+                {"id": ID_ONE, "name": "first", "url": "http://a/api"},
+                {"id": ID_ONE, "name": "dup", "url": "http://b/api"},
+                {"id": ID_TWO, "name": "second", "url": "http://c/api"},
+            ]
+        },
+    )
+
+    loaded = config.Settings.load()
+
+    assert [r.name for r in loaded.custom_indexers] == ["first", "second"]
+
+
+def test_existing_settings_preserved_alongside_custom_indexer(tmp_path, monkeypatch):
+    # Representative existing fields: a network setting (proxy_host), an
+    # ordinary setting (max_concurrent), and a secret-bearing setting
+    # (rpc_secret). None may drift when a custom indexer is added.
+    secret = "x" * 24
+    _write(
+        tmp_path,
+        monkeypatch,
+        {
+            "download_dir": "/srv/dl",
+            "proxy_host": "127.0.0.1",
+            "max_concurrent": 3,
+            "rpc_secret": secret,
+        },
+    )
+
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(id=ID_ONE, name="n", url=ENDPOINT, api_key="sek")
+    ]
+    loaded.save()
+
+    reloaded = config.Settings.load()
+    assert reloaded.download_dir == "/srv/dl"
+    assert reloaded.proxy_host == "127.0.0.1"
+    assert reloaded.max_concurrent == 3
+    assert reloaded.rpc_secret == secret
+    assert [r.id for r in reloaded.custom_indexers] == [ID_ONE]
+
+
+def test_removed_custom_indexer_secret_absent_from_saved_file(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {})
+
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(
+            id=ID_ONE, name="n", url="http://x/api", api_key="super-secret-test-key"
+        ),
+        CustomTorznabIndexer(
+            id=ID_TWO, name="n2", url="http://y/api", api_key="other-key"
+        ),
+    ]
+    loaded.save()
+
+    loaded.custom_indexers = loaded.custom_indexers[1:]
+    loaded.save()
+
+    raw = (tmp_path / "settings.json").read_text()
+    assert "super-secret-test-key" not in raw
+    assert "other-key" in raw
+
+
+@pytest.mark.skipif(os.name == "nt", reason="0600 is a POSIX-only promise")
+def test_settings_file_saved_with_custom_indexers_is_0600(tmp_path, monkeypatch):
+    import stat
+
+    _write(tmp_path, monkeypatch, {})
+
+    loaded = config.Settings.load()
+    loaded.custom_indexers = [
+        CustomTorznabIndexer(id=ID_ONE, name="n", url="http://x/api", api_key="sek")
+    ]
+    loaded.save()
+
+    mode = stat.S_IMODE(os.stat(tmp_path / "settings.json").st_mode)
+    assert mode == 0o600

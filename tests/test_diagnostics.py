@@ -191,6 +191,21 @@ def test_scrub_text_removes_every_fixture_secret(raw):
     assert_clean(diagnostics.scrub_text(raw))
 
 
+def test_scrub_text_redacts_custom_indexer_api_key_forms():
+    # S2 persists a user-configured Torznab API key under the field name
+    # `api_key`. The sanitizer must recognise the conventional keyed-secret
+    # spelling so the value can never reach a retained record, even if a
+    # future caller logs the record; `apikey` shares the same pattern.
+    for raw in (
+        "api_key=super-secret-test-key",
+        "api_key: super-secret-test-key",
+        "apikey=super-secret-test-key",
+    ):
+        out = diagnostics.scrub_text(raw)
+        assert "super-secret-test-key" not in out
+        assert "<redacted>" in out
+
+
 def test_scrub_text_keeps_ordinary_message_readable():
     assert diagnostics.scrub_text("Invalid engine output path") == (
         "Invalid engine output path"

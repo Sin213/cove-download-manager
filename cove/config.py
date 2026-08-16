@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List
 
 from .portable import is_portable, portable_data_dir
+from .search.indexers import CustomTorznabIndexer, parse_custom_indexers
 
 if is_portable():
     _portable = Path(portable_data_dir("cove-download-manager"))
@@ -349,6 +350,12 @@ class Settings:
     # Whether the first-run "install the browser extension" banner has been
     # answered (dismissed, acted on, or made moot by a connected extension).
     extension_prompt_shown: bool = False
+    # User-configured generic Torznab indexers. These are dormant configuration
+    # in S2: each record describes an indexer (stable id, enabled, display
+    # name, full endpoint, optional api_key) so a later slice can build a
+    # network-backed source from it. No network I/O, SearchService, registry,
+    # or UI reads this yet, and configured order is preserved as entered.
+    custom_indexers: List[CustomTorznabIndexer] = field(default_factory=list)
 
     @classmethod
     def load(cls) -> "Settings":
@@ -403,9 +410,11 @@ class Settings:
         if sched_reset:
             sched = ScheduleWindow()
         cat = CategoryDirs(**_sub_fields(raw.pop("category_dirs", None), CategoryDirs))
+        indexers = parse_custom_indexers(raw.pop("custom_indexers", None))
         s = cls(**_well_typed_fields(cls, raw))
         s.schedule = sched
         s.category_dirs = cat
+        s.custom_indexers = indexers
         if s.theme not in ("dark", "light"):
             s.theme = "dark"
         # A hand-edited non-boolean must not be read as "enabled" via Python
