@@ -26,9 +26,11 @@ from typing import Iterable
 from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 
 from cove import diagnostics
+from cove.search.indexers import CustomTorznabIndexer
 from cove.search.models import Category, SearchResult, SourceError
 from cove.search.registry import SOURCES, sources_for
 from cove.search.sources.base import SearchHttp, Source
+from cove.search.sources.torznab import TorznabSource
 
 # Every Search event is recorded under this one name, so a support log can be
 # read as one lifecycle rather than one per provider. Which source an event is
@@ -75,6 +77,12 @@ _SOURCE_RANK: dict[str, int] = {source.id: index for index, source in enumerate(
 # mixing them would describe a torrent no source actually offered.
 _BACKFILL_FIELDS = ("size_bytes", "added")
 
+# The global ceiling on distinct results one search may publish. This is an
+# output budget only: it bounds how many unique rows the UI is shown after
+# dedupe and sort, and never cancels workers early, trims a source's own
+# network budget, or pretends every source gets representation.
+_MAX_PUBLISHED_RESULTS = 500
+
 
 @dataclass(frozen=True)
 class Aggregation:
@@ -84,40 +92,51 @@ class Aggregation:
     dedupe_dropped: int
 
 
-def _priority_key(row: SearchResult, arrival: int) -> tuple[int, int, str, int]:
+def _priority_key(
+    row: SearchResult, arrival: int, rank: dict[str, int] | None = None
+) -> tuple[int, int, str, int]:
     """Source priority for `row`, first occurrence breaking a remaining tie.
 
-    Registry sources come first, in registry order. A source id the registry
-    does not know still has to sort somewhere, so it ranks behind every
-    built-in one and ties with its peers on the id itself.
+    Registry sources come first, in registry order. A source id the rank does
+    not know still has to sort somewhere, so it ranks behind every known one
+    and ties with its peers on the id itself.
+
+    ``rank`` is the per-generation ordering authority. The default is the
+    module registry rank; a search that added custom sources passes a rank that
+    extends it, so custom rows tie on their configured order rather than on
+    whichever worker happened to finish first.
     """
-    rank = _SOURCE_RANK.get(row.source)
     if rank is None:
+        rank = _SOURCE_RANK
+    order = rank.get(row.source)
+    if order is None:
         return (1, 0, row.source, arrival)
-    return (0, rank, "", arrival)
+    return (0, order, "", arrival)
 
 
-def _source_order(source_id: str) -> tuple[int, int, str]:
+def _source_order(source_id: str, rank: dict[str, int] | None = None) -> tuple[int, int, str]:
     """Where one source id sorts when several are reported at once.
 
-    The registry is the authority here too, so a listener hears about sources
-    in the order it already ranks them; ids the registry does not know sort
-    behind every built-in one and among themselves by the id. This is about
-    announcement order only and touches no ranking of results.
+    The rank is the authority here too, so a listener hears about sources in
+    the order it already ranks them; ids the rank does not know sort behind
+    every known one and among themselves by the id. This is about announcement
+    order only and touches no ranking of results.
     """
-    rank = _SOURCE_RANK.get(source_id)
     if rank is None:
+        rank = _SOURCE_RANK
+    order = rank.get(source_id)
+    if order is None:
         return (1, 0, source_id)
-    return (0, rank, "")
+    return (0, order, "")
 
 
-def _winner_key(row: SearchResult, arrival: int) -> tuple:
+def _winner_key(row: SearchResult, arrival: int, rank: dict[str, int] | None = None) -> tuple:
     """Which of two rows for the same hash Cove keeps.
 
-    Most seeders first, then the earlier source in the registry, then whichever
-    was seen first - so the choice never depends on completion order.
+    Most seeders first, then the earlier source in the rank, then whichever was
+    seen first - so the choice never depends on completion order.
     """
-    return (-row.seeders,) + _priority_key(row, arrival)
+    return (-row.seeders,) + _priority_key(row, arrival, rank)
 
 
 def _sort_key(row: SearchResult) -> tuple:
@@ -139,18 +158,20 @@ def _sort_key(row: SearchResult) -> tuple:
     )
 
 
-def _backfilled(winner: SearchResult, group: list[tuple[SearchResult, int]]) -> SearchResult:
+def _backfilled(
+    winner: SearchResult, group: list[tuple[SearchResult, int]], rank: dict[str, int] | None = None
+) -> SearchResult:
     """`winner` with any optional field it lacks taken from a duplicate.
 
     Donors are considered in source-priority order, so which duplicate supplies
-    a value is fixed by the registry rather than by arrival. A field the winner
+    a value is fixed by the rank rather than by arrival. A field the winner
     already has is never touched.
     """
     missing = [field for field in _BACKFILL_FIELDS if getattr(winner, field) is None]
     if not missing:
         return winner
 
-    donors = sorted(group, key=lambda pair: _priority_key(*pair))
+    donors = sorted(group, key=lambda pair: _priority_key(*pair, rank))
     found = {}
     for field in missing:
         for donor, _ in donors:
@@ -164,12 +185,22 @@ def _backfilled(winner: SearchResult, group: list[tuple[SearchResult, int]]) -> 
     return replace(winner, **found)
 
 
-def aggregate(results: Iterable[SearchResult]) -> Aggregation:
+def aggregate(
+    results: Iterable[SearchResult],
+    *,
+    rank: dict[str, int] | None = None,
+    limit: int | None = None,
+) -> Aggregation:
     """Merge `results` from any number of sources into one ordered list.
 
     Duplicate info hashes collapse to a single row, that row picks up any
     optional metadata only its duplicates reported, and the output is sorted
     into a total order. The input is left untouched.
+
+    ``rank`` is the per-generation source ordering used for duplicate winners;
+    the default is the module registry rank. ``limit`` bounds the number of
+    unique rows published, applied after dedupe and sort, so it never changes
+    which row wins or the order it appears in.
     """
     groups: dict[str, list[tuple[SearchResult, int]]] = {}
     total = 0
@@ -179,11 +210,14 @@ def aggregate(results: Iterable[SearchResult]) -> Aggregation:
 
     merged = []
     for group in groups.values():
-        winner, _ = min(group, key=lambda pair: _winner_key(*pair))
-        merged.append(_backfilled(winner, group))
+        winner, _ = min(group, key=lambda pair: _winner_key(*pair, rank))
+        merged.append(_backfilled(winner, group, rank))
 
     merged.sort(key=_sort_key)
-    return Aggregation(results=tuple(merged), dedupe_dropped=total - len(merged))
+    dedupe_dropped = total - len(merged)
+    if limit is not None and len(merged) > limit:
+        merged = merged[:limit]
+    return Aggregation(results=tuple(merged), dedupe_dropped=dedupe_dropped)
 
 
 def _configure_pool(pool: QThreadPool) -> QThreadPool:
@@ -436,6 +470,7 @@ class SearchService(QObject):
         http_factory=None,
         deadline_ms: int = _SEARCH_DEADLINE_MS,
         cache=None,
+        custom_indexers=None,
     ):
         super().__init__(parent)
         # Which interface Search leaves through is the service's business and
@@ -502,6 +537,33 @@ class SearchService(QObject):
         self._pending: set[str] = set()
         self._results: dict[str, tuple[SearchResult, ...]] = {}
         self._failures: list[SourceFailure] = []
+        # Where the current custom-indexer configuration comes from. None is the
+        # shipped, backward-compatible state: no custom sources, exactly the
+        # pre-S5 behaviour. A callable is called once per generation and returns
+        # the live records; a list or tuple is read live each generation, so an
+        # edit takes effect on the next search. Any other iterable (a generator,
+        # iterator, set view and so on) is materialized to a tuple once here, so
+        # a one-shot iterable cannot be silently exhausted by the first search.
+        # The service consumes this state, it never owns persistence, reloads a
+        # file, or reads it from a worker thread.
+        if custom_indexers is None:
+            self._custom_provider = lambda: ()
+        elif callable(custom_indexers):
+            self._custom_provider = custom_indexers
+        elif isinstance(custom_indexers, (list, tuple)):
+            self._custom_provider = lambda: custom_indexers
+        else:
+            records = tuple(custom_indexers)
+            self._custom_provider = lambda: records
+        # The last generation's per-id runtime config (url, api_key), used only
+        # to know when a custom source's cached answers have become stale. Never
+        # logged or published: the api_key in here must not reach a repr, a
+        # signal, a status or a diagnostics record.
+        self._custom_config: dict[str, tuple[str, str]] = {}
+        # The per-generation source ordering used to break duplicate ties.
+        # None is "no search yet": the pure aggregation layer falls back to the
+        # module registry rank, exactly as it always has.
+        self._rank: dict[str, int] | None = None
 
     # ---- diagnostics -----------------------------------------------------
     #
@@ -544,12 +606,79 @@ class SearchService(QObject):
         """The number of the newest search. Read-only, and never goes back."""
         return self._generation
 
+    def _snapshot_custom(self) -> tuple[list[CustomTorznabIndexer], dict[str, tuple[str, str]]]:
+        """The enabled custom records for one generation, plus per-id config.
+
+        Called once, synchronously, at the very start of a generation. Each
+        record is copied, so a Settings edit made while the generation runs can
+        never reach a source already under construction; the copy is what makes
+        a TorznabSource's lazily-read api_key stable for the whole flight.
+
+        The config map covers every record, enabled or not: a disabled record
+        with an unchanged endpoint and key keeps its cached answers, so a later
+        re-enable can still reuse them, while one whose endpoint or key changed
+        is treated as a different source.
+
+        Raises ValueError when two records share an id, enabled or not: two
+        workers under one logical source identity would be ambiguous, and a
+        duplicate would let one record's runtime signature silently overwrite
+        another's in the config map (which would then fail to evict stale cache
+        entries for the disabled record's endpoint/key). S2 already rejects
+        duplicates at parse time, so this is a last, cheap guard.
+        """
+        config: dict[str, tuple[str, str]] = {}
+        enabled: list[CustomTorznabIndexer] = []
+        seen_ids: set[str] = set()
+        for record in self._custom_provider():
+            snapshot = CustomTorznabIndexer(
+                id=record.id,
+                enabled=record.enabled,
+                name=record.name,
+                url=record.url,
+                api_key=record.api_key,
+            )
+            if snapshot.id in seen_ids:
+                raise ValueError(f"duplicate custom indexer id: {snapshot.id}")
+            seen_ids.add(snapshot.id)
+            config[snapshot.id] = (snapshot.url, snapshot.api_key)
+            if snapshot.enabled:
+                enabled.append(snapshot)
+        return enabled, config
+
+    def _reconcile_custom_cache(self, config: dict[str, tuple[str, str]]) -> None:
+        """Evict custom-source cache entries whose runtime config changed.
+
+        A custom source keeps its stable id across edits, so the id alone is not
+        a sufficient cache key: the same id pointing at a new URL or API key
+        must not reuse the old endpoint's answers. This comparison is private,
+        in-memory and source-scoped - a custom edit never flushes a built-in
+        source's cache - and it stores no secret anywhere visible.
+        """
+        previous = self._custom_config
+        for source_id, signature in config.items():
+            old = previous.get(source_id)
+            if old is not None and old != signature:
+                self._cache.evict_source(source_id)
+        for source_id in previous:
+            if source_id not in config:
+                self._cache.evict_source(source_id)
+        self._custom_config = config
+
     def start(self, query: str, category: Category = Category.ALL) -> int:
         """Search for the given text across every source serving the category.
 
-        Returns the number given to this search, which is what tells its
-        events apart from an older search's.
+        Enabled custom Torznab indexers are snapshotted once here and become
+        ordinary sources for this generation, appended after the built-ins in
+        configured order. Returns the number given to this search, which is what
+        tells its events apart from an older search's.
         """
+        # Snapshot before numbering the search: a duplicate id or a malformed
+        # record must fail before any generation state is touched, and the
+        # cache reconciliation must happen before any cache read this search
+        # could make.
+        enabled_custom, custom_config = self._snapshot_custom()
+        self._reconcile_custom_cache(custom_config)
+
         generation = self._begin()
 
         text = query.strip()
@@ -562,7 +691,20 @@ class SearchService(QObject):
             self._finish(generation)
             return generation
 
-        sources = sources_for(category)
+        # Built-ins first, in registry order, then the enabled custom records in
+        # persisted order. Construction is S3-proven network-free, so no caps,
+        # DNS or HTTP happens here.
+        sources = list(sources_for(category))
+        sources.extend(TorznabSource(record) for record in enabled_custom)
+        # The generation's own ordering authority: the registry rank, extended
+        # with the custom sources after every built-in. This never mutates the
+        # module rank, so the registry stays the sole built-in authority and a
+        # later generation can derive a different custom order without touching
+        # one that is still publishing.
+        rank = dict(_SOURCE_RANK)
+        for index, record in enumerate(enabled_custom, start=len(_SOURCE_RANK)):
+            rank[record.id] = index
+        self._rank = rank
         # Recorded once the search knows what it is: which sources it will ask,
         # and how long the question was. Never the question itself.
         self._diag_started(generation, category, len(sources), len(text))
@@ -715,6 +857,10 @@ class SearchService(QObject):
         self._pending.clear()
         self._results.clear()
         self._failures.clear()
+        # The previous search's source ordering goes with it; the next search
+        # derives its own from its own custom snapshot, so a Settings edit
+        # between generations can never reorder results already in flight.
+        self._rank = None
         # The previous search is over as far as this service is concerned, so
         # its deadline goes with it: the search about to start gets a fresh one
         # rather than inheriting whatever was left of the old window.
@@ -765,7 +911,9 @@ class SearchService(QObject):
         # Several sources can run out of time in the same instant, and which
         # order they are announced in must not be whatever a set happened to
         # iterate in.
-        for source_id in sorted(self._pending, key=_source_order):
+        for source_id in sorted(
+            self._pending, key=lambda sid: _source_order(sid, self._rank)
+        ):
             self._pending.discard(source_id)
             self._failures.append(SourceFailure(source_id, _TIMEOUT_ERROR))
             # Running out of time is its own terminal record. The summary
@@ -925,7 +1073,7 @@ class SearchService(QObject):
         rows: list[SearchResult] = []
         for source_results in self._results.values():
             rows.extend(source_results)
-        return aggregate(rows)
+        return aggregate(rows, rank=self._rank, limit=_MAX_PUBLISHED_RESULTS)
 
     def _finish(self, generation: int) -> None:
         """End the numbered search, exactly once, and go inactive."""
@@ -1077,6 +1225,16 @@ class _SearchCache:
     def clear(self) -> None:
         """Forget everything, so nothing answered before is reused."""
         self._entries.clear()
+
+    def evict_source(self, source_id: str) -> None:
+        """Forget every entry `source_id` owns, keeping the rest.
+
+        Narrow on purpose: one source's answer becoming stale must not flush
+        what its neighbours still hold, so a single custom indexer being edited
+        or removed never costs the built-in sources their cache.
+        """
+        for key in [key for key in self._entries if key.source_id == source_id]:
+            del self._entries[key]
 
     def __len__(self) -> int:
         return len(self._entries)

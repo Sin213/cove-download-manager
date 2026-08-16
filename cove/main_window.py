@@ -758,6 +758,7 @@ class MainWindow(QMainWindow):
             interface=str(
                 getattr(self.settings, "torrent_network_interface", "") or ""
             ),
+            custom_indexers=lambda: getattr(self.settings, "custom_indexers", ()),
         )
         self.search_widget.search_requested.connect(self._on_search_requested)
         self.search_widget.download_requested.connect(
