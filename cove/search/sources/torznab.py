@@ -1,20 +1,27 @@
 """A generic Torznab search source for one user-configured indexer.
 
-Search v2 slice S3. One :class:`TorznabSource` is built from one
+Search v2 slices S3 and S4. One :class:`TorznabSource` is built from one
 :class:`~cove.search.indexers.CustomTorznabIndexer` record and reuses Cove's
 existing :class:`~cove.search.sources.base.SearchHttp` transport and the S1
 protocol parser. It performs bounded caps discovery plus bounded ``offset`` /
 ``limit`` paging, and returns ordinary Cove :class:`SearchResult` rows.
 
-It is deliberately disconnected from the rest of Search: nothing here registers
-the source, reads Settings globally, or changes custom-endpoint network-security
-policy (that is slice S4).
+Before any request the configured endpoint passes through the S4 custom-endpoint
+network-security policy: literal local/private destinations run over ordinary
+direct transport (no interface binding, no environment proxy), while
+public/unresolved destinations require HTTPS and keep the caller-selected
+interface. Local routing privilege never makes endpoint responses trusted.
+
+It is still deliberately disconnected from the rest of Search: nothing here
+registers the source, reads Settings globally, or touches SearchService,
+registry or UI.
 """
 from __future__ import annotations
 
 from urllib.parse import parse_qsl, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
+from cove.search.custom_endpoint import resolve_custom_torznab_transport
 from cove.search.indexers import CustomTorznabIndexer
 from cove.search.models import Category, SearchResult, SourceError, SourceErrorKind
 from cove.search.sources.base import MAX_RESULTS, SearchHttp, Source
@@ -80,14 +87,18 @@ class TorznabSource(Source):
         # The persisted id is authoritative; name/URL/key never substitute for it.
         self.id = indexer.id
         self.label = indexer.name
-        self.homepage = indexer.url
+        # Snapshot the configured URL exactly once: the security policy, the
+        # displayed homepage and every request must act on the same immutable
+        # endpoint, not a mutable field that could change after construction.
+        self._endpoint = indexer.url
+        self.homepage = self._endpoint
         # Real capability is only known after caps discovery, so this source
         # claims broad eligibility up front and then rejects unsupported
         # categories locally after discovery. It is not registered globally
         # yet, so this broad claim has no global effect.
         self.categories = (Category.MOVIES, Category.TV, Category.ANIME, Category.GAMES)
         self.reports_swarm = True
-        parts = urlsplit(indexer.url)
+        parts = urlsplit(self._endpoint)
         self._base_url = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         self._preserved_params = [
             (key, value)
@@ -103,8 +114,17 @@ class TorznabSource(Source):
     ) -> list[SearchResult]:
         """Normalised results, or [] when the endpoint cannot serve the request.
 
-        Raises :class:`SourceError` on network, timeout, HTTP or parse failure.
+        Raises :class:`SourceError` on network, timeout, HTTP or parse failure,
+        and on an endpoint the custom-endpoint security policy rejects before
+        transport.
         """
+        policy = resolve_custom_torznab_transport(self._endpoint, http.interface)
+        if not policy.allowed:
+            raise SourceError(SourceErrorKind.PARSE, policy.reason)
+        http.apply_routing(
+            policy.effective_interface if policy.effective_interface is not None else "",
+            suppress_env_proxy=policy.suppress_env_proxy,
+        )
         caps = self._discover_caps(http)
         token = self._select_search_token(caps, category)
         if token is None:

@@ -32,6 +32,13 @@ USER_AGENT = f"Cove/{__version__} (+https://github.com/Sin213/cove-download-mana
 
 _CHUNK = 64 * 1024
 
+# Explicit "no proxy" sentinel for the custom local/private path. A None entry
+# blocks the environment-proxy merge for that scheme (``setdefault`` leaves the
+# None in place) and the merge then drops None keys. ``all`` must be present too:
+# requests falls back to it when no scheme-specific proxy remains, so an unset
+# ``all`` would still let ALL_PROXY route local traffic through a proxy.
+_NO_ENV_PROXY = {"http": None, "https": None, "all": None}
+
 
 class SearchHttp:
     """Bounded HTTP for source adapters.
@@ -43,14 +50,60 @@ class SearchHttp:
     """
 
     def __init__(self, interface: str = "", *, session=None):
+        # The requested interface is the caller's choice and never changes; the
+        # effective interface is what the session is actually built with. The
+        # custom Torznab source may lower the latter via :meth:`apply_routing`.
         self._interface = interface
+        self._effective_interface = interface
         self._session = session
+        # An injected session is a test seam: its sockets belong to the caller.
+        # A lazily built session is ours to rebuild if the routing changes.
+        self._owns_session = session is None
+        self._session_interface: str | None = None
+        # Environment-proxy inheritance is the default and unchanged: only the
+        # custom Torznab source suppresses it, and only for the local path.
+        self._suppress_env_proxy = False
+
+    @property
+    def interface(self) -> str:
+        """The interface the caller requested (``""`` = unbound)."""
+        return self._interface
+
+    @property
+    def effective_interface(self) -> str:
+        """The interface the session is actually built with."""
+        return self._effective_interface
+
+    def apply_routing(self, interface: str, *, suppress_env_proxy: bool) -> None:
+        """Re-point this transport's effective interface and proxy policy.
+
+        Only :class:`~cove.search.sources.torznab.TorznabSource` calls this, at
+        the very start of a search, to honour the custom-endpoint security
+        policy (slice S4). Built-in sources never call it, so their routing is
+        unchanged.
+
+        An owned session whose interface binding would change is dropped so the
+        next request rebuilds it with the new binding. The proxy suppression is
+        applied per request (see :meth:`_read`), never by disabling
+        ``trust_env`` - that would also drop an environment-provided CA bundle
+        and break private-HTTPS verification.
+        """
+        self._effective_interface = interface
+        self._suppress_env_proxy = suppress_env_proxy
+        if self._session is not None and self._owns_session and interface != self._session_interface:
+            # The interface binding of a requests session is fixed when its
+            # adapters are created, so a changed effective interface means the
+            # owned session must be rebuilt on the next request.
+            self._session.close()
+            self._session = None
+            self._session_interface = None
 
     def session(self):
         if self._session is None:
             from cove.netiface import bound_requests_session
 
-            self._session = bound_requests_session(self._interface)
+            self._session = bound_requests_session(self._effective_interface)
+            self._session_interface = self._effective_interface
         return self._session
 
     def close(self) -> None:
@@ -91,20 +144,27 @@ class SearchHttp:
         import requests
 
         session = self.session()
+        request_kwargs: dict[str, Any] = {
+            "params": params,
+            "headers": {"User-Agent": USER_AGENT},
+            "timeout": (CONNECT_TIMEOUT, READ_TIMEOUT),
+            "stream": True,
+            "verify": True,
+            # An indexer does not get to choose where Cove sends its next
+            # request: a redirect could point at loopback, a private
+            # address, or plain HTTP. The endpoints here are fixed and
+            # HTTPS, so a redirect is a failure, not a hop to follow.
+            "allow_redirects": False,
+        }
+        if self._suppress_env_proxy:
+            # A custom local/private endpoint must not be silently routed
+            # through HTTP_PROXY/HTTPS_PROXY/ALL_PROXY. Explicit None proxies
+            # block the environment-proxy merge for this request while leaving
+            # ``trust_env`` (and therefore an environment CA bundle) intact, so
+            # private HTTPS still verifies exactly as SearchHttp defines it.
+            request_kwargs["proxies"] = _NO_ENV_PROXY
         try:
-            response = session.get(
-                url,
-                params=params,
-                headers={"User-Agent": USER_AGENT},
-                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                stream=True,
-                verify=True,
-                # An indexer does not get to choose where Cove sends its next
-                # request: a redirect could point at loopback, a private
-                # address, or plain HTTP. The endpoints here are fixed and
-                # HTTPS, so a redirect is a failure, not a hop to follow.
-                allow_redirects=False,
-            )
+            response = session.get(url, **request_kwargs)
         except requests.Timeout as error:
             raise SourceError(SourceErrorKind.TIMEOUT, str(error))
         except requests.RequestException as error:
