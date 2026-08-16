@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Download Only</title>
+      <enclosure url="https://example.invalid/download/9.torrent" length="500" type="application/x-bittorrent"/>
+      <torznab:attr name="size" value="500"/>
+      <torznab:attr name="seeders" value="2"/>
+      <torznab:attr name="leechers" value="0"/>
+      <torznab:attr name="category" value="1000"/>
+    </item>
+  </channel>
+</rss>

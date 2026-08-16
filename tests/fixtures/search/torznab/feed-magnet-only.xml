@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Magnet Only</title>
+      <torznab:attr name="size" value="1000"/>
+      <torznab:attr name="seeders" value="1"/>
+      <torznab:attr name="leechers" value="0"/>
+      <torznab:attr name="category" value="2000"/>
+      <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:c9e15763f722f23e98a29decdfae341b98d53056&amp;dn=Example"/>
+    </item>
+  </channel>
+</rss>

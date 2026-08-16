@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<caps>
+  <limits max="100" default="50"/>
+  <searching>
+    <audio-search available="yes" supportedParams="q"/>
+    <book-search available="yes" supportedParams="q"/>
+  </searching>
+  <categories>
+    <category id="3000" name="Audio"/>
+  </categories>
+</caps>

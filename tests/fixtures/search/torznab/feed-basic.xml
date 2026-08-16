@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>Example Indexer</title>
+    <item>
+      <title>Example Movie 2020 1080p</title>
+      <guid isPermaLink="true">https://example.invalid/view/1</guid>
+      <pubDate>Sat, 05 Aug 2023 12:34:56 +0000</pubDate>
+      <enclosure url="https://example.invalid/download/1.torrent" length="1468006400" type="application/x-bittorrent"/>
+      <torznab:attr name="size" value="1468006400"/>
+      <torznab:attr name="seeders" value="123"/>
+      <torznab:attr name="leechers" value="4"/>
+      <torznab:attr name="category" value="2000"/>
+      <torznab:attr name="category" value="2040"/>
+      <torznab:attr name="infohash" value="c9e15763f722f23e98a29decdfae341b98d53056"/>
+    </item>
+    <item>
+      <title>Example Show S01E01 720p</title>
+      <guid>plain-guid-2</guid>
+      <pubDate>Sun, 06 Aug 2023 01:00:00 +0000</pubDate>
+      <torznab:attr name="size" value="350200000"/>
+      <torznab:attr name="seeders" value="7"/>
+      <torznab:attr name="leechers" value="0"/>
+      <torznab:attr name="category" value="5000"/>
+      <torznab:attr name="category" value="5070"/>
+      <torznab:attr name="infohash" value="0123456789ABCDEF0123456789ABCDEF01234567"/>
+    </item>
+  </channel>
+</rss>

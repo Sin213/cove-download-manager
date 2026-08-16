@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<caps>
+  <limits max="75" default="30"/>
+  <searching>
+    <movie-search available="yes" supportedParams="q"/>
+  </searching>
+  <categories>
+    <category id="2000" name="Movies"/>
+  </categories>
+</caps>

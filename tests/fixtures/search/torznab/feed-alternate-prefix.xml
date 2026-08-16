@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:x="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <item>
+      <title>Prefix Test</title>
+      <x:attr name="size" value="1024"/>
+      <x:attr name="seeders" value="3"/>
+      <x:attr name="leechers" value="1"/>
+      <x:attr name="category" value="2000"/>
+      <x:attr name="infohash" value="c9e15763f722f23e98a29decdfae341b98d53056"/>
+    </item>
+  </channel>
+</rss>

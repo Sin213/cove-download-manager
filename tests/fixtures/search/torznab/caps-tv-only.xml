@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<caps>
+  <limits max="50" default="25"/>
+  <searching>
+    <tv-search available="yes" supportedParams="q,season,ep"/>
+  </searching>
+  <categories>
+    <category id="5000" name="TV"/>
+  </categories>
+</caps>
