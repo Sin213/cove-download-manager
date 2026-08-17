@@ -1,12 +1,17 @@
 """GOG Games - a DRM-free GOG release index with a public JSON search.
 
-One search is one request. The API answers with a page of catalogue entries and
-each entry's bare info hash, so nothing here opens a detail page, reads a
-`.torrent` or talks to a tracker. The response also carries a paginator - a
-`links.next` and a `meta.last_page` in the hundreds - and every row carries a
-`slug` that resolves to a release page; Cove reads none of them, because a
-second page or a per-row fetch would multiply what a search costs the index for
-results the cap would mostly discard anyway.
+A search walks the advertised result pages, at most `MAX_PAGES` of them and at
+most `MAX_RAW_ITEMS` raw rows in total. Each page answers with catalogue entries
+and each entry's bare info hash, so nothing here opens a detail page, reads a
+`.torrent` or talks to a tracker. Every row also carries a `slug` that resolves
+to a release page; that is never followed either - pagination is a further list
+request built from the same endpoint, not a fan-out into detail pages.
+
+The paginator advertises `links.next` and a `meta.last_page` in the hundreds,
+but the deepest pages would cost a broad search most of its request budget for
+rows a real search would not reach. `links.next` is used only as an availability
+signal; the next request is always the trusted endpoint with the next page
+number, so a malformed or foreign `links.next` can never turn into a request.
 
 The filtering parameter is `search`. `query` is accepted and silently ignored,
 and the paginator echoes `query` back in the URLs it builds, so sending it
@@ -24,6 +29,16 @@ from cove.search.models import Category, SearchResult, SourceError, SourceErrorK
 from cove.search.sources.base import MAX_RESULTS, SearchHttp, Source
 
 ENDPOINT = "https://gog-games.to/search"
+
+# Depth policy: a single search costs at most three list requests and inspects
+# at most 200 raw rows, including rows that turn out to be unusable. The API
+# advertises hundreds of pages; these fixed budgets keep a broad query from
+# becoming an unbounded crawl and fit the existing search deadline unchanged.
+# A raw item is a provider row before SearchResult conversion; MAX_RAW_ITEMS is
+# a retrieval budget, while MAX_RESULTS caps how many normalised results a
+# source may contribute - they coincide by value but answer different questions.
+MAX_PAGES = 3
+MAX_RAW_ITEMS = 200
 
 
 def parse_last_update(value: Any) -> int | None:
@@ -69,10 +84,72 @@ class GogGamesSource(Source):
     ) -> list[SearchResult]:
         if not self.serves(category):
             return []
-        payload = http.get_json(ENDPOINT, {"search": query, "page": 1})
-        return self._parse(payload)
+        results: list[SearchResult] = []
+        seen: list[tuple[str, str]] = []
+        raw_items = 0
+        # A fixed range, not a follow-until-exhaustion loop: page 1, then page 2
+        # and page 3 if the paginator advertises them, then stop. No fourth
+        # page exists in this slice.
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                payload = http.get_json(ENDPOINT, {"search": query, "page": page})
+                rows = self._rows(payload)
+            except SourceError:
+                # Page 1 has always been mandatory: the search cannot stand
+                # without it, so its failures keep their pre-pagination
+                # semantics. A later page is optional enrichment, so an
+                # expected source error there (network, timeout, HTTP or a
+                # parse violation) keeps the pages already parsed instead of
+                # throwing away a valid page 1 because page 2 failed.
+                if page == 1:
+                    raise
+                break
 
-    def _parse(self, payload: Any) -> list[SearchResult]:
+            # The raw budget counts every provider row examined, usable or not,
+            # and it is capped before conversion: a page that would overshoot
+            # it contributes only the remaining allowance and no later page is
+            # requested.
+            take = min(len(rows), MAX_RAW_ITEMS - raw_items)
+            page_results = self._parse_rows(rows[:take])
+
+            # A provider that serves the same page twice is not making
+            # progress. Stop before appending the repeat, and do not ask for
+            # the page after it.
+            signature = tuple((r.info_hash, r.name) for r in page_results)
+            if page > 1 and signature in seen:
+                break
+            seen.append(signature)
+
+            raw_items += take
+            results.extend(page_results)
+            if len(results) >= MAX_RESULTS or raw_items >= MAX_RAW_ITEMS:
+                break
+            if not self._advertises_more(payload, page):
+                break
+        return results
+
+    def _advertises_more(self, payload: Any, page: int) -> bool:
+        """Whether the committed paginator agrees another page exists.
+
+        Both signals must line up: `meta.last_page` must be a sensible number
+        past the current page and `links.next` must be a non-empty string.
+        Contradictory, missing or malformed metadata stops pagination
+        conservatively while the rows already parsed still stand. `links.next`
+        is evidence only; it is never used as a request URL.
+        """
+        meta = payload.get("meta")
+        links = payload.get("links")
+        if not isinstance(meta, dict) or not isinstance(links, dict):
+            return False
+        last_page = meta.get("last_page")
+        if not isinstance(last_page, int) or isinstance(last_page, bool):
+            return False
+        if page >= last_page:
+            return False
+        next_link = links.get("next")
+        return isinstance(next_link, str) and bool(next_link)
+
+    def _rows(self, payload: Any) -> list[Any]:
         # A search that matched nothing still answers with the full envelope
         # and an empty `data` array, so the envelope is not optional: a payload
         # missing it is schema drift, and reporting that as "no matches" would
@@ -86,14 +163,14 @@ class GogGamesSource(Source):
             raise SourceError(
                 SourceErrorKind.PARSE, "GOG Games result list is not a list"
             )
+        return rows
 
+    def _parse_rows(self, rows: list[Any]) -> list[SearchResult]:
         results: list[SearchResult] = []
         for row in rows:
             result = self._row(row)
             if result is not None:
                 results.append(result)
-                if len(results) >= MAX_RESULTS:
-                    break
         return results
 
     def _row(self, row: Any):

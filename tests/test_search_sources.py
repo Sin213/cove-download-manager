@@ -2124,18 +2124,288 @@ def test_goggames_caps_the_number_of_results():
     assert len(session.calls) == 1
 
 
-def test_goggames_never_paginates_or_follows_a_slug():
+# Group G2 - bounded pagination
+#
+# The API advertises hundreds of pages (`meta.last_page`, `links.next`) and
+# every row carries a `slug` resolving to a detail page. S10 intentionally
+# reverses the old "never paginate" half: a search now walks advertised result
+# pages - at most three of them and at most 200 raw rows in total - while the
+# "never follow a slug/detail page" half stays. Each next request is built from
+# the trusted endpoint and the page counter; `links.next` is an availability
+# signal only and is never itself requested.
+
+
+def gog_page(
+    rows: int,
+    *,
+    start: int = 1,
+    current_page: int = 1,
+    last_page: int = 178,
+    next_link: str | None = "https://gog-games.to/search?query=&page=2",
+) -> dict:
+    """One committed GOG response page.
+
+    Rows are numbered from `start` so several pages can feed one search
+    without hash collisions; the numbering is what the tests assert on.
+    """
+    return {
+        "data": [
+            {
+                "id": str(index),
+                "slug": f"example_game_{index:04d}",
+                "title": f"Example Game {index:04d}",
+                "release_timestamp": 1417039200,
+                "last_update": "2025-08-07T05:31:26.000000Z",
+                "infohash": f"{index:040x}",
+            }
+            for index in range(start, start + rows)
+        ],
+        "links": {"next": next_link},
+        "meta": {
+            "current_page": current_page,
+            "last_page": last_page,
+            "per_page": 36,
+            "total": rows,
+        },
+    }
+
+
+def test_goggames_paginates_an_advertised_second_page():
     source = goggames_source()
-    # `meta.last_page` is 178, `links.next` is populated and every row carries a
-    # slug that resolves to a detail page. None of that buys a second request.
-    http, session = http_with(json_response(goggames_payload(3)))
+    page1 = gog_page(2, start=1, last_page=2)
+    page2 = gog_page(2, start=3, last_page=2, next_link=None)
+    http, session = http_with(json_response(page1), json_response(page2))
+    results = source.search("example", Category.GAMES, http)
+
+    # Page-1 rows first, then page-2 rows, in provider order.
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 5)]
+    assert [url for url, _ in session.calls] == [GOGGAMES_ENDPOINT, GOGGAMES_ENDPOINT]
+    assert [kwargs["params"]["page"] for _, kwargs in session.calls] == [1, 2]
+    assert all(
+        kwargs["params"]["search"] == "example" for _, kwargs in session.calls
+    )
+
+
+def test_goggames_makes_one_request_when_the_last_page_is_reached():
+    source = goggames_source()
+    http, session = http_with(
+        json_response(gog_page(3, last_page=1, next_link=None))
+    )
+    results = source.search("example", Category.GAMES, http)
+
+    assert len(results) == 3
+    assert len(session.calls) == 1
+
+
+def test_goggames_stops_after_three_pages_no_matter_how_many_are_advertised():
+    source = goggames_source()
+    pages = [
+        gog_page(
+            3,
+            start=1 + 3 * (page - 1),
+            current_page=page,
+            last_page=999999,
+            next_link=f"https://gog-games.to/search?query=&page={page + 1}",
+        )
+        for page in (1, 2, 3)
+    ]
+    http, session = http_with(*(json_response(p) for p in pages))
+    results = source.search("example", Category.GAMES, http)
+
+    # The paginator claims a million pages and every answer is unique: the
+    # search still costs exactly three requests and rows stay in page order.
+    assert [kwargs["params"]["page"] for _, kwargs in session.calls] == [1, 2, 3]
+    assert len(session.calls) == 3
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 10)]
+
+
+def test_goggames_never_fetches_links_next_directly():
+    source = goggames_source()
+    page1 = gog_page(
+        2, start=1, last_page=2, next_link="https://unexpected.example.invalid/something"
+    )
+    page2 = gog_page(2, start=3, last_page=2, next_link=None)
+    http, session = http_with(json_response(page1), json_response(page2))
+    results = source.search("example", Category.GAMES, http)
+
+    # `links.next` advertises an unrelated host; the follow-up is still built
+    # from the trusted endpoint and the incremented page counter.
+    assert len(results) == 4
+    assert [url for url, _ in session.calls] == [GOGGAMES_ENDPOINT, GOGGAMES_ENDPOINT]
+    assert session.calls[1][1]["params"] == {"search": "example", "page": 2}
+
+
+@pytest.mark.parametrize(
+    ("last_page", "next_link"),
+    [
+        # `meta.last_page` says another page exists but `links.next` is absent.
+        (3, None),
+        # `links.next` is populated but the current page already is the last.
+        (1, "https://gog-games.to/search?query=&page=2"),
+    ],
+)
+def test_goggames_stops_when_pagination_metadata_contradicts_itself(
+    last_page, next_link
+):
+    source = goggames_source()
+    http, session = http_with(
+        json_response(gog_page(2, last_page=last_page, next_link=next_link))
+    )
+    results = source.search("example", Category.GAMES, http)
+
+    # Contradictory signals buy no second request; page 1 still stands.
+    assert len(results) == 2
+    assert len(session.calls) == 1
+
+
+def test_goggames_stops_when_a_later_page_repeats_an_earlier_one():
+    source = goggames_source()
+    page1 = gog_page(2, start=1, last_page=3)
+    page2 = gog_page(2, start=1, last_page=3)
+    http, session = http_with(json_response(page1), json_response(page2))
+    results = source.search("example", Category.GAMES, http)
+
+    # Page 2 is recognised as a repeat of page 1: its rows are not appended
+    # again and page 3 is never requested.
+    assert [r.info_hash for r in results] == [f"{1:040x}", f"{2:040x}"]
+    assert len(session.calls) == 2
+
+
+def test_goggames_raw_budget_stops_at_two_hundred_rows_across_pages():
+    source = goggames_source()
+    page1 = gog_page(120, start=1, last_page=3)
+    page2 = gog_page(120, start=121, last_page=3)
+    http, session = http_with(json_response(page1), json_response(page2))
+    results = source.search("example", Category.GAMES, http)
+
+    # 120 raw rows on page 1 leave 80 of the budget; page 2 contributes only
+    # its first 80 rows and page 3 is never requested.
+    assert len(results) == 200
+    assert results[0].info_hash == f"{1:040x}"
+    assert results[-1].info_hash == f"{200:040x}"
+    assert len(session.calls) == 2
+
+
+def test_goggames_raw_budget_counts_unusable_rows_against_the_budget():
+    source = goggames_source()
+    page1 = {
+        "data": [
+            {
+                "id": str(i),
+                "slug": f"broken_{i:04d}",
+                "title": f"Broken Row {i:04d}",
+                "infohash": None,
+            }
+            for i in range(1, 121)
+        ],
+        "links": {"next": "https://gog-games.to/search?query=&page=2"},
+        "meta": {"current_page": 1, "last_page": 3, "per_page": 36, "total": 120},
+    }
+    page2 = gog_page(120, start=121, last_page=3)
+    http, session = http_with(json_response(page1), json_response(page2))
+    results = source.search("example", Category.GAMES, http)
+
+    # The 120 rows with a null hash still spent the budget: page 2 can add
+    # only the remaining 80 rows and page 3 is never requested.
+    assert len(results) == 80
+    assert results[0].info_hash == f"{121:040x}"
+    assert results[-1].info_hash == f"{200:040x}"
+    assert len(session.calls) == 2
+
+
+def test_goggames_pagination_never_follows_a_result_slug():
+    source = goggames_source()
+    pages = [
+        gog_page(
+            3,
+            start=1 + 3 * (page - 1),
+            current_page=page,
+            last_page=2,
+            next_link="https://gog-games.to/search?query=&page=2" if page == 1 else None,
+        )
+        for page in (1, 2)
+    ]
+    http, session = http_with(*(json_response(p) for p in pages))
     source.search("example", Category.GAMES, http)
 
+    # Every row carries a `slug` that resolves to a detail page; every request
+    # here is a list page on the trusted endpoint with nothing but search+page.
+    assert len(session.calls) == 2
+    for url, kwargs in session.calls:
+        assert url == GOGGAMES_ENDPOINT
+        assert set(kwargs["params"]) == {"search", "page"}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda p: p["meta"].update({"last_page": "many"}),
+        lambda p: p["meta"].update({"last_page": 2.5}),
+        lambda p: p["meta"].update({"last_page": True}),
+        lambda p: p["links"].update({"next": 42}),
+        lambda p: p["links"].update({"next": ""}),
+        lambda p: p.pop("meta"),
+        lambda p: p.pop("links"),
+        lambda p: p["meta"].clear(),
+    ],
+)
+def test_goggames_malformed_pagination_metadata_keeps_page_one_and_stops(mutate):
+    source = goggames_source()
+    payload = gog_page(2, start=1, last_page=3)
+    mutate(payload)
+    http, session = http_with(json_response(payload))
+    results = source.search("example", Category.GAMES, http)
+
+    # Optional continuation metadata must not sink an otherwise usable page:
+    # page-1 rows survive and pagination stops conservatively.
+    assert len(results) == 2
     assert len(session.calls) == 1
-    url, kwargs = session.calls[0]
-    assert url == GOGGAMES_ENDPOINT
-    assert set(kwargs["params"]) == {"search", "page"}
-    assert kwargs["params"]["page"] == 1
+
+
+def test_goggames_keeps_the_full_query_on_every_page():
+    source = goggames_source()
+    query = "age of empires 2 hd"
+    pages = [
+        gog_page(
+            2,
+            start=1 + 2 * (page - 1),
+            current_page=page,
+            last_page=3,
+            next_link=f"https://gog-games.to/search?query=&page={page + 1}",
+        )
+        for page in (1, 2, 3)
+    ]
+    http, session = http_with(*(json_response(p) for p in pages))
+    source.search(query, Category.GAMES, http)
+
+    assert len(session.calls) == 3
+    for page, (url, kwargs) in enumerate(session.calls, start=1):
+        assert url == GOGGAMES_ENDPOINT
+        assert kwargs["params"] == {"search": query, "page": page}
+
+
+def test_goggames_later_page_network_failure_keeps_earlier_results():
+    source = goggames_source()
+    page1 = gog_page(2, start=1, last_page=3)
+    http, session = http_with(
+        json_response(page1), FakeResponse(b"nope", status_code=503)
+    )
+    results = source.search("example", Category.GAMES, http)
+
+    # Page 2 failed over the existing SourceError boundary; the already parsed
+    # page 1 still stands and no page 3 is attempted.
+    assert len(results) == 2
+    assert len(session.calls) == 2
+
+
+def test_goggames_later_page_parse_failure_keeps_earlier_results():
+    source = goggames_source()
+    page1 = gog_page(2, start=1, last_page=3)
+    http, session = http_with(json_response(page1), json_response({"items": []}))
+    results = source.search("example", Category.GAMES, http)
+
+    assert len(results) == 2
+    assert len(session.calls) == 2
 
 
 def test_goggames_never_bypasses_search_http():
