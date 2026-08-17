@@ -753,3 +753,154 @@ def test_main_window_empty_settings_stay_backward_compatible():
     host = Host()
     _wire(host)
     assert list(host.search_service._custom_provider()) == []
+
+
+# ============================================================================
+# S9: custom indexer order is the S5 priority tie-break
+#
+# The Settings Move Up / Move Down controls reorder the persisted list. S5
+# already proves ties resolve by persisted order; these tests prove the S9
+# surface: a reordered list flips an equal tie on the next generation, a
+# reorder alone never evicts the per-source cache, built-ins keep winning an
+# equal tie no matter where the customs sit, and a mid-flight reorder only
+# reaches the next generation.
+# ============================================================================
+
+
+def _tie_winner(monkeypatch, records, completes_first, expected):
+    """Run one generation with both customs gated; release one, then the other."""
+    _select(monkeypatch, [_FakeSource([])])
+    gates = {_ID_A: threading.Event(), _ID_B: threading.Event()}
+    harness = _CustomHarness(
+        monkeypatch,
+        {
+            _ID_A: {
+                "rows": [_result(source=_ID_A, info_hash=A, seeders=7, name="A")],
+                "on_search": lambda: gates[_ID_A].wait(5.0),
+            },
+            _ID_B: {
+                "rows": [_result(source=_ID_B, info_hash=A, seeders=7, name="B")],
+                "on_search": lambda: gates[_ID_B].wait(5.0),
+            },
+        },
+    )
+    svc = SearchService(custom_indexers=list(records))
+    watch = _Watch(svc)
+    svc.start("dune")
+    gates[completes_first].set()
+    _pump(
+        lambda: any(
+            st.source_id == completes_first
+            and st.state is SourceState.COMPLETED
+            for st in watch.statuses
+        )
+    )
+    other = _ID_A if completes_first == _ID_B else _ID_B
+    gates[other].set()
+    summary = _finish(watch)
+    winner = next(r for r in summary.results if r.info_hash == A)
+    assert winner.source == expected
+
+
+def test_reorder_flips_the_equal_tie_on_the_next_generation(monkeypatch, fresh_pool):
+    """Order [A,B] with B completing first -> A wins; [B,A] with A first -> B."""
+    _tie_winner(
+        monkeypatch,
+        [_rec(_ID_A, name="A"), _rec(_ID_B, name="B")],
+        completes_first=_ID_B,
+        expected=_ID_A,
+    )
+    # The Settings Move Down on A produced this persisted order.
+    _tie_winner(
+        monkeypatch,
+        [_rec(_ID_B, name="B"), _rec(_ID_A, name="A")],
+        completes_first=_ID_A,
+        expected=_ID_B,
+    )
+
+
+def test_reorder_alone_reuses_cached_source_answers(monkeypatch, fresh_pool):
+    _select(monkeypatch, [_FakeSource([])])
+    harness = _CustomHarness(
+        monkeypatch,
+        {
+            _ID_A: {"rows": [_result(source=_ID_A, info_hash=A, seeders=7, name="A")]},
+            _ID_B: {"rows": [_result(source=_ID_B, info_hash=A, seeders=7, name="B")]},
+        },
+    )
+    # Same list object the Settings dialog would hand the live provider: the
+    # S5 provider reads it live each generation, so an in-place reorder is
+    # visible without re-instantiating the service.
+    records = [_rec(_ID_A, name="A"), _rec(_ID_B, name="B")]
+    svc = SearchService(custom_indexers=records)
+    svc.start("dune")
+    summary = _finish(_Watch(svc))
+    assert next(r for r in summary.results if r.info_hash == A).source == _ID_A
+    records.reverse()  # the S9 Move Up/Down writes the list in place
+    watch = _Watch(svc)
+    svc.start("dune")
+    summary = _finish(watch)
+    # A reorder is not a config change: same id/url/api_key signatures mean
+    # the per-source cache is served, not re-fetched.
+    assert _total_queries(harness, _ID_A) == 1
+    assert _total_queries(harness, _ID_B) == 1
+    winner = next(r for r in summary.results if r.info_hash == A)
+    assert winner.source == _ID_B
+
+
+def test_custom_at_top_of_list_still_loses_to_builtin_tie(monkeypatch, fresh_pool):
+    builtin = _FakeSource(
+        source_id="yts", rows=[_result(source="yts", info_hash=A, seeders=7)]
+    )
+    _select(monkeypatch, [builtin])
+    harness = _CustomHarness(
+        monkeypatch,
+        {
+            _ID_B: {"rows": [_result(source=_ID_B, info_hash=A, seeders=7)]},
+            _ID_A: {"rows": [_result(source=_ID_A, info_hash=A, seeders=7)]},
+        },
+    )
+    # B moved above A, but built-ins still rank ahead of every custom.
+    svc = SearchService(custom_indexers=[_rec(_ID_B), _rec(_ID_A)])
+    watch = _Watch(svc)
+    svc.start("dune")
+    summary = _finish(watch)
+    winner = next(r for r in summary.results if r.info_hash == A)
+    assert winner.source == "yts"
+
+
+def test_reorder_mid_generation_applies_to_next_generation_only(
+    monkeypatch, fresh_pool
+):
+    _select(monkeypatch, [_FakeSource([])])
+    gate_a = threading.Event()
+    harness = _CustomHarness(
+        monkeypatch,
+        {
+            _ID_A: {
+                "rows": [_result(source=_ID_A, info_hash=A, seeders=7, name="A")],
+                "on_search": lambda: gate_a.wait(5.0),
+            },
+            _ID_B: {
+                "rows": [_result(source=_ID_B, info_hash=A, seeders=7, name="B")]
+            },
+        },
+    )
+    records = [_rec(_ID_A, name="A"), _rec(_ID_B, name="B")]
+    svc = SearchService(custom_indexers=records)
+    watch = _Watch(svc)
+    gen1 = svc.start("dune")
+    _pump(lambda: len(harness.sources[_ID_A].calls) == 1)
+    # Generation 1 snapshotted A,B. Now the Settings dialog reorders.
+    assert harness.built == [_ID_A, _ID_B]
+    records.reverse()
+    watch2 = _Watch(svc)
+    gen2 = svc.start("dune")  # supersedes generation 1
+    # Generation 2 snapshotted the reordered B,A.
+    assert harness.built == [_ID_A, _ID_B, _ID_B, _ID_A]
+    gate_a.set()
+    summary = _finish(watch2)
+    assert summary.generation == gen2
+    assert gen1 != gen2
+    winner = next(r for r in summary.results if r.info_hash == A)
+    assert winner.source == _ID_B

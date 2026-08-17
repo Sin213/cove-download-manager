@@ -746,3 +746,372 @@ def test_editor_closed_during_test_does_not_crash(monkeypatch):
     shiboken6.delete(editor)
     release.set()
     _settle()  # the completed probe must not touch the deleted editor
+
+
+# ============================================================================
+# S9: custom indexer order / priority controls (Move Up / Move Down)
+#
+# The list order inside Settings *is* the S5 tie-break priority, so these
+# tests pin the move semantics: adjacent swaps on the draft list only, no
+# wraparound, selection follows the moved record, ids and secrets are never
+# re-created, disabled records and duplicate names move by row identity, and
+# nothing reaches the live Settings object before accept.
+# ============================================================================
+
+
+# --- S9 GROUP 1: controls exist, disabled with no selection -----------------
+
+
+def test_move_buttons_exist_and_are_disabled_without_selection():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    assert dlg.indexer_move_up_btn.text() == "Move Up"
+    assert dlg.indexer_move_down_btn.text() == "Move Down"
+    assert dlg.indexer_move_up_btn.isEnabled() is False
+    assert dlg.indexer_move_down_btn.isEnabled() is False
+
+
+def test_move_without_selection_is_a_noop():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    before = list(dlg._indexer_draft)
+    dlg._move_indexer_up()
+    dlg._move_indexer_down()
+    assert dlg._indexer_draft == before
+    assert [r.id for r in dlg._indexer_draft] == [ID_A, ID_B, ID_C]
+
+
+# --- S9 GROUP 2: middle row enables both buttons -----------------------------
+
+
+def test_middle_row_enables_both_move_buttons():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)
+    assert dlg.indexer_move_up_btn.isEnabled() is True
+    assert dlg.indexer_move_down_btn.isEnabled() is True
+
+
+# --- S9 GROUP 3: first row cannot move up ------------------------------------
+
+
+def test_first_row_disables_move_up_only():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(0, 0)
+    assert dlg.indexer_move_up_btn.isEnabled() is False
+    assert dlg.indexer_move_down_btn.isEnabled() is True
+
+
+def test_move_up_on_first_row_is_a_noop():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(0, 0)
+    dlg._move_indexer_up()
+    assert [r.id for r in dlg._indexer_draft] == [ID_A, ID_B, ID_C]
+    assert dlg.indexer_table.currentRow() == 0
+
+
+# --- S9 GROUP 4: last row cannot move down -----------------------------------
+
+
+def test_last_row_disables_move_down_only():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(2, 0)
+    assert dlg.indexer_move_up_btn.isEnabled() is True
+    assert dlg.indexer_move_down_btn.isEnabled() is False
+
+
+def test_move_down_on_last_row_is_a_noop():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(2, 0)
+    dlg._move_indexer_down()
+    assert [r.id for r in dlg._indexer_draft] == [ID_A, ID_B, ID_C]
+    assert dlg.indexer_table.currentRow() == 2
+
+
+# --- S9 GROUP 5: empty and single-row tables --------------------------------
+
+
+def test_move_buttons_disabled_on_empty_table():
+    settings, dlg = _dialog()
+    assert dlg.indexer_table.rowCount() == 0
+    assert dlg.indexer_move_up_btn.isEnabled() is False
+    assert dlg.indexer_move_down_btn.isEnabled() is False
+
+
+def test_single_row_has_no_move_targets():
+    settings, dlg = _dialog([_rec(ID_A, name="A")])
+    dlg.indexer_table.setCurrentCell(0, 0)
+    assert dlg.indexer_move_up_btn.isEnabled() is False
+    assert dlg.indexer_move_down_btn.isEnabled() is False
+    dlg._move_indexer_up()
+    dlg._move_indexer_down()
+    assert [r.id for r in dlg._indexer_draft] == [ID_A]
+
+
+# --- S9 GROUP 6: move up swaps one slot, selection follows -------------------
+
+
+def test_move_up_swaps_one_slot_and_keeps_selection():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)
+    dlg._move_indexer_up()
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A, ID_C]
+    assert dlg.indexer_table.currentRow() == 0
+    assert dlg.indexer_table.rowCount() == 3
+    assert dlg.indexer_table.item(0, 1).text() == "B"
+    assert dlg.indexer_table.item(1, 1).text() == "A"
+    assert dlg.indexer_table.item(2, 1).text() == "C"
+
+
+def test_move_up_preserves_ids_names_urls_and_flags():
+    settings, dlg = _dialog(
+        [
+            _rec(ID_A, name="A", enabled=False),
+            _rec(ID_B, name="B", api_key="key-b"),
+            _rec(ID_C, name="C", url=ENDPOINT_C),
+        ]
+    )
+    before = [(r.id, r.enabled, r.name, r.url, r.api_key) for r in dlg._indexer_draft]
+    dlg.indexer_table.setCurrentCell(1, 0)
+    dlg._move_indexer_up()
+    after = [(r.id, r.enabled, r.name, r.url, r.api_key) for r in dlg._indexer_draft]
+    assert sorted(after) == sorted(before)  # same record contents, new order
+    assert after[0][0] == ID_B and after[1][0] == ID_A
+
+
+# --- S9 GROUP 7: move down swaps one slot ------------------------------------
+
+
+def test_move_down_swaps_one_slot_and_keeps_selection():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)
+    dlg._move_indexer_down()
+    assert [r.id for r in dlg._indexer_draft] == [ID_A, ID_C, ID_B]
+    assert dlg.indexer_table.currentRow() == 2
+    assert dlg.indexer_table.item(1, 1).text() == "C"
+    assert dlg.indexer_table.item(2, 1).text() == "B"
+
+
+# --- S9 GROUP 8: multiple moves compose ---------------------------------------
+
+
+def test_multiple_moves_compose_and_selection_follows_the_record():
+    settings, dlg = _dialog(
+        [
+            _rec(ID_A, name="A"),
+            _rec(ID_B, name="B"),
+            _rec(ID_C, name="C"),
+            _rec(ID_D, name="D"),
+        ]
+    )
+    dlg.indexer_table.setCurrentCell(2, 0)  # select C
+    dlg._move_indexer_up()  # C -> row 1
+    assert dlg.indexer_table.currentRow() == 1
+    dlg._move_indexer_up()  # C -> row 0
+    assert dlg.indexer_table.currentRow() == 0
+    dlg._move_indexer_down()  # C -> row 1
+    assert dlg.indexer_table.currentRow() == 1
+    assert [r.id for r in dlg._indexer_draft] == [ID_A, ID_C, ID_B, ID_D]
+    ids = [r.id for r in dlg._indexer_draft]
+    assert len(ids) == len(set(ids)) == 4  # nothing duplicated or re-created
+
+
+# --- S9 GROUP 9: disabled records move too ------------------------------------
+
+
+def test_disabled_record_moves_with_enabled_flag_preserved():
+    settings, dlg = _dialog(
+        [
+            _rec(ID_A, name="A"),
+            _rec(ID_B, name="B", enabled=False),
+            _rec(ID_C, name="C"),
+        ]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)
+    dlg._move_indexer_up()
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A, ID_C]
+    assert dlg._indexer_draft[0].enabled is False
+
+
+# --- S9 GROUP 10: secrets survive reorder and never reach table text ---------
+
+
+def test_secrets_survive_reorder_and_never_enter_table_text():
+    settings, dlg = _dialog(
+        [
+            _rec(ID_A, name="A", api_key="secret-a"),
+            _rec(ID_B, name="B", api_key=SECRET),
+            _rec(ID_C, name="C", api_key="secret-c"),
+        ]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)
+    dlg._move_indexer_up()  # [B, A, C]
+    dlg._move_indexer_down()  # [A, B, C]
+    dlg._move_indexer_up()  # [B, A, C]
+    keys = [r.api_key for r in dlg._indexer_draft]
+    assert keys == [SECRET, "secret-a", "secret-c"]
+    assert SECRET not in _table_texts(dlg)
+    assert "secret-a" not in _table_texts(dlg)
+
+
+# --- S9 GROUP 11: edit after reorder keeps the new position -------------------
+
+
+def test_edit_after_reorder_keeps_the_new_position(monkeypatch):
+    monkeypatch.setattr(dialogs, "IndexerEditorDialog", _FakeEditor)
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)  # select B
+    dlg._move_indexer_up()  # B -> row 0
+    assert dlg.indexer_table.currentRow() == 0
+    _FakeEditor.result_factory = lambda idx: _rec(
+        id=idx.id, name="B-renamed", url=idx.url
+    )
+    dlg._edit_indexer()
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A, ID_C]
+    assert dlg._indexer_draft[0].name == "B-renamed"
+    assert dlg._indexer_draft[0].id == ID_B
+
+
+# --- S9 GROUP 12: toggle after reorder keeps the order -------------------------
+
+
+def test_toggle_after_reorder_keeps_the_order():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)  # select B
+    dlg._move_indexer_up()
+    dlg.indexer_table.cellWidget(1, 0).setChecked(False)  # toggle A off
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A, ID_C]
+    assert dlg._indexer_draft[1].enabled is False
+    assert dlg._indexer_draft[0].enabled is True
+
+
+# --- S9 GROUP 13: remove after reorder keeps survivor order --------------------
+
+
+def test_remove_after_reorder_keeps_survivor_order():
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)  # select B
+    dlg._move_indexer_up()  # B,A,C ; selection on B at row 0
+    dlg.indexer_table.setCurrentCell(2, 0)  # select C
+    dlg._remove_indexer()
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A]
+
+
+# --- S9 GROUP 14: cancel discards the reorder ----------------------------------
+
+
+def test_settings_cancel_discards_the_reorder(monkeypatch):
+    monkeypatch.setattr(dialogs, "IndexerEditorDialog", _FakeEditor)
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")],
+        monkeypatch,
+    )
+    dlg.indexer_table.setCurrentCell(2, 0)  # select C
+    dlg._move_indexer_up()
+    dlg._move_indexer_up()
+    assert [r.id for r in dlg._indexer_draft] == [ID_C, ID_A, ID_B]
+    # Cancel means no _on_accept: the live Settings object is untouched.
+    assert [r.id for r in settings.custom_indexers] == [ID_A, ID_B, ID_C]
+
+
+# --- S9 GROUP 15: accept persists the reordered list ---------------------------
+
+
+def test_accept_persists_the_reordered_list(monkeypatch):
+    monkeypatch.setattr(dialogs, "IndexerEditorDialog", _FakeEditor)
+    settings, dlg = _dialog(
+        [_rec(ID_A, name="A"), _rec(ID_B, name="B"), _rec(ID_C, name="C")],
+        monkeypatch,
+    )
+    dlg.indexer_table.setCurrentCell(2, 0)  # select C
+    dlg._move_indexer_up()  # [A, C, B]
+    dlg._on_accept()
+    assert [r.id for r in settings.custom_indexers] == [ID_A, ID_C, ID_B]
+
+
+def test_reorder_roundtrips_through_the_real_save_path(tmp_path, monkeypatch):
+    config_file = _isolated_config(tmp_path, monkeypatch)
+    settings = _settings_with(
+        _rec(ID_A, name="A", api_key="key-a"),
+        _rec(ID_B, name="B", api_key="key-b"),
+        _rec(ID_C, name="C", api_key="key-c"),
+    )
+    dlg = SettingsDialog(settings, None)
+    _live_hosts.append(dlg)
+    dlg.indexer_table.setCurrentCell(2, 0)  # select C
+    dlg._move_indexer_up()
+    dlg._move_indexer_up()
+    assert [r.id for r in dlg._indexer_draft] == [ID_C, ID_A, ID_B]
+    dlg._on_accept()
+    reloaded = config.Settings.load()
+    assert [r.id for r in reloaded.custom_indexers] == [ID_C, ID_A, ID_B]
+    assert [r.name for r in reloaded.custom_indexers] == ["C", "A", "B"]
+    assert reloaded.custom_indexers[0].api_key == "key-c"
+    assert reloaded.custom_indexers[1].api_key == "key-a"
+    assert reloaded.custom_indexers[2].api_key == "key-b"
+
+
+# --- S9 GROUP 16: duplicate names move by row identity --------------------------
+
+
+def test_duplicate_names_move_by_row_identity_not_content():
+    settings, dlg = _dialog(
+        [
+            _rec(ID_A, name="Same"),
+            _rec(ID_B, name="Same"),
+            _rec(ID_C, name="Other"),
+        ]
+    )
+    dlg.indexer_table.setCurrentCell(1, 0)  # the second "Same"
+    dlg._move_indexer_up()
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A, ID_C]
+    assert dlg.indexer_table.currentRow() == 0
+    assert dlg._indexer_draft[0].name == "Same"
+    assert dlg._indexer_draft[0].id == ID_B  # row identity, not name match
+
+
+# --- S9 GROUP 17: sorting stays off, visual order == draft order ---------------
+
+
+def test_table_sorting_stays_disabled_and_rows_mirror_draft():
+    settings, dlg = _dialog(
+        [
+            _rec(ID_A, name="B"),
+            _rec(ID_B, name="C"),
+            _rec(ID_C, name="A"),
+        ]
+    )
+    assert dlg.indexer_table.isSortingEnabled() is False
+    # Names are deliberately not alphabetical: the table must keep showing
+    # draft order after moves, because that order is the S5 tie-break
+    # priority and must never be re-sorted by display.
+    dlg.indexer_table.setCurrentCell(0, 0)
+    dlg._move_indexer_down()
+    assert [r.id for r in dlg._indexer_draft] == [ID_B, ID_A, ID_C]
+    assert [dlg.indexer_table.item(r, 1).text() for r in range(3)] == [
+        "C",
+        "B",
+        "A",
+    ]
+    assert dlg.indexer_table.isSortingEnabled() is False

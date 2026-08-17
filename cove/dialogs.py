@@ -975,16 +975,24 @@ class SettingsDialog(QDialog):
         self.indexer_add_btn = QPushButton("Add")
         self.indexer_edit_btn = QPushButton("Edit")
         self.indexer_remove_btn = QPushButton("Remove")
+        self.indexer_move_up_btn = QPushButton("Move Up")
+        self.indexer_move_down_btn = QPushButton("Move Down")
         self.indexer_add_btn.clicked.connect(self._add_indexer)
         self.indexer_edit_btn.clicked.connect(self._edit_indexer)
         self.indexer_remove_btn.clicked.connect(self._remove_indexer)
+        self.indexer_move_up_btn.clicked.connect(self._move_indexer_up)
+        self.indexer_move_down_btn.clicked.connect(self._move_indexer_down)
         indexer_buttons.addWidget(self.indexer_add_btn)
         indexer_buttons.addWidget(self.indexer_edit_btn)
         indexer_buttons.addWidget(self.indexer_remove_btn)
+        indexer_buttons.addWidget(self.indexer_move_up_btn)
+        indexer_buttons.addWidget(self.indexer_move_down_btn)
         indexer_buttons.addStretch(1)
         indexer_lay.addLayout(indexer_buttons)
         indexer_note = QLabel(
             "Add, edit, remove or enable/disable your Torznab indexers here. "
+            "List order is your priority tie-break: when two indexers return "
+            "the same result, the one higher in this list wins. "
             "Changes apply to the next search."
         )
         indexer_note.setProperty("role", "muted")
@@ -1305,6 +1313,13 @@ class SettingsDialog(QDialog):
         has_selection = self.indexer_table.currentRow() >= 0
         self.indexer_edit_btn.setEnabled(has_selection)
         self.indexer_remove_btn.setEnabled(has_selection)
+        row = self.indexer_table.currentRow()
+        last = len(self._indexer_draft) - 1
+        # Move Up / Move Down shift the selected record by exactly one slot;
+        # the row index is the draft position (sorting is disabled), so the
+        # boundary checks are against the draft length, never the table.
+        self.indexer_move_up_btn.setEnabled(has_selection and row > 0)
+        self.indexer_move_down_btn.setEnabled(has_selection and row < last)
 
     def _on_indexer_toggled(self, record: CustomTorznabIndexer, checked: bool) -> None:
         # Mutate the draft record in place: id, name, url, key and position are
@@ -1354,6 +1369,33 @@ class SettingsDialog(QDialog):
             return
         del self._indexer_draft[row]
         self._refresh_indexer_table()
+
+    def _move_indexer_up(self) -> None:
+        self._move_indexer(-1)
+
+    def _move_indexer_down(self) -> None:
+        self._move_indexer(1)
+
+    def _move_indexer(self, delta: int) -> None:
+        """Shift the selected draft record by one slot; never wrap around.
+
+        The swap moves the record object itself, so its id, secrets and
+        fields are untouched and only the list order changes — which is
+        exactly the S5 priority tie-break. Selection follows the record to
+        its new row.
+        """
+        row = self.indexer_table.currentRow()
+        if row < 0 or row >= len(self._indexer_draft):
+            return
+        target = row + delta
+        if target < 0 or target >= len(self._indexer_draft):
+            return
+        self._indexer_draft[row], self._indexer_draft[target] = (
+            self._indexer_draft[target],
+            self._indexer_draft[row],
+        )
+        self._refresh_indexer_table()
+        self.indexer_table.setCurrentCell(target, 0)
 
     def _on_accept(self) -> None:
         self.settings.download_dir = self.dir_edit.text().strip() or self.settings.download_dir
