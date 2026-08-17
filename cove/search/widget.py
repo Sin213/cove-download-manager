@@ -115,8 +115,25 @@ class SearchWidget(QWidget):
     #: anything less than the whole object would have to be rebuilt there.
     download_requested = Signal(object)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        custom_source_names=None,
+    ) -> None:
+        """Build the widget.
+
+        ``custom_source_names`` is an optional callable returning the current
+        ``{custom_id: display_name}`` mapping for custom Torznab indexers. It
+        is consulted once per result-table refresh, and only for the Source
+        column: results keep their stable ``custom:<uuid>`` identity, and the
+        label is derived at render time so a name-only edit is visible on the
+        next refresh without touching SearchService or the cache. A callable
+        that fails, or returns anything but a mapping, degrades to raw source
+        strings - a display nicety must never abort a refresh.
+        """
         super().__init__(parent)
+        self._custom_source_names = custom_source_names
 
         self.query = QLineEdit(self)
         self.query.setPlaceholderText("Search torrents…")
@@ -191,15 +208,42 @@ class SearchWidget(QWidget):
         """
         self.search_button.setEnabled(not searching)
 
+    def _current_source_names(self) -> dict:
+        """The custom id -> display-name mapping for this refresh, or {}.
+
+        Queried once per set_results call, so every row in one batch agrees
+        and a later refresh re-queries. The widget only ever handles a plain
+        id -> name mapping - never Settings, records, URLs or API keys - and
+        a broken provider degrades to raw source strings rather than
+        aborting the refresh.
+        """
+        provider = self._custom_source_names
+        if provider is None:
+            return {}
+        try:
+            names = provider()
+        except Exception:
+            return {}
+        if not isinstance(names, dict):
+            return {}
+        return names
+
     def set_results(self, results) -> None:
         """Render exactly these results, in exactly this order.
 
         A full replacement, matching the complete snapshots SearchService
         emits: no merging, no dedupe, no filtering and no re-ranking. Any
         earlier selection goes with the rows it belonged to.
+
+        The Source cell is the one display-only derivation: a result whose
+        source is a configured custom indexer shows that indexer's current
+        name; anything else (built-ins, unknown or removed custom ids, future
+        sources) shows the raw source string. The result object itself is
+        never touched.
         """
         self.table.clearContents()
         self.table.setRowCount(0)
+        source_names = self._current_source_names()
         for row, result in enumerate(results):
             self.table.insertRow(row)
             cells = (
@@ -208,7 +252,7 @@ class SearchWidget(QWidget):
                 _human_count(result.seeders),
                 _human_count(result.leechers),
                 _human_added(result.added),
-                result.source,
+                source_names.get(result.source, result.source),
             )
             for col, text in enumerate(cells):
                 item = QTableWidgetItem(text)

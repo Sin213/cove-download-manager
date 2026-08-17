@@ -31,10 +31,11 @@ from PySide6.QtWidgets import QMainWindow, QWidget
 import cove.main_window as mw
 from cove.search import service as search_service
 from cove.search.magnet import build_magnet
+from cove.search.indexers import CustomTorznabIndexer
 from cove.search.models import Category, SearchResult, SourceError, SourceErrorKind
 from cove.search.service import SearchService, SearchSummary, SourceFailure
 from cove.search.sources.base import Source
-from cove.search.widget import SearchWidget
+from cove.search.widget import COLUMNS, SearchWidget
 
 # Every wait in this module is bounded: a broken window must fail the suite,
 # not hang it.
@@ -1093,3 +1094,116 @@ def test_the_window_leaves_search_unbound_when_no_interface_is_configured(monkey
 
     assert _pump(lambda: bool(seen)), "no source transport was ever built"
     assert seen == [""]
+
+
+# --- Group K: custom source display names (S8) --------------------------------
+
+_CUSTOM_A = "custom:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+_CUSTOM_B = "custom:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+def _custom_record(record_id, name):
+    """The one record shape the window's provider is allowed to read."""
+    return CustomTorznabIndexer(
+        id=record_id,
+        name=name,
+        url="https://indexer.invalid/torznab",
+        api_key="",
+    )
+
+
+def _sources_shown(host):
+    """The Source column, top to bottom."""
+    table = host.search_widget.table
+    col = COLUMNS.index("Source")
+    return [table.item(row, col).text() for row in range(table.rowCount())]
+
+
+def test_a_custom_source_row_shows_the_configured_name(monkeypatch):
+    """The window feeds the widget a live {id: name} provider from Settings."""
+    host = _host(monkeypatch, [])
+    host.settings.custom_indexers = [_custom_record(_CUSTOM_A, "My Indexer")]
+    result = _result(source=_CUSTOM_A)
+
+    host._on_search_results(host.search_service.generation, (result,))
+
+    assert _sources_shown(host) == ["My Indexer"]
+    assert result.source == _CUSTOM_A
+
+
+def test_without_custom_records_sources_render_as_before(monkeypatch):
+    """The shipped default has no custom_indexers attribute: raw sources."""
+    host = _host(monkeypatch, [])
+
+    host._on_search_results(
+        host.search_service.generation, (_result(source="yts"),)
+    )
+
+    assert _sources_shown(host) == ["yts"]
+
+
+def test_an_accepted_name_edit_is_rendered_on_the_next_batch(monkeypatch):
+    """Settings are mutated in place; the provider sees the current object."""
+    host = _host(monkeypatch, [])
+    record = _custom_record(_CUSTOM_A, "Old Name")
+    host.settings.custom_indexers = [record]
+    result = _result(source=_CUSTOM_A)
+
+    host._on_search_results(host.search_service.generation, (result,))
+    assert _sources_shown(host) == ["Old Name"]
+
+    # The Settings dialog mutates the same record in place on accept.
+    record.name = "New Name"
+    host._on_search_results(host.search_service.generation, (result,))
+
+    assert _sources_shown(host) == ["New Name"]
+    assert result.source == _CUSTOM_A
+
+
+def test_a_stale_custom_id_falls_back_to_the_raw_id(monkeypatch):
+    """A result whose record was removed still renders, id and all."""
+    host = _host(monkeypatch, [])
+    host.settings.custom_indexers = [_custom_record(_CUSTOM_A, "My Indexer")]
+
+    host._on_search_results(
+        host.search_service.generation, (_result(source=_CUSTOM_B),)
+    )
+
+    assert _sources_shown(host) == [_CUSTOM_B]
+
+
+def test_the_provider_is_consulted_at_render_time_not_startup(monkeypatch):
+    """A lambda over self.settings stays current across settings mutations."""
+    host = _host(monkeypatch, [])
+    first = _custom_record(_CUSTOM_A, "First")
+    host.settings.custom_indexers = [first]
+    result = _result(source=_CUSTOM_A)
+    host._on_search_results(host.search_service.generation, (result,))
+    assert _sources_shown(host) == ["First"]
+
+    # Simulate a fresh settings object with the same id renamed, as if the
+    # window had been handed a new one after save.
+    host.settings.custom_indexers = [_custom_record(_CUSTOM_A, "Second")]
+    host._on_search_results(host.search_service.generation, (result,))
+
+    assert _sources_shown(host) == ["Second"]
+    assert result.source == _CUSTOM_A
+
+
+def test_the_source_cell_never_carries_the_api_key(monkeypatch):
+    """The window's provider forwards only id and name, never the secret."""
+    host = _host(monkeypatch, [])
+    record = CustomTorznabIndexer(
+        id=_CUSTOM_A,
+        name="Friendly Indexer",
+        url="https://indexer.invalid/torznab",
+        api_key="super-secret-s8-key",
+    )
+    host.settings.custom_indexers = [record]
+
+    host._on_search_results(
+        host.search_service.generation, (_result(source=_CUSTOM_A),)
+    )
+
+    assert _sources_shown(host) == ["Friendly Indexer"]
+    assert "super-secret-s8-key" not in _sources_shown(host)[0]

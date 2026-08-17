@@ -343,6 +343,27 @@ def test_same_config_custom_source_is_served_from_cache(monkeypatch, fresh_pool)
     assert _total_queries(harness, _ID_A) == 1
 
 
+# --- RED GROUP 8: a name-only edit is not a cache-evicting edit (S8) ---------
+
+
+def test_name_only_edit_reuses_the_custom_cache(monkeypatch, fresh_pool):
+    """S8: display names are presentation; the cache signature is id/url/key."""
+    _select(monkeypatch, [_FakeSource([])])
+    harness = _CustomHarness(
+        monkeypatch, {_ID_A: {"rows": [_result(source=_ID_A, info_hash=A)]}}
+    )
+    record = _rec(_ID_A, name="Old Name")
+    svc = SearchService(custom_indexers=[record])
+    svc.start("dune")
+    _finish(_Watch(svc))
+    assert _total_queries(harness, _ID_A) == 1
+    record.name = "New Name"
+    watch = _Watch(svc)
+    svc.start("dune")
+    _finish(watch)
+    assert _total_queries(harness, _ID_A) == 1
+
+
 # --- RED GROUP 9: URL edit invalidates source cache -------------------------
 
 

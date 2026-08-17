@@ -748,7 +748,12 @@ class MainWindow(QMainWindow):
         The window adds no Search behaviour of its own. It forwards what the
         user asked for, and renders what the service reports back.
         """
-        self.search_widget = SearchWidget()
+        self.search_widget = SearchWidget(
+            custom_source_names=lambda: {
+                record.id: record.name
+                for record in getattr(self.settings, "custom_indexers", ())
+            },
+        )
         # Search traffic is Cove's traffic: it leaves through the interface the
         # user chose in Settings, the same as aria2's downloads, debrid
         # resolution and update checks. Read once here, because that setting
