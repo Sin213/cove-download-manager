@@ -4855,3 +4855,306 @@ def test_search_http_binds_its_session_to_the_interface_it_was_given(monkeypatch
 
     assert asked == ["cove-test0"]
     assert session is not None
+
+
+# --- AA. relevance ranking (S12) --------------------------------------------
+#
+# Search v2 ranks by relevance first, then by the deterministic order every
+# earlier section pinned. Relevance is whole-token only and never changes the
+# dedupe winner, the source-priority tie break, the backfill or the cap - it
+# only reorders the merged rows, and only when the caller says what the query
+# was. These tests pin that boundary, and that aggregate() without a query is
+# exactly the pre-S12 order.
+
+
+def test_relevance_exact_match_beats_a_weak_match_with_far_more_seeders():
+    rows = [
+        _result(info_hash=B, name="Spring Festival Collection", seeders=20000),
+        _result(info_hash=A, name="Elden Ring", seeders=2),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.name for r in merged.results] == [
+        "Elden Ring",
+        "Spring Festival Collection",
+    ]
+
+
+def test_relevance_tiers_precede_seeders():
+    rows = [
+        _result(info_hash=C, name="Spring Festival Collection", seeders=20000),
+        _result(info_hash=A, name="Elden Ring", seeders=1),
+        _result(info_hash=B, name="The Ultimate Elden Ring Guide", seeders=10000),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.name for r in merged.results] == [
+        "Elden Ring",
+        "The Ultimate Elden Ring Guide",
+        "Spring Festival Collection",
+    ]
+
+
+def test_a_prefix_match_beats_a_contiguous_subsequence_match():
+    rows = [
+        _result(info_hash=B, name="The Ultimate Elden Ring Guide", seeders=10000),
+        _result(
+            info_hash=A,
+            name="Elden Ring Shadow of the Erdtree",
+            seeders=1,
+        ),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.name for r in merged.results] == [
+        "Elden Ring Shadow of the Erdtree",
+        "The Ultimate Elden Ring Guide",
+    ]
+
+
+def test_a_query_match_beats_a_non_match_at_equal_seeders():
+    rows = [
+        _result(info_hash=B, name="Blade Runner 2049", seeders=7),
+        _result(info_hash=A, name="Dune", seeders=7),
+    ]
+
+    merged = aggregate(rows, query="dune")
+
+    assert [r.name for r in merged.results] == ["Dune", "Blade Runner 2049"]
+
+
+def test_same_tier_keeps_the_exact_pres12_sort_order():
+    # Every row is a tier-1 prefix match, so the pre-existing deterministic
+    # sort must decide: seeders, then recency, then name, then hash.
+    rows = [
+        _result(
+            info_hash=A,
+            name="Elden Ring Artbook",
+            seeders=3,
+            added=1700000000,
+        ),
+        _result(info_hash=B, name="Elden Ring Shadow", seeders=9),
+        _result(
+            info_hash=C,
+            name="Elden Ring Bestiary",
+            seeders=3,
+            added=1600000000,
+        ),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.name for r in merged.results] == [
+        "Elden Ring Shadow",
+        "Elden Ring Artbook",
+        "Elden Ring Bestiary",
+    ]
+
+
+def test_within_a_tier_added_none_sorts_last():
+    rows = [
+        _result(info_hash=A, name="Elden Ring Shadow", seeders=5, added=None),
+        _result(info_hash=B, name="Elden Ring Artbook", seeders=5),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.name for r in merged.results] == [
+        "Elden Ring Artbook",
+        "Elden Ring Shadow",
+    ]
+
+
+def test_relevance_never_changes_the_dedupe_winner():
+    rows = [
+        _result(
+            info_hash=A,
+            source="yts",
+            seeders=50,
+            name="Spring Festival Collection",
+        ),
+        _result(info_hash=A, source="nyaa", seeders=30, name="Elden Ring"),
+    ]
+
+    (winner,) = aggregate(rows, query="elden ring").results
+
+    assert winner.name == "Spring Festival Collection"
+
+
+def test_dedupe_ties_follow_source_priority_not_relevance():
+    rows = [
+        _result(
+            info_hash=A,
+            source="yts",
+            seeders=7,
+            name="Spring Festival Collection",
+        ),
+        _result(info_hash=A, source="nyaa", seeders=7, name="Elden Ring"),
+    ]
+
+    (winner,) = aggregate(rows, query="elden ring").results
+
+    assert winner.source == "yts"
+    assert winner.name == "Spring Festival Collection"
+
+
+def test_backfill_still_happens_on_a_relevance_ranked_merge():
+    rows = [
+        _result(
+            info_hash=A,
+            source="nyaa",
+            seeders=50,
+            name="Spring Festival Collection",
+            size_bytes=None,
+            added=None,
+        ),
+        _result(
+            info_hash=A,
+            source="yts",
+            seeders=1,
+            name="Elden Ring",
+            size_bytes=4096,
+            added=1600000000,
+        ),
+    ]
+
+    (winner,) = aggregate(rows, query="elden ring").results
+
+    assert winner.size_bytes == 4096
+    assert winner.added == 1600000000
+    assert winner.name == "Spring Festival Collection"
+
+
+def test_the_limit_is_applied_after_the_relevance_sort():
+    rows = [
+        _result(info_hash=_hash("e"), name="Elden Ring", seeders=1),
+    ]
+    for index in range(500):
+        rows.append(
+            _result(
+                info_hash=f"{index + 1:040x}",
+                name="Spring Festival Collection",
+                seeders=10000,
+            )
+        )
+
+    merged = aggregate(rows, query="elden ring", limit=500)
+
+    assert len(merged.results) == 500
+    assert merged.results[0].name == "Elden Ring"
+
+
+def test_casefold_makes_the_query_match_across_case():
+    rows = [
+        _result(info_hash=B, name="Dune", seeders=1000),
+        _result(info_hash=A, name="Straße", seeders=1),
+    ]
+
+    merged = aggregate(rows, query="STRASSE")
+
+    assert [r.name for r in merged.results] == ["Straße", "Dune"]
+
+
+def test_an_exact_match_with_no_swarm_beats_a_fuzzy_match_with_a_full_swarm():
+    rows = [
+        _result(info_hash=B, name="Elden Ring Guide", seeders=1000),
+        _result(info_hash=A, name="Elden Ring", seeders=0),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.name for r in merged.results] == ["Elden Ring", "Elden Ring Guide"]
+
+
+def test_a_relevance_tie_falls_back_to_the_total_pres12_order():
+    # Two distinct hashes, both exact matches, identical swarms and names:
+    # relevance and seeders cannot decide, and the source must not boost -
+    # the total order falls through to the info hash.
+    rows = [
+        _result(info_hash=B, name="Elden Ring", seeders=5, source="nyaa"),
+        _result(info_hash=A, name="Elden Ring", seeders=5, source="yts"),
+    ]
+
+    merged = aggregate(rows, query="elden ring")
+
+    assert [r.info_hash for r in merged.results] == [A, B]
+
+
+def test_standalone_aggregate_without_a_query_is_unchanged():
+    rows = [
+        _result(info_hash=A, name="zeta", seeders=5, added=1600000000),
+        _result(info_hash=B, name="Example", seeders=9),
+        _result(info_hash=C, name="alpha", seeders=5, added=1700000000),
+    ]
+
+    plain = aggregate(rows)
+    neutral = aggregate(rows, query=None)
+    unmatched = aggregate(rows, query="dune")
+
+    expected = [r.info_hash for r in plain.results]
+    assert [r.info_hash for r in neutral.results] == expected
+    assert [r.info_hash for r in unmatched.results] == expected
+    assert [r.info_hash for r in plain.results] == [B, C, A]
+
+
+def test_a_service_search_ranks_by_relevance(monkeypatch):
+    rows = [
+        _result(info_hash=B, name="Spring Festival Collection", seeders=20000),
+        _result(info_hash=A, name="Elden Ring", seeders=2),
+    ]
+    _select(monkeypatch, [_FakeSource(rows)])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    svc.start("elden ring")
+
+    summary = _finish(watch)
+    assert [r.name for r in summary.results] == [
+        "Elden Ring",
+        "Spring Festival Collection",
+    ]
+
+
+def test_a_repeated_search_keeps_the_same_relevance_order_from_cache(monkeypatch):
+    rows = [
+        _result(info_hash=B, name="Spring Festival Collection", seeders=20000),
+        _result(info_hash=A, name="Elden Ring", seeders=2),
+    ]
+    source = _FakeSource(rows)
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    _prime(svc, watch, query="elden ring")
+    svc.start("elden ring")
+
+    summary = _finish(watch)
+    assert [r.name for r in summary.results] == [
+        "Elden Ring",
+        "Spring Festival Collection",
+    ]
+    assert len(source.calls) == 1, "the second search was not served from cache"
+
+
+def test_changing_the_query_recomputes_the_relevance_order(monkeypatch):
+    rows = [
+        _result(info_hash=A, name="Elden Ring", seeders=2),
+        _result(info_hash=B, name="Spring Festival Collection", seeders=20000),
+    ]
+    source = _FakeSource(rows)
+    _select(monkeypatch, [source])
+    svc = service.SearchService(http_factory=_FakeHttp)
+    watch = _Watch(svc)
+
+    _prime(svc, watch, query="elden ring")
+    svc.start("spring festival")
+
+    summary = _finish(watch)
+    assert [r.name for r in summary.results] == [
+        "Spring Festival Collection",
+        "Elden Ring",
+    ]
+    assert len(source.calls) == 2, "the new query should have missed the cache"

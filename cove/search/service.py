@@ -29,6 +29,7 @@ from cove import diagnostics
 from cove.search.indexers import CustomTorznabIndexer
 from cove.search.models import Category, SearchResult, SourceError
 from cove.search.registry import SOURCES, sources_for
+from cove.search.relevance import relevance_key, tokenize_relevance_text
 from cove.search.sources.base import SearchHttp, Source
 from cove.search.sources.torznab import TorznabSource
 
@@ -139,16 +140,20 @@ def _winner_key(row: SearchResult, arrival: int, rank: dict[str, int] | None = N
     return (-row.seeders,) + _priority_key(row, arrival, rank)
 
 
-def _sort_key(row: SearchResult) -> tuple:
-    """The total order the UI shows: seeders, then recency, then name.
+def _sort_key(row: SearchResult, query_tokens: tuple[str, ...] = ()) -> tuple:
+    """The total order the UI shows: relevance, seeders, then recency, then name.
 
-    Rows without an ``added`` date sort last inside their seeder group rather
-    than pretending to be ancient, and ``casefold`` keeps the name order
-    intuitive without being locale-sensitive. The hash is a final tie break, so
-    the order is total: no two distinct rows can compare equal.
+    Relevance sorts first and is neutral when the caller never supplied a
+    query, so every row an existing caller aggregates keeps exactly the order
+    it always had. Rows without an ``added`` date sort last inside their
+    seeder group rather than pretending to be ancient, and ``casefold`` keeps
+    the name order intuitive without being locale-sensitive. The hash is a
+    final tie break, so the order is total: no two distinct rows can compare
+    equal.
     """
     added_missing = row.added is None
     return (
+        relevance_key(query_tokens, row.name)[0],
         -row.seeders,
         added_missing,
         -(row.added if row.added is not None else 0),
@@ -189,6 +194,7 @@ def aggregate(
     results: Iterable[SearchResult],
     *,
     rank: dict[str, int] | None = None,
+    query: str | None = None,
     limit: int | None = None,
 ) -> Aggregation:
     """Merge `results` from any number of sources into one ordered list.
@@ -198,9 +204,12 @@ def aggregate(
     into a total order. The input is left untouched.
 
     ``rank`` is the per-generation source ordering used for duplicate winners;
-    the default is the module registry rank. ``limit`` bounds the number of
-    unique rows published, applied after dedupe and sort, so it never changes
-    which row wins or the order it appears in.
+    the default is the module registry rank. ``query`` is the text the rows
+    were searched for, used only to rank them by relevance before the
+    deterministic order; when it is None the rank is neutral, so a caller
+    aggregating without a query sees exactly the order it always saw.
+    ``limit`` bounds the number of unique rows published, applied after dedupe
+    and sort, so it never changes which row wins or the order it appears in.
     """
     groups: dict[str, list[tuple[SearchResult, int]]] = {}
     total = 0
@@ -213,7 +222,8 @@ def aggregate(
         winner, _ = min(group, key=lambda pair: _winner_key(*pair, rank))
         merged.append(_backfilled(winner, group, rank))
 
-    merged.sort(key=_sort_key)
+    query_tokens = tokenize_relevance_text(query) if query is not None else ()
+    merged.sort(key=lambda row: _sort_key(row, query_tokens))
     dedupe_dropped = total - len(merged)
     if limit is not None and len(merged) > limit:
         merged = merged[:limit]
@@ -564,6 +574,10 @@ class SearchService(QObject):
         # None is "no search yet": the pure aggregation layer falls back to the
         # module registry rank, exactly as it always has.
         self._rank: dict[str, int] | None = None
+        # The generation's own query text, the one relevance ranks by. Stripped
+        # in start(), so the ranking never sees the padding a UI may have
+        # added. Reset whenever the search it belongs to ends.
+        self._text: str = ""
 
     # ---- diagnostics -----------------------------------------------------
     #
@@ -682,6 +696,7 @@ class SearchService(QObject):
         generation = self._begin()
 
         text = query.strip()
+        self._text = text
         if not text:
             # A blank query is not an error and not a search: it completes
             # immediately so the UI gets one lifecycle rather than none. The
@@ -837,6 +852,9 @@ class SearchService(QObject):
         # Nothing is waiting for this search any more, so nothing may time it
         # out either.
         self._stop_deadline()
+        # The cancelled search's query goes with its results: nothing may rank
+        # by text a search that is no longer current.
+        self._text = ""
         # Recorded as cancelled and never as superseded: the user asking for
         # this search to stop and another search replacing it are two different
         # things, and a log that blurs them cannot tell what the user did. How
@@ -861,6 +879,7 @@ class SearchService(QObject):
         # derives its own from its own custom snapshot, so a Settings edit
         # between generations can never reorder results already in flight.
         self._rank = None
+        self._text = ""
         # The previous search is over as far as this service is concerned, so
         # its deadline goes with it: the search about to start gets a fresh one
         # rather than inheriting whatever was left of the old window.
@@ -1073,7 +1092,9 @@ class SearchService(QObject):
         rows: list[SearchResult] = []
         for source_results in self._results.values():
             rows.extend(source_results)
-        return aggregate(rows, rank=self._rank, limit=_MAX_PUBLISHED_RESULTS)
+        return aggregate(
+            rows, rank=self._rank, query=self._text, limit=_MAX_PUBLISHED_RESULTS
+        )
 
     def _finish(self, generation: int) -> None:
         """End the numbered search, exactly once, and go inactive."""
