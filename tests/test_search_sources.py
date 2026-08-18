@@ -1713,6 +1713,45 @@ def nekobt_payload(rows: int) -> dict:
     }
 
 
+def nekobt_meta(offset: int, limit: int) -> dict:
+    """Continuation metadata the provider echoes alongside a page."""
+    return {"offset": offset, "limit": limit}
+
+
+def nekobt_page(
+    rows: int,
+    *,
+    start: int = 1,
+    search: dict | None = None,
+    more: bool = True,
+) -> dict:
+    """One nekoBT response page.
+
+    Rows are numbered from `start` so consecutive pages can feed one search
+    without hash collisions; tests assert on those numbers.
+    """
+    return {
+        "error": False,
+        "data": {
+            "results": [
+                {
+                    "id": str(index),
+                    "title": f"[Example] Example Anime - {index:04d}",
+                    "infohash": f"{index:040x}",
+                    "magnet": f"magnet:?xt=urn:btih:{index:040x}",
+                    "filesize": "1024",
+                    "seeders": "1",
+                    "leechers": "0",
+                    "uploaded_at": 1785499942639,
+                }
+                for index in range(start, start + rows)
+            ],
+            "more": more,
+            "search": search,
+        },
+    }
+
+
 def test_nekobt_caps_the_number_of_results():
     source = nekobt_source()
     http, session = http_with(json_response(nekobt_payload(MAX_RESULTS + 50)))
@@ -1725,12 +1764,28 @@ def test_nekobt_caps_the_number_of_results():
     assert len(session.calls) == 1
 
 
-def test_nekobt_never_paginates_or_follows_a_result():
+def test_nekobt_paginates_list_pages_but_never_follows_a_result():
     source = nekobt_source()
-    # `more` is true and every row carries an id, yet neither buys a request.
-    http, session = http_with(json_response(nekobt_payload(3)))
-    source.search("example", Category.ANIME, http)
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(50, 50), more=False)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
 
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 5)]
+    # The list endpoint may be walked; individual results are never followed.
+    assert len(session.calls) == 2
+    for url, kwargs in session.calls:
+        assert url == NEKOBT_ENDPOINT
+        assert set(kwargs["params"]) <= {"query", "offset"}
+
+
+def test_nekobt_does_not_paginate_without_continuation_metadata():
+    source = nekobt_source()
+    # `more` is true, but without search metadata there is no continuation.
+    http, session = http_with(json_response(nekobt_payload(3)))
+    results = source.search("example", Category.ANIME, http)
+
+    assert len(results) == 3
     assert len(session.calls) == 1
     url, kwargs = session.calls[0]
     assert url == NEKOBT_ENDPOINT
@@ -1755,6 +1810,345 @@ def test_nekobt_never_bypasses_search_http():
         "lxml",
     ):
         assert banned not in text
+
+
+# Group G2 - bounded pagination. The adapter walks at most three list pages
+# and examines at most 200 raw rows, following the provider-echoed
+# `search.offset + search.limit` continuation. It never follows a result.
+
+
+def test_nekobt_fetches_an_advertised_second_page():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(50, 50), more=False)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 5)]
+    assert [kwargs["params"] for _, kwargs in session.calls] == [
+        {"query": "example"},
+        {"query": "example", "offset": 50},
+    ]
+
+
+def test_nekobt_makes_one_request_when_no_more_pages_are_advertised():
+    source = nekobt_source()
+    page = nekobt_page(3, search=nekobt_meta(0, 50), more=False)
+    http, session = http_with(json_response(page))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 4)]
+    assert len(session.calls) == 1
+
+
+def test_nekobt_stops_after_three_pages_no_matter_how_many_are_advertised():
+    source = nekobt_source()
+    pages = [
+        nekobt_page(2, start=1 + 2 * page, search=nekobt_meta(50 * page, 50), more=True)
+        for page in range(3)
+    ]
+    http, session = http_with(*(json_response(p) for p in pages))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 7)]
+    assert len(session.calls) == 3
+    assert [kwargs["params"] for _, kwargs in session.calls] == [
+        {"query": "example"},
+        {"query": "example", "offset": 50},
+        {"query": "example", "offset": 100},
+    ]
+
+
+def test_nekobt_continues_with_the_provider_reported_limit_not_a_fixed_page_size():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 30), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(30, 20), more=True)
+    page_three = nekobt_page(2, start=5, search=nekobt_meta(50, 20), more=False)
+    http, session = http_with(
+        json_response(page_one),
+        json_response(page_two),
+        json_response(page_three),
+    )
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 7)]
+    assert [kwargs["params"] for _, kwargs in session.calls] == [
+        {"query": "example"},
+        {"query": "example", "offset": 30},
+        {"query": "example", "offset": 50},
+    ]
+
+
+def test_nekobt_stops_when_the_response_offset_does_not_match_the_request():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(40, 50), more=True)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 5)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_stops_when_page_one_echoes_a_nonzero_offset():
+    """Page 1 implies the provider default offset 0, so a nonzero echo is
+    inconsistent continuation metadata and must not start a later page."""
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(50, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(100, 50), more=False)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in (1, 2)]
+    assert len(session.calls) == 1
+    assert session.calls[0][1]["params"] == {"query": "example"}
+
+
+def test_nekobt_stops_when_the_provider_reports_a_zero_limit():
+    source = nekobt_source()
+    page = nekobt_page(2, search=nekobt_meta(0, 0), more=True)
+    http, session = http_with(json_response(page))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("offset", [-1, "0", 1.5, True, None])
+def test_nekobt_stops_on_a_malformed_response_offset(offset):
+    source = nekobt_source()
+    page = nekobt_page(2, search=nekobt_meta(offset, 50), more=True)
+    http, session = http_with(json_response(page))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("limit", [0, -50, "50", 50.0, True, None])
+def test_nekobt_stops_on_a_malformed_response_limit(limit):
+    source = nekobt_source()
+    page = nekobt_page(2, search=nekobt_meta(0, limit), more=True)
+    http, session = http_with(json_response(page))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 1
+
+
+@pytest.mark.parametrize("more", [1, 0, "true", "false", None, []])
+def test_nekobt_requires_more_to_be_a_real_boolean(more):
+    source = nekobt_source()
+    page = nekobt_page(2, search=nekobt_meta(0, 50), more=more)
+    http, session = http_with(json_response(page))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 1
+
+
+def test_nekobt_stops_when_a_later_page_repeats_an_earlier_one():
+    source = nekobt_source()
+    page_one = nekobt_page(3, start=1, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(3, start=1, search=nekobt_meta(50, 50), more=True)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 4)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_partial_overlap_between_pages_is_not_a_repeat():
+    source = nekobt_source()
+    page_one = nekobt_page(3, start=1, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(3, start=3, search=nekobt_meta(50, 50), more=False)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    # Overlap stays ordinary adapter output; downstream aggregation dedupes.
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in (1, 2, 3, 3, 4, 5)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_stops_on_an_empty_later_page():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(0, search=nekobt_meta(50, 50), more=True)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_raw_budget_stops_at_two_hundred_rows_across_pages():
+    source = nekobt_source()
+    page_one = nekobt_page(120, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(120, start=121, search=nekobt_meta(50, 50), more=True)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert len(results) == MAX_RESULTS
+    assert results[0].info_hash == f"{1:040x}"
+    assert results[-1].info_hash == f"{MAX_RESULTS:040x}"
+    assert len(session.calls) == 2
+
+
+def test_nekobt_raw_budget_counts_unusable_rows_against_the_budget():
+    source = nekobt_source()
+    page_one = {
+        "error": False,
+        "data": {
+            "results": [
+                {
+                    "id": str(index),
+                    "title": f"Broken {index}",
+                    "magnet": None,
+                    "filesize": "1024",
+                    "seeders": "1",
+                    "leechers": "0",
+                    "uploaded_at": 1785499942639,
+                }
+                for index in range(1, 121)
+            ],
+            "more": True,
+            "search": nekobt_meta(0, 50),
+        },
+    }
+    page_two = nekobt_page(120, start=121, search=nekobt_meta(50, 50), more=True)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    # 120 unusable rows consumed the budget; only 80 rows of page two fit.
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(121, 201)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_keeps_provider_page_order():
+    source = nekobt_source()
+    pages = [
+        nekobt_page(2, start=1 + 2 * page, search=nekobt_meta(50 * page, 50), more=page < 2)
+        for page in range(3)
+    ]
+    http, session = http_with(*(json_response(p) for p in pages))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 7)]
+    assert len(session.calls) == 3
+
+
+def test_nekobt_keeps_the_full_query_on_every_page():
+    source = nekobt_source()
+    query = "frieren beyond journey"
+    pages = [
+        nekobt_page(2, start=1 + 2 * page, search=nekobt_meta(50 * page, 50), more=page < 2)
+        for page in range(3)
+    ]
+    http, session = http_with(*(json_response(p) for p in pages))
+    source.search(query, Category.ANIME, http)
+
+    assert [kwargs["params"] for _, kwargs in session.calls] == [
+        {"query": query},
+        {"query": query, "offset": 50},
+        {"query": query, "offset": 100},
+    ]
+
+
+def test_nekobt_pagination_never_fetches_a_result_detail():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(50, 50), more=False)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    source.search("example", Category.ANIME, http)
+
+    assert len(session.calls) == 2
+    for url, kwargs in session.calls:
+        assert url == NEKOBT_ENDPOINT
+        assert set(kwargs["params"]) <= {"query", "offset"}
+
+
+def test_nekobt_later_page_network_failure_keeps_earlier_results():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    http, session = http_with(
+        json_response(page_one),
+        FakeResponse(b"service unavailable", status_code=503),
+    )
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_later_page_parse_failure_keeps_earlier_results():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    http, session = http_with(json_response(page_one), json_response({"items": []}))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 2
+
+
+def test_nekobt_page_three_failure_keeps_pages_one_and_two():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(50, 50), more=True)
+    http, session = http_with(
+        json_response(page_one),
+        json_response(page_two),
+        FakeResponse(b"service unavailable", status_code=503),
+    )
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 5)]
+    assert len(session.calls) == 3
+
+
+def test_nekobt_does_not_swallow_unexpected_errors_on_later_pages():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    http, session = http_with(json_response(page_one), RuntimeError("programmer bug"))
+    with pytest.raises(RuntimeError, match="programmer bug"):
+        source.search("example", Category.ANIME, http)
+
+
+def test_nekobt_stops_when_continuation_would_repeat_a_requested_offset():
+    source = nekobt_source()
+    page_one = nekobt_page(2, search=nekobt_meta(0, 50), more=True)
+    page_two = nekobt_page(2, start=3, search=nekobt_meta(50, 0), more=True)
+    http, session = http_with(json_response(page_one), json_response(page_two))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 5)]
+    assert len(session.calls) == 2
+    assert [kwargs["params"] for _, kwargs in session.calls] == [
+        {"query": "example"},
+        {"query": "example", "offset": 50},
+    ]
+
+
+def test_nekobt_page_one_stays_a_query_only_request():
+    source = nekobt_source()
+    page = nekobt_page(2, search=nekobt_meta(0, 50), more=False)
+    http, session = http_with(json_response(page))
+    source.search("example", Category.ANIME, http)
+
+    assert len(session.calls) == 1
+    url, kwargs = session.calls[0]
+    assert url == NEKOBT_ENDPOINT
+    assert kwargs["params"] == {"query": "example"}
+
+
+@pytest.mark.parametrize("search", [None, "none", [], 42])
+def test_nekobt_stops_when_search_metadata_is_not_an_object(search):
+    source = nekobt_source()
+    page = nekobt_page(2, search=search, more=True)
+    http, session = http_with(json_response(page))
+    results = source.search("example", Category.ANIME, http)
+
+    assert [r.info_hash for r in results] == [f"{i:040x}" for i in range(1, 3)]
+    assert len(session.calls) == 1
 
 
 # Group H - registration. The adapter is now a shipped source; which position
