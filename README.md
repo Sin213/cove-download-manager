@@ -85,8 +85,8 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
   own aria2 BitTorrent engine, or is cancelled if you prefer. See
   [Torrents](#torrents).
 - **Torrent search** - a built-in Search tab covering Movies, TV, Anime and
-  Games across seven sources, with anything you pick going straight into the
-  queue. See [Search](#search).
+  Games across seven sources, plus any Torznab indexer you add yourself, with
+  anything you pick going straight into the queue. See [Search](#search).
 - **Network interface binding** - bind all of Cove's traffic to a chosen
   interface, such as a VPN adapter, in Settings -> BitTorrent. If that
   interface disappears, Cove stops rather than falling back to another one.
@@ -540,9 +540,30 @@ sends it to the same queue as any other download.
 | Games | FitGirl, GOG Games |
 
 Search requests use the network interface selected in Settings, the same one
-downloads are bound to. The source list is fixed at build time - there is no
-indexer to configure, nothing is loaded from disk or the network to decide
-what runs, and no source needs an account.
+downloads are bound to. The built-in source list is fixed at build time:
+nothing is loaded from disk or the network to decide what runs, and no
+built-in source needs an account.
+
+Results are ranked by how well the title matches what you typed, from an
+exact match down to the same words scattered anywhere in the title, and ties
+below that fall back to seeders and source priority. Matching works on whole
+words, so a query for `Ring` finds "The Ring" and never "Daring".
+
+#### Custom Torznab indexers
+
+Beyond the built-ins you can add your own Torznab endpoints - a Jackett or
+Prowlarr instance, or anything else that speaks Torznab. Open **Settings ->
+Indexers**, add the endpoint URL and its API key if it needs one, and it is
+queried alongside the built-in sources for every category. Each entry can be
+enabled or disabled on its own, and reordered to set which source wins when
+two of them return the same torrent.
+
+Endpoint URLs are classified before any request is made. Only exact
+localhost, literal loopback, RFC1918 and link-local addresses (and their IPv6
+equivalents) are treated as local; everything else must be HTTPS and stays
+bound to your selected interface. A hostname is never resolved to decide
+this. Local routing is a transport decision only - responses from a custom
+indexer are parsed as untrusted input either way.
 
 Torrents-CSV carries no category of its own, so Movies and TV run the same
 query against it; the release titles carry the season and episode markers that

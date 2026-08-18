@@ -349,8 +349,17 @@ jobs:
           ### Added
 
           - **Built-in Search for Movies, TV, Anime and Games.** Type a query, pick a category, and every source that covers it is queried at once; the results come back merged, de-duplicated and sorted together, and adding one queues it like any other download.
-          - **Seven active Search sources: YTS, Nyaa, FitGirl, SubsPlease, nekoBT, GOG Games and Torrents-CSV.** Movies come from YTS and Torrents-CSV, TV from Torrents-CSV, Anime from Nyaa, SubsPlease and nekoBT, and Games from FitGirl and GOG Games. The list is fixed at build time - nothing is loaded from disk or the network to decide what runs, and there is no indexer to configure.
+          - **Seven built-in Search sources: YTS, Nyaa, FitGirl, SubsPlease, nekoBT, GOG Games and Torrents-CSV.** Movies come from YTS and Torrents-CSV, TV from Torrents-CSV, Anime from Nyaa, SubsPlease and nekoBT, and Games from FitGirl and GOG Games. The built-in list is fixed at build time - nothing is loaded from disk or the network to decide what runs, and no built-in source needs an account.
+          - **Your own Torznab indexers, added in Settings -> Indexers.** Point Cove at a Jackett or Prowlarr instance, or anything else that speaks Torznab, and it is queried alongside the built-in sources. Each entry can be enabled or disabled on its own and reordered to decide which source wins when two of them return the same torrent.
+          - **Custom endpoints are classified before any request is made.** Only exact localhost, literal loopback, RFC1918 and link-local addresses and their IPv6 equivalents count as local; everything else must be HTTPS and stays bound to your selected interface. A hostname is never resolved to make that decision, and an indexer's response is parsed as untrusted input either way.
+          - **Results are ranked by how well the title matches the query**, from an exact match down to the same words scattered anywhere in the title, with seeders and source priority breaking the ties below that. Matching works on whole words, so a search for `Ring` finds "The Ring" and never "Daring".
           - **Search requests use the network interface selected in Cove's Settings**, the same interface downloads are already bound to, rather than going out over whatever adapter happens to be default.
+
+          ### Changed
+
+          - **Every source now walks a bounded number of result pages** rather than stopping at the first one, so a query reaches deeper without any source being able to run away with the request.
+          - **Torrents-CSV replaces Rutor** as the Movies and TV source.
+          - **The Pirate Bay source is deactivated for this release.** Its documented API host stopped answering Cove entirely while DNS, TCP and TLS to it all still succeed; no Cove defect was found and no successor host is documented, so it sits out rather than failing every search it takes part in.
 
           ### Fixed
 
