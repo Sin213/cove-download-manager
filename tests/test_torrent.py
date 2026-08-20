@@ -801,3 +801,136 @@ def test_store_managed_torrent_works_without_fchmod(managed, monkeypatch):
 
     assert Path(path).read_bytes() == meta.raw_bytes
     assert sorted(p.suffix for p in managed.iterdir()) == [".torrent"]
+
+
+# ---------------------------------------------------------------------------
+# Per-file selection
+# ---------------------------------------------------------------------------
+#
+# Cove numbers a torrent's files the way the manifest does, from 0. aria2
+# numbers them from 1. Everything below pins the canonical 0-based domain and
+# the single place the two numbering schemes meet; the load-bearing rule is
+# that nothing here may ever turn "some files" into "every file".
+
+
+def test_selection_none_means_every_file():
+    assert torrent.normalize_file_selection(None) is None
+
+
+def test_selection_is_deduplicated_and_sorted():
+    assert torrent.normalize_file_selection([5, 2, 5, 0]) == (0, 2, 5)
+
+
+def test_selection_does_not_mutate_the_callers_collection():
+    given = [5, 2, 5, 0]
+
+    torrent.normalize_file_selection(given)
+
+    assert given == [5, 2, 5, 0]
+
+
+def test_empty_explicit_selection_is_rejected_rather_than_widened():
+    """"Download nothing" is not "download everything"."""
+    with pytest.raises(TorrentError):
+        torrent.normalize_file_selection([])
+
+
+@pytest.mark.parametrize("bad", [-1, True, False, "1", 1.2, None])
+def test_invalid_selection_entries_are_rejected(bad):
+    with pytest.raises(TorrentError):
+        torrent.normalize_file_selection([bad])
+
+
+def test_a_bare_string_is_not_a_selection():
+    with pytest.raises(TorrentError):
+        torrent.normalize_file_selection("0,2")
+
+
+def test_selection_serializes_to_canonical_zero_based_text():
+    assert torrent.serialize_file_selection(None) == ""
+    assert torrent.serialize_file_selection((0,)) == "0"
+    assert torrent.serialize_file_selection((0, 2, 5)) == "0,2,5"
+
+
+@pytest.mark.parametrize("given", [(2, 0), (0, 2), (2, 2, 0)])
+def test_equivalent_selections_persist_identically(given):
+    assert torrent.serialize_file_selection(given) == "0,2"
+
+
+@pytest.mark.parametrize("legacy", [None, ""])
+def test_legacy_empty_storage_restores_as_every_file(legacy):
+    """Only the exact legacy representation means all files.
+
+    `''` is the v6 column default every pre-selection row carries, and NULL
+    covers a database missing the column. Nothing else is treated as an
+    absent selection, because nothing else is one Cove wrote.
+    """
+    assert torrent.parse_file_selection(legacy) is None
+
+
+def test_persisted_subset_restores_canonically():
+    assert torrent.parse_file_selection("0,2,5") == (0, 2, 5)
+
+
+@pytest.mark.parametrize("corrupt", ["-1", "abc", "0,,2", "1.5", "True",
+                                     "0,evil", ",", "0 2", "²",
+                                     # Whitespace is not the legacy empty
+                                     # value; treating it as one would widen a
+                                     # damaged subset back to every file.
+                                     "   ", "\t", " 1", "1 ", " 0,2",
+                                     # Not text at all: an empty BLOB is no
+                                     # more "all files" than any other
+                                     # unreadable value.
+                                     b"", b"0,2", 0,
+                                     # Digits, but far more of them than any
+                                     # index needs. int() raises ValueError
+                                     # past its conversion limit, which would
+                                     # escape the TorrentError-only recovery
+                                     # path and take startup down with it.
+                                     "1" * 11, "9" * 5000, "0," + "1" * 5000])
+def test_malformed_persisted_selection_fails_closed(corrupt):
+    """A subset that cannot be read must never become "all files".
+
+    Widening it would start downloading exactly the files the user had
+    deselected, which is the one outcome selection exists to prevent.
+    """
+    with pytest.raises(TorrentError):
+        torrent.parse_file_selection(corrupt)
+
+
+def test_aria2_select_file_is_one_based():
+    assert torrent.aria2_select_file((0,)) == "1"
+    assert torrent.aria2_select_file((0, 2, 4)) == "1,3,5"
+
+
+def test_aria2_select_file_leaves_the_all_files_call_alone():
+    assert torrent.aria2_select_file(None) is None
+
+
+def test_the_largest_accepted_index_survives_a_full_round_trip():
+    """The accepted domain must be closed under persist-and-restore.
+
+    Anything normalization accepts gets written to the database, so anything
+    it accepts must also parse back. The boundary is the interesting case:
+    one index at the limit, and the first one past it.
+    """
+    largest = 10 ** torrent._MAX_SELECTION_INDEX_DIGITS - 1
+
+    selection = torrent.normalize_file_selection([largest])
+    stored = torrent.serialize_file_selection(selection)
+
+    assert selection == (largest,)
+    assert stored == str(largest)
+    assert torrent.parse_file_selection(stored) == (largest,)
+
+
+def test_an_index_past_the_bound_is_refused_before_it_can_be_persisted():
+    """Rejected at the door, not on the way back in.
+
+    Accepting it here would persist a value the parser refuses, turning a
+    task the user successfully queued into an unreadable row after a restart.
+    """
+    too_large = 10 ** torrent._MAX_SELECTION_INDEX_DIGITS
+
+    with pytest.raises(TorrentError):
+        torrent.normalize_file_selection([too_large])

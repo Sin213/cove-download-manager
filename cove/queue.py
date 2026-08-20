@@ -165,6 +165,10 @@ class PreparedDownload:
     torrent_path: str = ""
     debrid_route: str = ""
     intake: str = "unknown"
+    # Chosen files, as 0-based indexes into the torrent's own manifest.
+    # None is the absence of a choice and means every file, which is what
+    # every non-torrent request and every pre-selection torrent carries.
+    selected_files: Optional[tuple[int, ...]] = None
 
 # Where a URL entered Cove. Diagnostics only - never affects routing.
 _INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "search", "unknown")
@@ -194,6 +198,20 @@ TORRENT_CANCELLED_UNCACHED = (
     "download was cancelled."
 )
 TORRENT_METADATA_FAILED = "Cove could not read this torrent's metadata."
+# Choosing files needs the file list to choose from, and only a .torrent Cove
+# already holds provides one. A magnet's manifest arrives from the swarm long
+# after the add, so a subset aimed at one is refused rather than ignored -
+# ignoring it would download every file the user had just deselected.
+TORRENT_SELECTION_UNSUPPORTED = (
+    "Choosing individual files is only available for a torrent whose file "
+    "list Cove already holds."
+)
+# A restored row whose selection cannot be read. The row is failed rather
+# than restarted: the alternative is treating "unreadable" as "all files".
+TORRENT_SELECTION_UNREADABLE = (
+    "Cove could not read which files were chosen for this torrent, so it "
+    "was not restarted."
+)
 TORRENT_SUPPORT_DISABLED = (
     "BitTorrent support is turned off in Settings, so this magnet link was "
     "not added."
@@ -267,7 +285,12 @@ def _row_get(row, key, default=None):
 
 
 def _task_from_persisted_row(row) -> "DownloadTask":
-    """Rebuild a DownloadTask from a persisted 'downloads' row on startup."""
+    """Rebuild a DownloadTask from a persisted 'downloads' row on startup.
+
+    Raises TorrentError when the row claims a file selection that cannot be
+    read; the caller fails that row rather than restoring it, because the
+    only other reading of an unreadable subset is "all files".
+    """
     return DownloadTask(
         id=row["id"],
         url=row["url"],
@@ -294,6 +317,13 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         info_hash=_row_get(row, "info_hash", "") or "",
         torrent_name=_row_get(row, "torrent_name", "") or "",
         torrent_path=_row_get(row, "torrent_path", "") or "",
+        # Deliberately no `or ""` fallback: that would turn a falsey stored
+        # value such as an empty BLOB into the legacy all-files reading
+        # instead of letting it fail closed. Only a genuinely absent column
+        # gets the legacy default.
+        selected_files=torrent.parse_file_selection(
+            _row_get(row, "selected_files", "")
+        ),
         debrid_route=_row_get(row, "debrid_route", "") or "",
         debrid_item_id=_row_get(row, "debrid_item_id", "") or "",
         debrid_file_id=_row_get(row, "debrid_file_id", "") or "",
@@ -338,6 +368,12 @@ class DownloadTask:
     info_hash: str = ""
     torrent_name: str = ""
     torrent_path: str = ""
+    # The files this torrent should download, as 0-based indexes into its own
+    # manifest, persisted in the v6 `selected_files` column. None means no
+    # choice was made and every file downloads - the behaviour of every task
+    # created before per-file selection existed. Cove owns this intent: it is
+    # never re-derived from aria2, which forgets it with every recreated gid.
+    selected_files: Optional[tuple[int, ...]] = None
     debrid_route: str = ""
     # Third-party provider identifiers, persisted by the v7 schema. Empty
     # for AllDebrid/Real-Debrid, which have no such identity to reuse.
@@ -603,9 +639,29 @@ class QueueManager(QObject):
             rows = conn.execute(
                 "SELECT * FROM downloads WHERE status IN ('queued','active','paused')"
             ).fetchall()
+        unreadable: list[int] = []
         for row in rows:
-            t = _task_from_persisted_row(row)
+            try:
+                t = _task_from_persisted_row(row)
+            except TorrentError:
+                # The row says some files were chosen but no longer says
+                # which. Restoring it would have to guess, and the only
+                # available guess is "all of them" - the one outcome the
+                # user ruled out. Fail the row instead; nothing is launched
+                # and nothing the user deselected can start downloading.
+                unreadable.append(row["id"])
+                continue
             self.tasks[t.id] = t
+        for tid in unreadable:
+            with db.connect() as conn:
+                conn.execute(
+                    "UPDATE downloads SET status='error', error=?, "
+                    "finished_at=? WHERE id=?",
+                    (TORRENT_SELECTION_UNREADABLE, time.time(), tid),
+                )
+            # The stored value may be arbitrary bytes from a damaged file;
+            # only the row id, which Cove issued itself, is recorded.
+            self._diag("queue", "selection_unreadable", "ERROR", task_id=tid)
 
     # aria2 download status -> Cove task status. "waiting" is omitted on
     # purpose: a waiting download has a gid but isn't polled by _poll_active,
@@ -974,6 +1030,7 @@ class QueueManager(QObject):
         torrent_path: str = "",
         debrid_route: str = "",
         intake: str = "unknown",
+        selected_files=None,
     ) -> Optional[int]:
         """Add one URL to the queue.
 
@@ -1002,6 +1059,7 @@ class QueueManager(QObject):
             torrent_path=torrent_path,
             debrid_route=debrid_route,
             intake=intake,
+            selected_files=selected_files,
         )
         if prepared is None:
             return None
@@ -1024,6 +1082,7 @@ class QueueManager(QObject):
         torrent_path: str = "",
         debrid_route: str = "",
         intake: str = "unknown",
+        selected_files=None,
     ) -> Optional[PreparedDownload]:
         """Classify one URL and compute its task specification.
 
@@ -1045,6 +1104,11 @@ class QueueManager(QObject):
         referrer = _clean_header(referrer)
         user_agent = _clean_header(user_agent)
         if source_type not in SOURCE_TYPES:
+            return None
+        try:
+            selection = torrent.normalize_file_selection(selected_files)
+        except TorrentError as exc:
+            self.error.emit(str(exc))
             return None
         if not URL_RE.match(url):
             return None
@@ -1072,6 +1136,14 @@ class QueueManager(QObject):
                 source_type = SOURCE_TORRENT
                 info_hash = magnet.info_hash
                 torrent_name = _safe_torrent_name(magnet.display_name)
+        if selection is not None and (
+            source_type != SOURCE_TORRENT or not torrent_path
+        ):
+            # Nothing downstream of here can apply a subset without the
+            # manifest a managed .torrent provides, and silently dropping
+            # it would download every file instead of the chosen few.
+            self.error.emit(TORRENT_SELECTION_UNSUPPORTED)
+            return None
         import posixpath
         from urllib.parse import unquote, urlparse
         from .config import categorize
@@ -1132,6 +1204,7 @@ class QueueManager(QObject):
             torrent_path=torrent_path,
             debrid_route=debrid_route,
             intake=intake,
+            selected_files=selection,
         )
 
     def commit_prepared(self, prepared: PreparedDownload) -> Optional[int]:
@@ -1159,6 +1232,7 @@ class QueueManager(QObject):
             info_hash=prepared.info_hash,
             torrent_name=prepared.torrent_name,
             torrent_path=prepared.torrent_path,
+            selected_files=prepared.selected_files,
             debrid_route=prepared.debrid_route,
         )
         with db.connect() as conn:
@@ -1169,8 +1243,8 @@ class QueueManager(QObject):
                      created_at, category, backend, filename,
                      cookies, referrer, user_agent,
                      source_type, info_hash, torrent_name, torrent_path,
-                     debrid_route)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                     selected_files, debrid_route)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     prepared.url,
@@ -1189,6 +1263,7 @@ class QueueManager(QObject):
                     prepared.info_hash,
                     prepared.torrent_name,
                     prepared.torrent_path,
+                    torrent.serialize_file_selection(prepared.selected_files),
                     prepared.debrid_route,
                 ),
             )
@@ -1442,6 +1517,16 @@ class QueueManager(QObject):
         return meta, torrent.store_managed_torrent(meta)
 
     def _launch_torrent(self, t: DownloadTask) -> None:
+        if t.selected_files is not None:
+            # A cache hit materialises every file the provider holds, and
+            # _materialize_cached_torrent has no notion of a chosen subset
+            # yet - so probing here would turn "these three files" into the
+            # whole torrent. Provider-side filtering is a later slice; until
+            # it exists a selected torrent takes the local route, which is
+            # the one that can honour select-file. A torrent with no
+            # selection is untouched and still probes the providers first.
+            self._start_local_torrent(t.id)
+            return
         self._spawn(
             self._probe_torrent,
             t,
@@ -1807,6 +1892,12 @@ class QueueManager(QObject):
         tends to include the magnet, so it is replaced with a fixed sentence
         before it can reach a task row.
         """
+        if t.selected_files is not None:
+            # There is no manifest to select against on this route, and
+            # adding the magnet anyway would download every file - the
+            # opposite of what the selection asked for. prepare_url already
+            # refuses this combination; this is the launch-side backstop.
+            raise TorrentError(TORRENT_SELECTION_UNSUPPORTED)
         try:
             return self.rpc.add_magnet(t.url, t.out_dir, t.speed_limit_kbps)
         except Aria2Error:
@@ -1823,8 +1914,14 @@ class QueueManager(QObject):
         # and is the more useful diagnosis, so it is left alone; only
         # aria2's message is replaced.
         data = torrent.read_managed_torrent(t.torrent_path, t.info_hash)
+        # The one place Cove's 0-based selection becomes aria2's 1-based
+        # select-file. No selection stays None, so the whole-torrent add is
+        # byte for byte the call it was before selection existed.
+        select_file = torrent.aria2_select_file(t.selected_files)
         try:
-            return self.rpc.add_torrent(data, t.out_dir, t.speed_limit_kbps)
+            return self.rpc.add_torrent(
+                data, t.out_dir, t.speed_limit_kbps, select_file=select_file
+            )
         except Aria2Error:
             raise TorrentError(TORRENT_ARIA2_FAILED) from None
 

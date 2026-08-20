@@ -242,7 +242,8 @@ class _FakeRpc:
 
     def add_torrent(self, data, out_dir, speed_limit_kbps=0, select_file=None):
         self.torrents.append({"data": data, "out_dir": out_dir,
-                              "speed_limit_kbps": speed_limit_kbps})
+                              "speed_limit_kbps": speed_limit_kbps,
+                              "select_file": select_file})
         return "gid-file"
 
     def get_files(self, gid):
@@ -8232,3 +8233,326 @@ def test_prepare_url_ytdlp_and_hls_requests_are_still_committable(queue_env, mon
         assert prepared.backend == backend, url
         tid = queue.commit_prepared(prepared)
         assert queue.tasks[tid].backend == backend, url
+
+
+# --- per-file selection ----------------------------------------------------
+#
+# The selection a task carries is 0-based, exactly like the torrent manifest;
+# aria2's select-file is 1-based. These tests pin the conversion happening
+# once, at the aria2 call, and pin the two things that must never happen:
+# a selection quietly disappearing, and an unreadable selection quietly
+# becoming "download everything".
+
+
+def _bencoded_bytes(value: bytes) -> bytes:
+    return str(len(value)).encode() + b":" + value
+
+
+# index 0 Season/Episode01.mkv, index 1 Season/Episode02.mkv, index 2 Sample.mkv
+def _multi_torrent_bytes():
+    entries = b""
+    for length, parts in (
+        (7, (b"Season", b"Episode01.mkv")),
+        (9, (b"Season", b"Episode02.mkv")),
+        (5, (b"Sample.mkv",)),
+    ):
+        path = b"l" + b"".join(_bencoded_bytes(p) for p in parts) + b"e"
+        entries += b"d6:lengthi" + str(length).encode() + b"e4:path" + path + b"e"
+    info = (
+        b"d5:filesl" + entries + b"e4:name" + _bencoded_bytes(b"Show S01")
+        + b"12:piece lengthi16384e6:pieces" + _bencoded_bytes(b"\x01" * 20) + b"e"
+    )
+    return b"d4:info" + info + b"e"
+
+
+def _managed_torrent_task(queue_env, monkeypatch, tmp_path, selection=None):
+    """A managed multi-file .torrent queued exactly as add_torrent_file does."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    raw = _multi_torrent_bytes()
+    meta = torrent_mod.parse_torrent(raw)
+    managed = torrent_mod.store_managed_torrent(meta)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(meta.info_hash),
+        out_dir=str(tmp_path),
+        source_type=SOURCE_TORRENT,
+        info_hash=meta.info_hash,
+        torrent_name=meta.name,
+        torrent_path=managed,
+        selected_files=selection,
+    )
+    _running(queue)
+    return queue, rpc, db_path, tid, raw
+
+
+def test_torrent_manifest_indexes_are_zero_based(tmp_path):
+    """The premise the whole conversion rests on."""
+    meta = torrent_mod.parse_torrent(_multi_torrent_bytes())
+
+    assert [f.index for f in meta.files] == [0, 1, 2]
+    assert meta.files[0].name == "Episode01.mkv"
+    assert meta.files[2].name == "Sample.mkv"
+
+
+def test_prepared_download_has_no_selection_by_default(queue_env):
+    queue, _rpc, _db_path = queue_env()
+
+    prepared = queue.prepare_url("https://example.com/a.bin")
+
+    assert prepared.selected_files is None
+
+
+def test_prepared_selection_is_canonicalised_without_reaching_aria2(
+    queue_env, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    queue, rpc, _db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    meta = torrent_mod.parse_torrent(_multi_torrent_bytes())
+    managed = torrent_mod.store_managed_torrent(meta)
+
+    prepared = queue.prepare_url(
+        torrent_mod.minimal_magnet(meta.info_hash),
+        out_dir=str(tmp_path),
+        source_type=SOURCE_TORRENT,
+        info_hash=meta.info_hash,
+        torrent_path=managed,
+        selected_files=[2, 0],
+    )
+
+    assert prepared.selected_files == (0, 2)
+    assert rpc.torrents == []
+
+
+def test_download_task_has_no_selection_by_default(queue_env):
+    queue, _rpc, db_path = queue_env()
+
+    tid = queue.add_url("https://example.com/a.bin")
+
+    assert queue.tasks[tid].selected_files is None
+    assert _persisted_row(db_path, tid)["selected_files"] == ""
+
+
+def test_committed_selection_reaches_the_task_and_the_row(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, _rpc, db_path, tid, _raw = _managed_torrent_task(
+        queue_env, monkeypatch, tmp_path, selection=[2, 0]
+    )
+
+    assert queue.tasks[tid].selected_files == (0, 2)
+    assert _persisted_row(db_path, tid)["selected_files"] == "0,2"
+
+
+def test_managed_torrent_selection_reaches_aria2_one_based(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, _db_path, tid, _raw = _managed_torrent_task(
+        queue_env, monkeypatch, tmp_path, selection=(0, 2)
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert rpc.torrents[0]["select_file"] == "1,3"
+
+
+def test_whole_torrent_still_sends_no_select_file(queue_env, monkeypatch, tmp_path):
+    queue, rpc, _db_path, tid, _raw = _managed_torrent_task(
+        queue_env, monkeypatch, tmp_path
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert rpc.torrents[0]["select_file"] is None
+
+
+def test_restart_reapplies_the_same_selection_exactly_once(
+    queue_env, monkeypatch, tmp_path
+):
+    """The regression this feature exists to prevent.
+
+    The gid is recreated on every start, so aria2 remembers nothing. If the
+    restored selection were dropped, or converted twice, Episode02 would
+    start downloading after a restart that the user never asked for.
+    """
+    queue, rpc, db_path, tid, _raw = _managed_torrent_task(
+        queue_env, monkeypatch, tmp_path, selection=(0, 2)
+    )
+    queue._launch(queue.tasks[tid])
+    assert rpc.torrents[0]["select_file"] == "1,3"
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    restored = queue2.tasks[tid]
+    assert restored.selected_files == (0, 2)
+
+    queue2._launch(restored)
+
+    assert rpc2.torrents[0]["select_file"] == "1,3"
+
+
+def test_restart_of_a_whole_torrent_gains_no_select_file(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, _rpc, db_path, tid, _raw = _managed_torrent_task(
+        queue_env, monkeypatch, tmp_path
+    )
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    assert queue2.tasks[tid].selected_files is None
+
+    queue2._launch(queue2.tasks[tid])
+
+    assert rpc2.torrents[0]["select_file"] is None
+
+
+@pytest.mark.parametrize("corrupt", ["0,,2", "abc", "-1", "   ", " 1",
+                                     sqlite3.Binary(b""),
+                                     sqlite3.Binary(b"0,2"),
+                                     "9" * 5000])
+def test_unreadable_persisted_selection_never_downloads_everything(
+    queue_env, monkeypatch, tmp_path, corrupt
+):
+    queue, _rpc, db_path, tid, _raw = _managed_torrent_task(
+        queue_env, monkeypatch, tmp_path, selection=(0, 2)
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE downloads SET selected_files=? WHERE id=?",
+                     (corrupt, tid))
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+
+    assert tid not in queue2.tasks
+    assert rpc2.torrents == []
+    assert _persisted_row(db_path, tid)["status"] == "error"
+
+
+def test_a_selection_cannot_be_dropped_into_a_manifest_less_magnet(queue_env):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    errors = []
+    queue.error.connect(errors.append)
+
+    assert queue.add_url(MAGNET, selected_files=(0,)) is None
+    assert _rows(db_path) == []
+    assert errors
+    assert rpc.magnets == []
+
+
+def test_a_selection_is_refused_for_an_ordinary_download(queue_env):
+    queue, _rpc, db_path = queue_env()
+    errors = []
+    queue.error.connect(errors.append)
+
+    assert queue.add_url("https://example.com/a.bin", selected_files=(0,)) is None
+    assert _rows(db_path) == []
+    assert errors
+
+
+def test_an_ordinary_magnet_is_untouched_by_the_selection_plumbing(queue_env, monkeypatch):
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    _running(queue)
+    tid = queue.add_url(MAGNET)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].selected_files is None
+    assert _persisted_row(db_path, tid)["selected_files"] == ""
+    assert rpc.magnets[0]["uri"] == MAGNET
+
+
+def test_the_magnet_route_itself_refuses_a_selection_it_cannot_apply(queue_env, monkeypatch):
+    """The launch-side backstop, independent of the prepare-time refusal.
+
+    prepare_url already blocks this combination, so nothing in production
+    reaches here today. It is asserted anyway because the failure mode it
+    guards - a selection reaching a route with no manifest, and every file
+    downloading as a result - is silent.
+    """
+    queue, rpc, _db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    _uncached(queue, monkeypatch)
+    # Deliberately not _running: the queue must not auto-start the magnet,
+    # or the add below would be indistinguishable from the launch under test.
+    tid = queue.add_url(MAGNET)
+    task = queue.tasks[tid]
+    task.selected_files = (0,)
+
+    with pytest.raises(torrent_mod.TorrentError):
+        queue._add_local_magnet(task)
+
+    assert rpc.magnets == []
+
+
+def test_a_selected_torrent_never_takes_the_cached_debrid_route(
+    queue_env, monkeypatch, tmp_path
+):
+    """A cache hit materialises every provider file, selection or not.
+
+    Provider-side filtering is Slice 2. Until it exists, a torrent that
+    carries an explicit subset takes the local route, where select-file is
+    honoured, rather than silently downloading everything the provider
+    holds. Nothing changes for a torrent with no selection.
+    """
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    probes = []
+
+    def probe(*a, **k):
+        probes.append(a)
+        return _cached()
+
+    monkeypatch.setattr(debrid, "resolve_torrent", probe)
+    raw = _multi_torrent_bytes()
+    meta = torrent_mod.parse_torrent(raw)
+    managed = torrent_mod.store_managed_torrent(meta)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(meta.info_hash),
+        out_dir=str(tmp_path),
+        source_type=SOURCE_TORRENT,
+        info_hash=meta.info_hash,
+        torrent_name=meta.name,
+        torrent_path=managed,
+        selected_files=(0, 2),
+    )
+    _running(queue)
+
+    queue._launch(queue.tasks[tid])
+
+    # One row, still the torrent itself: no provider file rows were created.
+    assert len(_rows(db_path)) == 1
+    assert queue.tasks[tid].source_type == SOURCE_TORRENT
+    assert queue.tasks[tid].debrid_route == ""
+    assert probes == []
+    assert rpc.torrents[0]["select_file"] == "1,3"
+
+
+def test_an_unselected_torrent_still_takes_the_cached_debrid_route(
+    queue_env, monkeypatch, tmp_path
+):
+    """The compatibility half: no selection, no routing change."""
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    queue, rpc, db_path = queue_env(**_local_settings())
+    _sync_spawn(queue)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    raw = _multi_torrent_bytes()
+    meta = torrent_mod.parse_torrent(raw)
+    managed = torrent_mod.store_managed_torrent(meta)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(meta.info_hash),
+        out_dir=str(tmp_path),
+        source_type=SOURCE_TORRENT,
+        info_hash=meta.info_hash,
+        torrent_name=meta.name,
+        torrent_path=managed,
+    )
+    _running(queue)
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].source_type == SOURCE_TORRENT_FILE
+    assert rpc.torrents == []

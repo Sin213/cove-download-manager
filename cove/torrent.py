@@ -67,6 +67,7 @@ _MANAGED_CHANGED = (
     "Cove's stored copy of this .torrent no longer matches this torrent."
 )
 _MANAGED_UNSAFE = "Cove will not write its .torrent copy to that path."
+_BAD_SELECTION = "Cove could not read which files were chosen for this torrent."
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +496,118 @@ def parse_torrent(data) -> TorrentMetadata:
         raw_bytes=data,
         info_bytes=data[info_span[0]:info_span[1]],
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-file selection
+# ---------------------------------------------------------------------------
+#
+# A selection names files by their index in the torrent's own manifest, so
+# it is 0-based exactly like TorrentFile.index. aria2 numbers the same files
+# from 1; `aria2_select_file` below is the only place that gap is bridged.
+#
+# `None` is not a selection at all: it is the absence of one, and it means
+# what Cove has always meant, every file. That distinction is the whole
+# point of this module's half of the feature. An explicit subset that cannot
+# be read - malformed storage, a stray value, an empty list - is refused
+# rather than downgraded to `None`, because downgrading it would start
+# downloading precisely the files the user had deselected.
+
+# Bounded, not just digits. A torrent holds at most _MAX_FILES entries, so ten
+# digits is already far more index than can exist, while an unbounded run of
+# digits would reach int(), whose conversion limit raises ValueError rather
+# than TorrentError - escaping the per-row recovery path and failing startup
+# instead of failing the one damaged row.
+#
+# One bound, used twice. The parser refuses anything longer, so normalization
+# has to refuse the same values on the way in: accepting an index that cannot
+# be read back would persist a task that fails to restore after a restart.
+_MAX_SELECTION_INDEX_DIGITS = 10
+_MAX_SELECTION_INDEX = 10 ** _MAX_SELECTION_INDEX_DIGITS - 1
+_SELECTION_INDEX_RE = re.compile(r"\A[0-9]{1,%d}\Z" % _MAX_SELECTION_INDEX_DIGITS)
+
+
+def normalize_file_selection(values) -> tuple[int, ...] | None:
+    """Canonical form of a caller's chosen files, or None for all of them.
+
+    Set-like in meaning, but stored and compared as a unique, ascending
+    tuple so the persisted text, the tests and any diagnostic are stable
+    whatever order the caller happened to build.
+    """
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes, bytearray)):
+        # Iterable, but a string of indexes is storage, not a selection.
+        raise TorrentError(_BAD_SELECTION)
+    try:
+        items = list(values)
+    except TypeError:
+        raise TorrentError(_BAD_SELECTION) from None
+    unique: set[int] = set()
+    for value in items:
+        # bool is a subclass of int: True must never quietly become file 1.
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise TorrentError(_BAD_SELECTION)
+        if value > _MAX_SELECTION_INDEX:
+            # Refused here rather than on the way back in, so the accepted
+            # domain stays closed under persist-and-restore.
+            raise TorrentError(_BAD_SELECTION)
+        unique.add(value)
+    if not unique:
+        raise TorrentError(_BAD_SELECTION)
+    return tuple(sorted(unique))
+
+
+def serialize_file_selection(selection) -> str:
+    """The durable `downloads.selected_files` text for a selection.
+
+    "" is what every row written before this feature already holds, and it
+    keeps its existing meaning of all files.
+    """
+    selection = normalize_file_selection(selection)
+    if selection is None:
+        return ""
+    return ",".join(str(index) for index in selection)
+
+
+def parse_file_selection(text) -> tuple[int, ...] | None:
+    """Restore a persisted selection, failing closed on anything unreadable.
+
+    Only two values mean "no selection": SQL NULL, for a database that
+    predates the column, and the exact empty string the v6 default writes.
+    Nothing is stripped or coerced first. Whitespace, a BLOB, an integer -
+    none of those were written by `serialize_file_selection`, so none of
+    them are evidence that the user chose every file, and reading them that
+    way would restart a torrent with files they had deselected.
+    """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        raise TorrentError(_BAD_SELECTION)
+    if text == "":
+        return None
+    indexes = []
+    for part in text.split(","):
+        # Deliberately stricter than int(): a plain run of ASCII digits and
+        # nothing else, so "", "-1", " 1", "1.5" and the Unicode digit-like
+        # characters int() accepts are all refused instead of guessed at.
+        if not _SELECTION_INDEX_RE.match(part):
+            raise TorrentError(_BAD_SELECTION)
+        indexes.append(int(part))
+    return normalize_file_selection(indexes)
+
+
+def aria2_select_file(selection) -> str | None:
+    """aria2's `select-file` value for a canonical selection.
+
+    The single 0-based-to-1-based conversion in Cove. None stays None so
+    the all-files path issues exactly the call it issued before selection
+    existed, with no `select-file` option at all.
+    """
+    selection = normalize_file_selection(selection)
+    if selection is None:
+        return None
+    return ",".join(str(index + 1) for index in selection)
 
 
 # ---------------------------------------------------------------------------
