@@ -350,6 +350,12 @@ class Settings:
     # Whether the first-run "install the browser extension" banner has been
     # answered (dismissed, acted on, or made moot by a connected extension).
     extension_prompt_shown: bool = False
+    # Whether the per-download "Download File Info" preflight is shown before
+    # a single manual direct HTTP download starts. Defaults to True (the
+    # dialog appears) so a missing key — a config written before this feature
+    # existed — behaves like the feature is enabled, and a hand-edited
+    # non-boolean is not read as a dismissal the user never made.
+    show_download_options: bool = True
     # User-configured generic Torznab indexers. These are dormant configuration
     # in S2: each record describes an indexer (stable id, enabled, display
     # name, full endpoint, optional api_key) so a later slice can build a
@@ -415,6 +421,10 @@ class Settings:
         s.schedule = sched
         s.category_dirs = cat
         s.custom_indexers = indexers
+        # Any repair below sets this so load() persists the corrected value.
+        # Reassigned to the baseline migration flags later, never overwriting
+        # an earlier repair.
+        changed = False
         if s.theme not in ("dark", "light"):
             s.theme = "dark"
         # A hand-edited non-boolean must not be read as "enabled" via Python
@@ -431,11 +441,20 @@ class Settings:
         # prompt the user has never actually answered.
         if not isinstance(s.extension_prompt_shown, bool):
             s.extension_prompt_shown = False
+        # Same reasoning once more: a hand-edited non-boolean must not be read
+        # as "off" via Python truthiness, or the download preflight would be
+        # skipped even though the user never dismissed it.
+        if not isinstance(s.show_download_options, bool):
+            s.show_download_options = True
+            changed = True
         # Not a dataclass field, so it is never written back to settings.json.
         # Task 6 consumes it once, at startup, to migrate existing opt-ins.
         s.magnet_setting_missing = magnet_setting_missing
         # Migrate legacy / empty / suspiciously-short secrets up to a real one.
-        changed = speed_limit_unit_missing or sched_reset
+        # Accumulate: the show_download_options repair above (and any other
+        # earlier repair) must survive this baseline recomputation, or the
+        # corrected value never reaches the save at the end of load().
+        changed = changed or speed_limit_unit_missing or sched_reset
         if (
             not isinstance(s.rpc_secret, str)
             or not s.rpc_secret

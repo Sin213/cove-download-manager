@@ -16,6 +16,7 @@ import platform as _platform
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from math import ceil
 from pathlib import Path
 
@@ -60,18 +61,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import APP_NAME, __version__, dedup, magnet_handler, theme
+from . import APP_NAME, __version__, debrid, dedup, magnet_handler, theme
 from .clipboard import extract_urls
 from .config import Settings
 from .dialogs import (
     AddDownloadDialog,
     ClipboardBatchDialog,
+    DownloadFileInfoDialog,
     SchedulerDialog,
     SettingsDialog,
     SourceDetailsDialog,
     torrent_file_problem,
 )
-from .queue import PHASE_METADATA, DownloadTask, QueueManager
+from .queue import PHASE_METADATA, DownloadTask, PreparedDownload, QueueManager
 from .scheduler import Scheduler
 from .search.models import SearchResult
 from .search.service import SearchService
@@ -1134,6 +1136,26 @@ class MainWindow(QMainWindow):
         text = (url or "").strip()
         return dedup.Candidate(url=text, info_hash=dedup.magnet_info_hash(text))
 
+    @staticmethod
+    def _debrid_provider_host(url: str) -> str:
+        """A debrid share/landing host, or "" — for Download File Info eligibility.
+
+        Debrid routing in this version resolves only at launch; preparation is
+        network-free. Share links are the shapes that are never an ordinary
+        direct download, and they can be recognised locally with the queue's
+        own gate: AllDebrid `/f/` and Real-Debrid `/d/` apex share links are
+        excluded, while generated delivery subdomains (`*.debrid.it/dl/...`,
+        `*.download.real-debrid.com/d/...`) stay eligible — exactly the
+        distinction `debrid.share_link_reason` already makes at launch.
+        """
+        from .debrid import share_link_reason
+
+        reason = share_link_reason(url)
+        if reason:
+            host = debrid._hostname(url)
+            return host or url
+        return ""
+
     def _focus_task(self, tid: int | None) -> None:
         item = self._items.get(tid) if tid is not None else None
         if item is None:
@@ -1253,6 +1275,62 @@ class MainWindow(QMainWindow):
             return [c.url for c, m in checked if m is None]
         return []
 
+    def _preflight_download_info(
+        self, prepared: "PreparedDownload"
+    ) -> "PreparedDownload | None":
+        """One Download File Info preflight for an eligible manual direct HTTP request.
+
+        Eligibility is mechanical and narrow: exactly one manual request whose
+        prepared classification is plain direct HTTP (aria2 backend, no torrent
+        provenance, no provider-owned host, no video/HLS engine). Everything
+        else — extension, Search, yt-dlp, HLS, torrent, debrid, batch,
+        clipboard — returns the prepared request unchanged, so the caller
+        commits it through the same single authoritative path the dialog
+        uses.
+
+        Returns the request to commit, or None when the user cancelled
+        (Cancel/X/Escape: no task, no row, no backend job, and the
+        Don't-show-again checkbox is deliberately not persisted). `filename`
+        is None when the user left the field blank, which preserves the
+        server/backend naming (no URL-basename is ever forced into aria2
+        `out`). The chosen `out_dir` replaces only this prepared request's
+        destination; the global default and category destinations are never
+        mutated here.
+        """
+        if prepared.backend != "aria2":
+            return prepared
+        if prepared.source_type != "":
+            return prepared
+        if not (
+            prepared.url.lower().startswith("http://")
+            or prepared.url.lower().startswith("https://")
+        ):
+            # FTP and any other scheme aria2 accepts stay on the legacy path:
+            # the preflight is a direct-HTTP feature only. Scheme compare is
+            # case-insensitive, matching the queue's own URL acceptance.
+            return prepared
+        if debrid_provider_host := self._debrid_provider_host(prepared.url):
+            return prepared
+        dlg = DownloadFileInfoDialog(prepared.url, prepared.out_dir, self)
+        if dlg.exec() != DownloadFileInfoDialog.Accepted:
+            return None
+        if dlg.result_dont_show_again():
+            previous = self.settings.show_download_options
+            self.settings.show_download_options = False
+            try:
+                self.settings.save()
+            except Exception:
+                # The preference is optional; a failed write (unwritable
+                # config, transient FS error) must not lose the accepted
+                # download. Revert the in-memory value so runtime state does
+                # not claim a dismissal that never persisted.
+                self.settings.show_download_options = previous
+        return replace(
+            prepared,
+            out_dir=dlg.result_dir() or prepared.out_dir,
+            filename=dlg.result_filename(),
+        )
+
     def add_urls_checked(
         self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
     ) -> list[int]:
@@ -1281,6 +1359,9 @@ class MainWindow(QMainWindow):
                     seen[ident] = cand
             checked.append((cand, match))
         if all(m is None for _, m in checked):
+            if len(checked) == 1 and intake == "manual":
+                cand = checked[0][0]
+                return self._add_single_manual(cand, out_dir)
             return self.queue.add_urls(
                 [c.url for c, _ in checked], out_dir, intake=intake
             )
@@ -1288,10 +1369,61 @@ class MainWindow(QMainWindow):
             cand, match = checked[0]
             if not self._confirm_duplicate(match, dedup.safe_label(cand)):
                 return []
+            # Duplicate status affects the confirmation, not the preflight:
+            # an eligible single manual direct HTTP URL still gets the
+            # Download File Info dialog after "Download Anyway".
+            if intake == "manual":
+                return self._add_single_manual(cand, out_dir)
             tid = self.queue.add_url(cand.url, out_dir, intake=intake)
             return [] if tid is None else [tid]
         chosen = self._confirm_duplicate_batch(checked)
         return self.queue.add_urls(chosen, out_dir, intake=intake) if chosen else []
+
+    def _add_single_manual(
+        self, cand: dedup.Candidate, out_dir: str | None
+    ) -> list[int]:
+        """Add one manual URL through the preflight-aware single path.
+
+        With `show_download_options` enabled the Download File Info dialog
+        runs; otherwise (or when the request is ineligible/rejected) the
+        exact legacy `add_url` behavior is preserved. Exactly one task is
+        ever committed.
+        """
+        if (
+            getattr(getattr(self, "settings", None), "show_download_options", True)
+            is not True
+        ):
+            # Setting off: the exact legacy path, no dialog and no double
+            # preparation.
+            tid = self.queue.add_url(
+                cand.url, out_dir, intake="manual",
+                source_type=cand.source_type,
+                info_hash=cand.info_hash,
+            )
+            return [] if tid is None else [tid]
+        if not hasattr(self.queue, "prepare_url"):
+            # Test doubles and minimal callers without the prepare/commit
+            # surface keep the exact legacy single-add behavior.
+            tid = self.queue.add_url(
+                cand.url, out_dir, intake="manual",
+                source_type=cand.source_type,
+                info_hash=cand.info_hash,
+            )
+            return [] if tid is None else [tid]
+        prepared = self.queue.prepare_url(
+            cand.url, out_dir=out_dir, source_type=cand.source_type,
+            info_hash=cand.info_hash, intake="manual",
+        )
+        if prepared is None:
+            # Rejected during classification: prepare_url already emitted
+            # the error once; nothing to commit.
+            return []
+        prepared = self._preflight_download_info(prepared)
+        if prepared is None:
+            # The user cancelled the dialog: discard.
+            return []
+        tid = self.queue.commit_prepared(prepared)
+        return [] if tid is None else [tid]
 
     def add_search_result(self, result: SearchResult) -> list[int]:
         """Download one selected built-in Search result.

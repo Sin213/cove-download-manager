@@ -7,6 +7,94 @@ import subprocess
 import sys
 
 
+# ---------------------------------------------------------------------------
+# Download File Info preflight setting
+# ---------------------------------------------------------------------------
+
+
+def test_settings_dialog_show_download_options_checkbox(tmp_path):
+    """Toggle + Save persists; toggle + Cancel does not.
+
+    The checkbox is a draft control like every other Settings row: it starts
+    from the settings value, and only _on_accept copies it onto the shared
+    Settings object and saves.
+    """
+    script = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import SettingsDialog
+
+app = QApplication([])
+out = {}
+
+# Loads on by default.
+settings = Settings()
+dialog = SettingsDialog(settings)
+out["label"] = dialog.show_download_options_check.text()
+out["default_checked"] = dialog.show_download_options_check.isChecked()
+# Toggle off then Cancel: nothing persists.
+dialog.show_download_options_check.setChecked(False)
+dialog.reject()
+out["after_cancel"] = settings.show_download_options
+out["file_after_cancel"] = config.CONFIG_FILE.exists()
+
+# Toggle off then Save: persists.
+settings2 = Settings()
+dialog2 = SettingsDialog(settings2)
+dialog2.show_download_options_check.setChecked(False)
+dialog2._on_accept()
+out["after_save"] = settings2.show_download_options
+raw = json.loads(config.CONFIG_FILE.read_text())
+out["persisted_false"] = raw.get("show_download_options")
+
+# Toggle back on from a dismissed state and Save: restores.
+settings3 = Settings(show_download_options=False)
+dialog3 = SettingsDialog(settings3)
+out["restored_from_false"] = dialog3.show_download_options_check.isChecked()
+dialog3.show_download_options_check.setChecked(True)
+dialog3._on_accept()
+out["re_enabled"] = settings3.show_download_options
+raw3 = json.loads(config.CONFIG_FILE.read_text())
+out["persisted_true"] = raw3.get("show_download_options")
+
+print(json.dumps(out))
+'''
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+        check=True,
+    )
+    out = json.loads(result.stdout)
+
+    assert out["label"] == "Show download options before starting downloads"
+    assert out["default_checked"] is True
+    # Cancel never persists, and never even writes the settings file.
+    assert out["after_cancel"] is True
+    assert out["file_after_cancel"] is False
+    # Save persists the explicit False through the existing transaction.
+    assert out["after_save"] is False
+    assert out["persisted_false"] is False
+    # A previously dismissed preference restores through Settings.
+    assert out["restored_from_false"] is False
+    assert out["re_enabled"] is True
+    assert out["persisted_true"] is True
+
+
 def test_settings_dialog_can_shrink_vertically_and_scroll():
     # Other test modules use QCoreApplication. Qt cannot upgrade that singleton
     # to QApplication later, so exercise the real widget in an isolated process.
@@ -1605,3 +1693,314 @@ print(json.dumps({
     assert result["stale_ignored"], "a superseded callback re-enabled the controls"
     assert result["recovered"], "a failed probe left the controls stuck disabled"
     assert result["locked"], "one operation did not lock the others out"
+
+
+# ---------------------------------------------------------------------------
+# Download File Info dialog
+# ---------------------------------------------------------------------------
+
+
+FILE_INFO_SCRIPT = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication, QFileDialog
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import DownloadFileInfoDialog
+
+app = QApplication([])
+out = {}
+url = "https://example.com/files/example.zip"
+
+# ---- defaults ------------------------------------------------------------
+dlg = DownloadFileInfoDialog(url, default_dir=str(tmp), parent=None)
+out["title"] = dlg.windowTitle()
+out["url_text"] = dlg.url_edit.text()
+out["url_readonly"] = dlg.url_edit.isReadOnly()
+out["filename_blank"] = dlg.filename_edit.text() == ""
+out["save_to"] = dlg.dir_edit.text()
+out["dont_show_again_default"] = dlg.dont_show_again.isChecked()
+out["filename_placeholder"] = dlg.filename_edit.placeholderText()
+out["buttons"] = [b.text() for b in dlg.buttons()]
+
+# ---- filename result mapping --------------------------------------------
+dlg.filename_edit.setText("  custom-name.zip  ")
+dlg.dir_edit.setText("/srv/alt")
+dlg.dont_show_again.setChecked(True)
+dlg.accept()
+out["result_after_accept"] = {
+    "accepted": dlg.result() == dlg.DialogCode.Accepted,
+    "filename": dlg.result_filename(),
+    "dir": dlg.result_dir(),
+    "dont_show_again": dlg.result_dont_show_again(),
+}
+dlg.deleteLater()
+
+# Whitespace-only filename is blank -> None.
+dlg2 = DownloadFileInfoDialog(url, default_dir=str(tmp), parent=None)
+dlg2.filename_edit.setText("   ")
+out["whitespace_filename_none"] = dlg2.result_filename() is None
+dlg2.deleteLater()
+
+# URL cannot be edited by the user; the widget is pinned read-only and the
+# dialog never rewrites the URL it was given (setText on a read-only widget
+# is a programmatic no-op for the user path, and the source value is the
+# request's own URL).
+dlg3 = DownloadFileInfoDialog(url, default_dir=str(tmp), parent=None)
+out["url_readonly_widget"] = dlg3.url_edit.isReadOnly()
+out["url_field_shows_request"] = dlg3.url_edit.text() == url
+dlg3.deleteLater()
+
+# Browse cancel retains the previous directory and keeps the dialog open.
+picked = {"value": ""}
+real_get = QFileDialog.getExistingDirectory
+def fake_get(parent, title, start):
+    out["browse_start"] = start
+    return picked["value"]
+QFileDialog.getExistingDirectory = staticmethod(fake_get)
+dlg4 = DownloadFileInfoDialog(url, default_dir=str(tmp), parent=None)
+dlg4.dir_edit.setText("/srv/prior")
+dlg4._browse()
+out["browse_cancel_retains"] = dlg4.dir_edit.text()
+picked["value"] = "/srv/new"
+dlg4._browse()
+out["browse_pick_updates"] = dlg4.dir_edit.text()
+out["browse_start_after_edit"] = out["browse_start"]
+QFileDialog.getExistingDirectory = staticmethod(real_get)
+dlg4.deleteLater()
+
+print(json.dumps(out))
+'''
+
+
+def _run_file_info_script(tmp_path):
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", FILE_INFO_SCRIPT, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr[-4000:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_download_file_info_defaults_and_read_only_url(tmp_path):
+    m = _run_file_info_script(tmp_path)
+
+    assert m["title"] == "Download File Info"
+    assert m["url_text"] == "https://example.com/files/example.zip"
+    assert m["url_readonly"] is True
+    assert m["filename_blank"] is True
+    assert m["save_to"] == str(tmp_path)
+    assert m["dont_show_again_default"] is False
+    assert m["filename_placeholder"]
+    assert sorted(m["buttons"]) == ["Cancel", "Start Download"]
+
+
+def test_download_file_info_accept_result_and_validation(tmp_path):
+    m = _run_file_info_script(tmp_path)
+
+    assert m["result_after_accept"]["accepted"] is True
+    assert m["result_after_accept"]["filename"] == "custom-name.zip"
+    assert m["result_after_accept"]["dir"] == "/srv/alt"
+    assert m["result_after_accept"]["dont_show_again"] is True
+
+
+def test_download_file_info_whitespace_filename_is_none(tmp_path):
+    m = _run_file_info_script(tmp_path)
+    assert m["whitespace_filename_none"] is True
+
+
+def test_download_file_info_url_cannot_be_edited(tmp_path):
+    m = _run_file_info_script(tmp_path)
+    assert m["url_readonly_widget"] is True
+    assert m["url_field_shows_request"] is True
+
+
+def test_download_file_info_browse_semantics(tmp_path):
+    m = _run_file_info_script(tmp_path)
+
+    # Browse starts from the current field value; cancel keeps it.
+    assert m["browse_start"] == "/srv/prior"
+    assert m["browse_cancel_retains"] == "/srv/prior"
+    # A picked directory updates the field.
+    assert m["browse_pick_updates"] == "/srv/new"
+
+
+INVALID_FILENAME_SCRIPT = r'''
+import json, sys
+from pathlib import Path
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import DownloadFileInfoDialog
+
+app = QApplication([])
+out = {}
+
+def _invalid(value, default_dir):
+    dlg = DownloadFileInfoDialog(
+        "https://example.com/f.zip", default_dir=default_dir, parent=None
+    )
+    dlg.filename_edit.setText(value)
+    ok = dlg.validate()
+    msg = dlg.error_label.text()
+    dlg._on_start()
+    rejected = dlg.result() != dlg.DialogCode.Accepted
+    out.setdefault("cases", []).append({
+        "value": value, "valid": ok, "message": msg, "rejected": rejected,
+    })
+    dlg.deleteLater()
+
+# Path separators / absolute / dot names / reserved / controls / trailing.
+for bad in ("../evil.zip", "a/b", "/abs.zip", "..", ".", "CON", "ctrl\x01x", "trail ", "trail.", "x" * 300):
+    _invalid(bad, str(tmp))
+
+# Directory validation: empty or relative is invalid.
+dlg = DownloadFileInfoDialog("https://example.com/f.zip", default_dir=str(tmp), parent=None)
+dlg.dir_edit.setText("")
+out["empty_dir_valid"] = dlg.validate()
+out["empty_dir_msg"] = dlg.error_label.text()
+dlg.deleteLater()
+
+dlg = DownloadFileInfoDialog("https://example.com/f.zip", default_dir=str(tmp), parent=None)
+dlg.dir_edit.setText("relative/path")
+out["relative_dir_valid"] = dlg.validate()
+out["relative_dir_msg"] = dlg.error_label.text()
+dlg.deleteLater()
+
+print(json.dumps(out))
+'''
+
+
+def _run_invalid_filename_script(tmp_path):
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", INVALID_FILENAME_SCRIPT, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr[-4000:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_download_file_info_invalid_filenames_are_rejected(tmp_path):
+    m = _run_invalid_filename_script(tmp_path)
+
+    for case in m["cases"]:
+        assert case["valid"] is False, case["value"]
+        assert case["message"], case["value"]
+        # The Start Download action must not accept an invalid value.
+        assert case["rejected"] is True, case["value"]
+
+
+def test_download_file_info_invalid_directories_are_rejected(tmp_path):
+    m = _run_invalid_filename_script(tmp_path)
+
+    assert m["empty_dir_valid"] is False
+    assert m["empty_dir_msg"]
+    assert m["relative_dir_valid"] is False
+    assert m["relative_dir_msg"]
+
+
+EXPAND_DIR_SCRIPT = r'''
+import json, sys, os
+from pathlib import Path
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove.config import Settings
+from cove.dialogs import DownloadFileInfoDialog
+
+app = QApplication([])
+out = {}
+
+os.environ["COVE_DLFI_TEST_DIR"] = "/srv/env-expanded"
+
+# ~ expansion is validated AND committed expanded.
+dlg = DownloadFileInfoDialog("https://example.com/f.zip", default_dir=str(tmp), parent=None)
+dlg.dir_edit.setText("~/cove-expanded")
+valid = dlg.validate()
+out["tilde_valid"] = valid
+out["tilde_result"] = dlg.result_dir()
+dlg.deleteLater()
+
+# $VAR expansion is validated AND committed expanded.
+dlg = DownloadFileInfoDialog("https://example.com/f.zip", default_dir=str(tmp), parent=None)
+dlg.dir_edit.setText("$COVE_DLFI_TEST_DIR/sub")
+valid = dlg.validate()
+out["env_valid"] = valid
+out["env_result"] = dlg.result_dir()
+dlg.deleteLater()
+
+# A $VAR whose expanded value carries a control character must be rejected,
+# because that expanded value is exactly what would be committed.
+os.environ["COVE_DLFI_CTRL_DIR"] = "/srv/bad\x01dir"
+dlg = DownloadFileInfoDialog("https://example.com/f.zip", default_dir=str(tmp), parent=None)
+dlg.dir_edit.setText("$COVE_DLFI_CTRL_DIR")
+valid = dlg.validate()
+out["ctrl_expanded_valid"] = valid
+out["ctrl_expanded_msg"] = dlg.error_label.text()
+dlg.deleteLater()
+
+print(json.dumps(out))
+'''
+
+
+def _run_expand_dir_script(tmp_path):
+    env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    result = subprocess.run(
+        [sys.executable, "-c", EXPAND_DIR_SCRIPT, str(tmp_path)],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr[-4000:])
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def test_download_file_info_expanded_directories_validate_and_commit_expanded(
+    tmp_path,
+):
+    """Codex #3: `~` and `$VAR` forms pass validation AND the committed path
+    is the expanded absolute path — never the raw text."""
+    m = _run_expand_dir_script(tmp_path)
+
+    assert m["tilde_valid"] is True
+    assert m["tilde_result"] == str(Path.home() / "cove-expanded")
+    assert m["env_valid"] is True
+    assert m["env_result"] == "/srv/env-expanded/sub"
+    # Codex round 4 #2: control characters are checked on the EXPANDED value.
+    assert m["ctrl_expanded_valid"] is False
+    assert m["ctrl_expanded_msg"]

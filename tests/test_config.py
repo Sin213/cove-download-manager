@@ -50,6 +50,66 @@ def test_close_to_tray_defaults_to_false():
     assert Settings().close_to_tray is False
 
 
+def test_show_download_options_defaults_to_true():
+    """Missing config key -> True. No migration may be required."""
+    from cove.config import Settings
+
+    assert Settings().show_download_options is True
+
+
+def test_show_download_options_missing_key_loads_true(tmp_path, monkeypatch):
+    """An existing config written before this feature had no key: True."""
+    _write(tmp_path, monkeypatch, {"download_dir": "/srv/dl", "theme": "light"})
+
+    loaded = config.Settings.load()
+
+    assert loaded.show_download_options is True
+    assert loaded.download_dir == "/srv/dl"
+
+
+def test_show_download_options_explicit_false_round_trips(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {"show_download_options": False})
+
+    loaded = config.Settings.load()
+    assert loaded.show_download_options is False
+    loaded.save()
+
+    assert config.Settings.load().show_download_options is False
+
+
+def test_show_download_options_explicit_true_round_trips(tmp_path, monkeypatch):
+    _write(tmp_path, monkeypatch, {"show_download_options": True})
+
+    assert config.Settings.load().show_download_options is True
+
+
+@pytest.mark.parametrize("value", ["false", "yes", 1, 0, None, [], {}])
+def test_show_download_options_non_boolean_falls_back_to_true(
+    tmp_path, monkeypatch, value
+):
+    """A hand-edited non-boolean must not read as "off" via truthiness:
+    that would silently skip the preflight the user never dismissed."""
+    _write(tmp_path, monkeypatch, {"show_download_options": value})
+
+    assert config.Settings.load().show_download_options is True
+
+
+def test_show_download_options_repair_is_persisted(tmp_path, monkeypatch):
+    """Codex round 3 #3: repairing a hand-edited non-boolean must reach the
+    save at the end of load(), not only the in-memory value."""
+    import json as _json
+
+    _write(tmp_path, monkeypatch, {"show_download_options": "yes"})
+
+    loaded = config.Settings.load()
+    assert loaded.show_download_options is True
+
+    raw = _json.loads((tmp_path / "settings.json").read_text())
+    assert raw.get("show_download_options") is True, (
+        "the repaired True must be written back to settings.json"
+    )
+
+
 def test_close_to_tray_round_trips_true(tmp_path):
     assert _load_close_to_tray(tmp_path, {"close_to_tray": True}) is True
 

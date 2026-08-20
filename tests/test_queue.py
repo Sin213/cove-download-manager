@@ -7939,3 +7939,296 @@ def test_resuming_an_aria2_transfer_keeps_its_displayed_progress(queue_env):
     queue.resume(tid)
 
     assert task.interpolated_completed_bytes() == 400
+
+
+# ---------------------------------------------------------------------------
+# Download File Info — prepare/commit boundary
+# ---------------------------------------------------------------------------
+#
+# S1 (Download File Info preflight) needs to classify a manual direct HTTP
+# request and calculate its effective destination BEFORE any irreversible
+# work, so the GUI can ask the user about task-local directory/filename.
+# `prepare_url` is that side-effect-free phase; `commit_prepared` is the
+# single authoritative commit path `add_url` also routes through. These tests
+# pin the boundary, the parity with the legacy path and the request-local
+# isolation of the prepared value.
+
+DIRECT_URL = "https://example.com/dir/archive.zip"
+
+
+def _prepared_fields(prepared):
+    return {
+        "url": prepared.url,
+        "backend": prepared.backend,
+        "category": prepared.category,
+        "out_dir": prepared.out_dir,
+        "filename": prepared.filename,
+        "connections": prepared.connections,
+        "speed_limit_kbps": prepared.speed_limit_kbps,
+        "cookies": prepared.cookies,
+        "referrer": prepared.referrer,
+        "user_agent": prepared.user_agent,
+        "source_type": prepared.source_type,
+        "info_hash": prepared.info_hash,
+        "torrent_name": prepared.torrent_name,
+        "torrent_path": prepared.torrent_path,
+        "debrid_route": prepared.debrid_route,
+        "intake": prepared.intake,
+    }
+
+
+def _rows_for(db_path):
+    return _rows(db_path)
+
+
+def test_prepare_url_classifies_and_computes_the_effective_destination(queue_env):
+    queue, _rpc, db_path = queue_env(auto_sort_by_category=True)
+    prepared = queue.prepare_url(
+        DIRECT_URL, out_dir=None, filename=None, intake="manual"
+    )
+
+    assert prepared.backend == "aria2"
+    assert prepared.category == "Archives"
+    assert prepared.out_dir == str(Path(db_path).parent / "Archives")
+    assert prepared.filename is None
+    assert prepared.url == DIRECT_URL
+    assert prepared.intake == "manual"
+
+def test_prepare_url_honours_an_explicit_out_dir_and_filename(queue_env):
+    queue, _rpc, _db = queue_env()
+    prepared = queue.prepare_url(
+        DIRECT_URL, out_dir="/srv/alt", filename="custom.zip", intake="manual"
+    )
+
+    assert prepared.out_dir == "/srv/alt"
+    assert prepared.filename == "custom.zip"
+
+
+def test_prepare_url_has_zero_side_effects(queue_env, monkeypatch):
+    """Preparation must not touch the DB, tasks, aria2, the network or
+    anything else. Even the diagnostic "url_added" event must not fire: it
+    belongs to the commit. The test DB gets no row and the queue owns no task.
+    """
+    queue, rpc, db_path = queue_env()
+    spawned = []
+    monkeypatch.setattr(queue, "_spawn", lambda *a, **k: spawned.append(a))
+    # A session build or a probe during prepare is a test failure, even if
+    # the probe's own errors would be swallowed.
+    monkeypatch.setattr(queue, "_bound_session", lambda: _raise_on_use())
+    queue.prepare_url(DIRECT_URL, intake="manual")
+
+    assert queue.tasks == {}
+    assert _rows_for(db_path) == []
+    assert rpc.added == []
+    assert spawned == []
+    assert queue._pending_launch == {}
+
+
+class _raise_on_use:
+    def __init__(self):
+        raise AssertionError("prepare_url built an HTTP session")
+
+    def head(self, *a, **k):
+        raise AssertionError("prepare_url performed a network probe")
+
+    def get(self, *a, **k):
+        raise AssertionError("prepare_url performed a network probe")
+
+
+def test_prepare_url_rejects_the_same_inputs_legacy_add_url_rejects(queue_env):
+    queue, _rpc, _db = queue_env()
+
+    assert queue.prepare_url("not a url") is None
+    assert queue.prepare_url("magnet:?xt=urn:btih:" + "a" * 40, source_type="bad") is None
+
+
+def test_commit_prepared_matches_legacy_add_url(queue_env):
+    """An untouched prepare+commit must equal the legacy single call."""
+    queue, _rpc, db_path = queue_env()
+
+    legacy_tid = queue.add_url(
+        DIRECT_URL, out_dir="/srv/legacy", filename="legacy.zip",
+        connections=4, speed_limit_kbps=128, intake="manual",
+    )
+    prepared = queue.prepare_url(
+        DIRECT_URL, out_dir="/srv/legacy", filename="legacy.zip",
+        connections=4, speed_limit_kbps=128, intake="manual",
+    )
+    tid = queue.commit_prepared(prepared)
+
+    assert tid == legacy_tid + 1
+    row = _persisted_row(db_path, tid)
+    legacy_row = _persisted_row(db_path, legacy_tid)
+    for col in ("url", "out_dir", "filename", "backend", "category",
+                "connections", "speed_limit_kbps", "cookies", "referrer",
+                "user_agent", "source_type", "info_hash", "torrent_name",
+                "torrent_path", "debrid_route", "status"):
+        assert row[col] == legacy_row[col], col
+    assert row["created_at"] == pytest.approx(legacy_row["created_at"], abs=1.0)
+    task = queue.tasks[tid]
+    assert task.out_dir == "/srv/legacy"
+    assert task.filename == "legacy.zip"
+
+
+def test_commit_prepared_creates_exactly_one_task(queue_env):
+    queue, _rpc, db_path = queue_env()
+    prepared = queue.prepare_url(DIRECT_URL, intake="manual")
+
+    tid = queue.commit_prepared(prepared)
+
+    assert isinstance(tid, int)
+    assert list(queue.tasks.keys()) == [tid]
+    assert len(_rows_for(db_path)) == 1
+
+
+def test_add_url_still_commits_through_the_single_path_without_a_dialog(queue_env, monkeypatch):
+    """The legacy entry point keeps its exact behavior; the queue never shows UI."""
+    queue, rpc, db_path = queue_env()
+    committed = []
+    monkeypatch.setattr(queue, "commit_prepared", lambda p: committed.append(p) or 99)
+
+    tid = queue.add_url(DIRECT_URL, intake="manual")
+
+    assert tid == 99
+    assert len(committed) == 1
+    assert committed[0].url == DIRECT_URL
+    assert queue.tasks == {}
+    assert rpc.added == []
+
+
+def test_add_url_and_commit_agree_without_an_explicit_destination(queue_env):
+    """Default destination parity for an untouched prepared request."""
+    queue, _rpc, db_path = queue_env()
+
+    legacy_tid = queue.add_url(DIRECT_URL)
+    prepared = queue.prepare_url(DIRECT_URL)
+    tid = queue.commit_prepared(prepared)
+
+    assert _persisted_row(db_path, tid)["out_dir"] == _persisted_row(db_path, legacy_tid)["out_dir"]
+    assert _persisted_row(db_path, tid)["filename"] == _persisted_row(db_path, legacy_tid)["filename"]
+
+
+def test_task_path_resolves_the_task_local_destination(queue_env):
+    """RED 30: Open File / Open Folder resolve the actual task destination,
+    never the global default."""
+    from pathlib import Path as _Path
+
+    queue, _rpc, _db = queue_env()
+    from dataclasses import replace as _replace
+
+    prepared = queue.prepare_url(DIRECT_URL, intake="manual")
+    prepared = _replace(prepared, out_dir="/srv/custom-dir")
+    tid = queue.commit_prepared(prepared)
+    task = queue.tasks[tid]
+
+    assert task.out_dir == "/srv/custom-dir"
+    # A filename that aria2 later resolves lands under the task-local dir.
+    task.filename = "server-name.zip"
+    assert queue._task_path(task) == _Path("/srv/custom-dir") / "server-name.zip"
+    assert queue._task_path(task) != _Path(queue.settings.download_dir) / "server-name.zip"
+
+
+def test_commit_prepared_persists_custom_dir_and_filename_and_restores(
+    queue_env, monkeypatch
+):
+    """RED 29: a task-local out_dir + filename survive persist/reload and the
+    aria2 launch receives dir/out exactly (dir always, out only when set)."""
+    from dataclasses import replace as _replace
+
+    queue, rpc, db_path = queue_env(intelligent_segments=False)
+    prepared = queue.prepare_url(DIRECT_URL, intake="manual")
+    prepared = _replace(
+        prepared, out_dir="/srv/custom-dir", filename="custom-name.zip"
+    )
+    tid = queue.commit_prepared(prepared)
+    task = queue.tasks[tid]
+
+    assert task.out_dir == "/srv/custom-dir"
+    assert task.filename == "custom-name.zip"
+    row = _persisted_row(db_path, tid)
+    assert row["out_dir"] == "/srv/custom-dir"
+    assert row["filename"] == "custom-name.zip"
+
+    # Restore path rebuilds the same task-local destination.
+    restored = _task_from_persisted_row(row)
+    assert restored.out_dir == "/srv/custom-dir"
+    assert restored.filename == "custom-name.zip"
+
+    # The launch path hands aria2 dir always and out only for a set filename.
+    def _sync_spawn(fn, *args, **kwargs):
+        kwargs.pop("on_done", None)
+        kwargs.pop("on_fail", None)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(queue, "_spawn", _sync_spawn)
+    queue._launch(task)
+    assert rpc.added and rpc.added[0]["out_dir"] == "/srv/custom-dir"
+    assert rpc.added[0]["filename"] == "custom-name.zip"
+
+
+def test_commit_prepared_blank_filename_sends_no_out(queue_env, monkeypatch):
+    """RED 6: a None filename must produce no forced aria2 `out`."""
+    queue, rpc, _db = queue_env(intelligent_segments=False)
+    prepared = queue.prepare_url(DIRECT_URL, intake="manual")
+    assert prepared.filename is None
+    tid = queue.commit_prepared(prepared)
+
+    # Run the launch's add_uri call inline, then inspect what it was given.
+    def _sync_spawn(fn, *args, **kwargs):
+        kwargs.pop("on_done", None)
+        kwargs.pop("on_fail", None)
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(queue, "_spawn", _sync_spawn)
+    queue._launch(queue.tasks[tid])
+
+    assert rpc.added and rpc.added[0]["filename"] is None
+    assert rpc.added[0]["out_dir"] == queue.settings.download_dir
+
+
+def test_two_prepared_requests_are_isolated(queue_env):
+    """Request-local prepared values: mutating one never leaks into another.
+
+    The prepared value is deliberately immutable, so an override is a
+    replacement (`dataclasses.replace`), never an in-place edit — there is
+    no mutable state two prepared requests could share.
+    """
+    from dataclasses import replace
+
+    queue, _rpc, _db = queue_env()
+    a = queue.prepare_url(DIRECT_URL, intake="manual")
+    b = queue.prepare_url("https://example.com/other/file.bin", intake="manual")
+
+    a = replace(a, out_dir="/srv/custom-a", filename="custom-a.bin")
+
+    assert b.out_dir != "/srv/custom-a"
+    assert b.filename is None
+    assert a.out_dir == "/srv/custom-a"
+    assert a.filename == "custom-a.bin"
+
+
+def test_prepare_url_takes_no_network_and_makes_no_probe(queue_env, monkeypatch):
+    """Preparation is pure local classification; the probe/HEAD stays at launch."""
+    queue, _rpc, _db = queue_env()
+    probed = []
+    monkeypatch.setattr(queue, "_probe_and_add", lambda t: probed.append(t) or "gid-x")
+
+    prepared = queue.prepare_url(DIRECT_URL, intake="manual")
+    queue.commit_prepared(prepared)
+
+    assert probed == []  # the probe belongs to _launch, not prepare/commit
+
+
+def test_prepare_url_ytdlp_and_hls_requests_are_still_committable(queue_env, monkeypatch):
+    """prepare_url classifies the same backends add_url does; commit keeps the
+    legacy backend selection (yt-dlp/HLS stay outside the dialog eligibility,
+    but their queue path must not fork)."""
+    queue, _rpc, _db = queue_env()
+    for url, backend in (
+        ("https://www.youtube.com/watch?v=fake", "yt-dlp"),
+        ("https://example.com/live/stream.m3u8", "ffmpeg"),
+    ):
+        prepared = queue.prepare_url(url, filename="movie.mp4")
+        assert prepared.backend == backend, url
+        tid = queue.commit_prepared(prepared)
+        assert queue.tasks[tid].backend == backend, url

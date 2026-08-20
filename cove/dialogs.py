@@ -52,6 +52,7 @@ from .config import (
 from .debrid import DebridError
 from .indexer_editor import IndexerEditorDialog
 from .netiface import ANY_INTERFACE, ANY_INTERFACE_LABEL, list_interfaces
+from .output_paths import OutputPathError, validate_public_filename
 from .search.indexers import CustomTorznabIndexer, new_custom_indexer_id
 from .source_info import redact_url, source_details
 from .speed_limit import (
@@ -350,6 +351,145 @@ class AddDownloadDialog(QDialog):
         return self.dir_edit.text().strip() or self.settings.download_dir
 
 
+class DownloadFileInfoDialog(QDialog):
+    """Pre-download "Download File Info" preflight for one manual direct HTTP URL.
+
+    Display and local validation only. It never creates a task, calls aria2,
+    writes database rows, classifies URLs, resolves providers, probes HTTP
+    metadata, or changes the global download directory. The caller (the
+    MainWindow manual-intake coordinator) owns eligibility and committing the
+    prepared request after this dialog is accepted.
+
+    `default_dir` is the exact effective destination the queue already
+    computed for this request; a user-selected directory replaces it for this
+    task only. A blank File name keeps `filename=None`, so the server/backend
+    naming (Content-Disposition, redirect, aria2) is preserved — the dialog
+    never invents a URL-basename `out`.
+    """
+
+    def __init__(self, url: str, default_dir: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Download File Info")
+        self.setMinimumWidth(560)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        _title_block(
+            layout,
+            "Download File Info",
+            "Choose where this download is saved.",
+        )
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        # URL is read-only by design: editing it would require reclassifying
+        # the request and could change the backend the task is routed to.
+        self.url_edit = QLineEdit(url)
+        self.url_edit.setReadOnly(True)
+        form.addRow("URL", self.url_edit)
+
+        self.filename_edit = QLineEdit()
+        self.filename_edit.setPlaceholderText("Leave blank to use the server-provided name")
+        form.addRow("File name", self.filename_edit)
+
+        self.dir_edit = QLineEdit(default_dir)
+        browse = QPushButton("Browse...")
+        browse.clicked.connect(self._browse)
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(self.dir_edit, 1)
+        dir_row.addWidget(browse)
+        form.addRow("Save to", dir_row)
+
+        layout.addLayout(form)
+
+        self.dont_show_again = QCheckBox("Don't show this dialog again")
+        layout.addWidget(self.dont_show_again)
+
+        self.error_label = QLabel("")
+        self.error_label.setProperty("role", "muted")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+        layout.addWidget(self.error_label)
+
+        bb = _make_buttons(self, ok_text="Start Download")
+        layout.addWidget(bb)
+        bb.accepted.disconnect()
+        bb.accepted.connect(self._on_start)
+        self._button_box = bb
+
+    def buttons(self):
+        """The dialog's action buttons, for tests and introspection."""
+        return list(self._button_box.buttons())
+
+    def _browse(self) -> None:
+        """Pick a destination directory. Cancelling keeps the prior value."""
+        path = QFileDialog.getExistingDirectory(
+            self, "Save downloads to", self.dir_edit.text()
+        )
+        if path:
+            self.dir_edit.setText(path)
+
+    def validate(self) -> bool:
+        """Local validation only; no side effects. True means "can commit"."""
+        message = ""
+        filename = self.filename_edit.text()
+        if filename.strip():
+            # Only whitespace is treated as blank (None -> backend naming).
+            # A real value goes through the canonical validator verbatim, so
+            # trailing spaces/dots are rejected exactly as the validator says.
+            try:
+                validate_public_filename(filename)
+            except OutputPathError as exc:
+                message = str(exc).replace("Invalid public filename: ", "")
+                message = message.replace("Public filename ", "File name ")
+                message = message.rstrip(".") + "."
+        if not message:
+            directory = self.dir_edit.text().strip()
+            if not directory:
+                message = "Choose a folder to save the download into."
+            else:
+                from os import path as osp
+
+                expanded = osp.expanduser(osp.expandvars(directory))
+                if not osp.isabs(expanded):
+                    message = "The save folder must be an absolute path."
+                elif any(ord(c) < 32 or ord(c) == 127 for c in expanded):
+                    # Check the expanded path: a $VAR or ~ can expand to
+                    # something containing a control character, and that
+                    # expanded value is exactly what would be committed.
+                    message = "The save folder contains control characters."
+        self.error_label.setText(message)
+        self.error_label.setVisible(bool(message))
+        return not message
+
+    def _on_start(self) -> None:
+        if self.validate():
+            self.accept()
+
+    def result_filename(self) -> str | None:
+        """Validated explicit basename, or None to preserve backend naming."""
+        text = self.filename_edit.text().strip()
+        if not text:
+            return None
+        return text
+
+    def result_dir(self) -> str:
+        """The absolute destination directory, with ~ and $VAR expanded.
+
+        This is the exact path `validate` approved, so what reaches the
+        backend matches what was validated.
+        """
+        from os import path as osp
+
+        return osp.expanduser(osp.expandvars(self.dir_edit.text().strip()))
+
+    def result_dont_show_again(self) -> bool:
+        return self.dont_show_again.isChecked()
+
+
 class SourceDetailsDialog(QDialog):
     """Read-only "View source" sheet for one task.
 
@@ -611,6 +751,18 @@ class SettingsDialog(QDialog):
         row.addWidget(self.dir_edit, 1)
         row.addWidget(browse)
         form.addRow("Default download folder", row)
+
+        self.show_download_options_check = QCheckBox(
+            "Show download options before starting downloads"
+        )
+        self.show_download_options_check.setChecked(
+            getattr(settings, "show_download_options", True) is True
+        )
+        self.show_download_options_check.setToolTip(
+            "For a single manually added download, ask where to save it and "
+            "optionally what to name it before it starts."
+        )
+        form.addRow("", self.show_download_options_check)
 
         self.connections = _make_connections_combo(settings.connections_per_server)
         form.addRow("Connections per file", self.connections)
@@ -1399,6 +1551,11 @@ class SettingsDialog(QDialog):
 
     def _on_accept(self) -> None:
         self.settings.download_dir = self.dir_edit.text().strip() or self.settings.download_dir
+        # getattr guards a stale Settings snapshot that predates the field.
+        if getattr(self.settings, "show_download_options", True) is not (
+            self.show_download_options_check.isChecked() is True
+        ):
+            self.settings.show_download_options = self.show_download_options_check.isChecked()
         self.settings.connections_per_server = self.connections.currentData()
         self.settings.max_concurrent = self.max_concurrent.value()
         self.settings.overall_speed_limit_kbps = self._speed_limit_kbps

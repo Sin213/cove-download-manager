@@ -132,6 +132,40 @@ SOURCE_TORRENT = "torrent"
 SOURCE_TORRENT_FILE = "torrent_file"
 SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE)
 
+
+@dataclass(frozen=True)
+class PreparedDownload:
+    """A classified manual/legacy URL, ready to commit, with no side effects.
+
+    Everything `add_url` used to compute before touching the database or the
+    backend lives here, so a caller can prepare a request, inspect it (and,
+    for a single manual direct HTTP request, let the user adjust the task-local
+    destination), and only then commit. `commit_prepared` is the single
+    authoritative task-creation path; `add_url` is prepare+commit so legacy
+    callers keep their exact behavior. No Qt types ever reach this class.
+
+    Immutable by design: the Download File Info coordinator overrides a
+    request with `dataclasses.replace`, never in place, so two prepared
+    requests can never share or cross-assign filename/directory state.
+    """
+
+    url: str
+    backend: str = "aria2"
+    category: str = "Other"
+    out_dir: str = ""
+    filename: Optional[str] = None
+    connections: int = MAX_CONNECTIONS_PER_SERVER
+    speed_limit_kbps: int = 0
+    cookies: str = ""
+    referrer: str = ""
+    user_agent: str = ""
+    source_type: str = SOURCE_PLAIN
+    info_hash: str = ""
+    torrent_name: str = ""
+    torrent_path: str = ""
+    debrid_route: str = ""
+    intake: str = "unknown"
+
 # Where a URL entered Cove. Diagnostics only - never affects routing.
 _INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "search", "unknown")
 
@@ -947,6 +981,64 @@ class QueueManager(QObject):
         set by Cove's own torrent routing below and by `add_torrent_file`,
         never by anything that carries user input (the local API and the
         native-messaging drop directory both pass explicit kwargs only).
+
+        This is the backward-compatible entry point: it prepares the request
+        and immediately commits it. The queue itself never shows UI; the
+        Download File Info preflight lives in the manual GUI coordinator,
+        which prepares first and commits only after the user confirms.
+        """
+        prepared = self.prepare_url(
+            url,
+            out_dir=out_dir,
+            filename=filename,
+            connections=connections,
+            speed_limit_kbps=speed_limit_kbps,
+            cookies=cookies,
+            referrer=referrer,
+            user_agent=user_agent,
+            source_type=source_type,
+            info_hash=info_hash,
+            torrent_name=torrent_name,
+            torrent_path=torrent_path,
+            debrid_route=debrid_route,
+            intake=intake,
+        )
+        if prepared is None:
+            return None
+        return self.commit_prepared(prepared)
+
+    def prepare_url(
+        self,
+        url: str,
+        out_dir: str | None = None,
+        filename: str | None = None,
+        *,
+        connections: int | None = None,
+        speed_limit_kbps: int = 0,
+        cookies: str = "",
+        referrer: str = "",
+        user_agent: str = "",
+        source_type: str = SOURCE_PLAIN,
+        info_hash: str = "",
+        torrent_name: str = "",
+        torrent_path: str = "",
+        debrid_route: str = "",
+        intake: str = "unknown",
+    ) -> Optional[PreparedDownload]:
+        """Classify one URL and compute its task specification.
+
+        Purely local and side-effect free: no database row, no DownloadTask,
+        no aria2 call, no backend launch, no provider request and no
+        persistent task state. Returns None for exactly the requests the
+        legacy path rejected (unapproved source type, non-URL, magnet with
+        BitTorrent disabled, missing video backend). A magnet whose parsing
+        fails is also refused here, exactly where `_add_magnet` refused it.
+
+        For an http(s) URL the returned value carries the classification
+        (backend/category), the effective destination (`out_dir`), the
+        optional explicit `filename` (None means the server/backend naming
+        is preserved) and every commit-time kwarg, so `commit_prepared` can
+        recreate the exact legacy task.
         """
         url = url.strip()
         cookies = _clean_header(cookies)
@@ -969,10 +1061,17 @@ class QueueManager(QObject):
                 self.error.emit(TORRENT_SUPPORT_DISABLED)
                 return None
             if source_type == SOURCE_PLAIN:
-                return self._add_magnet(
-                    url, out_dir=out_dir, speed_limit_kbps=speed_limit_kbps,
-                    intake=intake,
-                )
+                try:
+                    magnet = torrent.parse_magnet(url)
+                except TorrentError as exc:
+                    self.error.emit(str(exc))
+                    return None
+                if self._live_torrent(magnet.info_hash):
+                    self.error.emit("That torrent is already in Cove's queue.")
+                    return None
+                source_type = SOURCE_TORRENT
+                info_hash = magnet.info_hash
+                torrent_name = _safe_torrent_name(magnet.display_name)
         import posixpath
         from urllib.parse import unquote, urlparse
         from .config import categorize
@@ -1016,6 +1115,52 @@ class QueueManager(QObject):
             dest_dir = out_dir
         else:
             dest_dir = self._resolve_category_dir(url)
+        return PreparedDownload(
+            url=url,
+            backend=backend,
+            category=category,
+            out_dir=dest_dir,
+            filename=filename,
+            connections=effective_connections,
+            speed_limit_kbps=speed_limit_kbps,
+            cookies=cookies,
+            referrer=referrer,
+            user_agent=user_agent,
+            source_type=source_type,
+            info_hash=info_hash,
+            torrent_name=torrent_name,
+            torrent_path=torrent_path,
+            debrid_route=debrid_route,
+            intake=intake,
+        )
+
+    def commit_prepared(self, prepared: PreparedDownload) -> Optional[int]:
+        """Create exactly one task from a prepared request.
+
+        This is the single authoritative task-creation path: the legacy
+        `add_url` and the Download File Info preflight both commit through
+        here, so the two can never drift apart. The database insert, the
+        in-memory DownloadTask, the diagnostic event, the task_added signal
+        and the auto-start scheduling are exactly what the pre-feature
+        `add_url` did after its classification step.
+        """
+        t = DownloadTask(
+            id=-1,
+            url=prepared.url,
+            out_dir=prepared.out_dir,
+            connections=prepared.connections,
+            speed_limit_kbps=prepared.speed_limit_kbps,
+            backend=prepared.backend,
+            filename=prepared.filename,
+            cookies=prepared.cookies,
+            referrer=prepared.referrer,
+            user_agent=prepared.user_agent,
+            source_type=prepared.source_type,
+            info_hash=prepared.info_hash,
+            torrent_name=prepared.torrent_name,
+            torrent_path=prepared.torrent_path,
+            debrid_route=prepared.debrid_route,
+        )
         with db.connect() as conn:
             cur = conn.execute(
                 """
@@ -1028,48 +1173,31 @@ class QueueManager(QObject):
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
-                    url,
-                    dest_dir,
-                    effective_connections,
-                    speed_limit_kbps,
+                    prepared.url,
+                    prepared.out_dir,
+                    prepared.connections,
+                    prepared.speed_limit_kbps,
                     "queued",
                     time.time(),
-                    category,
-                    backend,
-                    filename,
-                    cookies,
-                    referrer,
-                    user_agent,
-                    source_type,
-                    info_hash,
-                    torrent_name,
-                    torrent_path,
-                    debrid_route,
+                    prepared.category,
+                    prepared.backend,
+                    prepared.filename,
+                    prepared.cookies,
+                    prepared.referrer,
+                    prepared.user_agent,
+                    prepared.source_type,
+                    prepared.info_hash,
+                    prepared.torrent_name,
+                    prepared.torrent_path,
+                    prepared.debrid_route,
                 ),
             )
-            tid = cur.lastrowid
-        t = DownloadTask(
-            id=tid,
-            url=url,
-            out_dir=dest_dir,
-            connections=effective_connections,
-            speed_limit_kbps=speed_limit_kbps,
-            backend=backend,
-            filename=filename,
-            cookies=cookies,
-            referrer=referrer,
-            user_agent=user_agent,
-            source_type=source_type,
-            info_hash=info_hash,
-            torrent_name=torrent_name,
-            torrent_path=torrent_path,
-            debrid_route=debrid_route,
-        )
-        self.tasks[tid] = t
-        self._diag_url_added(t, intake)
-        self.task_added.emit(tid)
+            t.id = cur.lastrowid
+        self.tasks[t.id] = t
+        self._diag_url_added(t, prepared.intake)
+        self.task_added.emit(t.id)
         self._maybe_start_next()
-        return tid
+        return t.id
 
     # ---- diagnostics ---------------------------------------------------
     #
@@ -1239,23 +1367,15 @@ class QueueManager(QObject):
         still what gets persisted as the task's URL: it is local-only, and
         the trackers in it are what Slice B's local downloader will need.
         """
-        try:
-            magnet = torrent.parse_magnet(url)
-        except TorrentError as exc:
-            self.error.emit(str(exc))
-            return None
-        if self._live_torrent(magnet.info_hash):
-            self.error.emit("That torrent is already in Cove's queue.")
-            return None
-        return self.add_url(
+        prepared = self.prepare_url(
             url,
             out_dir=out_dir,
             speed_limit_kbps=speed_limit_kbps,
-            source_type=SOURCE_TORRENT,
-            info_hash=magnet.info_hash,
-            torrent_name=_safe_torrent_name(magnet.display_name),
             intake=intake,
         )
+        if prepared is None:
+            return None
+        return self.commit_prepared(prepared)
 
     def add_torrent_file(
         self,
