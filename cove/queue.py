@@ -264,6 +264,73 @@ def _safe_torrent_name(value) -> str:
         return ""
 
 
+def _selected_provider_files(meta, selection, cached):
+    """The provider's files for `selection`, or None if that is unprovable.
+
+    A selection names files in the *torrent's* manifest; a provider returns
+    its own view of the same torrent, in its own order. Only the complete
+    relative path is allowed to bridge the two, because it is the only
+    identity both sides derive from the same source. List position is not:
+    a provider is free to reorder, and matching by position would silently
+    hand the user a different file than the one they ticked.
+
+    None is the only failure answer, and it means one thing: this provider
+    result cannot be narrowed to this selection, so the caller must create
+    no provider rows at all. Returning the files that happened to match
+    would download a subset of a subset; returning everything would
+    download what the user deselected. Both are worse than falling back to
+    the local route, which can still honour the selection exactly.
+
+    Everything here is a comparison. No path built below is ever written
+    to: publication still goes through `destination_parts` and `_within`
+    on the untouched provider entry.
+    """
+    if meta is None:
+        # The managed .torrent is gone, replaced or unreadable. Without it
+        # there is no authority on what index 1 refers to.
+        return None
+    if meta.multi_file and not cached.multi_file:
+        # The provider collapsed a multi-file torrent into a single
+        # top-level deliverable -- Real-Debrid's packed archive is the one
+        # that reaches here. That file is the whole torrent, not any one
+        # of its files, so no subset can be honestly served from it.
+        return None
+
+    wanted = {}
+    for f in meta.files:
+        if f.path in wanted:
+            # Two manifest entries sharing one canonical path. The parser
+            # already refuses this, and if it ever stopped, a selection
+            # could not say which of them it meant.
+            return None
+        wanted[f.path] = f
+    by_index = {f.index: f for f in meta.files}
+
+    provider: dict = {}
+    ambiguous = set()
+    for f in cached.files:
+        if f.path in provider:
+            ambiguous.add(f.path)
+        provider[f.path] = f
+
+    picked = []
+    for index in selection:
+        chosen = by_index.get(index)
+        if chosen is None:
+            # A syntactically valid index that this torrent does not have.
+            return None
+        match = provider.get(chosen.path)
+        if match is None or chosen.path in ambiguous:
+            return None
+        if chosen.size and match.size and chosen.size != match.size:
+            # Both sides took the size from the same torrent, so a
+            # disagreement means they are not describing the same file.
+            # A provider that omits sizes reports 0, which claims nothing.
+            return None
+        picked.append(match)
+    return tuple(picked)
+
+
 def _within(base: str, target: str) -> bool:
     """True when `target` is `base` itself or sits underneath it.
 
@@ -1517,28 +1584,26 @@ class QueueManager(QObject):
         return meta, torrent.store_managed_torrent(meta)
 
     def _launch_torrent(self, t: DownloadTask) -> None:
-        if t.selected_files is not None:
-            # A cache hit materialises every file the provider holds, and
-            # _materialize_cached_torrent has no notion of a chosen subset
-            # yet - so probing here would turn "these three files" into the
-            # whole torrent. Provider-side filtering is a later slice; until
-            # it exists a selected torrent takes the local route, which is
-            # the one that can honour select-file. A torrent with no
-            # selection is untouched and still probes the providers first.
-            self._start_local_torrent(t.id)
-            return
         self._spawn(
             self._probe_torrent,
             t,
-            on_done=lambda cached, tid=t.id: self._on_torrent_probed(tid, cached),
+            on_done=lambda probed, tid=t.id: self._on_torrent_probed(tid, probed),
             on_fail=lambda msg, tid=t.id: self._fail_task(tid, msg),
         )
 
     def _probe_torrent(self, t: DownloadTask):
         """Ask the providers whether they already hold this torrent.
 
+        Returns the provider's answer *and* the torrent's own metadata,
+        because a selected torrent needs both to decide anything and this
+        is the only place the `.torrent` is read off the GUI thread. The
+        metadata is None whenever it could not be trusted -- no managed
+        copy, an unreadable one, or one whose info hash no longer matches
+        the task -- which is exactly when a selection cannot be mapped.
+
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
+        meta = None
         torrent_bytes = None
         info_hash = t.info_hash
         if t.torrent_path:
@@ -1559,26 +1624,45 @@ class QueueManager(QObject):
                 # URLs, and a private-tracker announce URL carries their
                 # passkey. The info-only document hashes identically.
                 torrent_bytes = meta.info_only_document()
-        return debrid.resolve_torrent(
+        cached = debrid.resolve_torrent(
             info_hash, self.settings, torrent_bytes=torrent_bytes,
             session=self._bound_session(),
         )
+        return cached, meta
 
-    def _on_torrent_probed(self, tid: int, cached) -> None:
+    def _on_torrent_probed(self, tid: int, probed) -> None:
         t = self.tasks.get(tid)
         if t is None or t.source_type != SOURCE_TORRENT:
             return
+        cached, meta = probed
         if cached is None:
             # No enabled provider holds it. Cove downloads it itself rather
             # than handing the user off to another torrent client.
             self._start_local_torrent(tid)
             return
+        files = cached.files
+        if t.selected_files is not None:
+            files = _selected_provider_files(meta, t.selected_files, cached)
+            if files is None:
+                # Cached, but Cove cannot prove which provider file is
+                # which chosen file. Nothing has been created yet, so this
+                # takes the same route as "no provider has it": the local
+                # torrent, which honours the selection exactly. The user's
+                # fallback preference still decides whether that happens.
+                self._diag(
+                    "queue", "torrent_selection_unmapped", "WARNING",
+                    task_id=t.id, provider=cached.provider,
+                    selected=len(t.selected_files),
+                    provider_files=len(cached.files),
+                )
+                self._start_local_torrent(tid)
+                return
         try:
-            self._materialize_cached_torrent(t, cached)
+            self._materialize_cached_torrent(t, cached, files)
         except TorrentError as exc:
             self._fail_task(tid, str(exc))
 
-    def _materialize_cached_torrent(self, t: DownloadTask, cached) -> None:
+    def _materialize_cached_torrent(self, t: DownloadTask, cached, files) -> None:
         """Turn a cached provider torrent into ordinary HTTPS tasks.
 
         The source row becomes the torrent's first file and the remaining
@@ -1586,6 +1670,14 @@ class QueueManager(QObject):
         what makes the step idempotent: either every row exists or none
         does, and a second probe of the same info hash finds the rows and
         drops the redundant source instead of expanding twice.
+
+        `files` is which of the provider's files to create rows for: every
+        one of them, or the subset an explicit selection resolved to. The
+        subset is decided in full before this method is called, so a
+        selection that cannot be mapped never reaches the transaction
+        below and cannot leave half a torrent behind. Layout is still read
+        off `cached`, so a file keeps the destination it would have had
+        with its siblings selected.
 
         Only the provider's account-bound *locked* link is stored for
         AllDebrid/Real-Debrid. TorBox has no such link: its rows persist
@@ -1606,7 +1698,7 @@ class QueueManager(QObject):
 
         base = t.out_dir
         rows = []
-        for f in cached.files:
+        for f in files:
             parts = cached.destination_parts(f)
             dest_dir = os.path.join(base, *parts[:-1]) if len(parts) > 1 else base
             # The components are already validated, so this is a second

@@ -8248,21 +8248,26 @@ def _bencoded_bytes(value: bytes) -> bytes:
     return str(len(value)).encode() + b":" + value
 
 
-# index 0 Season/Episode01.mkv, index 1 Season/Episode02.mkv, index 2 Sample.mkv
-def _multi_torrent_bytes():
+def _multi_file_torrent_bytes(name: bytes, files):
+    """A bencoded multi-file `.torrent` from (length, path components) pairs."""
     entries = b""
-    for length, parts in (
-        (7, (b"Season", b"Episode01.mkv")),
-        (9, (b"Season", b"Episode02.mkv")),
-        (5, (b"Sample.mkv",)),
-    ):
+    for length, parts in files:
         path = b"l" + b"".join(_bencoded_bytes(p) for p in parts) + b"e"
         entries += b"d6:lengthi" + str(length).encode() + b"e4:path" + path + b"e"
     info = (
-        b"d5:filesl" + entries + b"e4:name" + _bencoded_bytes(b"Show S01")
+        b"d5:filesl" + entries + b"e4:name" + _bencoded_bytes(name)
         + b"12:piece lengthi16384e6:pieces" + _bencoded_bytes(b"\x01" * 20) + b"e"
     )
     return b"d4:info" + info + b"e"
+
+
+# index 0 Season/Episode01.mkv, index 1 Season/Episode02.mkv, index 2 Sample.mkv
+def _multi_torrent_bytes():
+    return _multi_file_torrent_bytes(b"Show S01", (
+        (7, (b"Season", b"Episode01.mkv")),
+        (9, (b"Season", b"Episode02.mkv")),
+        (5, (b"Sample.mkv",)),
+    ))
 
 
 def _managed_torrent_task(queue_env, monkeypatch, tmp_path, selection=None):
@@ -8487,48 +8492,31 @@ def test_the_magnet_route_itself_refuses_a_selection_it_cannot_apply(queue_env, 
     assert rpc.magnets == []
 
 
-def test_a_selected_torrent_never_takes_the_cached_debrid_route(
+def test_a_selected_torrent_still_asks_the_providers(
     queue_env, monkeypatch, tmp_path
 ):
-    """A cache hit materialises every provider file, selection or not.
+    """Slice 2 replaces Slice 1's temporary "selected means local" guard.
 
-    Provider-side filtering is Slice 2. Until it exists, a torrent that
-    carries an explicit subset takes the local route, where select-file is
-    honoured, rather than silently downloading everything the provider
-    holds. Nothing changes for a torrent with no selection.
+    A selection no longer disqualifies a torrent from the cached-debrid
+    route: it now narrows what that route materialises. What must never
+    happen is the reason the guard existed - a cache hit quietly expanding
+    an explicit subset back into the whole torrent.
     """
-    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
-    queue, rpc, db_path = queue_env(**_local_settings())
-    _sync_spawn(queue)
-    probes = []
-
-    def probe(*a, **k):
-        probes.append(a)
-        return _cached()
-
-    monkeypatch.setattr(debrid, "resolve_torrent", probe)
-    raw = _multi_torrent_bytes()
-    meta = torrent_mod.parse_torrent(raw)
-    managed = torrent_mod.store_managed_torrent(meta)
-    tid = queue.add_url(
-        torrent_mod.minimal_magnet(meta.info_hash),
-        out_dir=str(tmp_path),
-        source_type=SOURCE_TORRENT,
-        info_hash=meta.info_hash,
-        torrent_name=meta.name,
-        torrent_path=managed,
-        selected_files=(0, 2),
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), _provider_result(),
     )
-    _running(queue)
 
     queue._launch(queue.tasks[tid])
 
-    # One row, still the torrent itself: no provider file rows were created.
-    assert len(_rows(db_path)) == 1
-    assert queue.tasks[tid].source_type == SOURCE_TORRENT
-    assert queue.tasks[tid].debrid_route == ""
-    assert probes == []
-    assert rpc.torrents[0]["select_file"] == "1,3"
+    assert len(calls["probe"]) == 1
+    assert _materialised_files(db_path) == [
+        (str(tmp_path / "Show S01" / "Season"), "Episode01.mkv", SEL_LINK_EP1),
+        (str(tmp_path / "Show S01"), "Sample.mkv", SEL_LINK_SAMPLE),
+    ]
+    # Episode02 was deselected: no row, and no link ever resolved for it.
+    assert SEL_LINK_EP2 not in calls["unlock"]
+    assert rpc.torrents == []
+    assert rpc.magnets == []
 
 
 def test_an_unselected_torrent_still_takes_the_cached_debrid_route(
@@ -8555,4 +8543,727 @@ def test_an_unselected_torrent_still_takes_the_cached_debrid_route(
     queue._launch(queue.tasks[tid])
 
     assert queue.tasks[tid].source_type == SOURCE_TORRENT_FILE
+    assert rpc.torrents == []
+
+
+# ---------------------------------------------------------------------------
+# Selected files: cached-debrid materialisation
+# ---------------------------------------------------------------------------
+#
+# A selection names files in the *torrent's* manifest. A provider hands back
+# its own view of the same torrent, in its own order, and Cove has to prove
+# which provider file is which chosen file before it downloads anything. The
+# tests below pin the two halves of that: the exact mapping that is allowed,
+# and every near-miss that must instead fall back to the local route with the
+# subset intact. "Download everything" is never an acceptable answer to an
+# ambiguous mapping.
+
+SEL_LINK_EP1 = "https://alldebrid.com/f/EPISODE01"
+SEL_LINK_EP2 = "https://alldebrid.com/f/EPISODE02"
+SEL_LINK_SAMPLE = "https://alldebrid.com/f/SAMPLE"
+SEL_LINK_EXTRA = "https://alldebrid.com/f/EXTRA"
+
+_SHOW_NAME = "Show S01"
+# The provider's view of _multi_torrent_bytes(), already root-stripped and
+# path-validated the way cove.debrid hands it to the queue.
+_SHOW_ENTRIES = (
+    (("Season", "Episode01.mkv"), 7, SEL_LINK_EP1),
+    (("Season", "Episode02.mkv"), 9, SEL_LINK_EP2),
+    (("Sample.mkv",), 5, SEL_LINK_SAMPLE),
+)
+
+
+def _show_meta():
+    return torrent_mod.parse_torrent(_multi_torrent_bytes())
+
+
+def _provider_result(entries=_SHOW_ENTRIES, *, provider=ALL_DEBRID, name=_SHOW_NAME):
+    """A CachedTorrent from (path components, size, locked link) triples."""
+    return CachedTorrent(
+        provider, _show_meta().info_hash, name,
+        tuple(
+            CachedTorrentFile(index, tuple(path), size, locked_link=link)
+            for index, (path, size, link) in enumerate(entries)
+        ),
+    )
+
+
+def _torbox_provider_result(entries=_SHOW_ENTRIES, *, name=_SHOW_NAME):
+    """The same manifest as TorBox returns it: item/file IDs, no link."""
+    return CachedTorrent(
+        debrid.TORBOX, _show_meta().info_hash, name,
+        tuple(
+            CachedTorrentFile(
+                index, tuple(path), size,
+                item_id=TORBOX_TORRENT_ITEM, file_id=str(index + 1),
+            )
+            for index, (path, size, _link) in enumerate(entries)
+        ),
+    )
+
+
+def _selected_debrid_env(
+    queue_env, monkeypatch, tmp_path, selection, cached, raw=None, **settings
+):
+    """A managed `.torrent` with a selection, and a fully faked provider.
+
+    Every provider entry point a launch can reach is recorded and faked, so
+    a test can assert what was asked of the provider as well as what landed
+    in the database, and nothing can touch a real account.
+    """
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "data")
+    queue, rpc, db_path = queue_env(**_local_settings(**settings))
+    _sync_spawn(queue)
+    calls = {"probe": [], "unlock": [], "requestdl": []}
+
+    def probe(info_hash, _settings, **kw):
+        calls["probe"].append(info_hash)
+        return cached
+
+    def unlock(link, provider, _settings, **kw):
+        calls["unlock"].append(link)
+        return Unrestricted(TORRENT_NODE_URL, "", 0, provider)
+
+    def requestdl(item_id, file_id, _token, **kw):
+        calls["requestdl"].append((item_id, file_id))
+        return TORBOX_TORRENT_CDN_URL
+
+    monkeypatch.setattr(debrid, "resolve_torrent", probe)
+    monkeypatch.setattr(debrid, "unlock_torrent_file", unlock)
+    monkeypatch.setattr(debrid, "torbox_refresh_torrent_file", requestdl)
+
+    meta = torrent_mod.parse_torrent(
+        _multi_torrent_bytes() if raw is None else raw
+    )
+    managed = torrent_mod.store_managed_torrent(meta)
+    tid = queue.add_url(
+        torrent_mod.minimal_magnet(meta.info_hash),
+        out_dir=str(tmp_path),
+        source_type=SOURCE_TORRENT,
+        info_hash=meta.info_hash,
+        torrent_name=meta.name,
+        torrent_path=managed,
+        selected_files=selection,
+    )
+    _running(queue)
+    return queue, rpc, db_path, tid, calls
+
+
+def _materialised_files(db_path):
+    """(out_dir, filename, url) for every provider-backed row, in row order."""
+    return [
+        (r["out_dir"], r["filename"], r["url"])
+        for r in _rows(db_path)
+        if r["source_type"] == SOURCE_TORRENT_FILE
+    ]
+
+
+def _fell_back_locally(queue, rpc, db_path, tid, select_file):
+    """The whole no-provider-children-then-local-fallback outcome."""
+    assert _materialised_files(db_path) == []
+    assert len(_rows(db_path)) == 1
+    assert queue.tasks[tid].source_type == SOURCE_TORRENT
+    assert queue.tasks[tid].debrid_route == ""
+    assert [t["select_file"] for t in rpc.torrents] == [select_file]
+
+
+# --- the mapping helper, in isolation --------------------------------------
+
+
+def test_selected_provider_files_maps_canonical_paths_not_positions():
+    meta = _show_meta()
+    reordered = _provider_result((
+        _SHOW_ENTRIES[2], _SHOW_ENTRIES[0], _SHOW_ENTRIES[1],
+    ))
+
+    picked = queue_module._selected_provider_files(meta, (1,), reordered)
+
+    assert [f.relative_path for f in picked] == ["Season/Episode02.mkv"]
+    assert [f.locked_link for f in picked] == [SEL_LINK_EP2]
+
+
+def test_selected_provider_files_refuses_an_index_outside_the_manifest():
+    assert queue_module._selected_provider_files(
+        _show_meta(), (0, 5), _provider_result()
+    ) is None
+
+
+def test_selected_provider_files_refuses_a_missing_manifest():
+    assert queue_module._selected_provider_files(
+        None, (0,), _provider_result()
+    ) is None
+
+
+def test_selected_provider_files_refuses_a_collided_canonical_path():
+    """Two manifest entries that sanitise to one path cannot be told apart.
+
+    The parser refuses such a torrent outright today, so this is asserted
+    against a hand-built manifest: the mapper must not depend on that being
+    the only gate.
+    """
+    collided = torrent_mod.TorrentMetadata(
+        info_hash="0" * 40, name="Show S01",
+        files=(
+            torrent_mod.TorrentFile(0, ("Season", "Episode01.mkv"), 7),
+            torrent_mod.TorrentFile(1, ("Season", "Episode01.mkv"), 7),
+        ),
+        total_size=14, multi_file=True,
+    )
+
+    assert queue_module._selected_provider_files(
+        collided, (0,), _provider_result()
+    ) is None
+
+
+def test_selected_provider_files_refuses_a_duplicated_provider_path():
+    doubled = _provider_result(_SHOW_ENTRIES + (
+        (("Sample.mkv",), 5, SEL_LINK_EXTRA),
+    ))
+
+    assert queue_module._selected_provider_files(
+        _show_meta(), (2,), doubled
+    ) is None
+
+
+def test_selected_provider_files_ignores_unselected_provider_extras():
+    extra = _provider_result(_SHOW_ENTRIES + (
+        (("readme.nfo",), 3, SEL_LINK_EXTRA),
+    ))
+
+    picked = queue_module._selected_provider_files(_show_meta(), (0, 2), extra)
+
+    assert [f.relative_path for f in picked] == [
+        "Season/Episode01.mkv", "Sample.mkv",
+    ]
+
+
+def test_selected_provider_files_refuses_a_size_disagreement():
+    wrong_size = _provider_result((
+        _SHOW_ENTRIES[0],
+        (("Season", "Episode02.mkv"), 9999, SEL_LINK_EP2),
+        _SHOW_ENTRIES[2],
+    ))
+
+    assert queue_module._selected_provider_files(
+        _show_meta(), (1,), wrong_size
+    ) is None
+
+
+def test_selected_provider_files_accepts_a_provider_that_omits_sizes():
+    """`_safe_filesize` yields 0 for an absent size; 0 is "unknown", not 0 bytes."""
+    sizeless = _provider_result(tuple(
+        (path, 0, link) for path, _size, link in _SHOW_ENTRIES
+    ))
+
+    picked = queue_module._selected_provider_files(_show_meta(), (1,), sizeless)
+
+    assert [f.locked_link for f in picked] == [SEL_LINK_EP2]
+
+
+def test_alldebrid_root_stripping_is_the_committed_provider_transform():
+    """The mapper compares root-stripped provider paths because cove.debrid
+    already strips AllDebrid's repeated top folder. Pinned here so the two
+    halves cannot drift apart."""
+    assert debrid._strip_root(
+        _SHOW_NAME, (_SHOW_NAME, "Season", "Episode01.mkv")
+    ) == ("Season", "Episode01.mkv")
+    assert debrid._strip_root(
+        _SHOW_NAME, ("Season", "Episode01.mkv")
+    ) == ("Season", "Episode01.mkv")
+
+
+def test_selected_provider_files_does_not_strip_further_parents():
+    """A near miss is a miss. No "drop folders until something matches"."""
+    unstripped = _provider_result(tuple(
+        ((_SHOW_NAME,) + tuple(path), size, link)
+        for path, size, link in _SHOW_ENTRIES
+    ))
+
+    assert queue_module._selected_provider_files(
+        _show_meta(), (1,), unstripped
+    ) is None
+
+
+def test_selected_provider_files_does_not_match_on_basename():
+    dupe_raw = _multi_file_torrent_bytes(b"Movie", (
+        (7, (b"Disc1", b"movie.mkv")),
+        (9, (b"Disc2", b"movie.mkv")),
+    ))
+    meta = torrent_mod.parse_torrent(dupe_raw)
+    flattened = _provider_result(
+        ((("movie.mkv",), 7, SEL_LINK_EP1), (("movie.mkv",), 9, SEL_LINK_EP2)),
+        name="Movie",
+    )
+
+    assert queue_module._selected_provider_files(meta, (1,), flattened) is None
+
+
+def test_selected_provider_files_does_not_casefold():
+    shouty = _provider_result((
+        _SHOW_ENTRIES[0],
+        (("Season", "episode02.MKV"), 9, SEL_LINK_EP2),
+        _SHOW_ENTRIES[2],
+    ))
+
+    assert queue_module._selected_provider_files(
+        _show_meta(), (1,), shouty
+    ) is None
+
+
+def test_selected_provider_files_refuses_a_collapsed_multi_file_result():
+    """Real-Debrid's packed answer: one link standing for the whole torrent.
+
+    It is not any single file of the torrent, so it can never satisfy a
+    subset, whatever the archive happens to be called.
+    """
+    packed = _provider_result(
+        ((("Show S01.rar",), 4096, RD_LOCKED_1),), provider=REAL_DEBRID,
+    )
+
+    assert queue_module._selected_provider_files(
+        _show_meta(), (1,), packed
+    ) is None
+
+
+def test_a_packed_result_cannot_impersonate_the_file_it_is_named_after():
+    """The archive's name is not evidence that it *is* that file.
+
+    Real-Debrid names a packed result after the torrent, and a torrent is
+    free to contain a top-level file by that same name. The provider is
+    still offering the whole torrent in one piece, so it still cannot serve
+    a subset - and here the paths match, so only the collapsed-result rule
+    can say so. The size is left unknown on purpose, to keep the size
+    cross-check out of it.
+    """
+    raw = _multi_file_torrent_bytes(b"Show S01", (
+        (7, (b"Show S01.rar",)),
+        (9, (b"Season", b"Episode02.mkv")),
+    ))
+    packed = _provider_result(
+        ((("Show S01.rar",), 0, RD_LOCKED_1),), provider=REAL_DEBRID,
+    )
+
+    assert queue_module._selected_provider_files(
+        torrent_mod.parse_torrent(raw), (0,), packed
+    ) is None
+
+
+def test_selected_provider_files_keeps_the_selection_order():
+    reordered = _provider_result((
+        _SHOW_ENTRIES[2], _SHOW_ENTRIES[1], _SHOW_ENTRIES[0],
+    ))
+
+    picked = queue_module._selected_provider_files(_show_meta(), (0, 1, 2), reordered)
+
+    assert [f.relative_path for f in picked] == [
+        "Season/Episode01.mkv", "Season/Episode02.mkv", "Sample.mkv",
+    ]
+
+
+# --- AllDebrid -------------------------------------------------------------
+
+
+def test_selected_alldebrid_materialises_exactly_one_file(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), _provider_result(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == [
+        (str(tmp_path / "Show S01" / "Season"), "Episode02.mkv", SEL_LINK_EP2),
+    ]
+    assert len(_rows(db_path)) == 1
+    assert rpc.torrents == []
+
+
+def test_selected_alldebrid_materialises_exactly_two_files(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 1), _provider_result(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == [
+        (str(tmp_path / "Show S01" / "Season"), "Episode01.mkv", SEL_LINK_EP1),
+        (str(tmp_path / "Show S01" / "Season"), "Episode02.mkv", SEL_LINK_EP2),
+    ]
+
+
+def test_selected_materialisation_survives_a_reordered_provider_manifest(
+    queue_env, monkeypatch, tmp_path
+):
+    reordered = _provider_result((
+        _SHOW_ENTRIES[2], _SHOW_ENTRIES[0], _SHOW_ENTRIES[1],
+    ))
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), reordered,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == [
+        (str(tmp_path / "Show S01" / "Season"), "Episode01.mkv", SEL_LINK_EP1),
+        (str(tmp_path / "Show S01"), "Sample.mkv", SEL_LINK_SAMPLE),
+    ]
+
+
+def test_a_selected_nested_file_keeps_its_provider_directory(
+    queue_env, monkeypatch, tmp_path
+):
+    """Deselecting siblings must not flatten what is left into the root."""
+    nested_raw = _multi_file_torrent_bytes(b"Show S01", (
+        (7, (b"Season", b"Episode01.mkv")),
+        (4, (b"Season", b"Subs", b"Episode02.srt")),
+    ))
+    nested = _provider_result(
+        (
+            (("Season", "Episode01.mkv"), 7, SEL_LINK_EP1),
+            (("Season", "Subs", "Episode02.srt"), 4, SEL_LINK_EP2),
+        ),
+    )
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), nested, raw=nested_raw,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == [
+        (
+            str(tmp_path / "Show S01" / "Season" / "Subs"),
+            "Episode02.srt",
+            SEL_LINK_EP2,
+        ),
+    ]
+
+
+def test_unselected_provider_extras_are_not_materialised(
+    queue_env, monkeypatch, tmp_path
+):
+    extra = _provider_result(_SHOW_ENTRIES + (
+        (("readme.nfo",), 3, SEL_LINK_EXTRA),
+    ))
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), extra,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert [name for _dir, name, _url in _materialised_files(db_path)] == [
+        "Episode01.mkv", "Sample.mkv",
+    ]
+    assert SEL_LINK_EXTRA not in calls["unlock"]
+
+
+# --- Real-Debrid -----------------------------------------------------------
+
+
+def _rd_result(entries=_SHOW_ENTRIES):
+    return _provider_result(entries, provider=REAL_DEBRID)
+
+
+def _rd_settings():
+    return dict(real_debrid_enabled=True, real_debrid_api_token="rd-token-value")
+
+
+def test_selected_real_debrid_file_keeps_its_own_link(
+    queue_env, monkeypatch, tmp_path
+):
+    """The classic filtering bug: keep file B, hand it link A."""
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), _rd_result(), **_rd_settings(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == [
+        (str(tmp_path / "Show S01" / "Season"), "Episode02.mkv", SEL_LINK_EP2),
+    ]
+    assert calls["unlock"] == [SEL_LINK_EP2]
+
+
+def test_a_non_contiguous_real_debrid_selection_keeps_both_links(
+    queue_env, monkeypatch, tmp_path
+):
+    """Skipping the middle file must not shift the links up by one."""
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), _rd_result(), **_rd_settings(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert [url for _dir, _name, url in _materialised_files(db_path)] == [
+        SEL_LINK_EP1, SEL_LINK_SAMPLE,
+    ]
+    assert SEL_LINK_EP2 not in calls["unlock"]
+
+
+def test_a_packed_real_debrid_result_cannot_satisfy_a_selection(
+    queue_env, monkeypatch, tmp_path
+):
+    packed = _provider_result(
+        ((("Show S01.rar",), 4096, RD_LOCKED_1),), provider=REAL_DEBRID,
+    )
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), packed, **_rd_settings(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    _fell_back_locally(queue, rpc, db_path, tid, "2")
+    assert calls["unlock"] == []
+
+
+def test_a_packed_real_debrid_result_is_untouched_without_a_selection(
+    queue_env, monkeypatch, tmp_path
+):
+    """The compatibility half: whole-torrent users keep the packed download."""
+    packed = _provider_result(
+        ((("Show S01.rar",), 4096, RD_LOCKED_1),), provider=REAL_DEBRID,
+    )
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, None, packed, **_rd_settings(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == [
+        (str(tmp_path), "Show S01.rar", RD_LOCKED_1),
+    ]
+    assert rpc.torrents == []
+
+
+# --- TorBox ----------------------------------------------------------------
+
+
+def test_selected_torbox_materialises_only_the_chosen_file_ids(
+    queue_env, monkeypatch, tmp_path, torbox_available
+):
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), _torbox_provider_result(),
+        **_torbox_settings(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    rows = [r for r in _rows(db_path) if r["source_type"] == SOURCE_TORRENT_FILE]
+    assert [r["debrid_file_id"] for r in rows] == ["1", "3"]
+    assert [r["filename"] for r in rows] == ["Episode01.mkv", "Sample.mkv"]
+    assert [r["debrid_route"] for r in rows] == [debrid.TORBOX] * 2
+
+
+def test_torbox_never_requests_a_delivery_url_for_a_deselected_file(
+    queue_env, monkeypatch, tmp_path, torbox_available
+):
+    """TorBox resolves links per launch, so a file with no row can never
+    reach requestdl. Pinned because filtering later than task creation
+    would quietly restore those calls."""
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), _torbox_provider_result(),
+        **_torbox_settings(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert [file_id for _item, file_id in calls["requestdl"]] == ["2"]
+
+
+# --- fail closed -----------------------------------------------------------
+
+
+def test_a_selected_file_the_provider_lacks_materialises_nothing(
+    queue_env, monkeypatch, tmp_path
+):
+    """All or nothing: Episode01 maps, Sample does not, so neither is created."""
+    partial = _provider_result(_SHOW_ENTRIES[:2])
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), partial,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    _fell_back_locally(queue, rpc, db_path, tid, "1,3")
+    assert calls["unlock"] == []
+
+
+def test_an_index_outside_the_manifest_materialises_nothing(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 5), _provider_result(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    # The subset reaches aria2 unchanged; aria2 ignores a file number the
+    # torrent does not have. Cove does not get to reinterpret it.
+    _fell_back_locally(queue, rpc, db_path, tid, "1,6")
+
+
+def test_an_ambiguous_provider_match_materialises_nothing(
+    queue_env, monkeypatch, tmp_path
+):
+    doubled = _provider_result(_SHOW_ENTRIES + (
+        (("Sample.mkv",), 5, SEL_LINK_EXTRA),
+    ))
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (2,), doubled,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    _fell_back_locally(queue, rpc, db_path, tid, "3")
+
+
+def test_a_missing_managed_torrent_materialises_nothing(
+    queue_env, monkeypatch, tmp_path
+):
+    """No authoritative manifest, no way to say which provider file is which."""
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), _provider_result(),
+    )
+    os.remove(queue.tasks[tid].torrent_path)
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == []
+    assert queue.tasks[tid].source_type == SOURCE_TORRENT
+    assert calls["unlock"] == []
+
+
+def test_a_selection_cannot_reach_debrid_through_a_manifest_less_magnet(
+    queue_env, monkeypatch, tmp_path
+):
+    """Slice 1's magnet rule is not softened by the new provider route."""
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), _provider_result(),
+    )
+    task = queue.tasks[tid]
+    task.torrent_path = ""
+
+    queue._launch(task)
+
+    assert _materialised_files(db_path) == []
+    assert task.status == "error"
+    assert rpc.magnets == []
+
+
+# --- fallback --------------------------------------------------------------
+
+
+def test_an_uncached_selected_torrent_keeps_the_existing_fallback(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), None,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert len(calls["probe"]) == 1
+    _fell_back_locally(queue, rpc, db_path, tid, "1,3")
+
+
+def test_an_unmappable_result_does_not_start_a_local_torrent_when_forbidden(
+    queue_env, monkeypatch, tmp_path
+):
+    """"Cancel the download" stays authoritative for a selected torrent."""
+    partial = _provider_result(_SHOW_ENTRIES[:2])
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), partial,
+        torrent_fallback_mode="never",
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert _materialised_files(db_path) == []
+    assert rpc.torrents == []
+    assert queue.tasks[tid].status == "error"
+    assert queue.tasks[tid].error == TORRENT_CANCELLED_UNCACHED
+
+
+def test_a_successful_selected_materialisation_leaves_the_selection_alone(
+    queue_env, monkeypatch, tmp_path
+):
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (0, 2), _provider_result(),
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert queue.tasks[tid].selected_files == (0, 2)
+    assert _persisted_row(db_path, tid)["selected_files"] == "0,2"
+
+
+def test_a_restored_selection_still_drives_provider_filtering(
+    queue_env, monkeypatch, tmp_path
+):
+    """The subset survives a restart, so the provider route must reuse it."""
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, (1,), _provider_result(),
+    )
+    queue2, rpc2, _db = queue_env(**_local_settings())
+    _sync_spawn(queue2)
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _provider_result())
+    _running(queue2)
+
+    restored = queue2.tasks[tid]
+    assert restored.selected_files == (1,)
+    queue2._launch(restored)
+
+    assert _materialised_files(db_path) == [
+        (str(tmp_path / "Show S01" / "Season"), "Episode02.mkv", SEL_LINK_EP2),
+    ]
+
+
+# --- no selection: the legacy provider path is untouched --------------------
+
+
+@pytest.mark.parametrize("result", ["alldebrid", "torbox"])
+def test_no_selection_materialises_every_provider_file(
+    queue_env, monkeypatch, tmp_path, torbox_available, result
+):
+    cached = (
+        _provider_result() if result == "alldebrid" else _torbox_provider_result()
+    )
+    extra = {} if result == "alldebrid" else _torbox_settings()
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, None, cached, **extra,
+    )
+
+    queue._launch(queue.tasks[tid])
+
+    assert [name for _dir, name, _url in _materialised_files(db_path)] == [
+        "Episode01.mkv", "Episode02.mkv", "Sample.mkv",
+    ]
+    assert len(calls["probe"]) == 1
+
+
+def test_no_selection_is_not_subjected_to_manifest_mapping(
+    queue_env, monkeypatch, tmp_path
+):
+    """A provider manifest that no selection could ever map still works.
+
+    Paths the torrent does not contain, a size that disagrees and a missing
+    managed `.torrent` are all fatal to a subset and all irrelevant without
+    one.
+    """
+    unmappable = _provider_result((
+        (("elsewhere", "one.bin"), 1234, SEL_LINK_EP1),
+        (("elsewhere", "two.bin"), 5678, SEL_LINK_EP2),
+    ))
+    queue, rpc, db_path, tid, calls = _selected_debrid_env(
+        queue_env, monkeypatch, tmp_path, None, unmappable,
+    )
+    os.remove(queue.tasks[tid].torrent_path)
+
+    queue._launch(queue.tasks[tid])
+
+    assert [name for _dir, name, _url in _materialised_files(db_path)] == [
+        "one.bin", "two.bin",
+    ]
     assert rpc.torrents == []
