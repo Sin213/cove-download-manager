@@ -13,7 +13,7 @@ import os
 import re
 import stat
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional
 
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
@@ -170,6 +170,25 @@ class PreparedDownload:
     # every non-torrent request and every pre-selection torrent carries.
     selected_files: Optional[tuple[int, ...]] = None
 
+
+@dataclass(frozen=True)
+class TorrentPreflight:
+    """One parsed local `.torrent`, awaiting an interactive file choice.
+
+    Plain data, and request-local by construction: the manifest, the managed
+    copy (through `prepared.torrent_path`) and the prepared request travel
+    together in one immutable record, so two `.torrent` files being added at
+    once can never be given each other's manifest or each other's selection.
+
+    No Qt type ever reaches this class, and the queue never shows UI. An
+    interactive caller receives one of these, decides which files it wants,
+    and answers with `commit_torrent_preflight` or `discard_torrent_preflight`.
+    """
+
+    metadata: "torrent.TorrentMetadata"
+    prepared: PreparedDownload
+
+
 # Where a URL entered Cove. Diagnostics only - never affects routing.
 _INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "search", "unknown")
 
@@ -205,6 +224,19 @@ TORRENT_METADATA_FAILED = "Cove could not read this torrent's metadata."
 TORRENT_SELECTION_UNSUPPORTED = (
     "Choosing individual files is only available for a torrent whose file "
     "list Cove already holds."
+)
+# An interactive file-choice preflight that could not be completed. Nothing
+# was committed and Cove's own copy of the .torrent has been cleaned up, so
+# the user can simply add it again. Never a silent whole-torrent download.
+TORRENT_PREFLIGHT_FAILED = (
+    "Cove could not show the file list for that torrent, so nothing was "
+    "added."
+)
+# The same torrent submitted twice while the first copy is still waiting for
+# the user to choose its files. Not yet a queued task, so the queued-torrent
+# sentence would be untrue, but just as much of a duplicate.
+TORRENT_PREFLIGHT_PENDING = (
+    "That torrent is already waiting for you to choose its files."
 )
 # A restored row whose selection cannot be read. The row is failed rather
 # than restarted: the alternative is treating "unreadable" as "all files".
@@ -653,6 +685,14 @@ class QueueManager(QObject):
         # Whether this aria2 reports BitTorrent support. Asked once and
         # cached for the daemon's lifetime rather than on every poll.
         self._bt_capable: bool | None = None
+        # Info hashes of local `.torrent` requests parked on an interactive
+        # file choice. A preflight is an owner of its torrent exactly like a
+        # task is: it holds the managed copy, and it is going to become a
+        # task, so both the duplicate guard and managed-copy cleanup have to
+        # see it. Without that, the wait this slice introduces between the
+        # guard and the commit is a window a second copy of the same torrent
+        # slips through.
+        self._preflight_hashes: set[str] = set()
         # Tasks parked on the one-time P2P disclosure.
         self._awaiting_consent: set[int] = set()
         # Tasks whose owner already accepted the notice this session. The
@@ -1489,9 +1529,19 @@ class QueueManager(QObject):
         Completed rows are deliberately not counted: re-adding a torrent
         you finished last month is a legitimate thing to do, and matches
         how the queue already treats a finished HTTP download.
+
+        A local `.torrent` parked on its file-choice preflight counts as
+        represented even though no task exists yet. It already holds the
+        managed copy and it is going to become a task, and the commit that
+        would otherwise have blocked a duplicate is sitting waiting for the
+        user - so for exactly as long as that dialog is open, an identical
+        magnet from Search, the extension, the API or a second instance has
+        to be refused here instead.
         """
         if not info_hash:
             return False
+        if info_hash in self._preflight_hashes:
+            return True
         return any(
             t.info_hash == info_hash
             and t.source_type in (SOURCE_TORRENT, SOURCE_TORRENT_FILE)
@@ -1525,6 +1575,7 @@ class QueueManager(QObject):
         out_dir: str | None = None,
         *,
         duplicate_check=None,
+        precommit=None,
     ) -> None:
         """Queue a local `.torrent`.
 
@@ -1537,6 +1588,19 @@ class QueueManager(QObject):
         the call. It is invoked on the GUI thread with the match and the
         torrent's name, and returning False abandons the add. Automation
         passes nothing and is never prompted.
+
+        `precommit` is the second and larger say, and it is opt-in for the
+        same reason: with nothing passed this method commits immediately,
+        exactly as it always has, so the API bridge, the drop directory and
+        every test double keep the pre-feature behaviour and no background
+        caller can be made to wait on a desktop dialog. An interactive caller
+        that passes one gets a `TorrentPreflight` instead of a task -- the
+        authoritative manifest and a side-effect-free prepared request, with
+        no row, no DownloadTask, no provider probe and no aria2 job yet -- and
+        owns answering with `commit_torrent_preflight` or
+        `discard_torrent_preflight`. A callee that raises before taking
+        ownership fails closed here: the managed copy is cleaned and nothing
+        is committed.
         """
         if not self._torrent_enabled():
             return
@@ -1545,6 +1609,16 @@ class QueueManager(QObject):
 
         def on_done(result) -> None:
             meta, managed_path = result
+            if meta.info_hash in self._preflight_hashes:
+                # An earlier copy of this torrent is still on screen or still
+                # queued behind one. Refusing here rather than at commit time
+                # means the user is never asked to choose files twice for one
+                # torrent, and two preflights can never share the one managed
+                # copy their common info hash names. Checked before
+                # `_live_torrent`, which also covers held preflights, so this
+                # case keeps its own accurate sentence.
+                self.error.emit(TORRENT_PREFLIGHT_PENDING)
+                return
             if self._live_torrent(meta.info_hash):
                 self.error.emit("That torrent is already in Cove's queue.")
                 return
@@ -1560,19 +1634,106 @@ class QueueManager(QObject):
             # without persisting anything the .torrent might carry. The
             # persisted path is Cove's own copy, not the user's file, so a
             # restart or a retry cannot depend on where they put it.
-            self.add_url(
-                torrent.minimal_magnet(meta.info_hash),
+            kwargs = dict(
                 out_dir=dest,
                 source_type=SOURCE_TORRENT,
                 info_hash=meta.info_hash,
                 torrent_name=meta.name,
                 torrent_path=managed_path,
             )
+            url = torrent.minimal_magnet(meta.info_hash)
+            if precommit is None:
+                self.add_url(url, **kwargs)
+                return
+            prepared = self.prepare_url(url, **kwargs)
+            if prepared is None:
+                # Refused during classification, which already said why. The
+                # copy was made for a request that will never exist.
+                self._discard_managed_copy(meta.info_hash, managed_path)
+                return
+            request = TorrentPreflight(metadata=meta, prepared=prepared)
+            self.hold_torrent_preflight(request)
+            try:
+                precommit(request)
+            except Exception:
+                # The callee never took ownership, so this still owns the
+                # copy. Fail closed: no task, no fallback to "all files".
+                self.discard_torrent_preflight(request)
+                self.error.emit(TORRENT_PREFLIGHT_FAILED)
 
         self._spawn(
             self._read_and_store_torrent, source,
             on_done=on_done, on_fail=self.error.emit,
         )
+
+    def hold_torrent_preflight(self, request: TorrentPreflight) -> None:
+        """Record that this torrent is spoken for while its dialog is open.
+
+        Held from the moment the request exists until it is committed or
+        discarded, so that for the whole of that window the duplicate guard
+        and `_info_hash_in_use` both treat it as an owner of the torrent.
+        """
+        if request.metadata.info_hash:
+            self._preflight_hashes.add(request.metadata.info_hash)
+
+    def commit_torrent_preflight(
+        self, request: TorrentPreflight, selected_files=None
+    ) -> Optional[int]:
+        """Commit one preflighted local `.torrent` with the chosen files.
+
+        `None` is every file, and is deliberately the same value an
+        untouched request already carries, so confirming without changing
+        anything follows the exact route Cove took before this preflight
+        existed. A proper subset is canonicalised here, which is also where
+        an explicitly empty choice is refused: `normalize_file_selection`
+        has never accepted one, and this seam must not become the way in.
+        """
+        try:
+            selection = torrent.normalize_file_selection(selected_files)
+        except TorrentError as exc:
+            # An unusable answer is not a reason to keep holding the torrent:
+            # nothing will ever commit this request, so it is discarded like
+            # any other abandoned preflight.
+            self.error.emit(str(exc))
+            self.discard_torrent_preflight(request)
+            return None
+        try:
+            return self.commit_prepared(
+                replace(request.prepared, selected_files=selection)
+            )
+        finally:
+            # Released only once the task exists, so the managed copy is
+            # never momentarily ownerless between the two.
+            self._release_torrent_preflight(request)
+
+    def discard_torrent_preflight(self, request: TorrentPreflight) -> None:
+        """Drop a preflight nobody committed, taking its managed copy with it.
+
+        The hold is released first so this request stops counting as an owner
+        of its own copy; anything else still holding that info hash -- a live
+        task, or a task removal racing this -- keeps the file.
+
+        Only Cove's own copy: `discard_managed_torrent` refuses any path
+        outside the store, so the `.torrent` the user picked is never touched
+        whatever happens here.
+        """
+        self._release_torrent_preflight(request)
+        self._discard_managed_copy(
+            request.metadata.info_hash, request.prepared.torrent_path
+        )
+
+    def _release_torrent_preflight(self, request: TorrentPreflight) -> None:
+        self._preflight_hashes.discard(request.metadata.info_hash)
+
+    def _discard_managed_copy(self, info_hash: str, path: str) -> None:
+        """Delete a managed `.torrent` no task is relying on.
+
+        The copy belongs to the torrent, not to one request: a live task for
+        the same info hash still needs it, which is the same rule task
+        removal applies.
+        """
+        if path and not self._info_hash_in_use(info_hash):
+            torrent.discard_managed_torrent(path)
 
     @staticmethod
     def _read_and_store_torrent(source: str):
@@ -2868,9 +3029,18 @@ class QueueManager(QObject):
         )
 
     def _info_hash_in_use(self, info_hash: str) -> bool:
-        return bool(info_hash) and any(
-            t.info_hash == info_hash for t in self.tasks.values()
-        )
+        """Whether anything still needs the managed copy for this torrent.
+
+        A local `.torrent` waiting on its file-choice preflight counts: it
+        already holds that copy and is going to become a task, so removing an
+        unrelated task for the same torrent must not delete the file out from
+        under it.
+        """
+        if not info_hash:
+            return False
+        if info_hash in self._preflight_hashes:
+            return True
+        return any(t.info_hash == info_hash for t in self.tasks.values())
 
     @staticmethod
     def _torrent_file_paths(files) -> tuple[str, ...]:

@@ -10,6 +10,8 @@ matching the existing convention in tests/test_dialogs.py. Tray availability
 is always faked - a test must never depend on the desktop environment
 actually providing a system tray.
 """
+from collections import deque
+
 import pytest
 import shiboken6
 from PySide6.QtGui import QCloseEvent
@@ -182,6 +184,7 @@ class _Host(QMainWindow):
     """The real MainWindow close/tray methods without its heavy constructor."""
 
     closeEvent = mw.MainWindow.closeEvent
+    discard_torrent_preflights = mw.MainWindow.discard_torrent_preflights
     request_quit = mw.MainWindow.request_quit
     show_from_tray = mw.MainWindow.show_from_tray
     _install_tray_menu = mw.MainWindow._install_tray_menu
@@ -195,6 +198,9 @@ class _Host(QMainWindow):
         self._tray = _FakeTray() if tray else None
         self._tray_available_flag = tray_available
         self._force_quit = False
+        # A real window always has this; closing drains it so a `.torrent`
+        # preflight the user never answered cannot leave a copy behind.
+        self._torrent_preflights = deque()
         self.quit_calls = 0
         self.super_close_calls = 0
 

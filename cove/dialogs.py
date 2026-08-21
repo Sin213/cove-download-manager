@@ -32,11 +32,13 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTimeEdit,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from . import debrid
+from . import debrid, torrent
 from .clipboard import extract_urls
 from .config import (
     CATEGORY_NAMES,
@@ -54,6 +56,11 @@ from .indexer_editor import IndexerEditorDialog
 from .netiface import ANY_INTERFACE, ANY_INTERFACE_LABEL, list_interfaces
 from .output_paths import OutputPathError, validate_public_filename
 from .search.indexers import CustomTorznabIndexer, new_custom_indexer_id
+# Display-only byte formatting, reused rather than reimplemented: Cove already
+# has exactly two of these and a third would be one too many. This is the one
+# that renders a zero-length entry as "0 B" instead of a placeholder, which a
+# torrent manifest genuinely contains.
+from .search.widget import _human_size
 from .source_info import redact_url, source_details
 from .speed_limit import (
     SPEED_LIMIT_UNITS,
@@ -488,6 +495,325 @@ class DownloadFileInfoDialog(QDialog):
 
     def result_dont_show_again(self) -> bool:
         return self.dont_show_again.isChecked()
+
+
+# The role a leaf's canonical manifest index is stored under, and the role
+# every row's canonical relative path is stored under. Visual position is
+# never an identity here: rows are grouped into folders and folders are not
+# files, so the only thing that can name a file is the index the parser gave
+# it.
+_FILE_INDEX_ROLE = Qt.UserRole
+_ITEM_PATH_ROLE = Qt.UserRole + 1
+
+
+class TorrentContentsDialog(QDialog):
+    """Pre-download "Torrent Contents" preflight for one local `.torrent`.
+
+    Display and selection only. It never parses a `.torrent`, stores a
+    managed copy, creates a task, writes a database row, probes a provider,
+    calls aria2, chooses a route, serialises a selection or converts an index
+    to aria2's 1-based numbering. The caller (the MainWindow local-torrent
+    coordinator) owns the managed copy, the prepared request and committing
+    it after this dialog is accepted.
+
+    `metadata` is the authoritative manifest the parser already produced, and
+    `save_to` is the exact effective destination the queue already computed
+    for this request; both are read-only here.
+
+    The result contract is the whole point:
+
+    * rejected (Cancel / Escape / window close) -- nothing is committed, and
+      `result_selection` is never consulted;
+    * accepted with every file checked -- `None`, which is the absence of a
+      selection and means the exact legacy whole-torrent behaviour;
+    * accepted with a proper subset -- the canonical ascending 0-based tuple
+      `torrent.normalize_file_selection` defines.
+
+    No selection at all cannot be confirmed: Download is disabled, and
+    `result_selection` raises rather than degrade an empty choice into
+    `None`, which would download precisely the files the user deselected.
+    """
+
+    def __init__(self, metadata, save_to: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Torrent Contents")
+        self.setMinimumWidth(620)
+        self.setMinimumHeight(460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        _title_block(
+            layout,
+            "Torrent Contents",
+            "Choose which files to download.",
+        )
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        # The parsed torrent's own name, not the file the user picked: the
+        # picked file can be called anything at all.
+        self.name_edit = QLineEdit(metadata.name)
+        self.name_edit.setReadOnly(True)
+        form.addRow("Torrent", self.name_edit)
+        # Destination editing is deliberately absent: this dialog chooses
+        # files, and the prepared request already decided where they go.
+        self.dir_edit = QLineEdit(save_to)
+        self.dir_edit.setReadOnly(True)
+        form.addRow("Save to", self.dir_edit)
+        layout.addLayout(form)
+
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Files", "Size"])
+        self.tree.setUniformRowHeights(True)
+        # Manifest order is the display order, and the user cannot change it.
+        # Nothing depends on it -- identity is the stored index -- but a
+        # stable order keeps the tree readable and the tests deterministic.
+        self.tree.setSortingEnabled(False)
+        self.tree.header().setSectionsClickable(False)
+        self.tree.header().setSortIndicatorShown(False)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        layout.addWidget(self.tree, 1)
+
+        # (item, canonical index, size) for every actual file, in manifest
+        # order. Folders never appear here: they are aggregates of these.
+        self._leaves: list[tuple[QTreeWidgetItem, int, int]] = []
+        self._bulk = False
+        self._summary_refreshes = 0
+        self._selected_count = 0
+        self._selected_bytes = 0
+        self._build(metadata)
+        self._total_count = len(self._leaves)
+
+        bulk = QHBoxLayout()
+        self._select_all_button = QPushButton("Select All")
+        self._select_all_button.clicked.connect(self.select_all)
+        self._select_none_button = QPushButton("Select None")
+        self._select_none_button.clicked.connect(self.select_none)
+        bulk.addWidget(self._select_all_button)
+        bulk.addWidget(self._select_none_button)
+        bulk.addStretch(1)
+        layout.addLayout(bulk)
+
+        self.summary = QLabel("")
+        self.summary.setProperty("role", "muted")
+        layout.addWidget(self.summary)
+
+        bb = _make_buttons(self, ok_text="Download")
+        layout.addWidget(bb)
+        bb.accepted.disconnect()
+        bb.accepted.connect(self.confirm)
+        self._button_box = bb
+        self.download_button().setDefault(True)
+        self.download_button().setAutoDefault(True)
+
+        self.tree.expandAll()
+        self.tree.itemChanged.connect(self._on_item_changed)
+        self._refresh_summary()
+
+    # ---- construction ---------------------------------------------------
+
+    def _build(self, metadata) -> None:
+        """Turn the manifest into a checkable tree, in manifest order.
+
+        Folders are keyed by their full path prefix, never by basename: a
+        torrent holding `A/Sub/one` and `B/Sub/two` has two different `Sub`
+        folders, and merging them would move a file into a branch it does
+        not belong to.
+        """
+        root = self.tree.invisibleRootItem()
+        folders: dict[tuple[str, ...], QTreeWidgetItem] = {}
+        sizes: dict[tuple[str, ...], int] = {}
+        self.tree.blockSignals(True)
+        try:
+            for file in metadata.files:
+                parts = tuple(file.path)
+                parent = root
+                for depth in range(1, len(parts)):
+                    prefix = parts[:depth]
+                    node = folders.get(prefix)
+                    if node is None:
+                        node = QTreeWidgetItem(parent, [prefix[-1], ""])
+                        node.setFlags(node.flags() | Qt.ItemIsUserCheckable)
+                        node.setData(0, _FILE_INDEX_ROLE, None)
+                        node.setData(0, _ITEM_PATH_ROLE, prefix)
+                        node.setCheckState(0, Qt.Checked)
+                        folders[prefix] = node
+                    sizes[prefix] = sizes.get(prefix, 0) + file.size
+                    parent = node
+                leaf = QTreeWidgetItem(parent, [parts[-1], _human_size(file.size)])
+                leaf.setFlags(leaf.flags() | Qt.ItemIsUserCheckable)
+                leaf.setData(0, _FILE_INDEX_ROLE, file.index)
+                leaf.setData(0, _ITEM_PATH_ROLE, parts)
+                leaf.setCheckState(0, Qt.Checked)
+                self._leaves.append((leaf, file.index, file.size))
+            for prefix, node in folders.items():
+                node.setText(1, _human_size(sizes.get(prefix, 0)))
+        finally:
+            self.tree.blockSignals(False)
+
+    # ---- introspection --------------------------------------------------
+
+    def leaves(self) -> list[tuple[QTreeWidgetItem, int, int]]:
+        """(item, canonical index, size) for every file, in manifest order."""
+        return list(self._leaves)
+
+    @staticmethod
+    def file_index(item) -> int | None:
+        """The canonical 0-based manifest index, or None for a folder row."""
+        return item.data(0, _FILE_INDEX_ROLE)
+
+    @staticmethod
+    def item_path(item) -> tuple[str, ...]:
+        return item.data(0, _ITEM_PATH_ROLE)
+
+    def buttons(self):
+        """The dialog's action buttons, for tests and introspection."""
+        return [self._select_all_button, self._select_none_button] + list(
+            self._button_box.buttons()
+        )
+
+    def download_button(self):
+        return self._button_box.button(QDialogButtonBox.Ok)
+
+    def cancel_button(self):
+        return self._button_box.button(QDialogButtonBox.Cancel)
+
+    def total_count(self) -> int:
+        return self._total_count
+
+    def selected_count(self) -> int:
+        return self._selected_count
+
+    def selected_bytes(self) -> int:
+        return self._selected_bytes
+
+    def summary_text(self) -> str:
+        return self.summary.text()
+
+    def summary_refreshes(self) -> int:
+        """How many full summary passes have run. Bulk actions must cost 1."""
+        return self._summary_refreshes
+
+    # ---- check state ----------------------------------------------------
+
+    def _on_item_changed(self, item, column: int) -> None:
+        if column != 0 or self._bulk:
+            return
+        self._bulk = True
+        try:
+            if self.file_index(item) is None:
+                self._apply_to_descendants(item, item.checkState(0))
+            self._refresh_ancestors(item)
+        finally:
+            self._bulk = False
+        self._refresh_summary()
+
+    @staticmethod
+    def _apply_to_descendants(item, state) -> None:
+        """Push a folder's own state down its whole subtree.
+
+        Partial is an aggregate, never something a folder imposes on its
+        children, so it is not propagated.
+        """
+        if state not in (Qt.Checked, Qt.Unchecked):
+            return
+        stack = [item.child(i) for i in range(item.childCount())]
+        while stack:
+            node = stack.pop()
+            node.setCheckState(0, state)
+            stack.extend(node.child(i) for i in range(node.childCount()))
+
+    def _refresh_ancestors(self, item) -> None:
+        """Recompute every folder above `item` from its direct children."""
+        node = item.parent()
+        while node is not None:
+            states = {
+                node.child(i).checkState(0) for i in range(node.childCount())
+            }
+            if states == {Qt.Checked}:
+                state = Qt.Checked
+            elif states == {Qt.Unchecked}:
+                state = Qt.Unchecked
+            else:
+                state = Qt.PartiallyChecked
+            if node.checkState(0) != state:
+                node.setCheckState(0, state)
+            node = node.parent()
+
+    def _set_every_item(self, state) -> None:
+        """Bulk state change with exactly one summary pass at the end.
+
+        Signals stay blocked for the whole walk: letting `itemChanged` fire
+        once per row would re-scan the tree once per row, which on a large
+        torrent is the difference between one pass and twenty thousand.
+        """
+        self.tree.blockSignals(True)
+        try:
+            stack = [
+                self.tree.topLevelItem(i)
+                for i in range(self.tree.topLevelItemCount())
+            ]
+            while stack:
+                node = stack.pop()
+                node.setCheckState(0, state)
+                stack.extend(node.child(i) for i in range(node.childCount()))
+        finally:
+            self.tree.blockSignals(False)
+        self._refresh_summary()
+
+    def select_all(self) -> None:
+        self._set_every_item(Qt.Checked)
+
+    def select_none(self) -> None:
+        self._set_every_item(Qt.Unchecked)
+
+    def _refresh_summary(self) -> None:
+        self._summary_refreshes += 1
+        count = 0
+        total = 0
+        for item, _index, size in self._leaves:
+            if item.checkState(0) == Qt.Checked:
+                count += 1
+                # Integer bytes throughout; only the display is formatted.
+                total += size
+        self._selected_count = count
+        self._selected_bytes = total
+        noun = "file" if self._total_count == 1 else "files"
+        self.summary.setText(
+            f"Selected: {count} of {self._total_count} {noun} "
+            f"- {_human_size(total)}"
+        )
+        self.download_button().setEnabled(count > 0)
+
+    # ---- result ---------------------------------------------------------
+
+    def confirm(self) -> None:
+        """Accept, unless nothing is selected. Nothing else can commit."""
+        if self._selected_count <= 0:
+            return
+        self.accept()
+
+    def result_selection(self) -> tuple[int, ...] | None:
+        """The chosen files, or None when every file is chosen.
+
+        None is not "no answer": it is the answer that means the whole
+        torrent, and it is what keeps an untouched dialog on the exact route
+        Cove took before this preflight existed. An empty choice is refused
+        here as well as by the disabled button, because the one thing it must
+        never become is `None`.
+        """
+        chosen = [
+            index for item, index, _size in self._leaves
+            if item.checkState(0) == Qt.Checked
+        ]
+        if len(chosen) == len(self._leaves):
+            return None
+        return torrent.normalize_file_selection(chosen)
 
 
 class SourceDetailsDialog(QDialog):

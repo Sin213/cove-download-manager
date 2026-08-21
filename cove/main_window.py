@@ -16,6 +16,7 @@ import platform as _platform
 import shutil
 import subprocess
 import sys
+from collections import deque
 from dataclasses import replace
 from math import ceil
 from pathlib import Path
@@ -71,9 +72,16 @@ from .dialogs import (
     SchedulerDialog,
     SettingsDialog,
     SourceDetailsDialog,
+    TorrentContentsDialog,
     torrent_file_problem,
 )
-from .queue import PHASE_METADATA, DownloadTask, PreparedDownload, QueueManager
+from .queue import (
+    PHASE_METADATA,
+    TORRENT_PREFLIGHT_FAILED,
+    DownloadTask,
+    PreparedDownload,
+    QueueManager,
+)
 from .scheduler import Scheduler
 from .search.models import SearchResult
 from .search.service import SearchService
@@ -431,6 +439,12 @@ class MainWindow(QMainWindow):
         # Set before _build_ui: the extension indicator is built from them.
         self._extension_seen = False
         self._extension_setup_error = ""
+        # Local `.torrent` file-choice preflights waiting for their turn.
+        # Parsing is asynchronous, so two dropped torrents can finish while
+        # the first one's modal is up; these serialise the modals without
+        # letting either request lose its own manifest or selection.
+        self._torrent_preflights: deque = deque()
+        self._torrent_preflight_open = False
 
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setWindowTitle(f"{APP_NAME} Download Manager")
@@ -579,6 +593,9 @@ class MainWindow(QMainWindow):
             return
         if self._tray is not None:
             self._tray.hide()
+        # A queued file-choice preflight will never be answered now, and its
+        # managed copy belongs to no task, so it would be left behind.
+        self.discard_torrent_preflights()
         QMainWindow.closeEvent(self, event)
 
     # ---- UI construction ------------------------------------------------
@@ -1331,6 +1348,71 @@ class MainWindow(QMainWindow):
             filename=dlg.result_filename(),
         )
 
+    # ---- local .torrent file-choice preflight ---------------------------
+    #
+    # The queue hands one of these over after it has parsed the `.torrent`,
+    # stored Cove's own copy and prepared the request, and before anything
+    # durable exists. Everything below runs on the GUI thread, because that
+    # is where the queue's worker-completion callback is delivered — the same
+    # place the duplicate prompt has always run.
+
+    def _torrent_preflight(self, request) -> None:
+        """Show Torrent Contents for one parsed local `.torrent`, in turn.
+
+        FIFO by the order the parses finished, and strictly one modal at a
+        time: a second `.torrent` whose parse lands while the first dialog is
+        open joins the queue instead of stacking a nested modal on top of it.
+        Each request keeps its own manifest, managed copy and prepared
+        request, so waiting cannot mix two torrents up.
+        """
+        self._torrent_preflights.append(request)
+        if self._torrent_preflight_open:
+            # A drain is already running (we are inside its dialog's event
+            # loop); it will reach this request when the current one closes.
+            return
+        self._torrent_preflight_open = True
+        try:
+            while self._torrent_preflights:
+                self._resolve_torrent_preflight(self._torrent_preflights.popleft())
+        finally:
+            self._torrent_preflight_open = False
+
+    def _resolve_torrent_preflight(self, request) -> None:
+        """Run one Torrent Contents dialog and answer the queue with it.
+
+        Rejecting (Cancel, Escape, closing the window) commits nothing and
+        hands the managed copy back to be cleaned. So does anything that
+        fails outright, the commit included: an exception must never be read
+        as "download every file", and it must not strand whatever is queued
+        behind it either. Everything from constructing the dialog to creating
+        the task is therefore inside one guard, and the drain keeps going.
+        """
+        try:
+            dlg = TorrentContentsDialog(
+                request.metadata, request.prepared.out_dir, self
+            )
+            accepted = dlg.exec() == TorrentContentsDialog.Accepted
+            selection = dlg.result_selection() if accepted else None
+            if not accepted:
+                self.queue.discard_torrent_preflight(request)
+                return
+            self.queue.commit_torrent_preflight(request, selection)
+        except Exception:
+            # `discard_torrent_preflight` still defers to `_info_hash_in_use`,
+            # so a task that did get created keeps its managed copy.
+            self.queue.discard_torrent_preflight(request)
+            self.queue.error.emit(TORRENT_PREFLIGHT_FAILED)
+
+    def discard_torrent_preflights(self) -> None:
+        """Drop every preflight that never got to open, on the way out.
+
+        Only queued requests: one whose dialog is on screen is owned by the
+        `exec` above and answers for itself. The user's own `.torrent` files
+        are untouched — the queue only ever removes copies from its store.
+        """
+        while self._torrent_preflights:
+            self.queue.discard_torrent_preflight(self._torrent_preflights.popleft())
+
     def add_urls_checked(
         self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
     ) -> list[int]:
@@ -1453,6 +1535,7 @@ class MainWindow(QMainWindow):
                 dlg.torrent_path,
                 dlg.get_dir(),
                 duplicate_check=self._confirm_duplicate,
+                precommit=self._torrent_preflight,
             )
             self._maybe_offer_magnet_handler()
             return
@@ -2076,6 +2159,7 @@ class MainWindow(QMainWindow):
                 path,
                 self.settings.download_dir,
                 duplicate_check=self._confirm_duplicate,
+                precommit=self._torrent_preflight,
             )
         added = self.add_urls_checked(urls) if urls else []
         if added or torrents:
