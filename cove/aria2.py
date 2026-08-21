@@ -36,6 +36,29 @@ class Aria2Error(RuntimeError):
     pass
 
 
+class Aria2RpcError(Aria2Error):
+    """An error aria2 itself returned, as opposed to a failure reaching it.
+
+    The distinction is the point. A transport failure, a timeout or a
+    malformed body all mean "no answer", and a caller must not read anything
+    into them; only a JSON-RPC error object is aria2 stating a fact about the
+    request. Measured against 1.37.0, an unknown gid answers
+    `{code: 1, message: "GID <gid> is not found"}` on tellStatus, forceRemove
+    and removeDownloadResult alike, while an unreachable daemon produces no
+    error object at all - so cleanup can tell "this download is gone" from
+    "aria2 did not answer" without guessing at message text.
+    """
+
+    def __init__(self, method: str, code, message: str):
+        super().__init__(f"RPC {method} failed: {message}")
+        self.code = code
+        self.rpc_message = message
+
+    def gid_not_found(self) -> bool:
+        """True when aria2 said it has no such download."""
+        return "is not found" in str(self.rpc_message).lower()
+
+
 class Aria2InterfaceError(Aria2Error):
     """The configured network interface is not present on this machine.
 
@@ -422,8 +445,14 @@ class Aria2RPC:
         except ValueError as e:
             raise Aria2Error(f"RPC bad response: {e}") from e
         if "error" in data:
-            raise Aria2Error(
-                f"RPC {method} failed: {data['error'].get('message', data['error'])}"
+            error = data["error"]
+            if not isinstance(error, dict):
+                raise Aria2Error(f"RPC {method} failed: {error}")
+            # aria2 answered and said no. Subclassed so a caller can tell this
+            # apart from the "no answer" cases above without parsing strings
+            # that a transport failure could also produce.
+            raise Aria2RpcError(
+                method, error.get("code"), error.get("message", error)
             )
         return data.get("result")
 
@@ -474,6 +503,40 @@ class Aria2RPC:
         opts: dict[str, str] = {"dir": out_dir, "seed-time": "0"}
         if speed_limit_kbps > 0:
             opts["max-download-limit"] = f"{speed_limit_kbps}K"
+        return self._call("aria2.addUri", [[uri], opts])
+
+    def add_magnet_metadata(self, uri: str, out_dir: str) -> str:
+        """Fetch one magnet's metainfo and nothing else. Returns the gid.
+
+        The difference from `add_magnet` is `bt-metadata-only`, and it is the
+        whole difference: measured against aria2 1.37.0, a magnet added
+        without it completes its metadata download and immediately reports a
+        payload child through `followedBy`, writing the torrent's files and
+        an `.aria2` control file into `out_dir`. With it, the gid completes
+        with no `followedBy` at all and `out_dir` holds exactly one file.
+        (`follow-torrent` does not substitute: it governs a downloaded
+        `.torrent` *file*, and neither `mem` nor `false` suppresses the
+        payload child of a magnet.)
+
+        `bt-save-metadata` is what makes the result readable, and it names
+        the file for us: aria2 writes `<lowercase hex info hash>.torrent`
+        into the download directory, so the caller can name the artifact it
+        expects instead of guessing at whatever appeared.
+
+        `out_dir` must be a directory the caller owns and is prepared to
+        delete. It is never the user's download directory: this is a
+        temporary metadata job, and nothing it writes is a download.
+
+        Every option here is per request. Nothing in this method changes
+        aria2's global configuration, so an ordinary transfer running
+        alongside is unaffected.
+        """
+        opts: dict[str, str] = {
+            "dir": out_dir,
+            "bt-metadata-only": "true",
+            "bt-save-metadata": "true",
+            "seed-time": "0",
+        }
         return self._call("aria2.addUri", [[uri], opts])
 
     def add_torrent(

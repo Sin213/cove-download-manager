@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import stat
+import tempfile
+import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Optional
@@ -19,7 +22,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
 
 from . import db, debrid, dedup, diagnostics, netiface, torrent
-from .aria2 import Aria2Error, Aria2RPC, bittorrent_enabled
+from .aria2 import Aria2Error, Aria2RPC, Aria2RpcError, bittorrent_enabled
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
 from .output_paths import (
@@ -189,6 +192,180 @@ class TorrentPreflight:
     prepared: PreparedDownload
 
 
+# The five ways one magnet metadata request can end. Exactly one of them is
+# delivered per request, exactly once. SUCCESS is the only one that produces
+# a TorrentPreflight; the other four leave nothing behind at all.
+MAGNET_SUCCESS = "success"
+MAGNET_ERROR = "error"
+MAGNET_TIMEOUT = "timeout"
+MAGNET_CANCELLED = "cancelled"
+MAGNET_DUPLICATE = "duplicate"
+
+
+class MagnetResolution:
+    """One in-flight magnet metadata request, and everything it owns.
+
+    Request-local by construction, which is the point: two magnets resolving
+    at once each get their own gids, temporary directory and terminal state,
+    so neither can clean up, complete or cancel the other. There is
+    deliberately no queue-level "current resolution".
+
+    Touched from two threads -- a worker drives it, the GUI thread may cancel
+    it -- so every shared field is behind one lock. `state` is the arbiter:
+    whoever sets it first decides how this request ended.
+    """
+
+    def __init__(self, info_hash: str, magnet_uri: str):
+        self.info_hash = info_hash
+        # The magnet exactly as it was accepted, trackers and all. It is the
+        # future task's URL, so nothing here may reduce it to an info hash.
+        self.magnet_uri = magnet_uri
+        self._lock = threading.Lock()
+        self._cancel = threading.Event()
+        self._state = ""
+        self._pending_success = False
+        self._delivered = False
+        self._gids: set[str] = set()
+        self._workspace = ""
+        # Bounded-polling evidence: how many times the worker waited between
+        # status calls. A busy loop would show up here as an absent wait.
+        self.waits = 0
+
+    # ---- terminal state ------------------------------------------------
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    @property
+    def pending_success(self) -> bool:
+        with self._lock:
+            return self._pending_success
+
+    def settle(self, state: str) -> bool:
+        """Claim the terminal state. True only for the caller that won."""
+        with self._lock:
+            if self._state:
+                return False
+            self._state = state
+            return True
+
+    def begin_success(self) -> bool:
+        """Close the cancellation window, without yet declaring the outcome.
+
+        Separate steps because the last of a success - storing the managed
+        copy, preparing the request - runs on the GUI thread and can still
+        fail. Cancelling is refused from here on, but the terminal state
+        stays open so it reports whichever of SUCCESS or ERROR really happens.
+        """
+        with self._lock:
+            if self._state:
+                return False
+            self._pending_success = True
+            return True
+
+    def cancel(self) -> bool:
+        """Ask for this resolution to stop. Idempotent, and never delivers.
+
+        Cancellation only ever *claims the outcome*; the worker still owns
+        announcing it, so there is one deliverer and no way to produce a
+        cancel-then-success pair. A resolution that has already settled, or
+        whose success is already being finished, is past cancelling and says
+        so by returning False.
+        """
+        self._cancel.set()
+        with self._lock:
+            if self._state or self._pending_success:
+                return False
+            self._state = MAGNET_CANCELLED
+            return True
+
+    def abandon(self) -> None:
+        """End this resolution outright, even one already finishing a success.
+
+        The difference from `cancel` is that this cannot lose. `cancel`
+        politely declines to interrupt a success whose last steps are already
+        running, which is right while Cove is up; at shutdown there is nothing
+        left to hand a preflight to, so the pending success is dropped and
+        delivery is claimed here so that no callback can publish afterwards.
+        """
+        self._cancel.set()
+        with self._lock:
+            self._pending_success = False
+            if not self._state:
+                self._state = MAGNET_CANCELLED
+            self._delivered = True
+
+    def claim_delivery(self) -> bool:
+        """True for the first attempt to deliver this request's result."""
+        with self._lock:
+            if self._delivered:
+                return False
+            self._delivered = True
+            return True
+
+    # ---- owned resources -----------------------------------------------
+
+    def note_gid(self, gid) -> None:
+        """Record an aria2 job this request is responsible for."""
+        if isinstance(gid, str) and gid:
+            with self._lock:
+                self._gids.add(gid)
+
+    def note_children(self, followed_by) -> None:
+        """Record whatever `followedBy` this request's own status reported.
+
+        Against aria2 1.37.0 a metadata-only magnet never reports one; if a
+        build ever does, the child is owned and cleaned like the root. Only
+        gids named by *this* request's status, never a global sweep.
+        """
+        if isinstance(followed_by, (list, tuple)):
+            for gid in followed_by:
+                self.note_gid(gid)
+
+    def note_workspace(self, path: str) -> None:
+        with self._lock:
+            self._workspace = path
+
+    # Ownership is given up per resource, and only once that resource is
+    # actually gone. Clearing the bookkeeping first would make the retry pass
+    # a no-op: a removal that failed would be forgotten, and the job or
+    # directory it named would survive with nothing left pointing at it.
+
+    def owned_gids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._gids)
+
+    def release_gid(self, gid: str) -> None:
+        with self._lock:
+            self._gids.discard(gid)
+
+    @property
+    def workspace(self) -> str:
+        with self._lock:
+            return self._workspace
+
+    def release_workspace(self) -> None:
+        with self._lock:
+            self._workspace = ""
+
+    # ---- bounded waiting -----------------------------------------------
+
+    def wait(self, seconds: float) -> None:
+        """Sleep between status calls, returning early once cancelled.
+
+        An Event rather than `time.sleep`, so a cancel lands promptly instead
+        of after one more full poll interval, and so the wait is countable.
+        """
+        self.waits += 1
+        self._cancel.wait(seconds)
+
+
 # Where a URL entered Cove. Diagnostics only - never affects routing.
 _INTAKE_SOURCES = ("manual", "clipboard", "extension", "api", "search", "unknown")
 
@@ -253,6 +430,41 @@ TORRENT_SUPPORT_DISABLED = (
 # or a peer address, and a task error is persisted and shown in the UI. Only
 # aria2's numeric code — which carries no torrent data — is kept.
 TORRENT_ARIA2_FAILED = "Cove's BitTorrent engine could not download this torrent."
+
+# A magnet's file list has to come from the swarm, and the swarm may simply
+# not answer. None of these quotes the magnet, a tracker or a path: a
+# resolution failure is as user-facing as any other task error.
+MAGNET_METADATA_UNAVAILABLE = (
+    "Cove could not read this torrent's file list from the network."
+)
+MAGNET_METADATA_TIMED_OUT = (
+    "This torrent's file list did not arrive in time. The magnet may have no "
+    "peers online right now."
+)
+# The metainfo that came back hashes to a different torrent than the magnet
+# asked for. Peer-supplied data failing its own identity check is the one
+# failure here that is never worth retrying quietly.
+MAGNET_METADATA_MISMATCH = (
+    "This magnet's file list is for a different torrent, so it was not used."
+)
+# The same magnet submitted twice while the first copy is still fetching. Not
+# a held preflight yet - nobody has been asked to choose anything - so the
+# preflight sentence would be untrue, but just as much of a duplicate.
+MAGNET_ALREADY_RESOLVING = "Cove is already fetching this torrent's file list."
+
+# How long a magnet may spend fetching metadata before the resolution is
+# abandoned. Deliberately its own constant: this is a swarm round trip
+# gated on finding a peer that holds the torrent, which has nothing to do
+# with the RPC timeout or the queue's poll interval.
+MAGNET_METADATA_TIMEOUT_S = 60.0
+# Gap between status calls while waiting. Matches the queue's own poll
+# cadence, and is a wait rather than a spin - see MagnetResolution.wait.
+MAGNET_METADATA_POLL_S = 0.5
+# Every artifact one resolution produces lives under one of these, and the
+# whole directory is removed when the request ends however it ends. The
+# name is generated: no part of it comes from the magnet, its `dn`, its
+# trackers or the torrent's own name.
+MAGNET_WORKSPACE_PREFIX = "cove-magnet-metadata-"
 
 # Transient display phase for a magnet whose metadata aria2 is still
 # fetching. Deliberately not a database status: it lasts seconds and a
@@ -693,6 +905,13 @@ class QueueManager(QObject):
         # guard and the commit is a window a second copy of the same torrent
         # slips through.
         self._preflight_hashes: set[str] = set()
+        # Canonical info hash -> the magnet resolution currently fetching its
+        # metadata. An owner of the torrent in exactly the same sense as an
+        # entry above, and held in `_preflight_hashes` for as long as it
+        # lasts; this map exists only so a *second* magnet for the same
+        # torrent can be told which kind of owner it collided with, and so
+        # shutdown can find the resolutions it has to stop.
+        self._magnet_resolutions: dict[str, MagnetResolution] = {}
         # Tasks parked on the one-time P2P disclosure.
         self._awaiting_consent: set[int] = set()
         # Tasks whose owner already accepted the notice this session. The
@@ -1665,6 +1884,443 @@ class QueueManager(QObject):
             self._read_and_store_torrent, source,
             on_done=on_done, on_fail=self.error.emit,
         )
+
+    # ---- magnet metadata resolution ------------------------------------
+    #
+    # A magnet arrives with nothing but an info hash, so choosing files from
+    # one needs the metainfo fetched from the swarm first - and fetched
+    # *before* any commitment exists, or the choice would be happening after
+    # the download it constrains had already started.
+    #
+    # The ordering is the whole design, and is deliberately the opposite way
+    # round from the local `.torrent` path, which stores its managed copy
+    # before it knows whether the torrent is a duplicate. A magnet publishes
+    # its hash in the URI, so there is no excuse for writing anything first:
+    #
+    #     canonical info hash -> duplicate / live / held decision
+    #       -> hold claimed -> metadata fetched -> hash verified
+    #       -> managed copy published -> preflight handed over
+    #
+    # What comes back is an ordinary TorrentPreflight: the same record, held
+    # hash, commit and discard as a local `.torrent`. There is no second
+    # preflight model, and nothing here chooses files.
+
+    def resolve_magnet_preflight(
+        self,
+        url: str,
+        *,
+        out_dir: str | None = None,
+        intake: str = "unknown",
+        on_resolved=None,
+        on_failed=None,
+        timeout_s: float | None = None,
+        poll_s: float | None = None,
+    ) -> MagnetResolution:
+        """Fetch a magnet's metainfo and turn it into a torrent preflight.
+
+        Asynchronous: the swarm round trip, the parse and the info-hash
+        verification all happen on a worker, and the returned handle is how
+        the caller cancels. No UI calls this yet - manual magnets, Search and
+        the API bridge keep the route they had - but the shape is one a GUI
+        can use, because a caller that had to block the event loop for up to
+        a minute could not be written against it. The handle comes back
+        already settled when the request is refused outright: a magnet that
+        will not parse, or one whose torrent is already spoken for, never
+        reaches aria2 at all.
+
+        Exactly one of `on_resolved(request)` / `on_failed(resolution)` is
+        called per request. `on_resolved` receives a `TorrentPreflight` and
+        takes ownership of it, exactly as `add_torrent_file`'s `precommit`
+        does; `on_failed` receives this handle, whose `state` says which
+        failure it was. A refusal made before any work started calls back
+        inline, from this method.
+        """
+        resolution = MagnetResolution("", str(url))
+        if on_resolved is None:
+            # A success always produces a held preflight, which always needs
+            # an owner to commit or discard it. With nobody to hand it to,
+            # nothing would release the hash or delete the managed copy - so
+            # refuse here rather than after a wasted swarm round trip.
+            return self._refuse_magnet_resolution(
+                resolution, MAGNET_ERROR, TORRENT_PREFLIGHT_FAILED, on_failed
+            )
+        if not self._torrent_enabled():
+            return self._refuse_magnet_resolution(
+                resolution, MAGNET_ERROR, TORRENT_SUPPORT_DISABLED, on_failed
+            )
+        try:
+            magnet = torrent.parse_magnet(url)
+        except TorrentError as exc:
+            # Malformed, v2-only, contradictory or simply not a magnet. No
+            # workspace, no aria2 job, nothing to clean up.
+            return self._refuse_magnet_resolution(
+                resolution, MAGNET_ERROR, str(exc), on_failed
+            )
+        resolution = MagnetResolution(magnet.info_hash, magnet.original_uri)
+
+        # Ownership, before anything is written anywhere. All three are the
+        # same refusal and differ only in what they can honestly say about
+        # it. `_live_torrent` covers the last case and, being the queue's one
+        # duplicate guard, the middle one too - so the narrower checks come
+        # first to keep their own accurate sentence rather than borrow its.
+        if magnet.info_hash in self._magnet_resolutions:
+            return self._refuse_magnet_resolution(
+                resolution, MAGNET_DUPLICATE, MAGNET_ALREADY_RESOLVING, on_failed
+            )
+        if magnet.info_hash in self._preflight_hashes:
+            return self._refuse_magnet_resolution(
+                resolution, MAGNET_DUPLICATE, TORRENT_PREFLIGHT_PENDING, on_failed
+            )
+        if self._live_torrent(magnet.info_hash):
+            return self._refuse_magnet_resolution(
+                resolution, MAGNET_DUPLICATE,
+                "That torrent is already in Cove's queue.", on_failed,
+            )
+
+        # The claim itself: one entry in the queue's one held-hash registry,
+        # taken now and held continuously until either a preflight inherits
+        # it or this request fails. Nothing else can own this torrent in
+        # between, so no managed copy can be published under it twice.
+        self._preflight_hashes.add(magnet.info_hash)
+        self._magnet_resolutions[magnet.info_hash] = resolution
+
+        dest = out_dir or self.settings.download_dir
+        self._spawn(
+            self._resolve_magnet_metadata,
+            self.rpc,
+            resolution,
+            MAGNET_METADATA_TIMEOUT_S if timeout_s is None else timeout_s,
+            MAGNET_METADATA_POLL_S if poll_s is None else poll_s,
+            on_done=lambda meta, r=resolution: self._on_magnet_resolved(
+                r, meta, dest, intake, on_resolved, on_failed
+            ),
+            on_fail=lambda msg, r=resolution: self._on_magnet_resolution_failed(
+                r, msg, on_failed
+            ),
+        )
+        return resolution
+
+    def _refuse_magnet_resolution(
+        self, resolution: MagnetResolution, state: str, message: str, on_failed
+    ) -> MagnetResolution:
+        """End a request that never started, delivering its one result."""
+        resolution.settle(state)
+        if resolution.claim_delivery():
+            self.error.emit(message)
+            if on_failed is not None:
+                on_failed(resolution)
+        return resolution
+
+    @staticmethod
+    def _resolve_magnet_metadata(
+        rpc, resolution: MagnetResolution, timeout_s: float, poll_s: float
+    ):
+        """Fetch, contain, parse and verify one magnet's metainfo.
+
+        Runs on a QThreadPool worker; never call it from the GUI thread. It
+        does a network round trip, a bencode parse and a SHA-1.
+
+        Returns validated `TorrentMetadata` whose bytes are already in
+        memory. Deliberately *not* a path: by the time this returns, the
+        directory the metainfo was written to no longer exists.
+        """
+        try:
+            # Inside the try: a workspace that cannot be created is a failure
+            # of this resolution like any other, and must leave it with a
+            # terminal state rather than an empty one. The OSError is
+            # translated because its message carries a filesystem path and
+            # the generic worker handler would put that in front of the user.
+            try:
+                workspace = tempfile.mkdtemp(prefix=MAGNET_WORKSPACE_PREFIX)
+            except OSError:
+                raise TorrentError(MAGNET_METADATA_UNAVAILABLE) from None
+            resolution.note_workspace(workspace)
+            meta = QueueManager._fetch_magnet_metadata(
+                rpc, resolution, workspace, timeout_s, poll_s
+            )
+            # Cleanup is part of the result, not an afterthought. A metainfo
+            # that parsed while a resolver-owned aria2 job survived is not a
+            # clean success, and reporting one would hand the caller a
+            # preflight with a stranded backend job behind it.
+            if not QueueManager._clean_magnet_resolution(rpc, resolution):
+                raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+            # Past cancelling, but not yet declared a success: the caller
+            # still has to store the copy and prepare the request, and those
+            # decide whether this ends as SUCCESS or ERROR.
+            if not resolution.begin_success():
+                # Cancelled while the last of this was running. The state is
+                # already CANCELLED and cleanup has already happened.
+                raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+            return meta
+        except BaseException:
+            # Whatever went wrong, this request's aria2 jobs and its
+            # directory go with it. The original failure stays authoritative:
+            # cleanup here never raises over it.
+            #
+            # Two attempts, the same bounded retry the success path gets: a
+            # transient RPC or filesystem failure must not be the difference
+            # between a timeout that cleans up and one that strands a job.
+            # Each resource stays owned until its own removal succeeds, so
+            # the second pass retries exactly what the first could not free.
+            resolution.settle(MAGNET_ERROR)
+            if not QueueManager._clean_magnet_resolution(rpc, resolution):
+                QueueManager._clean_magnet_resolution(rpc, resolution)
+            raise
+
+    @staticmethod
+    def _fetch_magnet_metadata(
+        rpc, resolution: MagnetResolution, workspace: str,
+        timeout_s: float, poll_s: float,
+    ):
+        """The metadata-only aria2 job, bounded in both time and trust."""
+        if resolution.cancelled:
+            raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+        try:
+            gid = rpc.add_magnet_metadata(resolution.magnet_uri, workspace)
+        except Aria2Error:
+            # aria2's message for a bad magnet tends to quote the magnet.
+            raise TorrentError(MAGNET_METADATA_UNAVAILABLE) from None
+        # Recorded before the next cancellation check, so a cancel that lands
+        # in this instant still finds the gid to clean up.
+        resolution.note_gid(gid)
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if resolution.cancelled:
+                raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+            try:
+                status = rpc.tell_status(gid)
+            except Aria2Error:
+                raise TorrentError(MAGNET_METADATA_UNAVAILABLE) from None
+            # Owned before it is inspected: a child this request produced is
+            # this request's to remove even if the status is a failure.
+            resolution.note_children(status.get("followedBy"))
+            state = str(status.get("status") or "")
+            if state == "complete":
+                break
+            if state in ("error", "removed"):
+                raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+            if time.monotonic() >= deadline:
+                resolution.settle(MAGNET_TIMEOUT)
+                raise TorrentError(MAGNET_METADATA_TIMED_OUT)
+            resolution.wait(poll_s)
+
+        path = QueueManager._magnet_metadata_artifact(
+            workspace, resolution.info_hash
+        )
+        # Only now is anything read. `read_torrent_file` checks the file's
+        # size before opening it and never reads past Cove's `.torrent`
+        # ceiling, so peer-supplied bytes cannot be turned into unbounded
+        # memory here, and the parse is the same hardened one every other
+        # `.torrent` goes through - no faster path for aria2's output.
+        meta = torrent.read_torrent_file(path)
+        if meta.info_hash != resolution.info_hash:
+            # The filename aria2 chose said otherwise, which is exactly why
+            # the filename is not identity. Peer-supplied metainfo that
+            # hashes to a different torrent is refused outright.
+            raise TorrentError(MAGNET_METADATA_MISMATCH)
+        return meta
+
+    @staticmethod
+    def _magnet_metadata_artifact(workspace: str, info_hash: str) -> str:
+        """The one file this request is contracted to have produced.
+
+        aria2's `bt-save-metadata` names its output after the info hash, so
+        the expected path is known in advance and never guessed at: no
+        newest-file rule, no first-match glob, no display name. Anything
+        other than exactly that one file - none, an extra, a differently
+        named one - is ambiguous, and ambiguity fails closed.
+        """
+        expected = f"{info_hash}.torrent"
+        try:
+            found = sorted(
+                name for name in os.listdir(workspace)
+                if name.endswith(".torrent")
+            )
+        except OSError:
+            raise TorrentError(MAGNET_METADATA_UNAVAILABLE) from None
+        if found != [expected]:
+            raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+        path = os.path.join(workspace, expected)
+        # A symlink is refused rather than followed, and refused *without*
+        # being read: the target may be any file this process can open. Only
+        # the link inside the workspace is ever deleted, never what it points
+        # at, because cleanup removes the workspace and nothing else.
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+        # Unreachable as the code stands, and deliberately kept: the name is
+        # built from this workspace and the two checks above refuse any link,
+        # so nothing that gets here can resolve elsewhere. It is a backstop
+        # against a future change to how the artifact is found, not the guard
+        # that does the work - a mutation removing it alone stays green.
+        root = os.path.realpath(workspace)
+        if os.path.dirname(os.path.realpath(path)) != root:
+            raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+        return path
+
+    @staticmethod
+    def _gid_is_gone(rpc, gid: str) -> bool:
+        """Whether aria2 has no record of `gid` at all.
+
+        Asked only to tell an already-purged result apart from one a failure
+        left behind. Only aria2 saying so counts: a transport error, a
+        timeout, a malformed reply and an unreachable daemon are all "no
+        answer", and every one of them keeps the gid owned for the retry
+        rather than letting an outage look like a successful cleanup.
+        """
+        try:
+            return not rpc.tell_status(gid)
+        except Aria2RpcError as exc:
+            return exc.gid_not_found()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clean_magnet_resolution(rpc, resolution: MagnetResolution) -> bool:
+        """Remove exactly what this request owns. Idempotent; True if clean.
+
+        Only gids this request recorded - the metadata job it added and any
+        descendant its own status named. Never every stopped download, never
+        every job on this info hash, and never anything a user started.
+        """
+        clean = True
+        for gid in resolution.owned_gids():
+            try:
+                # Removes a running job, and falls back to purging the
+                # result entry of one that already finished - which is what
+                # a completed metadata gid always is.
+                rpc.remove(gid)
+            except Exception:
+                # Still ours, so the next pass can try again.
+                clean = False
+                continue
+            try:
+                rpc.remove_download_result(gid)
+            except Exception:
+                # Usually benign: for a gid that had already completed,
+                # `remove` above fell back to purging the result itself, so
+                # this second ask reports "not found". But an active gid that
+                # `remove` really did stop still has a result entry, and a
+                # transient failure purging *that* would leak it. The two are
+                # indistinguishable from the error text, so ask aria2
+                # instead: a gid it no longer knows about is genuinely gone.
+                if not QueueManager._gid_is_gone(rpc, gid):
+                    clean = False
+                    continue
+            resolution.release_gid(gid)
+        workspace = resolution.workspace
+        if workspace:
+            try:
+                shutil.rmtree(workspace)
+            except FileNotFoundError:
+                resolution.release_workspace()
+            except OSError:
+                clean = False
+            else:
+                resolution.release_workspace()
+        return clean
+
+    def _on_magnet_resolved(
+        self, resolution: MagnetResolution, meta, dest: str, intake: str,
+        on_resolved, on_failed,
+    ) -> None:
+        """Turn verified metainfo into the ordinary torrent preflight."""
+        if not resolution.pending_success:
+            # Cancelled or timed out while this result was on its way. The
+            # check is on the resolution's own state rather than on delivery
+            # bookkeeping alone, so nothing can publish a preflight for a
+            # request that already ended some other way.
+            return
+        if not resolution.claim_delivery():
+            return
+        try:
+            managed_path = torrent.store_managed_torrent(meta)
+        except TorrentError as exc:
+            resolution.settle(MAGNET_ERROR)
+            self._release_magnet_hold(resolution)
+            self.error.emit(str(exc))
+            if on_failed is not None:
+                on_failed(resolution)
+            return
+        # The original magnet is the request's URL, trackers and all. The
+        # torrent's name comes from the metainfo, never from the magnet's
+        # `dn`, which is a hint a stranger wrote.
+        prepared = self.prepare_url(
+            resolution.magnet_uri,
+            out_dir=dest,
+            source_type=SOURCE_TORRENT,
+            info_hash=meta.info_hash,
+            torrent_name=meta.name,
+            torrent_path=managed_path,
+            intake=intake,
+        )
+        if prepared is None:
+            # Refused during classification, which already said why.
+            resolution.settle(MAGNET_ERROR)
+            self._release_magnet_hold(resolution)
+            self._discard_managed_copy(meta.info_hash, managed_path)
+            if on_failed is not None:
+                on_failed(resolution)
+            return
+        resolution.settle(MAGNET_SUCCESS)
+        request = TorrentPreflight(metadata=meta, prepared=prepared)
+        # The hold does not change hands so much as change owner in place:
+        # the hash has been in `_preflight_hashes` since before the metadata
+        # was fetched, and this is the request that inherits it. There is no
+        # instant in which the torrent is unowned - which is why the
+        # resolution only stops being its owner *after* the preflight starts.
+        self.hold_torrent_preflight(request)
+        self._magnet_resolutions.pop(resolution.info_hash, None)
+        try:
+            if on_resolved is not None:
+                on_resolved(request)
+        except Exception:
+            # The callee never took ownership, so this still owns the copy.
+            # Fail closed, exactly as the local `.torrent` preflight does.
+            self.discard_torrent_preflight(request)
+            self.error.emit(TORRENT_PREFLIGHT_FAILED)
+
+    def _on_magnet_resolution_failed(
+        self, resolution: MagnetResolution, message: str, on_failed
+    ) -> None:
+        if not resolution.claim_delivery():
+            return  # A shutdown already answered for this request.
+        self._release_magnet_hold(resolution)
+        if resolution.state != MAGNET_CANCELLED:
+            # A cancellation is the caller's own doing and needs no sentence.
+            self.error.emit(message)
+        if on_failed is not None:
+            on_failed(resolution)
+
+    def _release_magnet_hold(self, resolution: MagnetResolution) -> None:
+        """Give up this request's claim on its info hash.
+
+        Safe to call for a hash that has already moved on to a preflight or
+        a task: the registry entry is this resolution's or nobody's, and the
+        held hash is only dropped while this resolution still owns it.
+        """
+        if self._magnet_resolutions.get(resolution.info_hash) is resolution:
+            self._magnet_resolutions.pop(resolution.info_hash, None)
+            self._preflight_hashes.discard(resolution.info_hash)
+
+    def cancel_magnet_resolutions(self) -> None:
+        """Stop every magnet resolution and release its hold.
+
+        For window close and application shutdown, where there is nobody left
+        to hand a preflight to. Each resolution is abandoned *before* its hold
+        is released, and abandoning claims delivery, so there is no instant in
+        which the hash is free while a queued completion could still publish
+        under it. Ordinary `cancel` would not do: a resolution already
+        finishing a success declines it, and releasing that one's hold anyway
+        would leave the torrent unowned with a publication still in flight.
+
+        Both this and the completion callback run on the GUI thread, so the
+        abandon-then-release pair cannot be interleaved by the very callback
+        it is suppressing.
+        """
+        for resolution in list(self._magnet_resolutions.values()):
+            resolution.abandon()
+            self._release_magnet_hold(resolution)
 
     def hold_torrent_preflight(self, request: TorrentPreflight) -> None:
         """Record that this torrent is spoken for while its dialog is open.
