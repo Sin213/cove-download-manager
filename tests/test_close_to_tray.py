@@ -180,10 +180,22 @@ def _destroy_hosts():
     QApplication.processEvents()
 
 
+class _ClosingQueue:
+    """Just enough queue for the close sweep to ask it to stop resolving."""
+
+    def __init__(self):
+        self.cancel_calls = 0
+
+    def cancel_magnet_resolutions(self):
+        self.cancel_calls += 1
+
+
 class _Host(QMainWindow):
     """The real MainWindow close/tray methods without its heavy constructor."""
 
     closeEvent = mw.MainWindow.closeEvent
+    close_interactive_preflights = mw.MainWindow.close_interactive_preflights
+    discard_magnet_requests = mw.MainWindow.discard_magnet_requests
     discard_torrent_preflights = mw.MainWindow.discard_torrent_preflights
     request_quit = mw.MainWindow.request_quit
     show_from_tray = mw.MainWindow.show_from_tray
@@ -198,9 +210,15 @@ class _Host(QMainWindow):
         self._tray = _FakeTray() if tray else None
         self._tray_available_flag = tray_available
         self._force_quit = False
-        # A real window always has this; closing drains it so a `.torrent`
-        # preflight the user never answered cannot leave a copy behind.
+        # A real window always has these; closing drains them so neither a
+        # `.torrent` preflight the user never answered nor a magnet still
+        # fetching its file list can leave anything behind.
         self._torrent_preflights = deque()
+        self._magnet_requests = deque()
+        self._magnet_loading = []
+        self._torrent_contents_dialog = None
+        self._preflights_closed = False
+        self.queue = _ClosingQueue()
         self.quit_calls = 0
         self.super_close_calls = 0
 

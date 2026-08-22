@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -504,6 +505,76 @@ class DownloadFileInfoDialog(QDialog):
 # it.
 _FILE_INDEX_ROLE = Qt.UserRole
 _ITEM_PATH_ROLE = Qt.UserRole + 1
+
+
+class MagnetMetadataDialog(QDialog):
+    """"Loading torrent metadata..." while a magnet's file list is fetched.
+
+    Deliberately almost nothing: one sentence, one indeterminate bar and one
+    Cancel. There is no percentage, ETA, peer count, tracker state, provider
+    name or file list, because none of them exist yet - a magnet is only an
+    info hash until the swarm answers, and inventing progress out of elapsed
+    time would be a number that means nothing.
+
+    Cancel is a request, not an outcome. Pressing it, dismissing with Escape
+    and closing the window all emit `cancelled` and leave the dialog up; only
+    `finish` closes it, and the coordinator calls that when the request has
+    actually ended. That is what makes the outcome single-valued: a
+    cancellation that arrives too late to stop a success does not leave the
+    window past a modal the success is still going to answer.
+    """
+
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Torrent Metadata")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        # The one sentence this dialog exists to say, in the shared title
+        # style. `_title_block` was given no subtitle, so the widget it just
+        # added is the heading.
+        _title_block(layout, "Loading torrent metadata...")
+        self.heading = layout.itemAt(layout.count() - 1).widget()
+
+        self.label = QLabel(
+            "Cove is fetching this torrent's file list so you can choose "
+            "which files to download."
+        )
+        self.label.setWordWrap(True)
+        self.label.setProperty("role", "muted")
+        layout.addWidget(self.label)
+
+        self.bar = QProgressBar()
+        # 0..0 is Qt's indeterminate range: a busy indicator, not a measure.
+        self.bar.setRange(0, 0)
+        self.bar.setTextVisible(False)
+        layout.addWidget(self.bar)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setProperty("kind", "ghost")
+        self.cancel_btn.clicked.connect(self.reject)
+        row.addWidget(self.cancel_btn)
+        layout.addLayout(row)
+
+    def reject(self) -> None:  # type: ignore[override]
+        """Ask for the request to stop. Never closes this dialog itself."""
+        self.cancelled.emit()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        """The window's close box means exactly what Cancel means."""
+        event.ignore()
+        self.cancelled.emit()
+
+    def finish(self) -> None:
+        """Close, because the request this belongs to has ended."""
+        QDialog.done(self, QDialog.Accepted)
 
 
 class TorrentContentsDialog(QDialog):

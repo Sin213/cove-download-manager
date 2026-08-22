@@ -754,6 +754,15 @@ class UpdateController(QObject):
             )
             return
         relaunch(new_path)
+        # The replacement is already starting, so this process has to actually
+        # go. A modal preflight runs its own event loop that `quit()` does not
+        # unwind, and lingering here would leave the new process to lose the
+        # single-instance race and exit -- an update that silently does not
+        # happen. The window's own sweep ends those modals through their
+        # ordinary discard paths, so nothing is committed or left held.
+        sweep = getattr(self._parent, "close_interactive_preflights", None)
+        if sweep is not None:
+            sweep()
         app = QApplication.instance()
         if app is not None:
             app.quit()

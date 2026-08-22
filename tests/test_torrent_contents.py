@@ -580,6 +580,7 @@ class Host(mw.MainWindow):
         self.status_pill = _Pill()
         self._torrent_preflights = deque()
         self._torrent_preflight_open = False
+        self._preflights_closed = False
 
     def _refresh_status_pill(self):
         pass
@@ -837,10 +838,16 @@ def test_a_local_torrent_never_reaches_the_download_file_info_preflight(
     assert info_calls == []
 
 
-@pytest.mark.parametrize("magnet_intake", ["manual", "search"])
-def test_a_magnet_never_opens_torrent_contents(
+@pytest.mark.parametrize("magnet_intake", ["search", "api"])
+def test_a_magnet_never_opens_this_local_torrent_preflight(
     queue_env, monkeypatch, tmp_path, magnet_intake
 ):
+    """The local `.torrent` hook is for files. A magnet has no manifest yet.
+
+    Manual magnets acquire one first and then reach this same dialog through
+    their own coordinator, which the manual-magnet suite owns; every other
+    intake keeps the exact route it had.
+    """
     host, queue, rpc, db_path, dialogs, source = _intake(
         queue_env, monkeypatch, tmp_path, _accept(None)
     )

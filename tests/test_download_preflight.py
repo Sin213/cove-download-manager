@@ -7,6 +7,7 @@ suite pins eligibility mechanically: only ONE manual direct HTTP request with
 (extension, Search, yt-dlp, HLS, magnet/torrent, debrid, batch, clipboard,
 internal queue callers) bypasses it and keeps the exact legacy add path.
 """
+from collections import deque
 from dataclasses import replace
 
 import pytest
@@ -38,6 +39,12 @@ class Host(mw.MainWindow):
             mw.Settings(), show_download_options=True, torrent_support_enabled=True
         )
         self._items = {}
+        # A real window always has these; a manual magnet leaves the direct
+        # preflight for the metadata one, which owns them.
+        self._magnet_requests = deque()
+        self._magnet_preflight_open = False
+        self._magnet_loading = []
+        self._preflights_closed = False
 
 
 def _dialog_calls(monkeypatch):
@@ -337,7 +344,6 @@ def test_blank_filename_keeps_none_and_backend_naming(queue_env, monkeypatch):
         ([DIRECT_URL], "extension", "extension direct"),
         ([HLS_URL], "manual", "manual HLS"),
         ([YTDLP_URL], "manual", "manual yt-dlp"),
-        ([MAGNET], "manual", "manual magnet"),
         ([DIRECT_URL, "https://example.com/b.bin"], "manual", "batch"),
         ([DIRECT_URL], "clipboard", "clipboard"),
         ([DIRECT_URL], "search", "search direct"),
@@ -361,6 +367,32 @@ def test_ineligible_paths_never_show_the_dialog(
         assert len(committed) == 2, label
     else:
         assert len(committed) == 1, label
+
+
+def test_a_manual_magnet_leaves_for_the_metadata_preflight_instead(
+    queue_env, monkeypatch
+):
+    """A magnet has no file list yet, so this dialog has nothing to describe.
+
+    It goes to the magnet metadata preflight, which the manual-magnet suite
+    owns, and commits nothing on the way there.
+    """
+    queue, _rpc, _db = queue_env(**_torrent_settings())
+    calls, _plan = _dialog_calls(monkeypatch)
+    committed = _commit_spy(monkeypatch, queue)
+    host = _host(queue)
+    routed = []
+    monkeypatch.setattr(
+        host, "_magnet_preflight",
+        lambda url, out_dir: (routed.append((url, out_dir)), [])[1],
+    )
+
+    ids = host.add_urls_checked([MAGNET], intake="manual")
+
+    assert routed == [(MAGNET, None)]
+    assert calls == []
+    assert committed == []
+    assert ids == []
 
 
 def test_ftp_manual_direct_bypasses_the_preflight(queue_env, monkeypatch):

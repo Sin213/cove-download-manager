@@ -69,6 +69,7 @@ from .dialogs import (
     AddDownloadDialog,
     ClipboardBatchDialog,
     DownloadFileInfoDialog,
+    MagnetMetadataDialog,
     SchedulerDialog,
     SettingsDialog,
     SourceDetailsDialog,
@@ -412,6 +413,75 @@ class DownloadTree(QTreeWidget):
         p.end()
 
 
+class _MagnetRequest:
+    """One manual magnet's interactive metadata request, and only its own.
+
+    Request-local on purpose: the resolver handle, the preflight it produces
+    and the modal showing it live here rather than on the window, so two
+    magnets can never be given each other's metadata, destination, selection
+    or cancellation. Everything on it runs on the GUI thread, where the
+    queue delivers worker completions.
+    """
+
+    def __init__(self, owner):
+        self._owner = owner
+        self.resolution = None
+        self.dialog = None
+        self.preflight = None
+        self.settled = False
+
+    def resolve(self, request) -> None:
+        """Take ownership of a resolved preflight, once."""
+        if self.settled:
+            if request is not self.preflight:
+                self._owner._discard_stale_preflight(request)
+            return
+        self.preflight = request
+        self._finish()
+
+    def fail(self, _resolution) -> None:
+        """Cancelled, refused, timed out or failed: nothing was produced.
+
+        Deliberately silent. The queue emits the one sentence a failure
+        deserves and says nothing for a cancellation, and there is no second
+        error surface here - and no fallback to adding the raw magnet, which
+        would download exactly the files the user was about to deselect.
+        """
+        if self.settled:
+            return
+        self._finish()
+
+    def cancel(self) -> None:
+        """Ask the resolution to stop. The result still closes the dialog."""
+        if self.resolution is not None:
+            self.resolution.cancel()
+
+    def abandon(self) -> None:
+        """End this request outright, whatever it has already produced.
+
+        Settling *before* cancelling is the point: cancellation politely
+        loses to a success whose last steps are already running, so a request
+        given up on here can still be handed a preflight afterwards. Marking
+        it settled first sends that late delivery down `resolve`'s stale
+        path, which gives the preflight back to be cleaned instead of leaving
+        its managed copy and held info hash owned by nobody.
+        """
+        self.settled = True
+        self.cancel()
+        preflight, self.preflight = self.preflight, None
+        if preflight is not None:
+            self._owner._discard_stale_preflight(preflight)
+        dlg, self.dialog = self.dialog, None
+        if dlg is not None:
+            dlg.finish()
+
+    def _finish(self) -> None:
+        self.settled = True
+        dlg, self.dialog = self.dialog, None
+        if dlg is not None:
+            dlg.finish()
+
+
 def _ask_magnet_offer(parent) -> bool:
     """Ask whether Cove should handle magnet links. True when accepted."""
     answer = QMessageBox.question(
@@ -445,6 +515,22 @@ class MainWindow(QMainWindow):
         # letting either request lose its own manifest or selection.
         self._torrent_preflights: deque = deque()
         self._torrent_preflight_open = False
+        # The Torrent Contents modal currently on screen, if any. Only an
+        # explicit Quit reads it, to end its event loop.
+        self._torrent_contents_dialog = None
+        # Latched by the shutdown sweep. Both interactive preflights refuse
+        # to start once it is set, so no order in which nested modal event
+        # loops happen to unwind can put a new one on screen after Cove has
+        # started leaving.
+        self._preflights_closed = False
+        # Manual magnets waiting for their metadata to be fetched, and the
+        # requests currently doing so. The same one-at-a-time discipline as
+        # above, for the same reason: a magnet submitted while another one's
+        # modal is up must wait rather than stack a second interactive
+        # preflight on top of it.
+        self._magnet_requests: deque = deque()
+        self._magnet_preflight_open = False
+        self._magnet_loading: list = []
 
         self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
         self.setWindowTitle(f"{APP_NAME} Download Manager")
@@ -572,7 +658,44 @@ class MainWindow(QMainWindow):
         self._force_quit = True
         if self._tray is not None:
             self._tray.hide()
+        # A modal runs its own event loop, and `QApplication.quit()` does not
+        # unwind one -- measured on Qt 6.11.1, and true of a stock QDialog
+        # too. So the metadata modal has to be ended here or the quit exits
+        # no loop at all: the tray icon is already hidden by this point, and
+        # on a magnet with no peers that window lasts the full metadata
+        # timeout. Cancelling first also means nothing is left resolving.
+        self.close_interactive_preflights()
         QApplication.quit()
+
+    def close_interactive_preflights(self) -> None:
+        """End whichever interactive preflight modal is on screen.
+
+        Both phases of the torrent preflight are modal, and each runs its own
+        event loop that `QApplication.quit()` does not unwind -- measured on
+        Qt 6.11.1, and true of a stock QDialog too. Either one left open
+        would therefore swallow an explicit Quit outright.
+
+        Rejecting rather than closing behind their backs is what keeps this
+        safe: each dialog's own return path then runs, so the resolution is
+        cancelled or the preflight discarded through the ordinary lifecycle
+        and nothing is committed or left held.
+
+        The latch is what makes this final rather than a snapshot. Closing
+        the dialogs that happen to be open is not enough on its own: work
+        already in flight can still deliver a preflight as those nested loops
+        unwind, and each unwind order is another way for one more modal to
+        appear after Cove has started leaving. Refusing to open any is the
+        only version of this that does not depend on the order.
+        """
+        self._preflights_closed = True
+        self.discard_magnet_requests()
+        # Queued preflights are dropped *before* the open dialog is rejected:
+        # unwinding it returns to the drain loop, which would otherwise take
+        # the next one straight out of the queue and put another modal up.
+        self.discard_torrent_preflights()
+        dlg = self._torrent_contents_dialog
+        if dlg is not None:
+            dlg.reject()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """Hide to the tray instead of exiting, only when opted in.
@@ -593,9 +716,11 @@ class MainWindow(QMainWindow):
             return
         if self._tray is not None:
             self._tray.hide()
-        # A queued file-choice preflight will never be answered now, and its
-        # managed copy belongs to no task, so it would be left behind.
-        self.discard_torrent_preflights()
+        # A preflight nobody will answer now owns a managed copy belonging to
+        # no task, so it would be left behind. One sweep serves both exits:
+        # keeping the quit path and this one identical is what stops them
+        # drifting apart and leaking on whichever one was forgotten.
+        self.close_interactive_preflights()
         QMainWindow.closeEvent(self, event)
 
     # ---- UI construction ------------------------------------------------
@@ -1356,7 +1481,7 @@ class MainWindow(QMainWindow):
     # is where the queue's worker-completion callback is delivered — the same
     # place the duplicate prompt has always run.
 
-    def _torrent_preflight(self, request) -> None:
+    def _torrent_preflight(self, request) -> "int | None":
         """Show Torrent Contents for one parsed local `.torrent`, in turn.
 
         FIFO by the order the parses finished, and strictly one modal at a
@@ -1365,20 +1490,37 @@ class MainWindow(QMainWindow):
         Each request keeps its own manifest, managed copy and prepared
         request, so waiting cannot mix two torrents up.
         """
+        if self._preflights_closed:
+            # Cove is leaving. Nobody will answer this, so it is discarded
+            # rather than shown -- the same end its queued siblings met.
+            self.queue.discard_torrent_preflight(request)
+            return None
         self._torrent_preflights.append(request)
         if self._torrent_preflight_open:
             # A drain is already running (we are inside its dialog's event
             # loop); it will reach this request when the current one closes.
-            return
+            return None
         self._torrent_preflight_open = True
+        # The task `request` itself produced, if any. A drain can commit
+        # several, and the caller asked about exactly one of them -- a drop
+        # that reported someone else's task as its own would be a lie.
+        committed = None
         try:
             while self._torrent_preflights:
-                self._resolve_torrent_preflight(self._torrent_preflights.popleft())
+                queued = self._torrent_preflights.popleft()
+                tid = self._resolve_torrent_preflight(queued)
+                if queued is request:
+                    committed = tid
         finally:
             self._torrent_preflight_open = False
+        return committed
 
-    def _resolve_torrent_preflight(self, request) -> None:
+    def _resolve_torrent_preflight(self, request) -> "int | None":
         """Run one Torrent Contents dialog and answer the queue with it.
+
+        Returns the task the user confirmed, or None for every way this can
+        end without one. Callers use it to tell a drop that really did add a
+        download from one that added nothing.
 
         Rejecting (Cancel, Escape, closing the window) commits nothing and
         hands the managed copy back to be cleaned. So does anything that
@@ -1391,17 +1533,25 @@ class MainWindow(QMainWindow):
             dlg = TorrentContentsDialog(
                 request.metadata, request.prepared.out_dir, self
             )
-            accepted = dlg.exec() == TorrentContentsDialog.Accepted
+            # Tracked only so an explicit Quit can end this modal's event
+            # loop; nothing else reads it, and it is cleared the moment the
+            # dialog returns.
+            self._torrent_contents_dialog = dlg
+            try:
+                accepted = dlg.exec() == TorrentContentsDialog.Accepted
+            finally:
+                self._torrent_contents_dialog = None
             selection = dlg.result_selection() if accepted else None
             if not accepted:
                 self.queue.discard_torrent_preflight(request)
-                return
-            self.queue.commit_torrent_preflight(request, selection)
+                return None
+            return self.queue.commit_torrent_preflight(request, selection)
         except Exception:
             # `discard_torrent_preflight` still defers to `_info_hash_in_use`,
             # so a task that did get created keeps its managed copy.
             self.queue.discard_torrent_preflight(request)
             self.queue.error.emit(TORRENT_PREFLIGHT_FAILED)
+            return None
 
     def discard_torrent_preflights(self) -> None:
         """Drop every preflight that never got to open, on the way out.
@@ -1412,6 +1562,146 @@ class MainWindow(QMainWindow):
         """
         while self._torrent_preflights:
             self.queue.discard_torrent_preflight(self._torrent_preflights.popleft())
+
+    # ---- manual magnet metadata preflight -------------------------------
+    #
+    # A magnet is only an info hash until the swarm answers, so choosing its
+    # files needs the metainfo first. The reviewed queue already fetches and
+    # verifies it and hands back the *same* `TorrentPreflight` a local
+    # `.torrent` produces; everything here is coordination:
+    #
+    #     manual magnet -> resolver (worker) -> loading modal
+    #       -> the existing Torrent Contents preflight -> commit / discard
+    #
+    # Nothing below parses metainfo, publishes a managed copy, verifies a
+    # hash, touches a resolver gid or rebuilds a magnet. Resolution happens
+    # once per request; the preflight it returns is what gets committed.
+
+    def _manual_magnet(self, url: str) -> bool:
+        """True for a magnet this window may resolve interactively.
+
+        Narrow on purpose. Only the single-URL manual path reaches here at
+        all, and the queue surface is checked because test doubles and
+        minimal callers without the resolver keep their exact prior route.
+        """
+        from . import torrent
+
+        return bool(torrent.is_magnet(url)) and hasattr(
+            self.queue, "resolve_magnet_preflight"
+        )
+
+    def _magnet_preflight(self, url: str, out_dir: str | None) -> list[int]:
+        """Resolve one manual magnet's file list, in turn, and act on it.
+
+        FIFO and strictly one interactive preflight at a time: a magnet that
+        arrives while another one's modal is up -- a second instance, a
+        magnet-handler click -- joins the queue rather than opening a nested
+        one.
+
+        Returns the tasks this call's drain actually committed, which is what
+        tells a caller like `dropEvent` whether anything was added. It is
+        empty whenever the user declined, the metadata never arrived, or the
+        request is still queued behind another -- in every one of those cases
+        no download exists yet, and saying otherwise would be a lie.
+        """
+        if self._preflights_closed:
+            return []
+        request = (url, out_dir)
+        self._magnet_requests.append(request)
+        if self._magnet_preflight_open:
+            # A drain is already running (we are inside its modal's event
+            # loop); it will reach this request when the current one ends.
+            return []
+        self._magnet_preflight_open = True
+        committed: list[int] = []
+        try:
+            while self._magnet_requests:
+                tid = self._resolve_magnet_request(*self._magnet_requests.popleft())
+                if tid is not None:
+                    committed.append(tid)
+        finally:
+            self._magnet_preflight_open = False
+        return committed
+
+    def _resolve_magnet_request(self, url: str, out_dir: str | None) -> "int | None":
+        """Fetch one magnet's metadata, then hand it to Torrent Contents.
+
+        Returns the task the user confirmed, or None for every way this can
+        end without one.
+
+        The modal is closed by whichever result the queue delivers, never by
+        the Cancel button, and that is what makes the outcome single-valued.
+        Cancel only *asks*; if it wins, the cancellation is the result that
+        closes the dialog, and if it loses to a success already being
+        finished, the success is. So a stale click cannot discard a preflight
+        that was handed over, and a late success cannot reopen a request the
+        user already stopped.
+        """
+        record = _MagnetRequest(self)
+        try:
+            record.resolution = self.queue.resolve_magnet_preflight(
+                url, out_dir=out_dir, intake="manual",
+                on_resolved=record.resolve, on_failed=record.fail,
+            )
+            if not record.settled:
+                # Refused outright (unparsable magnet, torrent already spoken
+                # for) answers inline and never gets a modal.
+                dlg = MagnetMetadataDialog(self)
+                record.dialog = dlg
+                dlg.cancelled.connect(record.cancel)
+                self._magnet_loading.append(record)
+                try:
+                    dlg.exec()
+                finally:
+                    if record in self._magnet_loading:
+                        self._magnet_loading.remove(record)
+                    record.dialog = None
+        except Exception:
+            # Anything that goes wrong around the modal still has to leave
+            # this request owning nothing: a resolution already in flight is
+            # cancelled, a preflight already delivered is handed back to be
+            # cleaned, and the exception is not allowed to escape and strand
+            # whatever is queued behind this. Fail closed, exactly as the
+            # local `.torrent` preflight does.
+            record.abandon()
+            self.queue.error.emit(TORRENT_PREFLIGHT_FAILED)
+            return None
+        if record.preflight is not None:
+            # An ordinary torrent preflight from here on: the same dialog,
+            # the same commit and the same discard as a local `.torrent`.
+            return self._torrent_preflight(record.preflight)
+        return None
+
+    def _discard_stale_preflight(self, request) -> None:
+        """Clean a preflight delivered to a request that had already ended.
+
+        The reviewed resolver delivers exactly one result, so this is defence
+        only. Dropping it silently would leak the managed copy and leave the
+        info hash held forever; opening a dialog for a finished request would
+        be worse.
+        """
+        self.queue.discard_torrent_preflight(request)
+
+    def discard_magnet_requests(self) -> None:
+        """Stop every manual magnet request, on the way out.
+
+        Queued entries own nothing at all, so forgetting them is enough. The
+        ones already resolving are stopped through the queue's own shutdown
+        path, which claims their delivery before releasing their hold, so no
+        completion can publish a preflight behind this. Their modals are then
+        closed here, because the result that would normally close them has
+        just been suppressed.
+        """
+        self._magnet_requests.clear()
+        cancel = getattr(self.queue, "cancel_magnet_resolutions", None)
+        if cancel is not None:
+            cancel()
+        for record in list(self._magnet_loading):
+            # `abandon`, not merely closing the dialog: a request whose
+            # `exec` is still trapped under an inner modal may already be
+            # holding a delivered preflight, and that has to be given back
+            # rather than dispatched once the inner loop unwinds.
+            record.abandon()
 
     def add_urls_checked(
         self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
@@ -1470,7 +1760,12 @@ class MainWindow(QMainWindow):
         runs; otherwise (or when the request is ineligible/rejected) the
         exact legacy `add_url` behavior is preserved. Exactly one task is
         ever committed.
+
+        A magnet leaves here before either: its files cannot be chosen until
+        its metadata exists, so it goes to the metadata preflight instead.
         """
+        if self._manual_magnet(cand.url):
+            return self._magnet_preflight(cand.url, out_dir)
         if (
             getattr(getattr(self, "settings", None), "show_download_options", True)
             is not True
