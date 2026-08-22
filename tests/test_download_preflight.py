@@ -384,12 +384,14 @@ def test_a_manual_magnet_leaves_for_the_metadata_preflight_instead(
     routed = []
     monkeypatch.setattr(
         host, "_magnet_preflight",
-        lambda url, out_dir: (routed.append((url, out_dir)), [])[1],
+        lambda url, out_dir, intake: (routed.append((url, out_dir, intake)), [])[1],
     )
 
     ids = host.add_urls_checked([MAGNET], intake="manual")
 
-    assert routed == [(MAGNET, None)]
+    # The origin travels with the request: the coordinator is shared with
+    # Search now, and it must not have to guess which caller it is serving.
+    assert routed == [(MAGNET, None, "manual")]
     assert calls == []
     assert committed == []
     assert ids == []
@@ -491,13 +493,23 @@ def _torrent_settings():
 
 def test_search_result_bypasses_the_preflight(queue_env, monkeypatch):
     """Search intake goes through add_search_result -> add_urls_checked with
-    intake='search'; the magnet is a torrent and must never see the dialog."""
+    intake='search'; the magnet is a torrent and must never see this dialog.
+
+    It leaves for the magnet metadata preflight instead, exactly as a pasted
+    magnet does -- that route is owned by tests/test_search_magnet_contents.py
+    and is stubbed here so this stays a Download File Info test.
+    """
     from cove.search.models import SearchResult
 
     queue, _rpc, _db = queue_env(**_torrent_settings())
     calls, _plan = _dialog_calls(monkeypatch)
     committed = _commit_spy(monkeypatch, queue)
     host = _host(queue)
+    routed = []
+    monkeypatch.setattr(
+        host, "_magnet_preflight",
+        lambda url, out_dir, intake: (routed.append((url, out_dir, intake)), [])[1],
+    )
     result = SearchResult(
         info_hash="0123456789abcdef0123456789abcdef01234567",
         name="Season 1",
@@ -512,8 +524,9 @@ def test_search_result_bypasses_the_preflight(queue_env, monkeypatch):
     ids = host.add_search_result(result)
 
     assert calls == []
-    assert len(ids) == 1
-    assert committed[0].source_type == "torrent"
+    assert routed == [(MAGNET, None, "search")]
+    assert ids == []
+    assert committed == []
 
 
 def test_extension_direct_http_keeps_the_direct_queue_path(queue_env, monkeypatch):

@@ -438,10 +438,15 @@ def test_a_local_torrent_file_never_reaches_the_magnet_resolver(
     assert len(contents.calls) == 1
 
 
-def test_a_search_magnet_keeps_its_existing_route(
+def test_a_search_magnet_now_shares_this_coordinator(
     queue_env, monkeypatch, tmp_path
 ):
-    """Search is a later slice. Nothing here may claim its magnets early."""
+    """One chosen Search result is the second caller this path ever gained.
+
+    Only the fact of the sharing is asserted here, and only so that a change
+    to the coordinator has to account for both origins; everything about what
+    Search then does with it belongs to tests/test_search_magnet_contents.py.
+    """
     host, queue, rpc, db_path, contents, loading, pending, _d = _env(
         queue_env, monkeypatch, tmp_path
     )
@@ -449,9 +454,9 @@ def test_a_search_magnet_keeps_its_existing_route(
 
     host.add_urls_checked([_magnet(meta.info_hash)], intake="search")
 
-    assert rpc.metadata_added == []
-    assert loading.calls == []
-    assert contents.calls == []
+    assert len(rpc.metadata_added) == 1
+    assert len(loading.calls) == 1
+    assert len(contents.calls) == 1
     assert len(_rows(db_path)) == 1
 
 

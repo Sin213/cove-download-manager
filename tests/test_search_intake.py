@@ -9,14 +9,12 @@ torrent path, and must not rewrite the magnet a source already normalised.
 from PySide6.QtWidgets import QMainWindow
 
 import cove.main_window as mw
-from cove.queue import SOURCE_TORRENT
 from cove.search.models import SearchResult
 
 # Fixture reuse: the real QueueManager environment lives in the queue suite,
 # and duplicating it here would create a second queue test framework.
 from tests.test_queue import (  # noqa: F401
     _one,
-    _persisted_row,
     _rows,
     diag,
     queue_env,
@@ -118,6 +116,13 @@ def test_the_helper_returns_what_add_urls_checked_returns():
 
 
 # ---- Group B: the existing magnet path ---------------------------------
+#
+# A chosen result is a magnet, so past the intake gate it now leaves for the
+# interactive metadata preflight rather than committing outright. That route
+# -- the resolver, both dialogs, the selection and the commit -- belongs to
+# tests/test_search_magnet_contents.py. What these keep proving is that the
+# handover into it is the ordinary one: the same gate, the same duplicate
+# guard, the same intake label, and no Search-only queue path.
 
 
 def _torrent_settings():
@@ -128,20 +133,28 @@ def _torrent_settings():
     )
 
 
-def test_a_selected_result_runs_the_standard_magnet_path(queue_env):
-    """No network, no SearchService, no provider: a real QueueManager sees
-    the magnet arrive through the ordinary torrent classification."""
-    queue, _rpc, db_path = queue_env(**_torrent_settings())
+def _preflight_host(queue):
+    """A host whose interactive coordinator is recorded instead of shown."""
     host = Host()
     host.queue = queue
     host._items = {}
+    host.routed = []
+    host._magnet_preflight = lambda url, out_dir, intake: (
+        host.routed.append((url, out_dir, intake)), []
+    )[1]
+    return host
+
+
+def test_a_selected_result_reaches_the_shared_magnet_coordinator(queue_env):
+    """No network, no SearchService, no provider, and nothing durable yet."""
+    queue, _rpc, db_path = queue_env(**_torrent_settings())
+    host = _preflight_host(queue)
 
     ids = host.add_search_result(make_result())
 
-    assert len(ids) == 1
-    row = _persisted_row(db_path, ids[0])
-    assert row["source_type"] == SOURCE_TORRENT
-    assert row["info_hash"] == INFO_HASH
+    assert host.routed == [(MAGNET, None, "search")]
+    assert ids == []
+    assert _rows(db_path) == []
 
 
 def test_search_provenance_survives_the_intake_allowlist(queue_env, diag):
@@ -149,14 +162,12 @@ def test_search_provenance_survives_the_intake_allowlist(queue_env, diag):
 
     The queue normalises any intake it does not recognise, so a Search
     download would otherwise be indistinguishable from a genuinely unknown
-    one the moment it crossed the diagnostics boundary.
+    one the moment it crossed the diagnostics boundary. Driven through the
+    queue's own commit seam because the GUI coordinator now sits in between.
     """
     queue, _rpc, _db = queue_env(**_torrent_settings())
-    host = Host()
-    host.queue = queue
-    host._items = {}
 
-    tid = host.add_search_result(make_result())[0]
+    tid = queue.add_url(MAGNET, intake="search")
 
     added = _one(diag, "queue", "url_added")
     assert added["task"] == tid
@@ -176,17 +187,22 @@ def test_the_allowlist_still_guards_the_other_intake_values(queue_env, diag):
 
 
 def test_the_standard_duplicate_guard_still_owns_a_repeat_add(queue_env):
-    """Search adds no dedupe of its own; the existing info-hash guard runs."""
+    """Search adds no dedupe of its own; the existing info-hash guard runs.
+
+    A live torrent is checked before the coordinator is ever reached, so the
+    repeat never becomes a second interactive request either.
+    """
     queue, _rpc, db_path = queue_env(**_torrent_settings())
-    host = Host()
-    host.queue = queue
-    host._items = {}
+    host = _preflight_host(queue)
+    prompts = []
+    host._confirm_duplicate = lambda match, label: prompts.append(label) or False
     errors = []
     queue.error.connect(errors.append)
 
-    first = host.add_search_result(make_result())
-    queue.add_url(f"magnet:?xt=urn:btih:{INFO_HASH}")
+    queue.add_url(f"magnet:?xt=urn:btih:{INFO_HASH}", intake="manual")
+    second = host.add_search_result(make_result())
 
-    assert len(first) == 1
     assert len(_rows(db_path)) == 1
-    assert errors
+    assert second == []
+    assert prompts  # the existing gate asked, before any resolver could start
+    assert host.routed == []

@@ -1577,12 +1577,13 @@ class MainWindow(QMainWindow):
     # hash, touches a resolver gid or rebuilds a magnet. Resolution happens
     # once per request; the preflight it returns is what gets committed.
 
-    def _manual_magnet(self, url: str) -> bool:
+    def _interactive_magnet(self, url: str) -> bool:
         """True for a magnet this window may resolve interactively.
 
-        Narrow on purpose. Only the single-URL manual path reaches here at
-        all, and the queue surface is checked because test doubles and
-        minimal callers without the resolver keep their exact prior route.
+        Narrow on purpose. Only single-URL gestures a person made in the GUI
+        reach here at all -- one pasted magnet, one chosen Search result --
+        and the queue surface is checked because test doubles and minimal
+        callers without the resolver keep their exact prior route.
         """
         from . import torrent
 
@@ -1590,13 +1591,21 @@ class MainWindow(QMainWindow):
             self.queue, "resolve_magnet_preflight"
         )
 
-    def _magnet_preflight(self, url: str, out_dir: str | None) -> list[int]:
-        """Resolve one manual magnet's file list, in turn, and act on it.
+    def _magnet_preflight(
+        self, url: str, out_dir: str | None, intake: str = "manual"
+    ) -> list[int]:
+        """Resolve one magnet's file list, in turn, and act on it.
 
         FIFO and strictly one interactive preflight at a time: a magnet that
         arrives while another one's modal is up -- a second instance, a
-        magnet-handler click -- joins the queue rather than opening a nested
-        one.
+        magnet-handler click, a Search result -- joins the queue rather than
+        opening a nested one.
+
+        `intake` is the request's origin, carried through unchanged. It is
+        the one thing that differs between the callers: everything else --
+        the resolver, both dialogs, the commit and this queue -- is shared,
+        which is what stops a Search download and a pasted magnet drifting
+        into two workflows.
 
         Returns the tasks this call's drain actually committed, which is what
         tells a caller like `dropEvent` whether anything was added. It is
@@ -1606,7 +1615,7 @@ class MainWindow(QMainWindow):
         """
         if self._preflights_closed:
             return []
-        request = (url, out_dir)
+        request = (url, out_dir, intake)
         self._magnet_requests.append(request)
         if self._magnet_preflight_open:
             # A drain is already running (we are inside its modal's event
@@ -1623,7 +1632,9 @@ class MainWindow(QMainWindow):
             self._magnet_preflight_open = False
         return committed
 
-    def _resolve_magnet_request(self, url: str, out_dir: str | None) -> "int | None":
+    def _resolve_magnet_request(
+        self, url: str, out_dir: str | None, intake: str
+    ) -> "int | None":
         """Fetch one magnet's metadata, then hand it to Torrent Contents.
 
         Returns the task the user confirmed, or None for every way this can
@@ -1640,7 +1651,7 @@ class MainWindow(QMainWindow):
         record = _MagnetRequest(self)
         try:
             record.resolution = self.queue.resolve_magnet_preflight(
-                url, out_dir=out_dir, intake="manual",
+                url, out_dir=out_dir, intake=intake,
                 on_resolved=record.resolve, on_failed=record.fail,
             )
             if not record.settled:
@@ -1731,9 +1742,10 @@ class MainWindow(QMainWindow):
                     seen[ident] = cand
             checked.append((cand, match))
         if all(m is None for _, m in checked):
-            if len(checked) == 1 and intake == "manual":
-                cand = checked[0][0]
-                return self._add_single_manual(cand, out_dir)
+            if len(checked) == 1:
+                single = self._add_single_interactive(checked[0][0], out_dir, intake)
+                if single is not None:
+                    return single
             return self.queue.add_urls(
                 [c.url for c, _ in checked], out_dir, intake=intake
             )
@@ -1743,13 +1755,41 @@ class MainWindow(QMainWindow):
                 return []
             # Duplicate status affects the confirmation, not the preflight:
             # an eligible single manual direct HTTP URL still gets the
-            # Download File Info dialog after "Download Anyway".
-            if intake == "manual":
-                return self._add_single_manual(cand, out_dir)
+            # Download File Info dialog after "Download Anyway", and a magnet
+            # still goes to the metadata preflight -- where the queue's own
+            # ownership guard has the final word on whether it may proceed.
+            single = self._add_single_interactive(cand, out_dir, intake)
+            if single is not None:
+                return single
             tid = self.queue.add_url(cand.url, out_dir, intake=intake)
             return [] if tid is None else [tid]
         chosen = self._confirm_duplicate_batch(checked)
         return self.queue.add_urls(chosen, out_dir, intake=intake) if chosen else []
+
+    def _add_single_interactive(
+        self, cand: dedup.Candidate, out_dir: str | None, intake: str
+    ) -> "list[int] | None":
+        """Take one GUI gesture down its interactive route, or decline it.
+
+        `None` means "not mine": the caller falls through to the exact
+        non-interactive path it had before. Only the two single-URL gestures
+        a person makes in the window are eligible, and they are eligible for
+        different things -- Add Download can preflight a direct HTTP URL as
+        well as a magnet, while a Search result is a magnet or nothing.
+
+        The origin travels with the request rather than being re-derived
+        later, because by the time the metadata arrives the row it was chosen
+        from may be gone.
+        """
+        if intake == "manual":
+            return self._add_single_manual(cand, out_dir)
+        if intake == "search" and self._interactive_magnet(cand.url):
+            # A Search result's files cannot be chosen until its metadata
+            # exists, exactly as for a pasted magnet -- so it goes to the
+            # same coordinator, and nothing durable is created until the
+            # user has confirmed what to download.
+            return self._magnet_preflight(cand.url, out_dir, intake)
+        return None
 
     def _add_single_manual(
         self, cand: dedup.Candidate, out_dir: str | None
@@ -1764,8 +1804,8 @@ class MainWindow(QMainWindow):
         A magnet leaves here before either: its files cannot be chosen until
         its metadata exists, so it goes to the metadata preflight instead.
         """
-        if self._manual_magnet(cand.url):
-            return self._magnet_preflight(cand.url, out_dir)
+        if self._interactive_magnet(cand.url):
+            return self._magnet_preflight(cand.url, out_dir, "manual")
         if (
             getattr(getattr(self, "settings", None), "show_download_options", True)
             is not True
@@ -1809,6 +1849,14 @@ class MainWindow(QMainWindow):
         already normalised crosses over, and the ordinary intake gate keeps
         duplicate checking, consent, debrid resolution and the torrent
         fallback. No second download path is created for Search.
+
+        Being a magnet, it now goes to the interactive metadata preflight the
+        same way a pasted one does -- one resolution, the existing loading
+        modal, the existing Torrent Contents dialog -- so a Search download
+        is a choice of files rather than the whole torrent. What arrives here
+        is the result object itself, captured when the user activated it, so
+        the rows underneath may be re-sorted, replaced or cleared while its
+        metadata loads without the request following them.
         """
         return self.add_urls_checked([result.magnet], intake="search")
 

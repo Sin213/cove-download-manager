@@ -838,14 +838,15 @@ def test_a_local_torrent_never_reaches_the_download_file_info_preflight(
     assert info_calls == []
 
 
-@pytest.mark.parametrize("magnet_intake", ["search", "api"])
+@pytest.mark.parametrize("magnet_intake", ["api", "extension"])
 def test_a_magnet_never_opens_this_local_torrent_preflight(
     queue_env, monkeypatch, tmp_path, magnet_intake
 ):
     """The local `.torrent` hook is for files. A magnet has no manifest yet.
 
-    Manual magnets acquire one first and then reach this same dialog through
-    their own coordinator, which the manual-magnet suite owns; every other
+    The two GUI magnet gestures -- a pasted one and a chosen Search result --
+    acquire one first and then reach this same dialog through the shared
+    metadata coordinator, which their own suites own; every non-interactive
     intake keeps the exact route it had.
     """
     host, queue, rpc, db_path, dialogs, source = _intake(
