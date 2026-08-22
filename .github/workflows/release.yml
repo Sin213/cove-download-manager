@@ -342,30 +342,15 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.6.0
+          ## What's new in 3.6.1
 
-          Cove can now find torrents itself. Search is built in, it goes through the same network interface as your downloads, and what you pick lands in the ordinary queue - no external site, no external client, no account anywhere.
+          A follow-up to Search: you can now review what's inside a torrent before it downloads, and sort search results by column - the latter suggested by QB, thank you.
 
           ### Added
 
-          - **Built-in Search for Movies, TV, Anime and Games.** Type a query, pick a category, and every source that covers it is queried at once; the results come back merged, de-duplicated and sorted together, and adding one queues it like any other download.
-          - **Seven built-in Search sources: YTS, Nyaa, FitGirl, SubsPlease, nekoBT, GOG Games and Torrents-CSV.** Movies come from YTS and Torrents-CSV, TV from Torrents-CSV, Anime from Nyaa, SubsPlease and nekoBT, and Games from FitGirl and GOG Games. The built-in list is fixed at build time - nothing is loaded from disk or the network to decide what runs, and no built-in source needs an account.
-          - **Your own Torznab indexers, added in Settings -> Indexers.** Point Cove at a Jackett or Prowlarr instance, or anything else that speaks Torznab, and it is queried alongside the built-in sources. Each entry can be enabled or disabled on its own and reordered to decide which source wins when two of them return the same torrent.
-          - **Custom endpoints are classified before any request is made.** Only exact localhost, literal loopback, RFC1918 and link-local addresses and their IPv6 equivalents count as local; everything else must be HTTPS and stays bound to your selected interface. A hostname is never resolved to make that decision, and an indexer's response is parsed as untrusted input either way.
-          - **Results are ranked by how well the title matches the query**, from an exact match down to the same words scattered anywhere in the title, with seeders and source priority breaking the ties below that. Matching works on whole words, so a search for `Ring` finds "The Ring" and never "Daring".
-          - **Search requests use the network interface selected in Cove's Settings**, the same interface downloads are already bound to, rather than going out over whatever adapter happens to be default.
-
-          ### Changed
-
-          - **Every source now walks a bounded number of result pages** rather than stopping at the first one, so a query reaches deeper without any source being able to run away with the request.
-          - **Torrents-CSV replaces Rutor** as the Movies and TV source.
-          - **The Pirate Bay source is deactivated for this release.** Its documented API host stopped answering Cove entirely while DNS, TCP and TLS to it all still succeed; no Cove defect was found and no successor host is documented, so it sits out rather than failing every search it takes part in.
-
-          ### Fixed
-
-          - **The frameless window is easier to grab by its edges.** The resize hit area was tight enough that a corner drag often missed and moved the window instead.
-          - **Magnet links that are still fetching metadata behave properly when you remove or restart them.** The metadata task is now tracked through its whole life, so cancelling one during that stage no longer leaves work behind.
-          - **Displayed download progress no longer jumps around.** Progress is reported steadily rather than briefly showing a stale or out-of-order position.
+          - **Torrent contents selection dialog.** Before a torrent starts, see the full list of files it contains and choose which ones to actually download, for both manually added magnets and magnets picked from Search.
+          - **Magnet metadata resolver.** Cove fetches a magnet's file list itself so the contents dialog has something to show, without needing an external site or client.
+          - **Search results can be sorted by column** (suggested by QB) - click a column header to reorder results by that field.
 
           ### Notes
 

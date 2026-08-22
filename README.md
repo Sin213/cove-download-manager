@@ -7,7 +7,7 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux-informational?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Version](https://img.shields.io/badge/release-v3.6.0-5eead4?style=flat-square)
+![Version](https://img.shields.io/badge/release-v3.6.1-5eead4?style=flat-square)
 
 ![Cove Download Manager](docs/screenshot.png)
 
