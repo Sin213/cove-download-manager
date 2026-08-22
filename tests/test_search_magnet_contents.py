@@ -1413,13 +1413,25 @@ def test_downloading_a_result_leaves_the_rows_and_their_order_alone(
     widget = _wired(host)
     results = (_result(meta_b, name="Zed"), _result(meta_a, name="Alpha"))
     widget.set_results(results)
-    widget.table.selectRow(1)
+    # Captured before the click rather than asserted as the supplied order:
+    # the widget sorts rows for display (see tests/test_search_sorting.py), and
+    # what this test is about is that downloading disturbs nothing.
+    before = [widget.table.item(r, 0).text() for r in range(widget.table.rowCount())]
+    rendered = [
+        widget.table.item(r, 0).data(mw.Qt.UserRole)
+        for r in range(widget.table.rowCount())
+    ]
+    widget.table.selectRow(before.index("Alpha"))
 
     widget.download_button.click()
 
     shown = [widget.table.item(r, 0).text() for r in range(widget.table.rowCount())]
-    assert shown == ["Zed", "Alpha"]
-    assert widget.table.item(0, 0).data(mw.Qt.UserRole) is results[0]
+    assert shown == before
+    assert [
+        widget.table.item(r, 0).data(mw.Qt.UserRole)
+        for r in range(widget.table.rowCount())
+    ] == rendered
+    assert {id(r) for r in rendered} == {id(r) for r in results}
     widget.deleteLater()
 
 

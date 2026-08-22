@@ -166,8 +166,11 @@ def test_set_results_renders_one_row_per_result():
     assert w.table.rowCount() == 3
 
 
-def test_set_results_preserves_the_order_it_was_given():
-    """SearchService already ranked these; the widget must not rank them again."""
+def test_set_results_renders_every_result_it_was_given():
+    """The widget owns display order (see tests/test_search_sorting.py), but
+    not membership: every result it is handed appears exactly once, and no
+    other one appears. This replaces an older assertion that the rows kept the
+    service's own order verbatim - the widget now sorts them for display."""
     w = SearchWidget()
     results = (
         _result(1, name="zulu", seeders=1),
@@ -177,7 +180,8 @@ def test_set_results_preserves_the_order_it_was_given():
 
     w.set_results(results)
 
-    assert _column(w, 0) == ["zulu", "alpha", "mike"]
+    assert sorted(_column(w, 0)) == ["alpha", "mike", "zulu"]
+    assert w.table.rowCount() == len(results)
 
 
 def test_the_table_does_not_sort_itself():
@@ -675,5 +679,10 @@ def test_an_absurd_swarm_count_falls_back_to_the_placeholder():
 
     w.set_results((_result(1, name="huge", seeders=10**5000), _result(2, name="next"),))
 
-    assert _column(w, 0) == ["huge", "next"]
-    assert w.table.item(0, 2).text() == "—"
+    # Row-position independent: a count that cannot be rendered is an unknown
+    # for sorting too, so it sinks to the bottom (see tests/test_search_sorting.py).
+    # What this test is about is that the refresh survives it and the cell
+    # degrades to the placeholder.
+    assert sorted(_column(w, 0)) == ["huge", "next"]
+    huge_row = _column(w, 0).index("huge")
+    assert w.table.item(huge_row, 2).text() == "—"

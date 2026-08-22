@@ -332,8 +332,17 @@ def test_a_large_result_batch_queries_the_mapping_once():
     assert w.table.rowCount() == 500
     # One mapping per refresh - never a per-row scan.
     assert calls == [1]
-    expected = ["A Name" if n % 2 else "B Name" for n in range(1, 501)]
-    assert _sources(w) == expected
+    # Paired against each row's own result rather than against the supplied
+    # order: the widget sorts rows for display (see tests/test_search_sorting.py),
+    # so the label a row shows must match the result on that row, whichever
+    # row it landed on.
+    name_col = COLUMNS.index("Name")
+    shown = {
+        w.table.item(r, name_col).data(Qt.UserRole): _sources(w)[r]
+        for r in range(w.table.rowCount())
+    }
+    assert len(shown) == 500
+    assert shown == {r: "A Name" if r.source == _CUSTOM_A else "B Name" for r in results}
 
 
 # --- provider failure safety --------------------------------------------------
