@@ -383,3 +383,55 @@ def test_rpc_session_is_thread_local():
     assert sessions["a"] is not sessions["b"]
     # Same thread reuses one session.
     assert rpc._session() is rpc._session()
+
+
+# ---- mid-session death ---------------------------------------------------
+#
+# start() only consults poll() on the way in, so an aria2c that dies after
+# boot used to stay dead for the rest of the session: every download failed
+# with a generic error and the zombie was never even reaped. is_running()
+# is the probe that notices. It deliberately does not repair.
+
+
+def _dead_proc(code: int = 1):
+    """A Popen stand-in for a child that has already exited."""
+    proc = MagicMock()
+    proc.poll.return_value = code
+    return proc
+
+
+def test_is_running_reads_the_child_and_nothing_else():
+    """The GUI timer calls this every few seconds: it must be a poll() and
+    no more - no port probe, no RPC round trip."""
+    daemon = Aria2Daemon(Settings())
+    assert daemon.is_running() is False  # never booted
+
+    daemon._proc = _live_proc()
+    with patch.object(Aria2Daemon, "_port_in_use", side_effect=AssertionError), \
+         patch.object(Aria2RPC, "get_version", side_effect=AssertionError):
+        assert daemon.is_running() is True
+        daemon._proc = _dead_proc()
+        assert daemon.is_running() is False
+
+
+def test_is_running_reaps_the_dead_child():
+    """poll() is what reaps a Popen child; without something calling it,
+    a dead aria2c lingers as a zombie for the rest of the session - which
+    is exactly what was found in the field."""
+    daemon = Aria2Daemon(Settings())
+    proc = _dead_proc()
+    daemon._proc = proc
+
+    assert daemon.is_running() is False
+    assert proc.poll.called
+
+
+def test_is_running_never_restarts_anything():
+    """The probe is the whole contract. Restarting aria2c from here would
+    leave Cove holding gids issued by a process that no longer exists."""
+    daemon = Aria2Daemon(Settings())
+    daemon._proc = _dead_proc()
+    with patch("cove.aria2.subprocess.Popen") as popen:
+        for _ in range(5):
+            assert daemon.is_running() is False
+    assert popen.call_count == 0

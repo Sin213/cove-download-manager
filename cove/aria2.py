@@ -278,6 +278,28 @@ class Aria2Daemon:
             )
         raise Aria2Error(f"aria2 RPC did not come up: {last_err}")
 
+    def is_running(self) -> bool:
+        """Whether our aria2c child is alive. Cheap enough for a GUI timer.
+
+        `start()` consults `poll()` only on the way in, as its first-line
+        guard, and nothing re-reads it afterwards. So a child that exits
+        after boot used to go unnoticed for the rest of the session: every
+        download failed with a generic error while the window still looked
+        idle. This is the periodic check that closes that window.
+
+        Deliberately a probe and not a repair. Restarting aria2c from here
+        would leave Cove holding gids issued by a process that no longer
+        exists, and unpicking that reaches into every asynchronous add in
+        the queue - a much larger change than the outage it would paper
+        over. Saying "aria2 is gone, restart Cove" is honest, immediate,
+        and cannot corrupt the queue.
+
+        `poll()` is also the call that reaps a child that has exited, so
+        asking this periodically is what stops a dead aria2c lingering as a
+        zombie for the rest of the session.
+        """
+        return self._proc is not None and self._proc.poll() is None
+
     def _spawn(self, args: list[str]) -> None:
         try:
             self._proc = subprocess.Popen(

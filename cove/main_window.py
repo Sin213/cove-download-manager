@@ -1202,6 +1202,22 @@ class MainWindow(QMainWindow):
         self._extension_setup_error = details
         self.extension_problem.setVisible(True)
 
+    def note_aria2_unavailable(self, message: str) -> None:
+        """aria2 died mid-session; say it where it cannot be missed.
+
+        Deliberately not `queue.error`: `_on_error` discards the message and
+        flashes a generic "Error" in the status pill for four seconds, which
+        is the right call for one download failing and the wrong one here.
+        This outage is session-fatal - every download from now on fails the
+        same way - and the recovery is a thing the user has to do, so the
+        text has to actually arrive.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(f"{APP_NAME} - aria2 stopped")
+        box.setText(message)
+        box.exec()
+
     def _show_extension_setup_details(self) -> None:
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
@@ -1674,6 +1690,12 @@ class MainWindow(QMainWindow):
             # cleaned, and the exception is not allowed to escape and strand
             # whatever is queued behind this. Fail closed, exactly as the
             # local `.torrent` preflight does.
+            #
+            # The toast is deliberately generic, so the cause is logged
+            # here or it is lost: this is the path a dead aria2 takes, and
+            # without a record the only symptom is "ERROR, nothing
+            # downloads" with nothing in the diagnostics to explain it.
+            logging.getLogger("cove").exception("magnet_preflight_failed")
             record.abandon()
             self.queue.error.emit(TORRENT_PREFLIGHT_FAILED)
             return None

@@ -152,6 +152,71 @@ class NativeHostRegistration(QObject):
         return True
 
 
+ARIA2_LOST_MESSAGE = (
+    "aria2 has stopped. Downloads will fail until you restart Cove."
+)
+
+# How often the aria2 child is checked. Long enough to be free, short
+# enough that the user is told before they have clicked Download twice.
+ARIA2_WATCH_INTERVAL_MS = 5000
+
+
+class Aria2Watchdog:
+    """Say so when aria2c dies mid-session, instead of failing in silence.
+
+    `Aria2Daemon.start()`'s liveness check only ever ran at boot, so an
+    aria2c that exited afterwards left the app looking idle while every
+    download failed with a generic error - observed live as ~28 hours of a
+    session whose engine had been dead the whole time, with nothing in the
+    diagnostics to say so.
+
+    Reporting, not repairing. Restarting aria2c here was tried and
+    withdrawn: the replacement daemon knows none of the gids Cove is
+    holding, and making the queue re-own its transfers safely reaches into
+    every asynchronous add it has - three review rounds of races, for an
+    outage the user can clear in seconds by restarting. The probe is a
+    `poll()`, so it is free and cannot itself break anything, and calling
+    it periodically is also what reaps the dead child.
+
+    The outage is reported once, not on every tick, and re-arms if aria2
+    ever comes back, so a second outage is news again.
+
+    `notify` is a callable taking the message, not `queue.error`: the
+    queue's error channel is rendered by `MainWindow._on_error`, which
+    discards the text and flashes a generic "Error" pill for four seconds.
+    That is right for one failed download and useless for an outage whose
+    whole content is what the user has to do next.
+    """
+
+    def __init__(self, daemon, notify):
+        self._daemon = daemon
+        self._notify = notify
+        self._reported = False
+        self._closing = False
+
+    def stop(self) -> None:
+        """Go quiet for shutdown.
+
+        Cleanup stops the daemon on purpose, and a "downloads will fail"
+        toast fired at a window being torn down is noise about something
+        the user just asked for.
+        """
+        self._closing = True
+
+    def check(self) -> None:
+        if self._closing:
+            return
+        if self._daemon.is_running():
+            # The next outage is a new one and must be reported again.
+            self._reported = False
+            return
+        if self._reported:
+            return
+        self._reported = True
+        logging.getLogger("cove").error("aria2_unavailable")
+        self._notify(ARIA2_LOST_MESSAGE)
+
+
 def activate_window(window) -> None:
     """Best-effort bring-to-front. Never raises - a compositor that refuses
     focus must not block the magnet that triggered the activation."""
@@ -517,6 +582,14 @@ def run() -> int:
         # races app startup cannot be persisted straight into "error".
         if settings.api_enabled:
             _start_api_server()
+        # Only now: watching a daemon that never started would report an
+        # outage the user has already been shown a dialog about.
+        watchdog = Aria2Watchdog(daemon, window.note_aria2_unavailable)
+        timer = QTimer(window)
+        timer.setInterval(ARIA2_WATCH_INTERVAL_MS)
+        timer.timeout.connect(watchdog.check)
+        timer.start()
+        window._aria2_watchdog = watchdog  # keep a strong reference
 
     QTimer.singleShot(0, _boot_daemon)
 
@@ -550,6 +623,14 @@ def run() -> int:
             api_server.stop()
         except Exception:
             pass
+        # Before daemon.stop(): shutting the daemon down is deliberate, and
+        # the watchdog must not report it as an outage on the way out.
+        watchdog = getattr(window, "_aria2_watchdog", None)
+        if watchdog is not None:
+            try:
+                watchdog.stop()
+            except Exception:
+                pass
         try:
             rpc.shutdown()
         except Exception:

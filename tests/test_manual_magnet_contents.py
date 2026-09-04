@@ -1846,3 +1846,36 @@ def test_a_single_file_magnet_still_opens_torrent_contents(
     assert len(contents.calls) == 1
     assert len(contents.calls[0].metadata.files) == 1
     assert _rows(db_path)[0]["selected_files"] == ""
+
+
+def test_a_failed_preflight_records_why_it_failed(
+    queue_env, monkeypatch, tmp_path, caplog
+):
+    """The toast is generic by design, so the cause has to reach the log.
+
+    A dead aria2 takes exactly this path: without a record the only
+    evidence a user can produce is "it says ERROR and nothing downloads".
+    """
+    import logging
+
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path
+    )
+    meta = _plan(rpc)
+    errors = _errors(queue)
+
+    def boom(*a, **k):
+        raise RuntimeError("aria2 is not reachable")
+
+    monkeypatch.setattr(queue, "resolve_magnet_preflight", boom)
+
+    with caplog.at_level(logging.ERROR, logger="cove"):
+        host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert errors, "the user is still told something went wrong"
+    records = [r for r in caplog.records if r.name == "cove"]
+    assert records, "the swallowed exception must be logged"
+    assert "magnet_preflight_failed" in records[0].getMessage()
+    assert records[0].exc_info is not None
+    assert "aria2 is not reachable" in str(records[0].exc_info[1])
+    assert _rows(db_path) == []
