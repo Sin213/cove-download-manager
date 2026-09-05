@@ -347,3 +347,233 @@ def test_firefox_zip_ships_its_own_media_boundary(bundles):
             "content/media-tab.js", "content/media-tab.css"} <= names
     assert "media-chrome.js" not in names
     assert "chrome-key.pem" not in names
+
+
+# ---- The popup: one shared shell, one Firefox-only stream module ----
+#
+# Detected streams are a Firefox feature - the detector that finds them ships
+# only there - but the popup section that listed them, and the button that
+# asked the native host to fetch one, shipped in both bundles. Chrome therefore
+# advertised a list it could never fill and carried a send nothing could reach.
+# The section, its stylesheet and its click handler are now one Firefox-only
+# module, composed into the popup at build time.
+
+_SCRIPT_RE = re.compile(r'<script\s+src="([^"]+)"\s*></script>')
+_STYLE_RE = re.compile(r'<link\s+rel="stylesheet"\s+href="([^"]+)"\s*>')
+
+_STREAM_MARKUP = ("streams-section", "streams-list", "Detected Streams")
+
+
+def _popup_html(bundle: Path) -> str:
+    return (bundle / "popup" / "popup.html").read_text()
+
+
+def test_chrome_bundle_has_no_popup_stream_module(bundles):
+    chrome = _files(bundles / "chrome")
+    assert "popup/streams.js" not in chrome
+    assert "popup/streams.css" not in chrome
+    assert "popup/popup.js" in chrome, "the shared popup is not what is excluded"
+
+
+def test_firefox_bundle_keeps_the_popup_stream_module(bundles):
+    firefox = _files(bundles / "firefox")
+    assert "popup/streams.js" in firefox
+    assert "popup/streams.css" in firefox
+
+
+def test_chrome_popup_markup_carries_no_stream_section(bundles):
+    html = _popup_html(bundles / "chrome")
+    for marker in _STREAM_MARKUP:
+        assert marker not in html, f"Chrome popup still ships {marker}"
+    assert not [s for s in _SCRIPT_RE.findall(html) if "streams" in s]
+    assert not [s for s in _STYLE_RE.findall(html) if "streams" in s]
+
+
+def test_the_stream_section_is_built_by_the_module_not_the_template(bundles):
+    """Neither template carries the markup: the Firefox module creates it."""
+    for browser in ("chrome", "firefox"):
+        html = _popup_html(bundles / browser)
+        for marker in _STREAM_MARKUP:
+            assert marker not in html, f"{browser} popup.html should not hard-code {marker}"
+
+
+def test_firefox_popup_loads_its_stream_module_before_the_shared_popup(bundles):
+    scripts = _SCRIPT_RE.findall(_popup_html(bundles / "firefox"))
+    assert scripts.count("streams.js") == 1
+    assert scripts.count("popup.js") == 1
+    # The module publishes the hook the shared popup looks for, so it has to be
+    # evaluated first or the hook is simply not there when initialisation runs.
+    assert scripts.index("streams.js") < scripts.index("popup.js")
+
+    styles = _STYLE_RE.findall(_popup_html(bundles / "firefox"))
+    assert styles.count("streams.css") == 1
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_every_popup_resource_exists_exactly_once(bundles, browser):
+    bundle = bundles / browser
+    html = _popup_html(bundle)
+    popup_dir = bundle / "popup"
+    references = _SCRIPT_RE.findall(html) + _STYLE_RE.findall(html)
+    assert references, "the popup references something"
+    for ref in references:
+        assert references.count(ref) == 1, f"{ref} referenced more than once"
+        assert not ref.startswith(("http://", "https://", "//")), "no remote resource"
+        resolved = (popup_dir / ref).resolve()
+        assert resolved.is_file(), f"{browser} popup references a missing {ref}"
+        assert bundle.resolve() in resolved.parents or resolved.parent == bundle.resolve()
+
+
+def test_the_popup_template_carries_one_of_each_composition_marker():
+    html = (ROOT / "extension" / "popup" / "popup.html").read_text()
+    for marker in (build_extension._POPUP_STYLE_MARKER,
+                   build_extension._POPUP_MODULE_MARKER):
+        assert html.count(marker) == 1
+
+
+def _template(tmp_path: Path, body: str) -> Path:
+    popup = tmp_path / "popup"
+    popup.mkdir()
+    (popup / "popup.html").write_text(body)
+    return popup / "popup.html"
+
+
+def test_popup_composition_swaps_a_marker_for_its_tag(tmp_path):
+    marker = build_extension._POPUP_MODULE_MARKER
+    html = _template(tmp_path, f"<body>\n  {marker}\n  <p></p>\n</body>\n")
+
+    build_extension._compose_popup(tmp_path, {marker: '<script src="streams.js"></script>'})
+
+    assert html.read_text() == (
+        '<body>\n  <script src="streams.js"></script>\n  <p></p>\n</body>\n'
+    )
+
+
+def test_popup_composition_drops_a_marker_it_has_no_tag_for(tmp_path):
+    marker = build_extension._POPUP_MODULE_MARKER
+    html = _template(tmp_path, f"<body>\n  {marker}\n  <p></p>\n</body>\n")
+
+    build_extension._compose_popup(tmp_path, {marker: ""})
+
+    assert html.read_text() == "<body>\n  <p></p>\n</body>\n"
+
+
+def test_popup_composition_refuses_a_missing_marker(tmp_path):
+    """A silently uncomposed popup ships without its module. Fail instead."""
+    _template(tmp_path, "<body>\n  <p></p>\n</body>\n")
+
+    with pytest.raises(ValueError, match="popup-modules"):
+        build_extension._compose_popup(
+            tmp_path, {build_extension._POPUP_MODULE_MARKER: ""})
+
+
+def test_popup_composition_refuses_a_duplicated_marker(tmp_path):
+    marker = build_extension._POPUP_MODULE_MARKER
+    _template(tmp_path, f"<body>\n  {marker}\n  {marker}\n</body>\n")
+
+    with pytest.raises(ValueError, match="popup-modules"):
+        build_extension._compose_popup(tmp_path, {marker: ""})
+
+
+# ---- The reproducibility claim the store listings make ----
+#
+# docs/firefox-store-listing.md tells an AMO reviewer that the bundle is the
+# extension/ directory with exactly one composed file, and describes the two
+# lines that differ. A reviewer diffs the XPI against the repository, so that
+# claim has to keep being true rather than having been true once.
+
+_COMPOSED = "popup/popup.html"
+
+
+def test_firefox_bundle_is_the_source_tree_with_one_composed_file(bundles):
+    bundle = bundles / "firefox"
+    source = ROOT / "extension"
+
+    for rel in sorted(_files(bundle)):
+        if rel == _COMPOSED:
+            continue
+        assert (bundle / rel).read_bytes() == (source / rel).read_bytes(), rel
+
+    built_lines = (bundle / _COMPOSED).read_text().splitlines()
+    source_lines = (source / _COMPOSED).read_text().splitlines()
+    assert len(built_lines) == len(source_lines), "composition replaces lines, never adds"
+
+    differing = [(a, b) for a, b in zip(source_lines, built_lines) if a != b]
+    assert [a.strip() for a, _ in differing] == [
+        build_extension._POPUP_STYLE_MARKER,
+        build_extension._POPUP_MODULE_MARKER,
+    ]
+    assert [b.strip() for _, b in differing] == [
+        '<link rel="stylesheet" href="streams.css">',
+        '<script src="streams.js"></script>',
+    ]
+
+
+def test_chrome_bundle_is_the_source_tree_with_its_markers_dropped(bundles):
+    bundle = bundles / "chrome"
+    source = ROOT / "extension"
+    markers = {build_extension._POPUP_STYLE_MARKER, build_extension._POPUP_MODULE_MARKER}
+
+    for rel in sorted(_files(bundle)):
+        # manifest.json is the MV3 manifest swapped in, not a copy of the MV2 one.
+        if rel in (_COMPOSED, "manifest.json"):
+            continue
+        assert (bundle / rel).read_bytes() == (source / rel).read_bytes(), rel
+
+    built_lines = (bundle / _COMPOSED).read_text().splitlines()
+    source_lines = (source / _COMPOSED).read_text().splitlines()
+    kept = [line for line in source_lines if line.strip() not in markers]
+    assert len(source_lines) - len(kept) == 2, "exactly the two marker lines"
+    assert built_lines == kept
+
+
+# ---- ZIP and unpacked bundle equivalence ----
+#
+# The ZIP is what a store receives and the unpacked directory is what the
+# browser loads when testing. A file count or a version that happens to match
+# is not equivalence, so these compare membership and bytes.
+
+
+def _zip_members(zip_path: Path) -> dict[str, bytes]:
+    from zipfile import ZipFile
+
+    with ZipFile(zip_path) as zf:
+        return {name: zf.read(name) for name in zf.namelist()}
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_zip_membership_matches_the_unpacked_bundle(bundles, browser):
+    zips = list(bundles.glob(f"cove-{browser}-*.zip"))
+    assert len(zips) == 1
+    assert set(_zip_members(zips[0])) == _files(bundles / browser)
+
+
+def test_firefox_zip_bytes_match_the_unpacked_bundle(bundles):
+    bundle = bundles / "firefox"
+    zips = list(bundles.glob("cove-firefox-*.zip"))
+    for name, data in _zip_members(zips[0]).items():
+        assert data == (bundle / name).read_bytes(), f"{name} differs from the unpacked copy"
+
+
+def test_chrome_zip_bytes_match_the_unpacked_bundle_but_for_the_key(bundles):
+    bundle = bundles / "chrome"
+    zips = list(bundles.glob("cove-chrome-*.zip"))
+    members = _zip_members(zips[0])
+
+    for name, data in members.items():
+        if name == "manifest.json":
+            continue
+        assert data == (bundle / name).read_bytes(), f"{name} differs from the unpacked copy"
+
+    # The one deliberate difference, and nothing else: the development key.
+    stored = json.loads(members["manifest.json"])
+    unpacked = json.loads((bundle / "manifest.json").read_text())
+    assert "key" in unpacked and "key" not in stored
+    assert stored == {k: v for k, v in unpacked.items() if k != "key"}
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_no_signing_key_reaches_either_artifact(bundles, browser):
+    zips = list(bundles.glob(f"cove-{browser}-*.zip"))
+    assert "chrome-key.pem" not in _zip_members(zips[0])
+    assert "chrome-key.pem" not in _files(bundles / browser)

@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <link rel="stylesheet" href="popup.css">
+  <!-- cove:popup-styles -->
 </head>
 <body>
   <div class="header">
@@ -19,11 +20,6 @@
     <div class="empty-state">No active downloads</div>
   </div>
 
-  <div id="streams-section" style="display: none;">
-    <div class="section-header">Detected Streams</div>
-    <div id="streams-list"></div>
-  </div>
-
   <div class="footer">
     <button id="open-options" class="footer-btn">Settings</button>
     <button id="copy-diagnostics" class="footer-btn">Copy diagnostics</button>
@@ -31,6 +27,7 @@
   </div>
 
   <script src="../diagnostics.js"></script>
+  <!-- cove:popup-modules -->
   <script src="popup.js"></script>
 </body>
 </html>

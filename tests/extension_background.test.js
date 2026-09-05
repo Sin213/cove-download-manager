@@ -33,7 +33,8 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          slowInterceptedIds = false,
                          worker = false, missingScripts = [],
                          installedMenus = new Map(), menuApi = "lenient" } = {}) {
-  const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [] };
+  const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
+                  notifications: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
@@ -142,7 +143,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       async search(query) { return downloadSearch(query); },
       async download(options) { browserDownloads.push(options); },
     },
-    notifications: { async create() {} },
+    notifications: { async create(options) { calls.notifications.push(options); } },
     runtime: {
       lastError: null,
       getManifest: () => ({ version: "1.4.4" }),
@@ -2327,4 +2328,264 @@ test("Firefox still registers exactly one menu on its promise-only API",
     Array.from(installedMenus.get("download-with-cove").contexts),
     ["link", "image", "video", "audio"],
   );
+});
+
+// ---- The minimum-size filter, as the store copy describes it ----
+//
+// PRIVACY.md and docs/chrome-store-listing.md now say the minimum applies
+// "whenever the browser reports a size", and say so because the filter is
+// `typeof size === "number" && size > 0 && size < minSizeBytes`. An unreported
+// size is deliberately not treated as zero: a response that declares no length
+// would otherwise never be intercepted at all. That carve-out is the part a
+// user-facing claim can most easily overstate, so both halves are pinned here.
+
+const SIZED_SETTINGS = {
+  enabled: true,
+  minSizeBytes: 1_000_000,
+  excludedDomains: [],
+  interceptExtensions: [".zip"],
+  mediaPillEnabled: true,
+};
+
+test("a download under the minimum size is left to the browser", async () => {
+  const { calls, events } = loadBackground({ settings: SIZED_SETTINGS });
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit({
+    id: 41,
+    url: "https://example.test/small.zip",
+    filename: "small.zip",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 500_000,
+  });
+  await settle();
+
+  assert.deepEqual(downloadsOf(calls), [], "below the minimum, so not handed over");
+  assert.deepEqual(calls.cancel, []);
+});
+
+test("a download the browser reports no size for is still intercepted",
+     async () => {
+  const { calls, events } = loadBackground({ settings: SIZED_SETTINGS });
+  await settle();
+  calls.native.length = 0;
+
+  // 0 is what the browser reports when the response declared no length. It is
+  // not a 0-byte file, and treating it as one would silently disable
+  // interception for every chunked response.
+  events.downloadCreated.emit({
+    id: 42,
+    url: "https://example.test/unknown.zip",
+    filename: "unknown.zip",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 0,
+  });
+  await settle();
+
+  assert.equal(downloadsOf(calls).length, 1,
+               "an unreported size is not filtered by the minimum");
+  assert.equal(downloadsOf(calls)[0].url, "https://example.test/unknown.zip");
+  assert.equal(downloadsOf(calls)[0].fileSize, 0);
+});
+
+// ---- Legacy stream dispatch (Tab 2C) ----
+//
+// downloadStream is the popup's original message for a detected HLS stream.
+// The stream detector is Firefox-only and always was, but the forwarding body
+// that answered this message sat in the shared background and would happily
+// hand any HTTP(S) address to the native host from a Chrome build that has no
+// detector, no popup section and no way for a user to reach it. These pin the
+// two halves of the split: Firefox keeps the behaviour it shipped, and Chrome
+// answers the message without a route behind it.
+
+// Emits one runtime message the way the browser would and reports everything
+// the dispatcher is contractually required to get right: what it answered, how
+// many times it answered, and what it returned to the browser. Returning true
+// keeps the response channel open, undefined means it already answered, and
+// false means nothing in this build owns the message - which, for a message the
+// popup is still allowed to send, would leave the caller waiting on a channel
+// that just closes.
+function sendRuntimeMessage(events, msg, sender = {}) {
+  const responses = [];
+  const returned = events.message.emit(msg, sender, (value) => { responses.push(value); });
+  return { responses, returned: returned[0] };
+}
+
+const downloadsOf = (calls) => calls.native.filter((m) => m.action === "download");
+
+test("Chrome answers the legacy stream download instead of forwarding it",
+     async () => {
+  const { calls, events, browserDownloads } = chromeWorker();
+  await settle();
+  calls.native.length = 0;  // Ignore the startup ping.
+  calls.notifications.length = 0;
+
+  const { responses } = sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "http://127.0.0.1:9/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+
+  assert.equal(responses.length, 1, "exactly one answer");
+  assert.equal(responses[0].ok, false);
+  assert.equal(responses[0].reason, "unsupported");
+  assert.deepEqual(downloadsOf(calls), [], "no native download may be sent");
+  assert.deepEqual(browserDownloads, [], "no browser download may stand in for it");
+  assert.deepEqual(calls.notifications, [], "nothing succeeded, so nothing is announced");
+});
+
+test("the Chrome refusal is not a downloadMedia alias", async () => {
+  const { calls, events } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+
+  sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "http://127.0.0.1:9/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+
+  // downloadMedia is the pill's message and reaches the native host. Routing a
+  // refused legacy action into it would restore the exact send this removes.
+  assert.deepEqual(calls.native, []);
+});
+
+test("a build with no media runtime still answers the legacy stream download",
+     async () => {
+  const { calls, events } = loadBackground({ media: false });
+  await settle();
+  calls.native.length = 0;
+
+  const { responses } = sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "http://127.0.0.1:9/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+
+  assert.equal(responses.length, 1);
+  assert.equal(responses[0].ok, false);
+  assert.equal(responses[0].reason, "unsupported");
+  assert.deepEqual(downloadsOf(calls), []);
+});
+
+test("a malformed legacy stream payload closes its channel without throwing",
+     async () => {
+  const { calls, events } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+
+  for (const msg of [
+    { type: "downloadStream" },
+    { type: "downloadStream", url: 42 },
+    { type: "downloadStream", url: "ftp://example.test/live.m3u8" },
+    { type: "downloadStream", url: "http://127.0.0.1:9/live.m3u8", filename: null },
+  ]) {
+    const { responses, returned } = sendRuntimeMessage(events, msg);
+    assert.equal(responses.length, 1, "one answer for " + JSON.stringify(msg));
+    assert.equal(responses[0].ok, false);
+    // Answered synchronously, so the browser must not be told to hold the
+    // channel open for a second reply that never comes.
+    assert.equal(returned, undefined);
+  }
+  await settle();
+  assert.deepEqual(downloadsOf(calls), []);
+});
+
+test("Firefox still forwards a detected stream with the message it shipped",
+     async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  const { responses, returned } = sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+  assert.equal(returned, true, "the response channel stays open for the native reply");
+  await settle();
+
+  assert.deepEqual(plain(calls.native), [{
+    action: "download",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+    referrer: "",
+    cookies: "",
+    fileSize: 0,
+    userAgent:
+      "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
+  }]);
+  assert.equal(responses.length, 1, "answered exactly once");
+  assert.deepEqual(plain(responses[0]), { ok: true });
+});
+
+test("Firefox falls back to an empty stream filename as it did", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+  });
+  await settle();
+
+  assert.equal(calls.native.length, 1);
+  assert.equal(calls.native[0].filename, "");
+});
+
+test("Firefox refuses a stream URL that is not HTTP(S)", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  const { responses, returned } = sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "ftp://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+
+  assert.equal(returned, undefined);
+  assert.equal(responses.length, 1);
+  assert.deepEqual(plain(responses[0]), { ok: false, error: "Unsupported stream URL" });
+  assert.deepEqual(calls.native, []);
+});
+
+test("Firefox reports a malformed native reply as unavailable", async () => {
+  const { events } = loadBackground({ nativeResult: null });
+  await settle();
+
+  const { responses } = sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+
+  assert.equal(responses.length, 1);
+  assert.deepEqual(plain(responses[0]), { ok: false, error: "Cove is unavailable" });
+});
+
+test("Firefox reports a rejected native send as unavailable", async () => {
+  const { events } = loadBackground({
+    nativeResult: () => Promise.reject(new Error("Native host has exited.")),
+  });
+  await settle();
+
+  const { responses } = sendRuntimeMessage(events, {
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+
+  assert.equal(responses.length, 1, "a rejection must still produce one answer");
+  assert.equal(responses[0].ok, false);
+  assert.equal(responses[0].error, "Native host has exited.");
 });

@@ -177,6 +177,41 @@ globalThis.CoveMediaCapability = {
       sendResponse({ url: extractorPageUrl(sender.tab && sender.tab.url) });
       return;
     }
+    if (msg.type === "downloadStream") return downloadStream(msg, sendResponse);
     return false;
   },
 };
+
+// The popup's Download button on a detected stream. This lived in the shared
+// background, which meant a Chrome bundle with no detector, no stream section
+// and no way for a user to reach it still carried a route that would hand any
+// HTTP(S) address to the native host. It belongs with the detector that
+// produced the address, so it is here, unchanged: same validation, same native
+// message, same replies, same asynchronous lifetime.
+//
+// Returns what the adapter contract requires: true while the native reply is
+// still outstanding, undefined once it has already answered.
+function downloadStream(msg, sendResponse) {
+  if (typeof msg.url !== "string" || !/^https?:\/\//i.test(msg.url)) {
+    sendResponse({ ok: false, error: "Unsupported stream URL" });
+    return;
+  }
+  sendNativeMessage({
+    action: "download",
+    url: msg.url,
+    filename: msg.filename || "",
+    referrer: "",
+    cookies: "",
+    fileSize: 0,
+    userAgent: navigator.userAgent,
+  }).then((result) => {
+    if (result && result.status === "ok") {
+      sendResponse({ ok: true });
+    } else {
+      sendResponse({ ok: false, error: (result && result.message) || "Cove is unavailable" });
+    }
+  }).catch((e) => {
+    sendResponse({ ok: false, error: (e && e.message) || "Cove is unavailable" });
+  });
+  return true;
+}

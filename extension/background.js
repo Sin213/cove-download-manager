@@ -521,6 +521,11 @@ const MEDIA_MESSAGE_TYPES = new Set([
   "getDetectedStreams",
   "getMediaPageUrl",
   "downloadMedia",
+  // The popup's original message for a detected stream. The detector that
+  // finds one is Firefox-only, so the send that answers it belongs to that
+  // bundle's adapter and not here; a build without the adapter answers that it
+  // has no such route rather than handing an arbitrary address to Cove.
+  "downloadStream",
 ]);
 
 function registerContextMenu() {
@@ -776,7 +781,18 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       });
       return;
     }
-    return CoveMedia.handleMessage(msg, sender, sendResponse);
+    const handled = CoveMedia.handleMessage(msg, sender, sendResponse);
+    // false is "nothing in this build owns it" - a legacy message whose
+    // capability this bundle does not ship. Answering it is what keeps the
+    // caller from waiting on a channel that simply closes, and it is
+    // deliberately an answer rather than a send: there is no route behind it.
+    if (handled !== false) return handled;
+    sendResponse({
+      ok: false,
+      reason: "unsupported",
+      error: "Stream downloads are not available in this build",
+    });
+    return;
   }
   // Content scripts and the popup cannot load diagnostics.js themselves (the
   // manifest lists one script per context), so they report through here.
@@ -800,30 +816,6 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         return;
       }
       Promise.resolve(coveDiag.clear()).then((ok) => sendResponse({ ok: !!ok }));
-    });
-    return true;
-  }
-  if (msg.type === "downloadStream") {
-    if (typeof msg.url !== "string" || !/^https?:\/\//i.test(msg.url)) {
-      sendResponse({ ok: false, error: "Unsupported stream URL" });
-      return;
-    }
-    sendNativeMessage({
-      action: "download",
-      url: msg.url,
-      filename: msg.filename || "",
-      referrer: "",
-      cookies: "",
-      fileSize: 0,
-      userAgent: navigator.userAgent,
-    }).then((result) => {
-      if (result && result.status === "ok") {
-        sendResponse({ ok: true });
-      } else {
-        sendResponse({ ok: false, error: (result && result.message) || "Cove is unavailable" });
-      }
-    }).catch((e) => {
-      sendResponse({ ok: false, error: (e && e.message) || "Cove is unavailable" });
     });
     return true;
   }

@@ -47,8 +47,29 @@ _EXCLUDE = {"manifest.chrome.json", "chrome-key.pem"}
 # content/ is no longer excluded wholesale, so content/media-sites.js is now
 # doing real work in this set rather than documenting an intent.
 # Guarded by tests/test_extension_bundle.py.
-_CHROME_EXCLUDE = {"media-sites.js", "content/media-sites.js"}
+#
+# popup/streams.js and popup/streams.css are the same decision one level up.
+# Detected streams come from media-sites.js, so a Chrome popup could only ever
+# show an empty list - and the Download button on a stream row was a send with
+# no detector behind it. The section, its styling and its click handler are one
+# Firefox-only module, composed into that bundle's popup below.
+_CHROME_EXCLUDE = {"media-sites.js", "content/media-sites.js",
+                   "popup/streams.js", "popup/streams.css"}
 _FIREFOX_EXCLUDE = {"media-chrome.js"}
+
+# Browser-specific popup resources are composed into the shared popup at build
+# time, so both source manifests keep naming the one popup/popup.html. The
+# markers sit on their own lines in the template and are replaced by a real tag
+# or removed outright.
+_POPUP_HTML = "popup/popup.html"
+_POPUP_STYLE_MARKER = "<!-- cove:popup-styles -->"
+_POPUP_MODULE_MARKER = "<!-- cove:popup-modules -->"
+
+_CHROME_POPUP = {_POPUP_STYLE_MARKER: "", _POPUP_MODULE_MARKER: ""}
+_FIREFOX_POPUP = {
+    _POPUP_STYLE_MARKER: '<link rel="stylesheet" href="streams.css">',
+    _POPUP_MODULE_MARKER: '<script src="streams.js"></script>',
+}
 
 
 def _is_excluded(rel: str, exclude) -> bool:
@@ -73,6 +94,35 @@ def _copy_shared(dest: Path, exclude: set[str] = frozenset()) -> None:
             shutil.copy2(item, target)
 
 
+def _compose_popup(dest: Path, replacements: dict[str, str]) -> None:
+    """Swap the popup's browser-specific include markers for real tags.
+
+    Each marker must sit on a line of its own and appear exactly once. A
+    missing or duplicated marker means the template moved out from under this
+    builder, and the failure it would otherwise produce is silent: a Firefox
+    popup shipped with no stream module, or a Chrome popup shipped with one.
+    """
+    path = dest / _POPUP_HTML
+    seen = {marker: 0 for marker in replacements}
+    out: list[str] = []
+    for line in path.read_text().splitlines(keepends=True):
+        marker = line.strip()
+        if marker in seen:
+            seen[marker] += 1
+            tag = replacements[marker]
+            if tag:
+                out.append(line[: len(line) - len(line.lstrip())] + tag + "\n")
+            continue
+        out.append(line)
+
+    wrong = {marker: count for marker, count in seen.items() if count != 1}
+    if wrong:
+        found = ", ".join(f"{marker} x{count}" for marker, count in sorted(wrong.items()))
+        raise ValueError(f"{_POPUP_HTML}: markers not present exactly once: {found}")
+
+    path.write_text("".join(out))
+
+
 def _zip_dir(src_dir: Path, zip_path: Path, manifest_override: str | None = None) -> None:
     with ZipFile(zip_path, "w", ZIP_DEFLATED) as zf:
         for path in sorted(src_dir.rglob("*")):
@@ -93,12 +143,14 @@ def build(dist: Path | None = None) -> None:
     # Firefox: manifest.json is already the MV2 manifest.
     firefox = DIST / "firefox"
     _copy_shared(firefox, exclude=_FIREFOX_EXCLUDE)
+    _compose_popup(firefox, _FIREFOX_POPUP)
     ff_version = json.loads((firefox / "manifest.json").read_text())["version"]
     _zip_dir(firefox, DIST / f"cove-firefox-{ff_version}.zip")
 
     # Chrome: swap in the MV3 manifest as manifest.json, minus site handling.
     chrome = DIST / "chrome"
     _copy_shared(chrome, exclude=_CHROME_EXCLUDE)
+    _compose_popup(chrome, _CHROME_POPUP)
     mv3 = json.loads((SRC / "manifest.chrome.json").read_text())
     # Unpacked dir keeps `key` so the dev extension id is stable and matches
     # the native host whitelist when loaded unpacked for local testing.

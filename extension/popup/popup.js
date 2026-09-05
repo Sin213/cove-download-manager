@@ -207,65 +207,21 @@ async function refreshDownloads() {
   }
 }
 
-async function refreshStreams() {
-  try {
-    const streams = await browser.runtime.sendMessage({ type: "getDetectedStreams" });
-    const section = document.getElementById("streams-section");
-    const list = document.getElementById("streams-list");
-    if (!section || !list) return;
+// Optional, package-local, and Firefox-only in practice: popup/streams.js
+// publishes it before this script runs, and the Chrome bundle does not contain
+// that file at all (see scripts/build_extension.py). Stream detection is a
+// Firefox feature, so a popup with no module here simply has no stream
+// section - it does not ask for one, and there is nothing to hide.
+const popupStreams = globalThis.CovePopupStreams || null;
 
-    if (!streams || streams.length === 0) {
-      section.style.display = "none";
-      return;
-    }
-
-    section.style.display = "block";
-    list.replaceChildren();
-
-    for (const stream of streams) {
-      const item = document.createElement("div");
-      item.className = "stream-item";
-
-      const urlSpan = document.createElement("span");
-      urlSpan.className = "stream-url";
-      const shortUrl = stream.url.split("?")[0].split("/").slice(-2).join("/");
-      urlSpan.textContent = shortUrl;
-      urlSpan.title = stream.url;
-
-      const btn = document.createElement("button");
-      btn.className = "stream-download-btn";
-      btn.textContent = "Download";
-      btn.addEventListener("click", async () => {
-        const filename = shortUrl.split("/").pop().replace(".m3u8", ".mp4") || "stream.mp4";
-        btn.textContent = "Sending...";
-        btn.disabled = true;
-        try {
-          const response = await browser.runtime.sendMessage({
-            type: "downloadStream",
-            url: stream.url,
-            filename: filename,
-          });
-          btn.textContent = response && response.ok ? "Sent!" : "Cove unavailable";
-        } catch {
-          btn.textContent = "Cove unavailable";
-        }
-        setTimeout(() => { btn.textContent = "Download"; btn.disabled = false; }, 2000);
-      });
-
-      item.appendChild(urlSpan);
-      item.appendChild(btn);
-      list.appendChild(item);
-    }
-  } catch {}
+function refreshAll() {
+  refreshDownloads();
+  if (popupStreams) popupStreams.refresh();
 }
 
 wireDiagnosticsButtons();
 checkConnection();
 loadSettings();
-refreshDownloads();
-refreshStreams();
+refreshAll();
 
-setInterval(() => {
-  refreshDownloads();
-  refreshStreams();
-}, 2000);
+setInterval(refreshAll, 2000);
