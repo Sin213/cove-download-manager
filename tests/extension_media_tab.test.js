@@ -76,19 +76,37 @@ class StubNode {
   }
 
   querySelector(selector) {
-    const match = String(selector).match(/^a\[href\*="([^"]+)"\]$/);
-    if (!match) return null;
-    const needle = match[1];
-    const walk = (node) => {
+    const sel = String(selector).trim();
+    const walk = (node, match) => {
       for (const child of node.children) {
-        const href = child.tagName === "A" ? child.getAttribute("href") : null;
-        if (href && href.includes(needle)) return child;
-        const found = walk(child);
+        if (match(child)) return child;
+        const found = walk(child, match);
         if (found) return found;
       }
       return null;
     };
-    return walk(this);
+
+    const link = sel.match(/^a\[href\*="([^"]+)"\]$/);
+    if (link) {
+      const needle = link[1];
+      return walk(this, (child) => {
+        const href = child.tagName === "A" ? child.getAttribute("href") : null;
+        return !!href && href.includes(needle);
+      });
+    }
+
+    // `tag[attr]`: first descendant of that tag carrying the attribute. The
+    // pill resolves a <source src> child through exactly this shape, so the
+    // stub has to answer it or a stale-source fixture is never seen at all.
+    const tagAttr = sel.match(/^([a-z][a-z0-9-]*)\[([a-z-]+)\]$/i);
+    if (tagAttr) {
+      const [, tag, attr] = tagAttr;
+      return walk(this, (child) =>
+        child.tagName === tag.toUpperCase() && child.getAttribute(attr) != null
+      );
+    }
+
+    return null;
   }
 
   getAttribute(name) {
@@ -106,10 +124,16 @@ class StubNode {
 }
 
 // A <video> placed at `top` with the given size, in viewport coordinates.
-function stubVideo({ top = 100, width = 640, height = 360 } = {}) {
+//
+// `readyState` defaults to HAVE_ENOUGH_DATA because the rest of the fixture
+// already describes a playing element with a resolved currentSrc, and a real
+// browser never reports that combination below HAVE_CURRENT_DATA. Tests that
+// mean "not ready yet" set it to 0 or 1 explicitly.
+function stubVideo({ top = 100, width = 640, height = 360, readyState = 4 } = {}) {
   const video = new StubNode("VIDEO");
   video.paused = false;
   video.ended = false;
+  video.readyState = readyState;
   video.currentSrc = "https://example.test/clip.mp4";
   video.src = "https://example.test/clip.mp4";
   video.scrollTo = (nextTop) => {
@@ -848,3 +872,482 @@ test("a player does not borrow another player's stream", async () => {
   assert.equal(pill.children[0].textContent, "No video found");
 });
 
+
+// ---------------------------------------------------------------------------
+// Direct candidate eligibility
+//
+// A direct DOM candidate has to be the resource the element is actually on,
+// and the browser has to hold data for it. Neither held before: a blob:
+// currentSrc fell through to whatever stale src/source the markup still
+// carried, and a video with no buffered data at all was offered and handed
+// over. Both are proven below through the real click path, and both are
+// gated without disturbing the site adapter's own fallbacks further down.
+// ---------------------------------------------------------------------------
+
+// A <source src> child, the shape the pill looks up with querySelector.
+function sourceChild(url) {
+  const source = new StubNode("SOURCE");
+  source.src = url;
+  return source;
+}
+
+const STALE_SOURCE = "https://cdn.test/stale-source.mp4";
+const STALE_ATTR = "https://cdn.test/stale-attribute.mp4";
+
+// A player on a blob: (MSE) resource whose markup still carries both older
+// direct URLs. Neither describes what is playing.
+function staleMarkupVideo(options = {}) {
+  const video = blobVideo(options);
+  video.src = STALE_ATTR;
+  video.appendChild(sourceChild(STALE_SOURCE));
+  return video;
+}
+
+function downloads(harness) {
+  return harness.sent.filter((m) => m.type === "downloadMedia");
+}
+
+test("the stale-markup fixture really does expose a source element", () => {
+  // Guard for the guards: the stub answered every source[src] lookup with
+  // null before, so a stale-source regression could pass without the branch
+  // it names ever being reached.
+  const video = staleMarkupVideo({ top: 200 });
+  const source = video.querySelector("source[src]");
+
+  assert.ok(source, "the fixture must expose a <source src> child");
+  assert.equal(source.src, STALE_SOURCE);
+  assert.equal(video.getAttribute("src"), STALE_ATTR);
+  assert.match(video.currentSrc, /^blob:/);
+});
+
+test("an ineligible active resource is not swapped for a stale source element", async () => {
+  const video = staleMarkupVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/player",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), [],
+    "the blob: resource is what is playing, so no older DOM URL substitutes for it",
+  );
+});
+
+test("an ineligible active resource is not swapped for a stale src attribute", async () => {
+  // The same rejection must not simply move from one stale DOM fallback to
+  // the other: with no <source> child at all the src attribute is equally
+  // not the active resource.
+  const video = blobVideo({ top: 200 });
+  video.src = STALE_ATTR;
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/player",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(downloads(harness).map((m) => m.url), []);
+});
+
+for (const readyState of [0, 1]) {
+  test(`a video with readyState ${readyState} is not handed over`, async () => {
+    const video = stubVideo({ top: 200, readyState });
+    const harness = loadMediaTab({
+      sites: false,
+      href: "https://example.test/watch",
+      videos: [video],
+      reply: { ok: true },
+    });
+
+    await clickPill(harness, video);
+
+    assert.deepEqual(
+      downloads(harness).map((m) => m.url), [],
+      "below HAVE_CURRENT_DATA the browser has nothing to hand over",
+    );
+  });
+}
+
+test("readyState 2 is enough for a direct resource", async () => {
+  // The boundary itself: HAVE_CURRENT_DATA is the point the gate admits.
+  const video = stubVideo({ top: 200, readyState: 2 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/clip.mp4"],
+  );
+});
+
+test("an eligible active resource outranks every stale DOM alternative", async () => {
+  const video = stubVideo({ top: 200 });
+  video.currentSrc = "https://example.test/active.mp4";
+  video.src = STALE_ATTR;
+  video.appendChild(sourceChild(STALE_SOURCE));
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/active.mp4"],
+    "one click, one handoff, and it is the resource being played",
+  );
+});
+
+test("an element with no currentSrc yet still uses its src attribute", async () => {
+  const video = stubVideo({ top: 200 });
+  video.currentSrc = "";
+  video.src = "https://example.test/from-attribute.mp4";
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/from-attribute.mp4"],
+  );
+});
+
+test("an element with no currentSrc or src falls back to its source child", async () => {
+  const video = stubVideo({ top: 200 });
+  video.currentSrc = "";
+  video.src = "";
+  video.appendChild(sourceChild("https://example.test/from-source.mp4"));
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/from-source.mp4"],
+  );
+});
+
+test("an extensionless direct resource is still eligible", async () => {
+  // Eligibility is structural, not an extension allowlist.
+  const video = stubVideo({ top: 200 });
+  video.currentSrc = "https://example.test/media/stream";
+  video.src = "https://example.test/media/stream";
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/media/stream"],
+  );
+});
+
+test("a replaced resource is re-resolved at click time", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+  hover(harness, video);
+
+  video.currentSrc = "https://example.test/second.mp4";
+  video.src = "https://example.test/second.mp4";
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/second.mp4"],
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The site adapter's own fallbacks survive the gate above
+//
+// Both restrictions apply to the direct DOM branch only. Firefox reaches its
+// embedded-stream and detected-stream candidates through the same function,
+// below that branch, and a blob: or unready element is exactly the case those
+// fallbacks exist for - so gating the direct branch must not short-circuit
+// past them.
+// ---------------------------------------------------------------------------
+
+const EMBEDDED_STREAM = "https://v.redd.it/embedded/HLSPlaylist.m3u8";
+const DETECTED_STREAM = "https://v.redd.it/detected/HLSPlaylist.m3u8";
+
+function withEmbeddedOwner(harness, video, url = EMBEDDED_STREAM) {
+  const owner = new StubNode("DIV");
+  owner["data-hls-url"] = url;
+  harness.body.appendChild(owner);
+  owner.appendChild(video);
+  return owner;
+}
+
+function streamReply(streams) {
+  return (message) => {
+    if (message.type === "getDetectedStreams") return streams;
+    if (message.type === "getSettings") return { mediaPillEnabled: true };
+    return { ok: true };
+  };
+}
+
+async function settle() {
+  for (let i = 0; i < 4; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("a stale source element never displaces the adapter's embedded stream", async () => {
+  const video = staleMarkupVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/feed",
+    videos: [video],
+    reply: streamReply([]),
+  });
+  withEmbeddedOwner(harness, video);
+  await settle();
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), [EMBEDDED_STREAM],
+    "the adapter's stream is the answer here, and the stale markup is not",
+  );
+});
+
+test("a stale source element never displaces the adapter's detected stream", async () => {
+  const video = staleMarkupVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/feed",
+    videos: [video],
+    reply: streamReply([{ url: DETECTED_STREAM }]),
+  });
+  await settle();
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(downloads(harness).map((m) => m.url), [DETECTED_STREAM]);
+});
+
+test("the embedded stream still outranks the detected stream", async () => {
+  const video = staleMarkupVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/feed",
+    videos: [video],
+    reply: streamReply([{ url: DETECTED_STREAM }]),
+  });
+  withEmbeddedOwner(harness, video);
+  await settle();
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), [EMBEDDED_STREAM],
+    "adapter precedence is unchanged by the direct-branch gate",
+  );
+});
+
+for (const readyState of [0, 1]) {
+  test(`the adapter's embedded stream survives readyState ${readyState}`, async () => {
+    // Baseline behaviour, pinned: an MSE player has no buffered data of its
+    // own at this point, which is precisely when the adapter's stream is the
+    // only usable answer. A readiness gate placed ahead of the adapter block
+    // would take it away.
+    const video = staleMarkupVideo({ top: 200, readyState });
+    const harness = loadMediaTab({
+      href: "https://www.reddit.com/feed",
+      videos: [video],
+      reply: streamReply([]),
+    });
+    withEmbeddedOwner(harness, video);
+    await settle();
+
+    await clickPill(harness, video);
+
+    assert.deepEqual(downloads(harness).map((m) => m.url), [EMBEDDED_STREAM]);
+  });
+
+  test(`the adapter's detected stream survives readyState ${readyState}`, async () => {
+    const video = staleMarkupVideo({ top: 200, readyState });
+    const harness = loadMediaTab({
+      href: "https://www.reddit.com/feed",
+      videos: [video],
+      reply: streamReply([{ url: DETECTED_STREAM }]),
+    });
+    await settle();
+
+    await clickPill(harness, video);
+
+    assert.deepEqual(downloads(harness).map((m) => m.url), [DETECTED_STREAM]);
+  });
+}
+
+test("the adapter's page address still wins over everything", async () => {
+  // sitePageUrl is resolved before candidateUrl is ever consulted, so the
+  // direct-branch gate must be invisible to it.
+  const video = staleMarkupVideo({ top: 200, readyState: 0 });
+  const harness = loadMediaTab({
+    href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    videos: [video],
+    reply: streamReply([{ url: DETECTED_STREAM }]),
+  });
+  await settle();
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url),
+    ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
+  );
+});
+
+test("with the adapter loaded and no stream of any kind nothing is handed over", async () => {
+  const video = staleMarkupVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/feed",
+    videos: [video],
+    reply: streamReply([]),
+  });
+  await settle();
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(downloads(harness).map((m) => m.url), []);
+});
+
+// ---------------------------------------------------------------------------
+// The cached candidate cannot outlive its resource
+//
+// onPillClick prefers the URL captured at activation over re-resolving the
+// element. That cache exists for a player that swaps its <video> out from
+// under a click in flight - a case where the old element is detached and
+// there is nothing left to re-resolve. It must not survive the element
+// simply changing what it is playing: `emptied` on a still-present, no
+// longer playing element only schedules a hide, so the pill stays clickable
+// for the grace period with a URL that no longer describes anything.
+// ---------------------------------------------------------------------------
+
+// Clicks the pill that is already up, without hovering again. hover() would
+// reactivate the video and refresh the cached URL, which is the whole thing
+// under test here.
+async function clickWithoutReactivating(host) {
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  assert.ok(pill, "expected the pill element inside the shadow root");
+  pill.dispatch("click", {});
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+test("a cached direct URL is dropped when the resource becomes ineligible", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+  const host = hover(harness, video);
+
+  // The player switches to an MSE source. Nothing reactivates the pill.
+  video.currentSrc = "blob:https://example.test/deadbeef";
+  video.src = "";
+  video.paused = true;
+  video.dispatch("emptied", { target: video });
+
+  await clickWithoutReactivating(host);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), [],
+    "the previous file is not what this element is on any more",
+  );
+});
+
+test("a cached direct URL is dropped when the resource stops being ready", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+  const host = hover(harness, video);
+
+  video.readyState = 0;
+  video.paused = true;
+  video.dispatch("emptied", { target: video });
+
+  await clickWithoutReactivating(host);
+
+  assert.deepEqual(downloads(harness).map((m) => m.url), []);
+});
+
+test("a detached element still falls back to the URL it was activated on", async () => {
+  // The cache's stated purpose, preserved: a dynamic player that tears the
+  // element down mid-click leaves nothing to re-resolve, and the address
+  // captured at activation is still the right answer.
+  //
+  // The element is torn down as well as removed. A detached element that
+  // still holds its own resolvable source would be answered identically with
+  // or without the cache, so the cache would not be under test at all.
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+  const host = hover(harness, video);
+
+  video.isConnected = false;
+  video.currentSrc = "";
+  video.src = "";
+
+  await clickWithoutReactivating(host);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), ["https://example.test/clip.mp4"],
+  );
+});
+
+test("a cached adapter stream survives an element that is still a blob", async () => {
+  // Firefox: the cached URL came from the adapter, and the element being a
+  // blob: is the normal steady state there, not a transition. Re-resolving
+  // must return the same stream rather than throwing the candidate away.
+  const video = staleMarkupVideo({ top: 200 });
+  const harness = loadMediaTab({
+    href: "https://www.reddit.com/feed",
+    videos: [video],
+    reply: streamReply([{ url: DETECTED_STREAM }]),
+  });
+  await settle();
+  const host = hover(harness, video);
+
+  video.paused = true;
+  video.dispatch("emptied", { target: video });
+
+  await clickWithoutReactivating(host);
+
+  assert.deepEqual(downloads(harness).map((m) => m.url), [DETECTED_STREAM]);
+});

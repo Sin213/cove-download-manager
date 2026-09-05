@@ -79,10 +79,32 @@
 
   function candidateUrl(video) {
     if (isDrmProtected(video)) return "";
-    const src = video.currentSrc || video.getAttribute("src") || "";
-    if (isHttpUrl(src)) return src;
-    const source = video.querySelector("source[src]");
-    if (source && isHttpUrl(source.src)) return source.src;
+    // Direct DOM branch. Two things have to hold before an address written in
+    // the markup describes something downloadable:
+    //
+    // - the browser holds data for it. Below HAVE_CURRENT_DATA there is no
+    //   resource yet, only an address that may never resolve, and a bare
+    //   play event does not establish otherwise.
+    // - it is the resource the element is on. currentSrc is what is playing,
+    //   so once it is set it decides: when it is a blob:/data:/MSE address
+    //   the answer is that there is no direct candidate, not that some older
+    //   src or <source> left in the markup can stand in for it. Those name a
+    //   different file.
+    //
+    // Both restrictions stop here. Everything below is the site adapter's,
+    // and a blob: or not-yet-buffered player is exactly what those fallbacks
+    // are for, so neither may return early past them.
+    if (video.readyState >= 2) {
+      const current = video.currentSrc || "";
+      if (current) {
+        if (isHttpUrl(current)) return current;
+      } else {
+        const src = video.getAttribute("src") || "";
+        if (isHttpUrl(src)) return src;
+        const source = video.querySelector("source[src]");
+        if (source && isHttpUrl(source.src)) return source.src;
+      }
+    }
     const embeddedUrl = embeddedStreamUrl(video);
     if (embeddedUrl) return embeddedUrl;
     // blob:/data:/MSE video: use a stream the adapter observed for this tab.
@@ -378,8 +400,20 @@
     // in-flight flag first would mean every exit from here had to remember to
     // release it, and deactivateVideo() refuses to run while that flag is set,
     // so forgetting once pins the pill over the page until a reload.
+    //
+    // currentUrl is the address captured when the pill was put up. It stands
+    // in only once there is nothing left to ask: while the element is still
+    // on the page its present state is what the user is looking at, and a
+    // cached address would otherwise outlive the resource it named. An
+    // element that stops playing without being removed only schedules a
+    // hide, so the pill stays clickable for that grace period, which is long
+    // enough for a player to have switched to a blob: source or dropped
+    // below HAVE_CURRENT_DATA underneath it.
     const pageUrl = sitePageUrl() || location.href;
-    const url = sitePageUrl() || currentUrl || candidateUrl(activeVideo);
+    const url = sitePageUrl() ||
+      (activeVideo && activeVideo.isConnected
+        ? candidateUrl(activeVideo)
+        : currentUrl);
 
     // Generated at the origin of the request so the same id can be followed
     // through the background, the native host and Cove itself.
