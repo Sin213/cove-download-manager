@@ -112,6 +112,46 @@ function diagLoadScript() {
 
 diagLoadScript();
 
+// ---- Media ----
+//
+// The media runtime is two scripts: media-core.js, which publishes CoveMedia,
+// and a per-browser capability it resolves - media-sites.js on Firefox,
+// media-chrome.js on Chrome. Firefox's MV2 manifest lists both ahead of this
+// script, so they are already loaded by the time this runs. Chrome's MV3
+// manifest can name a single service worker file, so this script is the
+// loader there.
+//
+// Synchronously, during ordinary top-level evaluation. An MV3 worker is woken
+// by the event it has to serve and gets no install or startup event on that
+// path, so anything deferred to onInstalled, onStartup, a later message or an
+// asynchronous fetch would leave a woken worker answering a pill click, and
+// registering a context menu, as if the build shipped no media at all.
+
+function mediaLoadScripts() {
+  // Firefox: the manifest already did it. Also the guard that keeps a worker
+  // restart from importing twice on a context that somehow kept the binding.
+  if (typeof CoveMedia !== "undefined") return;
+  // No importScripts and nothing preloaded: a build with no media runtime.
+  // Everything downstream already degrades to links and images.
+  if (typeof importScripts !== "function") return;
+  try {
+    // One call on purpose: a worker fetches every argument before evaluating
+    // any of them, so a missing file leaves neither half loaded rather than a
+    // core with no capability behind it.
+    importScripts("media-core.js", "media-chrome.js");
+  } catch (e) {
+    // The bundle is wrong, not the page. Degrade the way a media-less build
+    // does - CoveMedia stays undefined and the menu below reads it - but say
+    // so, because from the outside those two are indistinguishable and only
+    // one of them is a bug.
+    diagRecord("extension.background", "media_load_failed", "ERROR", {
+      reason: "import_failed",
+    });
+  }
+}
+
+mediaLoadScripts();
+
 function sendNativeMessage(msg, requestId) {
   const action = msg && typeof msg.action === "string" ? msg.action : "unknown";
   diagRecord("extension.background", "native_message_sent", "INFO",
@@ -484,12 +524,12 @@ const MEDIA_MESSAGE_TYPES = new Set([
 ]);
 
 function registerContextMenu() {
-  browser.contextMenus.create(
+  const create = () => browser.contextMenus.create(
     {
       id: "download-with-cove",
       title: "Download with Cove",
-      // media.js adds the media targets when it is present. The Chrome
-      // bundle omits that script, so the menu there is links and images.
+      // The media runtime adds the media targets when it loaded. A build
+      // without it - or one whose import failed - offers links and images.
       contexts: ["link", "image"].concat(
         typeof CoveMedia !== "undefined" ? CoveMedia.contexts : []
       ),
@@ -505,6 +545,48 @@ function registerContextMenu() {
       }
     }
   );
+
+  // Chrome keeps menu items across service worker restarts and across an
+  // extension update, and answers a second create() for the same id with a
+  // duplicate-id error while leaving the installed item exactly as it was -
+  // contexts included. Swallowing that error is therefore not the same as
+  // registering: an install upgrading from the links-and-images build would
+  // keep those two contexts for good and never acquire video and audio.
+  // Clearing first is what makes the registration describe this build rather
+  // than whichever one happened to install the item.
+  //
+  // Creation has to wait for the removal to finish, or the outstanding
+  // removal takes the new item with it and the extension is left with no menu
+  // at all. Which completion signal is available depends on the browser:
+  // Chrome answers with a callback and only gained promise support for this
+  // call in 123, which this manifest does not require; Firefox is
+  // promise-only and validates its arguments. Take whichever arrives, and
+  // create exactly once either way.
+  let created = false;
+  const createOnce = () => {
+    if (created) return;
+    created = true;
+    create();
+  };
+
+  let pending;
+  try {
+    pending = browser.contextMenus.removeAll(createOnce);
+  } catch (e) {
+    // The callback was rejected, so nothing was removed and nothing was
+    // scheduled. Ask again the way this browser wants to be asked.
+    try {
+      pending = browser.contextMenus.removeAll();
+    } catch (e2) {
+      // No usable removeAll at all: create as before. An existing item then
+      // stays as it is, which the duplicate-id branch above already reports.
+      createOnce();
+      return;
+    }
+  }
+  if (pending && typeof pending.then === "function") {
+    pending.then(createOnce, createOnce);
+  }
 }
 
 registerContextMenu();
@@ -513,12 +595,45 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   console.log("Cove: context menu clicked", info.menuItemId, info.linkUrl || info.srcUrl);
   if (info.menuItemId !== "download-with-cove") return;
 
-  // A link target is what the user pointed at, so it always wins. A media
-  // srcUrl does not: MSE players expose a blob: URL that nothing downstream
-  // can fetch, so fall back to the extractor page URL the pill already sends
-  // for the same video. Without media.js there is no fallback and a
-  // non-http target is simply ignored.
-  const target = info.linkUrl || info.srcUrl || "";
+  // The video and audio targets are new here, and a browser that publishes a
+  // media-target policy opts into both halves of it. Firefox publishes none
+  // and keeps exactly the behaviour it shipped with.
+  const mediaAction = info.mediaType === "video" || info.mediaType === "audio";
+  const mediaPolicy = (typeof CoveMediaCapability !== "undefined" &&
+    CoveMediaCapability.rejectMediaTarget) || null;
+
+  // First half: for a media action the element's own source is what was
+  // selected. A link target otherwise wins - which is right for the link and
+  // image targets this menu shipped with, and wrong for media, because a
+  // player wrapped in a hyperlink would hand over the link's destination, a
+  // page, in place of the media the user pointed at. An element with no
+  // source of its own still follows its link.
+  const target = (mediaPolicy && mediaAction)
+    ? (info.srcUrl || info.linkUrl || "")
+    : (info.linkUrl || info.srcUrl || "");
+
+  // Second half: a media element's src is allowed to name a playlist
+  // describing a stream rather than a file, and this build ships no stream
+  // handling. Refusing here, before the address below is chosen, is what
+  // stops a link on the same element, the page address, or a page fallback
+  // from standing in for a media source that was just refused. Ordinary link
+  // and image targets never reach this, and neither does a download the
+  // browser itself started.
+  if (mediaAction && mediaPolicy &&
+      (mediaPolicy(info.srcUrl || "") || mediaPolicy(target))) {
+    // Same silent outcome as any other target the menu cannot hand over, and
+    // recorded so a support report can tell a refusal from nothing happening.
+    diagRecord("extension.background", "request_failed", "WARNING",
+               { reason: "unsupported", trigger: "context_menu" });
+    return;
+  }
+
+  // A media srcUrl the browser cannot hand over directly - an MSE player's
+  // blob: URL - is where the capability may name an alternative. Only
+  // Firefox's does; on Chrome, and on any build with no media runtime, there
+  // is no fallback and a non-http target is simply ignored rather than being
+  // replaced by the page it sits on.
+
   const fallbackUrl = typeof CoveMedia !== "undefined"
     ? CoveMedia.pageFallbackUrl(tab, info)
     : "";
@@ -647,8 +762,9 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendNativeMessage({ action: "ping" }).then(sendResponse);
     return true;
   }
-  // Video messages are media.js's. Without that script (Chrome) the popup's
-  // stream list gets an empty answer and the pill does not exist to ask.
+  // Media messages belong to the media runtime. Without it the popup's stream
+  // list gets an empty answer and the pill does not exist to ask. Chrome loads
+  // the runtime but no stream detector, so it answers that list empty too.
   if (MEDIA_MESSAGE_TYPES.has(msg.type)) {
     if (typeof CoveMedia === "undefined") {
       if (msg.type === "getDetectedStreams") sendResponse([]);

@@ -147,8 +147,10 @@ function stubVideo({ top = 100, width = 640, height = 360, readyState = 4 } = {}
 // the shared pill so its capability global is published before the pill reads
 // it. `sites: false` is the no-adapter configuration the shared pill must also
 // survive, which is what a bundle without a site adapter would run.
+// `chromeOnly` drops the `browser` global. Chrome exposes `chrome` alone, and
+// the shared pill has to run there off the same file Firefox loads.
 function loadMediaTab({ href = "https://example.test/watch", videos = [],
-                       sites = true,
+                       sites = true, chromeOnly = false,
                        reply = { mediaPillEnabled: true } } = {}) {
   const timers = [];
   const documentElement = new StubNode("HTML");
@@ -208,7 +210,7 @@ function loadMediaTab({ href = "https://example.test/watch", videos = [],
 
   const context = vm.createContext({
     globalThis: undefined,
-    browser,
+    browser: chromeOnly ? undefined : browser,
     chrome: browser,
     document: doc,
     window: win,
@@ -1350,4 +1352,53 @@ test("a cached adapter stream survives an element that is still a blob", async (
   await clickWithoutReactivating(host);
 
   assert.deepEqual(downloads(harness).map((m) => m.url), [DETECTED_STREAM]);
+});
+
+// ---------------------------------------------------------------------------
+// The shared pill on Chrome
+// ---------------------------------------------------------------------------
+//
+// Chrome runs this file with no site adapter, which the block above already
+// covers in full and which stays the regression for every candidate rule. The
+// one thing Chrome changes is the extension API global: Chromium exposes
+// `chrome` and no `browser`.
+
+test("the shared pill runs and hands over a direct video with chrome alone",
+     async () => {
+  const video = stubVideo({ top: 200 });
+  video.currentSrc = "https://cdn.example.test/v/clip.mp4";
+  video.src = "https://cdn.example.test/v/clip.mp4";
+  const harness = loadMediaTab({
+    videos: [video],
+    sites: false,
+    chromeOnly: true,
+    reply: (message) => (message.type === "getSettings"
+      ? { mediaPillEnabled: true }
+      : { ok: true }),
+  });
+
+  const host = await clickPill(harness, video);
+  assert.ok(host, "the pill must exist without a `browser` global");
+
+  const sent = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.equal(sent.url, "https://cdn.example.test/v/clip.mp4");
+});
+
+test("the shared pill stays inert with chrome alone when nothing is eligible",
+     async () => {
+  const video = stubVideo({ top: 200 });
+  video.currentSrc = "blob:https://example.test/abcd";
+  video.src = "blob:https://example.test/abcd";
+  const harness = loadMediaTab({
+    videos: [video],
+    sites: false,
+    chromeOnly: true,
+  });
+
+  await clickPill(harness, video);
+
+  assert.deepEqual(
+    downloads(harness).map((m) => m.url), [],
+    "a blob player has no direct candidate and no adapter behind it",
+  );
 });

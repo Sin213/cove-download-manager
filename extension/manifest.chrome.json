@@ -22,6 +22,17 @@
     "service_worker": "background.js"
   },
 
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content/media-tab.js"],
+      "css": ["content/media-tab.css"],
+      "run_at": "document_idle",
+      "all_frames": true,
+      "match_about_blank": true
+    }
+  ],
+
   "action": {
     "default_popup": "popup/popup.html",
     "default_icon": {

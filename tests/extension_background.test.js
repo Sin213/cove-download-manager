@@ -18,13 +18,22 @@ function evalIn(context, source) {
   return vm.runInContext(source, context);
 }
 
+// `worker` reproduces Chrome's MV3 entry point: the manifest names
+// background.js and nothing else, so background.js is the only script the
+// browser evaluates and every other module arrives through its own
+// importScripts call. Nothing is pre-loaded in that mode - pre-loading is
+// what would hide a wrong load order. `installedMenus` is the browser's
+// surviving context-menu state, which is what makes a second load an upgrade
+// or a worker restart rather than a fresh install.
 function loadBackground({ nativeResult = { status: "ok" }, settings,
                          breakStorage = false, slowStorage = false,
                          storedDiag = null, media = true, cookies = [],
                          tabs = [], downloadSearch = () => [],
                          storedIntercepted = null, eraseThrows = false,
-                         slowInterceptedIds = false } = {}) {
-  const calls = { native: [], cancel: [], erase: [], menus: [] };
+                         slowInterceptedIds = false,
+                         worker = false, missingScripts = [],
+                         installedMenus = new Map(), menuApi = "lenient" } = {}) {
+  const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
@@ -64,7 +73,60 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     },
     commands: { onCommand: quietEvent() },
     contextMenus: {
-      create(props) { calls.menus.push(props); },
+      // Chrome keeps created items across service worker restarts and across
+      // an extension update, and answers a second create() for the same id
+      // with a duplicate-id lastError while leaving the installed item - and
+      // its contexts - exactly as they were. `installedMenus` is that
+      // surviving state; a shared Map across two loads is an upgrade.
+      create(props, callback) {
+        calls.menuOps.push("create");
+        calls.menus.push(props);
+        if (installedMenus.has(props.id)) {
+          browser.runtime.lastError = {
+            message: `Cannot create item with duplicate id ${props.id}`,
+          };
+        } else {
+          installedMenus.set(props.id, props);
+        }
+        if (callback) callback();
+        browser.runtime.lastError = null;
+        return props.id;
+      },
+      // removeAll is not the same API on every browser this ships to, and the
+      // difference is exactly what a create() racing an unfinished removal
+      // would hide. Removal is deferred in every mode, so an item created
+      // before it completes is wiped by it and the assertions see an empty
+      // menu rather than a passing one.
+      //
+      //   "callback"  Chrome: completion callback, no promise. Promise
+      //               support only arrived in Chrome 123, and the manifest
+      //               names no minimum version.
+      //   "strict"    Firefox: promise only, and it rejects extra arguments
+      //               the way a schema-validated API does.
+      //   "lenient"   promise, extra arguments ignored.
+      removeAll(callback) {
+        // A call rejected for its arguments removed nothing, so it is not
+        // recorded as a removal having happened.
+        if (menuApi === "strict" && arguments.length > 0) {
+          throw new TypeError("Incorrect argument types for menus.removeAll.");
+        }
+        calls.menuOps.push("removeAll");
+        const finish = () => {
+          installedMenus.clear();
+          calls.menuOps.push("removed");
+        };
+        if (menuApi === "callback") {
+          queueMicrotask(() => { finish(); if (callback) callback(); });
+          return undefined;
+        }
+        return new Promise((resolve) => {
+          queueMicrotask(() => {
+            finish();
+            if (menuApi === "lenient" && callback) callback();
+            resolve();
+          });
+        });
+      },
       onClicked: events.contextMenuClicked,
     },
     cookies: { async getAll() { return cookies; } },
@@ -115,29 +177,52 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     setTimeout,
     clearTimeout,
   });
-  // The browser loads extension/diagnostics.js into the background context
-  // before background.js runs (importScripts on Chrome, a script element on
-  // the Firefox background page). Mirror that ordering here.
-  vm.runInContext(
-    fs.readFileSync("extension/diagnostics.js", "utf8"),
-    context,
-    { filename: "extension/diagnostics.js" },
-  );
+  if (worker) {
+    // A worker fetches every argument before evaluating any of them, so a
+    // missing file leaves nothing half-loaded. Modelling that is the point:
+    // it is what lets background.js import the two media scripts in one call
+    // and still know that neither ran.
+    context.importScripts = (...names) => {
+      calls.imported.push(names);
+      const sources = names.map((name) => {
+        if (missingScripts.includes(name)) {
+          const error = new Error(`Failed to load '${name}'`);
+          error.name = "NetworkError";
+          throw error;
+        }
+        return [name, fs.readFileSync(`extension/${name}`, "utf8")];
+      });
+      for (const [name, source] of sources) {
+        vm.runInContext(source, context, { filename: `extension/${name}` });
+      }
+    };
+  } else {
+    // The browser loads extension/diagnostics.js into the background context
+    // before background.js runs (a script element on the Firefox background
+    // page). Mirror that ordering here.
+    vm.runInContext(
+      fs.readFileSync("extension/diagnostics.js", "utf8"),
+      context,
+      { filename: "extension/diagnostics.js" },
+    );
+  }
   if (storedDiag) store.data.coveDiag = storedDiag;
   if (storedIntercepted) store.data._interceptedIds = storedIntercepted;
-  // The media runtime is split in two: media-core.js holds browser-neutral
-  // mechanics and media-sites.js holds the Firefox-only site/extractor/stream
-  // capability. The MV2 manifest lists both ahead of background.js, in that
-  // order, so mirror it here. `media: false` reproduces the Chrome bundle,
-  // whose MV3 manifest loads neither (scripts/build_extension.py).
-  if (media) {
+  // The media runtime is split in three: media-core.js holds browser-neutral
+  // mechanics, media-sites.js holds the Firefox-only site/extractor/stream
+  // capability, and media-chrome.js holds Chrome's, which is the deliberate
+  // absence of one. The MV2 manifest lists core then sites ahead of
+  // background.js, so mirror it here. Chrome's MV3 manifest lists neither and
+  // background.js imports them itself, which is what `worker: true` exercises
+  // instead. `media: false` is a bundle with no media scripts at all.
+  if (media && !worker) {
     for (const script of ["extension/media-core.js", "extension/media-sites.js"]) {
       vm.runInContext(fs.readFileSync(script, "utf8"), context, { filename: script });
     }
   }
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
-  return { calls, events, browserDownloads, store, context, badge };
+  return { calls, events, browserDownloads, store, context, badge, installedMenus };
 }
 
 async function settle() {
@@ -1316,4 +1401,930 @@ test("overlapping persists leave the newest state stored", async () => {
   await settle();
 
   assert.deepEqual(Array.from(store.data._interceptedIds), [1, 2]);
+});
+
+// ---------------------------------------------------------------------------
+// Chrome MV3: the shared media runtime, activated through background.js
+// ---------------------------------------------------------------------------
+//
+// Firefox's manifest lists the media scripts ahead of background.js. Chrome's
+// MV3 manifest can name one service worker file, so background.js loads them
+// itself. Everything below starts from background.js alone, with importScripts
+// as the only way anything else gets in, because pre-loading the modules is
+// precisely what would hide a wrong order.
+
+const chromeWorker = (options = {}) => loadBackground({ worker: true, ...options });
+
+// Values built inside the vm have that context's prototypes, so a strict deep
+// comparison against a literal here fails on identity alone. Round-tripping
+// them is the same trick Array.from() plays elsewhere in this file.
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+// ---- Load order and cold start ----
+
+test("the Chrome worker imports the shared core and then its own capability",
+     async () => {
+  const { calls } = chromeWorker();
+  await settle();
+
+  assert.deepEqual(calls.imported, [
+    ["diagnostics.js"],
+    ["media-core.js", "media-chrome.js"],
+  ]);
+});
+
+test("media is available on a cold worker evaluation, before any event fires",
+     async () => {
+  const { calls, context } = chromeWorker();
+
+  // Read before settle() and before a single listener has been called: the
+  // capability has to exist from top-level evaluation, not from onInstalled,
+  // onStartup or a later message. A woken worker gets no install event.
+  assert.equal(evalIn(context, "typeof CoveMedia"), "object");
+  assert.equal(evalIn(context, "typeof CoveMediaCapability"), "object");
+
+  await settle();
+  const menu = calls.menus.find((m) => m.id === "download-with-cove");
+  assert.deepEqual(Array.from(menu.contexts), ["link", "image", "video", "audio"]);
+});
+
+test("the Chrome capability contributes no site hooks at all", async () => {
+  const { context } = chromeWorker();
+  await settle();
+
+  const capability = evalIn(context, "CoveMediaCapability");
+  // One key, and it is a refusal. Every hook media-core.js knows how to call
+  // is absent, so every site-dependent decision stays at its neutral default.
+  assert.deepEqual(Object.keys(capability), ["rejectMediaTarget"]);
+  for (const hook of ["sitePageUrl", "titleCleanup", "rejectExtension",
+                      "pageFallbackUrl", "handleMessage"]) {
+    assert.equal(capability[hook], undefined, `${hook} must not be supplied`);
+  }
+  assert.equal(evalIn(context, "CoveMedia.pageFallbackUrl({url:'https://example.test/watch'}, {pageUrl:'https://example.test/watch'})"), "");
+});
+
+test("a missing media module leaves a build that says it has no media",
+     async () => {
+  const { calls, events, context } = chromeWorker({
+    missingScripts: ["media-core.js"],
+  });
+  await settle();
+  calls.native.length = 0;
+
+  assert.equal(evalIn(context, "typeof CoveMedia"), "undefined");
+  const menu = calls.menus.find((m) => m.id === "download-with-cove");
+  assert.deepEqual(Array.from(menu.contexts), ["link", "image"]);
+
+  // And the message surface refuses rather than throwing or hanging.
+  let reply = null;
+  const kept = events.message.emit(
+    { type: "downloadMedia", url: "https://cdn.example.test/v/clip.mp4" },
+    { tab: { id: 3, url: "https://example.test/watch" } },
+    (r) => { reply = r; },
+  );
+  await settle();
+  assert.deepEqual(kept, [undefined]);
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+  assert.equal(calls.native.length, 0);
+});
+
+test("a failed media import is recorded rather than passed off as a plain build",
+     async () => {
+  const { store } = chromeWorker({ missingScripts: ["media-chrome.js"] });
+  await settle();
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+
+  const events = (store.data.coveDiag || []).map((e) => e.event);
+  assert.ok(events.includes("media_load_failed"),
+            `no media_load_failed in ${JSON.stringify(events)}`);
+});
+
+test("Firefox loads its media from the manifest and imports nothing",
+     async () => {
+  const { calls, context } = loadBackground();
+  await settle();
+
+  assert.equal(evalIn(context, "typeof importScripts"), "undefined");
+  assert.deepEqual(calls.imported, []);
+  // The site capability, not Chrome's: Firefox's own adapter is still the one
+  // media-core.js resolves.
+  assert.equal(typeof evalIn(context, "CoveMediaCapability").sitePageUrl, "function");
+});
+
+// ---- Context menu installation and upgrade ----
+
+test("a fresh Chrome install gets link, image, video and audio contexts",
+     async () => {
+  const { installedMenus, calls } = chromeWorker();
+  await settle();
+
+  assert.deepEqual(calls.menuOps, ["removeAll", "removed", "create"]);
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image", "video", "audio"],
+  );
+});
+
+test("an installed link/image-only menu gains the media contexts on upgrade",
+     async () => {
+  // The shipped Chrome build: no media scripts, so link and image only. Its
+  // menu item survives the update, which is the whole difficulty.
+  const installedMenus = new Map();
+  chromeWorker({ installedMenus, missingScripts: ["media-core.js", "media-chrome.js"] });
+  await settle();
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image"],
+  );
+
+  // The update. Swallowing the duplicate-id error would leave the item above
+  // in place with the contexts it was first registered with.
+  chromeWorker({ installedMenus });
+  await settle();
+
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image", "video", "audio"],
+  );
+});
+
+test("a worker restart re-registers exactly one menu item", async () => {
+  const installedMenus = new Map();
+  chromeWorker({ installedMenus });
+  await settle();
+  const second = chromeWorker({ installedMenus });
+  await settle();
+
+  assert.equal(installedMenus.size, 1);
+  assert.deepEqual(second.calls.menuOps, ["removeAll", "removed", "create"]);
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image", "video", "audio"],
+  );
+});
+
+test("Firefox still registers its menu once, unchanged", async () => {
+  const { calls, installedMenus } = loadBackground();
+  await settle();
+
+  assert.equal(installedMenus.size, 1);
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image", "video", "audio"],
+  );
+  assert.equal(calls.menus.length, 1);
+});
+
+// ---- Eligibility, by entry point ----
+//
+// The pill, the context menu and the runtime message are three different
+// inputs. A capability whose sitePageUrl is absent proves only that no page
+// address is substituted; what each entry point accepts has to be driven
+// through its own dispatch.
+
+const CHROME_TAB = { id: 7, url: "https://example.test/watch", title: "Clip" };
+
+async function chromeMediaMessage(msg, options = {}) {
+  const loaded = chromeWorker(options);
+  await settle();
+  loaded.calls.native.length = 0;
+
+  let reply;
+  let resolved = null;
+  const done = new Promise((resolve) => { resolved = resolve; });
+  const kept = loaded.events.message.emit(msg, { tab: CHROME_TAB }, (r) => {
+    reply = r;
+    resolved();
+  });
+  await settle();
+  return { ...loaded, kept, done, reply: () => reply };
+}
+
+for (const url of [
+  "blob:https://example.test/2b0f8c1e-0000-4000-8000-000000000000",
+  "data:video/mp4;base64,AAAA",
+  "file:///home/user/clip.mp4",
+  "javascript:void(0)",
+  "ftp://files.example.test/clip.mp4",
+  "",
+]) {
+  test(`Chrome refuses a downloadMedia request for ${url || "an empty url"}`,
+       async () => {
+    const m = await chromeMediaMessage({ type: "downloadMedia", url });
+    await m.done;
+
+    assert.equal(m.calls.native.length, 0, "nothing may reach the native host");
+    assert.deepEqual(plain(m.reply()), {
+      ok: false, reason: "unsupported", error: "Unsupported URL",
+    });
+  });
+}
+
+test("a downloadMedia request never falls back to the page it came from",
+     async () => {
+  const m = await chromeMediaMessage({
+    type: "downloadMedia",
+    url: "blob:https://example.test/abcd",
+    pageUrl: "https://example.test/watch",
+  });
+  await m.done;
+
+  assert.equal(m.calls.native.length, 0);
+  // The exact wording separates "the media path looked at this URL and would
+  // not take it" from "this build has no media path"; only the first is what
+  // is being asserted here.
+  assert.deepEqual(plain(m.reply()), {
+    ok: false, reason: "unsupported", error: "Unsupported URL",
+  });
+});
+
+test("a downloadMedia request the message calls eligible is still checked",
+     async () => {
+  // A message is not evidence about itself. Its own flags are ignored.
+  const m = await chromeMediaMessage({
+    type: "downloadMedia",
+    url: "blob:https://example.test/abcd",
+    eligible: true,
+    readyState: 4,
+  });
+  await m.done;
+
+  assert.equal(m.calls.native.length, 0);
+  assert.deepEqual(plain(m.reply()), {
+    ok: false, reason: "unsupported", error: "Unsupported URL",
+  });
+});
+
+test("Chrome answers the stream list empty rather than leaving it hanging",
+     async () => {
+  const { events, calls } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+
+  let streams;
+  let page;
+  events.message.emit({ type: "getDetectedStreams" }, { tab: CHROME_TAB },
+                      (r) => { streams = r; });
+  events.message.emit({ type: "getMediaPageUrl" }, { tab: CHROME_TAB },
+                      (r) => { page = r; });
+  await settle();
+
+  assert.deepEqual(plain(streams), []);
+  assert.deepEqual(plain(page), { url: "" });
+  assert.equal(calls.native.length, 0);
+});
+
+test("a Chrome context-menu click on a blob player is ignored, not guessed at",
+     async () => {
+  const { calls, events } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(events.contextMenuClicked.emit(
+    {
+      menuItemId: "download-with-cove",
+      srcUrl: "blob:https://example.test/2b0f8c1e-0000-4000-8000-000000000000",
+      pageUrl: "https://example.test/watch",
+    },
+    CHROME_TAB,
+  ));
+
+  assert.equal(calls.native.length, 0,
+               "the page must not stand in for a media target");
+});
+
+test("a Chrome context-menu click on a direct video hands over that video",
+     async () => {
+  const { calls, events } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+
+  await Promise.all(events.contextMenuClicked.emit(
+    {
+      menuItemId: "download-with-cove",
+      srcUrl: "https://cdn.example.test/v/clip.mp4",
+      pageUrl: "https://example.test/watch",
+    },
+    CHROME_TAB,
+  ));
+
+  assert.equal(calls.native.length, 1);
+  assert.equal(calls.native[0].url, "https://cdn.example.test/v/clip.mp4");
+  assert.equal(calls.native[0].filename, "clip.mp4");
+});
+
+// ---- Shared handoff parity ----
+
+test("Chrome and Firefox send the same native message for the same direct media",
+     async () => {
+  const msg = {
+    type: "downloadMedia",
+    url: "https://cdn.example.test/v/clip.mp4",
+    pageUrl: "https://neutral.example.test/watch",
+    requestId: "abcd1234",
+  };
+  const sender = { tab: { id: 7, url: "https://neutral.example.test/watch",
+                          title: "Neutral clip" } };
+
+  const messages = [];
+  for (const loaded of [chromeWorker(), loadBackground()]) {
+    await settle();
+    loaded.calls.native.length = 0;
+    let done = null;
+    const replied = new Promise((resolve) => { done = resolve; });
+    loaded.events.message.emit(msg, sender, done);
+    await replied;
+    messages.push(loaded.calls.native);
+  }
+
+  assert.equal(messages[0].length, 1);
+  assert.equal(messages[1].length, 1);
+  assert.deepEqual(plain(messages[0][0]), plain(messages[1][0]));
+  assert.deepEqual(plain(messages[0][0]), {
+    action: "download",
+    url: "https://cdn.example.test/v/clip.mp4",
+    filename: "Neutral clip.mp4",
+    referrer: "https://neutral.example.test/watch",
+    cookies: "",
+    fileSize: 0,
+    userAgent: messages[0][0].userAgent,
+    requestId: "abcd1234",
+  });
+});
+
+test("a Chrome pill handoff reports success the way the pill expects",
+     async () => {
+  const m = await chromeMediaMessage({
+    type: "downloadMedia",
+    url: "https://cdn.example.test/v/clip.mp4",
+    pageUrl: "https://example.test/watch",
+    requestId: "12345678",
+  });
+  await m.done;
+
+  assert.deepEqual(plain(m.reply()), { ok: true });
+  assert.equal(m.calls.native.length, 1);
+});
+
+test("a Chrome pill handoff distinguishes an unavailable Cove from a failure",
+     async () => {
+  for (const [nativeResult, reason] of [
+    [{ status: "error", message: "Cove is not available" }, "unavailable"],
+    [{ status: "error", message: "Disk full" }, "failed"],
+  ]) {
+    const m = await chromeMediaMessage(
+      { type: "downloadMedia", url: "https://cdn.example.test/v/clip.mp4" },
+      { nativeResult },
+    );
+    await m.done;
+    assert.equal(m.reply().reason, reason);
+  }
+});
+
+test("a Chrome pill handoff records no cookie, token or page title", async () => {
+  const m = await chromeMediaMessage(
+    {
+      type: "downloadMedia",
+      url: "https://cdn.example.test/v/clip.mp4?token=s3cr3t-token-value",
+      pageUrl: "https://example.test/watch",
+      requestId: "deadbeef",
+    },
+    { cookies: [{ name: "session", value: "s3cr3t-cookie-value" }] },
+  );
+  await m.done;
+  await new Promise((resolve) => setTimeout(resolve, 1100));
+
+  const serialised = JSON.stringify(m.store.data.coveDiag || []);
+  for (const secret of ["s3cr3t-cookie-value", "s3cr3t-token-value", "Clip"]) {
+    assert.ok(!serialised.includes(secret),
+              `${secret} must not reach the diagnostic ring`);
+  }
+  assert.ok(serialised.includes("deadbeef"), "the request id must correlate");
+});
+
+// ---- Deduplication ----
+
+async function chromePillSend(loaded, url, requestId = "aaaaaaaa") {
+  let done = null;
+  const replied = new Promise((resolve) => { done = resolve; });
+  loaded.events.message.emit(
+    { type: "downloadMedia", url, pageUrl: "https://example.test/watch", requestId },
+    { tab: CHROME_TAB },
+    done,
+  );
+  return replied;
+}
+
+test("two pill activations for the same media produce one native download",
+     async () => {
+  // The background's guard, not the pill's: the content script has its own
+  // sentUrls, but this is the worker's recentIntercepted doing the work.
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await chromePillSend(loaded, "https://cdn.example.test/v/clip.mp4");
+  loaded.events.downloadCreated.emit({
+    id: 1,
+    url: "https://cdn.example.test/v/clip.mp4",
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+
+  assert.equal(loaded.calls.native.length, 1,
+               "the browser's own download event must not send a second time");
+  // requestId is only ever set by the pill's handoff, so this is the pill's
+  // message and not an interception that happened to be the only one.
+  assert.equal(loaded.calls.native[0].requestId, "aaaaaaaa");
+});
+
+test("a failed pill handoff leaves a retry able to reach Cove", async () => {
+  let attempt = 0;
+  const loaded = chromeWorker({
+    nativeResult: () => {
+      attempt += 1;
+      return attempt === 1
+        ? { status: "error", message: "Cove is not available" }
+        : { status: "ok" };
+    },
+  });
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await chromePillSend(loaded, "https://cdn.example.test/v/clip.mp4");
+  await chromePillSend(loaded, "https://cdn.example.test/v/clip.mp4");
+
+  assert.equal(loaded.calls.native.length, 2,
+               "the dedup mark must be rolled back when the send failed");
+  assert.equal(evalIn(loaded.context, "recentIntercepted.size"), 1);
+});
+
+test("two different media are never deduplicated against each other",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await chromePillSend(loaded, "https://cdn.example.test/v/one.mp4");
+  await chromePillSend(loaded, "https://cdn.example.test/v/two.mp4");
+
+  assert.deepEqual(loaded.calls.native.map((m) => m.url), [
+    "https://cdn.example.test/v/one.mp4",
+    "https://cdn.example.test/v/two.mp4",
+  ]);
+});
+
+// ---- Worker recreation ----
+
+test("a recreated worker initialises media and hands over a fresh click",
+     async () => {
+  const installedMenus = new Map();
+  chromeWorker({ installedMenus });
+  await settle();
+
+  // A genuinely new background context. Nothing of the first one's state
+  // carries over, which is the point: recentIntercepted and interceptedIds
+  // are the worker's, and a restart is how MV3 loses them.
+  const restarted = chromeWorker({ installedMenus });
+  await settle();
+  restarted.calls.native.length = 0;
+
+  assert.equal(evalIn(restarted.context, "recentIntercepted.size"), 0);
+  await chromePillSend(restarted, "https://cdn.example.test/v/clip.mp4");
+
+  assert.equal(restarted.calls.native.length, 1);
+  assert.equal(restarted.calls.native[0].url, "https://cdn.example.test/v/clip.mp4");
+});
+
+test("cross-event dedup is the worker's, so a restart between the two loses it",
+     async () => {
+  // Measured, not claimed. The content script's sentUrls lives in the page and
+  // survives the restart, but it cannot suppress a browser download event -
+  // that is handled by the worker, whose recentIntercepted is gone. Both
+  // events reaching one worker is the covered case (asserted above); this
+  // records the boundary of it rather than pretending it extends further.
+  const first = chromeWorker();
+  await settle();
+  first.calls.native.length = 0;
+  await chromePillSend(first, "https://cdn.example.test/v/clip.mp4");
+  assert.equal(first.calls.native.length, 1);
+
+  const restarted = chromeWorker({ settings: { enabled: true } });
+  await settle();
+  restarted.calls.native.length = 0;
+  restarted.events.downloadCreated.emit({
+    id: 1,
+    url: "https://cdn.example.test/v/clip.mp4",
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+
+  assert.equal(restarted.calls.native.length, 1,
+               "a new worker has no record of the old one's handoff");
+});
+
+// ---- Settings ----
+
+test("Chrome keeps interception and the pill as two separate settings",
+     async () => {
+  // mediaPillEnabled is the content script's; `enabled` gates interception.
+  // Turning interception off must not stop a deliberate pill click, exactly
+  // as on Firefox.
+  const loaded = chromeWorker({
+    settings: { enabled: false, minSizeBytes: 0, excludedDomains: [],
+                interceptExtensions: [], mediaPillEnabled: true },
+  });
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await chromePillSend(loaded, "https://cdn.example.test/v/clip.mp4");
+  assert.equal(loaded.calls.native.length, 1);
+
+  loaded.events.downloadCreated.emit({
+    id: 2,
+    url: "https://cdn.example.test/other.zip",
+    filename: "other.zip",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+  assert.equal(loaded.calls.native.length, 1, "interception stays off");
+});
+
+test("Chrome serves the pill's settings request", async () => {
+  const { events } = chromeWorker({
+    settings: { enabled: true, minSizeBytes: 0, excludedDomains: [],
+                interceptExtensions: [], mediaPillEnabled: false },
+  });
+  await settle();
+
+  let reply;
+  events.message.emit({ type: "getSettings" }, {}, (r) => { reply = r; });
+  await settle();
+
+  assert.equal(reply.mediaPillEnabled, false);
+  assert.equal(reply.enabled, true);
+});
+
+// ---------------------------------------------------------------------------
+// Chrome: the new media context action refuses a playlist target
+// ---------------------------------------------------------------------------
+//
+// Enabling video and audio contexts put a new kind of address within reach of
+// the menu: a media element's src can name a playlist describing a stream
+// rather than a file. Chrome ships no stream handling, so forwarding one would
+// present that description as if it were the media. The refusal is Chrome's
+// alone - it lives on the Chrome capability - and it is a negative check on
+// identifiable manifest targets, not a claim that every other address is a
+// direct file.
+//
+// The pill cannot reach this: Chrome will not decode a playlist, so the
+// element never leaves readyState 0 and 2A.1's readiness gate already refuses
+// it. This is the separate context-menu entry point.
+
+function mediaMenuClick(loaded, info) {
+  return Promise.all(loaded.events.contextMenuClicked.emit(
+    { menuItemId: "download-with-cove", ...info }, CHROME_TAB,
+  ));
+}
+
+for (const srcUrl of [
+  "https://cdn.example.test/live/master.m3u8",
+  "https://cdn.example.test/live/manifest.mpd",
+  "https://cdn.example.test/live/playlist.m3u",
+  "https://cdn.example.test/live/MASTER.M3U8",
+  "https://cdn.example.test/live/master.m3u8?token=abc123",
+  "https://cdn.example.test/live/master.m3u8#t=10",
+  "https://cdn.example.test/live/manifest.MPD?cdn=edge&x=1",
+]) {
+  test(`a Chrome media context action refuses ${srcUrl}`, async () => {
+    const loaded = chromeWorker();
+    await settle();
+    loaded.calls.native.length = 0;
+
+    await mediaMenuClick(loaded, {
+      srcUrl, mediaType: "video", pageUrl: "https://example.test/watch",
+    });
+
+    assert.equal(loaded.calls.native.length, 0,
+                 "a playlist address must not reach the native host");
+    assert.equal(evalIn(loaded.context, "recentIntercepted.size"), 0,
+                 "a refusal must not leave a mark that blocks a later retry");
+  });
+}
+
+test("an audio context action refuses a playlist just as a video one does",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/live/audio.m3u8", mediaType: "audio",
+  });
+
+  assert.equal(loaded.calls.native.length, 0);
+});
+
+test("a link on the same element cannot smuggle a refused media source past",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  // The link is a perfectly ordinary address, so checking only the address the
+  // handler settles on would let it carry the refused media source through.
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/live/master.m3u8",
+    linkUrl: "https://cdn.example.test/v/decoy.mp4",
+    mediaType: "video",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.equal(loaded.calls.native.length, 0,
+               "the media source is what was selected, link or no link");
+});
+
+test("a refused media source is not replaced by the page it sits on",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/live/master.m3u8",
+    mediaType: "video",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.deepEqual(loaded.calls.native.map((m) => m.url), []);
+});
+
+test("the guard leaves a direct media context action exactly as it was",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/v/clip.mp4", mediaType: "video",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/v/clip.mp4");
+});
+
+test("the guard leaves extensionless direct media reachable", async () => {
+  // The check is on identifiable manifest suffixes. An address with no suffix
+  // at all is not one, and must not be swept up by a rule that only knows how
+  // to recognise names.
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/v/9f3ab21c", mediaType: "video",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/v/9f3ab21c");
+});
+
+test("an ordinary link to a playlist is untouched by the media guard",
+     async () => {
+  // Narrow on purpose: this is about the media action the slice added, not an
+  // application-wide restriction on what a user may download.
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    linkUrl: "https://cdn.example.test/live/master.m3u8",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url,
+               "https://cdn.example.test/live/master.m3u8");
+});
+
+test("an image context action is untouched by the media guard", async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/i/poster.png", mediaType: "image",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/i/poster.png");
+});
+
+test("browser-download interception is untouched by the media guard",
+     async () => {
+  const loaded = chromeWorker({
+    settings: { enabled: true, minSizeBytes: 0, excludedDomains: [],
+                interceptExtensions: [], mediaPillEnabled: true },
+  });
+  await settle();
+  loaded.calls.native.length = 0;
+
+  loaded.events.downloadCreated.emit({
+    id: 9,
+    url: "https://cdn.example.test/live/master.m3u8",
+    filename: "master.m3u8",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 4096,
+  });
+  await settle();
+
+  assert.equal(loaded.calls.native.length, 1,
+               "the user's own browser download is not this guard's business");
+});
+
+test("Firefox keeps the media context behaviour it shipped with", async () => {
+  // The refusal is on Chrome's capability. Firefox publishes its own, which
+  // does not carry it, so nothing here changes for Firefox.
+  const loaded = loadBackground();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/live/master.m3u8", mediaType: "video",
+    pageUrl: "https://example.test/watch",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url,
+               "https://cdn.example.test/live/master.m3u8");
+  assert.equal(evalIn(loaded.context,
+                      "typeof CoveMediaCapability.rejectMediaTarget"),
+               "undefined");
+});
+
+// ---------------------------------------------------------------------------
+// Codex review round 1 - two findings, both on code this slice added
+// ---------------------------------------------------------------------------
+
+// Finding 1: a media action inside a hyperlink handed over the link.
+//
+// The handler has always preferred info.linkUrl, which is right for the link
+// and image targets it shipped with. The video and audio targets are new, and
+// for those the media element's own source is what was selected: a player
+// wrapped in a hyperlink would otherwise hand over the link's destination, a
+// page, in place of the media. Firefox publishes no media-target policy and
+// keeps link-first, so its behaviour is unchanged.
+
+test("a linked video hands over the video, not the link's destination",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/v/clip.mp4",
+    linkUrl: "https://example.test/watch-page",
+    mediaType: "video",
+    pageUrl: "https://example.test/watch-page",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/v/clip.mp4",
+               "a direct media action must never become a page request");
+});
+
+test("a linked audio element hands over the audio, not the link", async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/a/track.m4a",
+    linkUrl: "https://example.test/album",
+    mediaType: "audio",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/a/track.m4a");
+});
+
+test("a linked image keeps the link-first behaviour it shipped with",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/i/thumb.png",
+    linkUrl: "https://cdn.example.test/i/full.png",
+    mediaType: "image",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/i/full.png");
+});
+
+test("a media element with no source of its own still follows its link",
+     async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    linkUrl: "https://cdn.example.test/v/clip.mp4",
+    mediaType: "video",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/v/clip.mp4");
+});
+
+test("Firefox keeps link-first on a linked video", async () => {
+  const loaded = loadBackground();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await mediaMenuClick(loaded, {
+    srcUrl: "https://cdn.example.test/v/clip.mp4",
+    linkUrl: "https://example.test/watch-page",
+    mediaType: "video",
+    pageUrl: "https://example.test/watch-page",
+  });
+
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://example.test/watch-page",
+               "the media-target policy is Chrome's; Firefox is untouched");
+});
+
+// Finding 2: creation raced an unfinished removal.
+//
+// removeAll answers with a completion callback on Chrome and gained promise
+// support only in Chrome 123; the manifest names no minimum version, and
+// Firefox's API is promise-only and validates its arguments. Creating before
+// removal completes lets the outstanding removal take the new item with it,
+// leaving no menu at all. The fake defers removal in every mode, so a create
+// that jumped the queue is wiped and shows up as an empty menu.
+
+for (const menuApi of ["callback", "strict", "lenient"]) {
+  test(`the menu survives removal sequencing on a ${menuApi} removeAll`,
+       async () => {
+    const installedMenus = new Map();
+    const { calls } = chromeWorker({ installedMenus, menuApi });
+    await settle();
+
+    assert.equal(installedMenus.size, 1,
+                 "creation must wait for removal to finish");
+    assert.deepEqual(
+      Array.from(installedMenus.get("download-with-cove").contexts),
+      ["link", "image", "video", "audio"],
+    );
+    assert.deepEqual(calls.menuOps, ["removeAll", "removed", "create"]);
+    assert.equal(calls.menus.length, 1, "exactly one create, never two");
+  });
+}
+
+test("an upgrade still gains the media contexts on a callback-only removeAll",
+     async () => {
+  const installedMenus = new Map();
+  chromeWorker({ installedMenus, menuApi: "callback",
+                 missingScripts: ["media-core.js", "media-chrome.js"] });
+  await settle();
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image"],
+  );
+
+  chromeWorker({ installedMenus, menuApi: "callback" });
+  await settle();
+
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image", "video", "audio"],
+  );
+});
+
+test("Firefox still registers exactly one menu on its promise-only API",
+     async () => {
+  const { calls, installedMenus } = loadBackground({ menuApi: "strict" });
+  await settle();
+
+  assert.equal(calls.menus.length, 1);
+  assert.equal(installedMenus.size, 1);
+  assert.deepEqual(
+    Array.from(installedMenus.get("download-with-cove").contexts),
+    ["link", "image", "video", "audio"],
+  );
 });

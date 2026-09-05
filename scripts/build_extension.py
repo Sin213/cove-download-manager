@@ -28,21 +28,27 @@ DIST = ROOT / "dist"
 # "content/media-sites.js" and a whole directory as "content".
 _EXCLUDE = {"manifest.chrome.json", "chrome-key.pem"}
 
-# Site handling, excluded from the Chrome bundle. The Chrome Web Store
-# rejected 1.3.5 under "Malicious and Prohibited Products" for facilitating
-# downloads of copyrighted media, naming YouTube, so the Chrome build ships
-# no in-page video pill, no HLS detection, and no page-extractor code.
+# Each browser gets the shared media runtime plus its own capability, and
+# never the other's.
 #
-# The exclusion is the site half only: media-core.js holds the browser-neutral
-# mechanics and is copied into the Chrome bundle, where the MV3 manifest does
-# not load it, so it is inert there. background.js degrades to links and
-# images whenever no media script is loaded. Firefox keeps all of it.
+# The Chrome Web Store rejected 1.3.5 under "Malicious and Prohibited
+# Products" for facilitating downloads of copyrighted media, naming YouTube.
+# What that rejection was about is site handling - page extractors, site
+# media discovery, stream observation - which is exactly the two files
+# excluded below. A media element whose own address is an ordinary HTTP(S)
+# file is not that, so Chrome keeps the browser-neutral mechanics
+# (media-core.js) and the shared in-page pill (content/media-tab.js and its
+# stylesheet) and gets media-chrome.js, a capability that supplies no site
+# hooks at all.
+#
+# Firefox keeps both site modules and, symmetrically, must not receive
+# media-chrome.js: two capabilities would fight over the same global.
+#
+# content/ is no longer excluded wholesale, so content/media-sites.js is now
+# doing real work in this set rather than documenting an intent.
 # Guarded by tests/test_extension_bundle.py.
-#
-# content/media-sites.js is redundant while the whole content/ directory is
-# excluded. It is listed anyway so the site boundary stays explicit when that
-# directory stops being excluded wholesale.
-_CHROME_EXCLUDE = {"media-sites.js", "content/media-sites.js", "content"}
+_CHROME_EXCLUDE = {"media-sites.js", "content/media-sites.js"}
+_FIREFOX_EXCLUDE = {"media-chrome.js"}
 
 
 def _is_excluded(rel: str, exclude) -> bool:
@@ -86,11 +92,11 @@ def build(dist: Path | None = None) -> None:
 
     # Firefox: manifest.json is already the MV2 manifest.
     firefox = DIST / "firefox"
-    _copy_shared(firefox)
+    _copy_shared(firefox, exclude=_FIREFOX_EXCLUDE)
     ff_version = json.loads((firefox / "manifest.json").read_text())["version"]
     _zip_dir(firefox, DIST / f"cove-firefox-{ff_version}.zip")
 
-    # Chrome: swap in the MV3 manifest as manifest.json, minus video handling.
+    # Chrome: swap in the MV3 manifest as manifest.json, minus site handling.
     chrome = DIST / "chrome"
     _copy_shared(chrome, exclude=_CHROME_EXCLUDE)
     mv3 = json.loads((SRC / "manifest.chrome.json").read_text())
