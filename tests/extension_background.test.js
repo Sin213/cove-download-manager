@@ -125,15 +125,15 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   );
   if (storedDiag) store.data.coveDiag = storedDiag;
   if (storedIntercepted) store.data._interceptedIds = storedIntercepted;
-  // media.js ships in the Firefox bundle only and the MV2 manifest lists it
-  // ahead of background.js. `media: false` reproduces the Chrome bundle,
-  // which omits it entirely (scripts/build_extension.py).
+  // The media runtime is split in two: media-core.js holds browser-neutral
+  // mechanics and media-sites.js holds the Firefox-only site/extractor/stream
+  // capability. The MV2 manifest lists both ahead of background.js, in that
+  // order, so mirror it here. `media: false` reproduces the Chrome bundle,
+  // whose MV3 manifest loads neither (scripts/build_extension.py).
   if (media) {
-    vm.runInContext(
-      fs.readFileSync("extension/media.js", "utf8"),
-      context,
-      { filename: "extension/media.js" },
-    );
+    for (const script of ["extension/media-core.js", "extension/media-sites.js"]) {
+      vm.runInContext(fs.readFileSync(script, "utf8"), context, { filename: script });
+    }
   }
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
@@ -423,13 +423,238 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
   assert.equal(browserDownloads.length, 0);
 });
 
-// ---- Chrome bundle: background.js without media.js ----
+// ---- Shared media core, loaded on its own ----
+//
+// media-core.js must be browser-neutral: it is copied into the Chrome bundle
+// and a later slice will load it there with no site adapter present. These
+// exercise the default path - buildCoveMedia() with no argument and no
+// CoveMediaCapability global - because that is the configuration Chrome will
+// run, not a special explicit one.
+
+function loadMediaCore({ capability } = {}) {
+  const noop = () => {};
+  const context = vm.createContext({
+    globalThis: undefined,
+    browser: {
+      webRequest: null,
+      tabs: {
+        onRemoved: { addListener: noop },
+        onUpdated: { addListener: noop },
+        onActivated: { addListener: noop },
+        query: () => Promise.resolve([]),
+      },
+    },
+    console: { log: noop, error: noop, warn: noop },
+    navigator: { userAgent: "test-agent" },
+    URL, Date, Math, Promise, Map, Set,
+    setTimeout, clearTimeout,
+  });
+  context.globalThis = context;
+  if (capability) context.CoveMediaCapability = capability;
+  vm.runInContext(
+    fs.readFileSync("extension/media-core.js", "utf8"),
+    context,
+    { filename: "extension/media-core.js" },
+  );
+  // CoveMedia is a top-level const, so it lives in the context's lexical
+  // scope rather than on the context object (see evalIn above).
+  return { context, CoveMedia: evalIn(context, "CoveMedia") };
+}
+
+test("the shared core offers video and audio contexts without any site adapter", () => {
+  const { CoveMedia } = loadMediaCore();
+  // Array.from: the value comes from the script's realm, so it is structurally
+  // but not referentially a host array.
+  assert.deepEqual(Array.from(CoveMedia.contexts), ["video", "audio"]);
+});
+
+test("the shared core sanitises a title into a filename with no site adapter", () => {
+  const { CoveMedia } = loadMediaCore();
+  const tab = { title: "  spaced   out  title...  ", url: "https://example.test/page" };
+
+  assert.equal(
+    CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.mov"),
+    "spaced out title.mov",
+  );
+});
+
+test("the shared core replaces characters a filename cannot contain", () => {
+  const { CoveMedia } = loadMediaCore();
+  const tab = { title: 'a/b:c*d?e"f<g>h|i', url: "https://example.test/page" };
+
+  assert.equal(
+    CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.mkv"),
+    "a b c d e f g h i.mkv",
+  );
+});
+
+test("the shared core caps a filename at 180 characters plus its extension", () => {
+  const { CoveMedia } = loadMediaCore();
+  const tab = { title: "z".repeat(250), url: "https://example.test/page" };
+
+  const name = CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.mp4");
+  assert.equal(name, "z".repeat(180) + ".mp4");
+});
+
+test("the shared core infers the extension from the media path", () => {
+  const { CoveMedia } = loadMediaCore();
+  const tab = { title: "Holiday clip", url: "https://example.test/page" };
+
+  assert.equal(
+    CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.webm"),
+    "Holiday clip.webm",
+  );
+  assert.equal(
+    CoveMedia.mediaFilename(tab, "https://cdn.example.test/stream"),
+    "Holiday clip.mp4",
+  );
+});
+
+test("the shared core rewrites no title on any site of its own accord", () => {
+  const { CoveMedia } = loadMediaCore();
+
+  // The exact inputs the Firefox adapter does rewrite. With no adapter the
+  // core must leave both alone rather than carrying site rules itself.
+  assert.equal(
+    CoveMedia.mediaFilename(
+      { title: "Clip - YouTube", url: "https://www.youtube.com/watch?v=abc123" },
+      "https://www.youtube.com/watch?v=abc123",
+    ),
+    "Clip - YouTube.mp4",
+  );
+  assert.equal(
+    CoveMedia.mediaFilename(
+      { title: "AI could never : funny", url: "https://old.reddit.com/r/funny/comments/a/b/" },
+      "https://v.redd.it/abc/DASH_720.mp4",
+    ),
+    // The colon is not a legal filename character, so the core replaces it -
+    // but it does not know the tail is a subreddit name to be dropped.
+    "AI could never funny.mp4",
+  );
+});
+
+test("the shared core returns no filename when the title is empty or the tab is gone", () => {
+  const { CoveMedia } = loadMediaCore();
+  const url = "https://cdn.example.test/v/clip.mp4";
+
+  assert.equal(CoveMedia.mediaFilename({ title: "   ", url: "https://a.test/" }, url), null);
+  assert.equal(CoveMedia.mediaFilename(null, url), null);
+});
+
+test("the shared core has no page fallback and no stream list without an adapter", () => {
+  const { CoveMedia } = loadMediaCore();
+
+  assert.equal(
+    CoveMedia.pageFallbackUrl(
+      { url: "https://www.youtube.com/watch?v=abc123" },
+      { pageUrl: "https://www.youtube.com/watch?v=abc123" },
+    ),
+    "",
+  );
+
+  let streams;
+  CoveMedia.handleMessage({ type: "getDetectedStreams" }, {}, (r) => { streams = r; });
+  assert.deepEqual(Array.from(streams), []);
+
+  let page;
+  CoveMedia.handleMessage({ type: "getMediaPageUrl" }, {}, (r) => { page = r; });
+  assert.equal(page.url, "");
+});
+
+test("the shared core leaves a message it does not own to the caller", () => {
+  const { CoveMedia } = loadMediaCore();
+  assert.equal(CoveMedia.handleMessage({ type: "somethingElse" }, {}, () => {}), false);
+});
+
+// ---- Firefox filename parity across the split ----
+//
+// Expected values were captured from the pre-split implementation. They pin
+// the site adapter's contribution: the core sanitises, the adapter rewrites
+// the title and rejects a playlist extension.
+
+function firefoxMediaFilename(tab, url) {
+  const { context } = loadBackground();
+  return evalIn(context, "CoveMedia").mediaFilename(tab, url);
+}
+
+test("a subreddit suffix is still stripped from an old.reddit title", () => {
+  assert.equal(
+    firefoxMediaFilename(
+      { title: "AI could never : funny", url: "https://old.reddit.com/r/funny/comments/abc/x/" },
+      "https://v.redd.it/abc/DASH_720.mp4",
+    ),
+    "AI could never.mp4",
+  );
+  assert.equal(
+    firefoxMediaFilename(
+      { title: "Cool clip : r/videos", url: "https://old.reddit.com/r/videos/comments/abc/x/" },
+      "https://v.redd.it/abc/DASH_720.mp4",
+    ),
+    "Cool clip.mp4",
+  );
+});
+
+test("the site suffix is still stripped from a watch-page title", () => {
+  assert.equal(
+    firefoxMediaFilename(
+      { title: "Clip - YouTube", url: "https://www.youtube.com/watch?v=abc123" },
+      "https://www.youtube.com/watch?v=abc123",
+    ),
+    "Clip.mp4",
+  );
+});
+
+test("a title is only rewritten on the site the rule belongs to", () => {
+  assert.equal(
+    firefoxMediaFilename(
+      { title: "Clip - YouTube", url: "https://example.test/page" },
+      "https://cdn.example.test/v/clip.mp4",
+    ),
+    "Clip - YouTube.mp4",
+  );
+});
+
+test("a playlist extension is still never used as the download's extension", () => {
+  assert.equal(
+    firefoxMediaFilename(
+      { title: "Live show", url: "https://example.test/live" },
+      "https://cdn.example.test/master.m3u8",
+    ),
+    "Live show.mp4",
+  );
+});
+
+test("a direct media extension still survives the site adapter", () => {
+  assert.equal(
+    firefoxMediaFilename(
+      { title: "Holiday clip", url: "https://example.test/page" },
+      "https://cdn.example.test/v/clip.webm",
+    ),
+    "Holiday clip.webm",
+  );
+});
+
+test("the site adapter still recognises exactly the extractor pages it did", () => {
+  const { context } = loadBackground();
+  const resolve = (u) => context.CoveMediaCapability.sitePageUrl(u);
+
+  assert.equal(resolve("https://www.youtube.com/watch?v=abc123"), "https://www.youtube.com/watch?v=abc123");
+  assert.equal(resolve("https://youtu.be/abc123"), "https://youtu.be/abc123");
+  assert.equal(resolve("https://m.youtube.com/shorts/xyz"), "https://m.youtube.com/shorts/xyz");
+  assert.equal(resolve("https://music.youtube.com/watch?v=q"), "https://music.youtube.com/watch?v=q");
+  assert.equal(resolve("https://www.youtube.com/"), "");
+  assert.equal(resolve("https://example.test/watch?v=abc"), "");
+  assert.equal(resolve(""), "");
+  assert.equal(resolve(null), "");
+});
+
+// ---- Chrome bundle: background.js without the media runtime ----
 //
 // The Chrome Web Store rejected 1.3.5 for facilitating downloads of
-// copyrighted media, so that bundle omits media.js and the pill content
-// script. background.js must degrade rather than throw on the references it
-// keeps. tests/test_extension_bundle.py asserts the exclusion itself; these
-// assert the behaviour that is left.
+// copyrighted media, so that bundle's manifest loads neither media script and
+// omits the pill content script. background.js must degrade rather than throw
+// on the references it keeps. tests/test_extension_bundle.py asserts the
+// exclusion itself; these assert the behaviour that is left.
 
 test("without media.js the context menu offers links and images only", async () => {
   const { calls } = loadBackground({ media: false });

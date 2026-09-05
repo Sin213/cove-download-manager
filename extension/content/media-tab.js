@@ -4,12 +4,17 @@
 // playing <video>. Appears automatically when a qualifying video starts
 // playing: every discovered <video> gets direct play/playing/pause/ended
 // listeners, and child-list observers attach them to videos inserted or
-// replaced later, including videos in open shadow roots (e.g. Reddit's
-// dynamic player). Hover remains a secondary
+// replaced later, including videos in open shadow roots (e.g. a dynamic
+// player that mounts below a custom element). Hover remains a secondary
 // convenience. Inert on pages without qualifying video: no DOM is created
 // until a video with a usable URL becomes the active target. Uses Shadow
 // DOM for isolation; never injects page-context scripts and never
 // auto-downloads.
+//
+// Site-neutral. Anything that depends on a particular site is supplied by an
+// optional adapter (content/media-sites.js) through the capability global
+// read below; with no adapter loaded the pill works from the media element's
+// own address alone.
 
 (() => {
   "use strict";
@@ -17,15 +22,19 @@
   const browser = globalThis.browser || globalThis.chrome;
   if (!browser || !browser.runtime || !browser.runtime.id) return;
 
+  // The site adapter, when one was loaded ahead of this script.
+  const sites = globalThis.__coveMediaSites || null;
+  const usesDetectedStreams = !!(sites && sites.usesDetectedStreams);
+
   const HIDE_DELAY_MS = 500;
   // Must outlast the background's 5s dedup window so a manual retry after
   // the window still produces a fresh native request.
   const SENT_RESET_MS = 6000;
   const PILL_GAP_PX = 8;
 
-  // HLS/M3U8 streams the background detected for this tab (Firefox only;
-  // Chrome has no webRequest detection and this stays empty).
-  let detectedStreams = [];
+  // Streams the background's site adapter observed for this tab. Stays empty
+  // when no adapter is loaded, since nothing is detecting them.
+  let adapterStreams = [];
 
   // Whether the in-page pill is allowed to show. Defaults to true so the
   // pill behaves as before until settings are read, and stays true if the
@@ -62,17 +71,10 @@
     return !!video.mediaKeys;
   }
 
+  // The address a player exposes on its own container, when the site adapter
+  // knows how to read one. "" without an adapter.
   function embeddedStreamUrl(video) {
-    // Reddit's embed exposes both DASH and HLS URLs in the player container,
-    // but normally requests only DASH. Prefer HLS because Cove can download
-    // and merge that stream directly.
-    //
-    // Ancestor-scoped on purpose. A document-wide lookup returns the first
-    // player on the page, so on a feed every video resolved to the first
-    // post's stream and downloaded the wrong video with no sign of error.
-    const player = video.closest("[data-hls-url]");
-    const hlsUrl = player ? player.getAttribute("data-hls-url") : "";
-    return isHttpUrl(hlsUrl) ? hlsUrl : "";
+    return (sites && sites.embeddedStreamUrl && sites.embeddedStreamUrl(video)) || "";
   }
 
   function candidateUrl(video) {
@@ -83,30 +85,24 @@
     if (source && isHttpUrl(source.src)) return source.src;
     const embeddedUrl = embeddedStreamUrl(video);
     if (embeddedUrl) return embeddedUrl;
-    // blob:/data:/MSE video: use an HLS stream detected for this tab. This
-    // must work in subframes too: Reddit's direct-post player can put the
-    // actual playing video in an iframe while the network stream remains
-    // tab-scoped in the background.
-    if (detectedStreams.length > 0 && isHttpUrl(detectedStreams[0].url)) {
-      return detectedStreams[0].url;
+    // blob:/data:/MSE video: use a stream the adapter observed for this tab.
+    // This must work in subframes too: a detached player can put the actual
+    // playing video in an iframe while the network stream remains tab-scoped
+    // in the background.
+    if (adapterStreams.length > 0 && isHttpUrl(adapterStreams[0].url)) {
+      return adapterStreams[0].url;
     }
     return "";
   }
 
-  function extractorPageUrl() {
-    try {
-      const url = new URL(location.href);
-      const host = url.hostname.toLowerCase().replace(/^www\./, "");
-      if (host === "youtu.be" && url.pathname.length > 1) return url.href;
-      if (!["youtube.com", "m.youtube.com", "music.youtube.com"].includes(host)) return "";
-      if (url.pathname === "/watch" && url.searchParams.get("v")) return url.href;
-      if (/^\/(?:shorts|live|embed)\/[^/]+/.test(url.pathname)) return url.href;
-    } catch {}
-    return "";
+  // The page address to download instead of the media element, when the site
+  // adapter designates one. "" without an adapter.
+  function sitePageUrl() {
+    return (sites && sites.sitePageUrl && sites.sitePageUrl()) || "";
   }
 
   function videoUrl(video) {
-    return extractorPageUrl() || candidateUrl(video);
+    return sitePageUrl() || candidateUrl(video);
   }
 
   function isCurrentlyPlaying(video) {
@@ -274,8 +270,9 @@
   }
 
   function deactivateVideo(force = false) {
-    // YouTube may pause or replace its <video> while a click is being
-    // handled. Keep the pill and target stable until the background replies.
+    // A dynamic player may pause or replace its <video> while a click is
+    // being handled. Keep the pill and target stable until the background
+    // replies.
     if (downloadPending && !force) return;
     activeVideo = null;
     watchActiveVideo(null);
@@ -344,33 +341,6 @@
 
   // ---- Click -> one explicit download request ----
 
-  async function resolveCurrentMediaUrl() {
-    const extractorUrl = extractorPageUrl();
-    if (extractorUrl) return extractorUrl;
-    try {
-      const response = await Promise.resolve(
-        browser.runtime.sendMessage({ type: "getMediaPageUrl" })
-      );
-      if (response && isHttpUrl(response.url)) return response.url;
-    } catch {}
-    for (const delay of [0, 250, 750]) {
-      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
-      const directUrl = activeVideo ? candidateUrl(activeVideo) : "";
-      if (directUrl) return directUrl;
-      try {
-        const streams = await Promise.resolve(
-          browser.runtime.sendMessage({ type: "getDetectedStreams" })
-        );
-        if (Array.isArray(streams)) detectedStreams = streams;
-      } catch {
-        // The final empty result is handled by the caller.
-      }
-      const detectedUrl = activeVideo ? candidateUrl(activeVideo) : "";
-      if (detectedUrl) return detectedUrl;
-    }
-    return "";
-  }
-
   // Diagnostics. A content script cannot load extension/diagnostics.js (the
   // manifest lists exactly one content script), so events are reported to the
   // background, which owns the ring. Only event names and outcomes travel:
@@ -399,17 +369,17 @@
   async function onPillClick() {
     if (!pillEnabled || downloadPending) return;
 
-    // Extractor-backed sites are downloaded from their page URL. Do not wait
-    // for a transient media/blob URL: YouTube frequently replaces that media
-    // element while its controls are being used.
+    // A page the site adapter designates is downloaded from its page URL. Do
+    // not wait for a transient media/blob URL: a dynamic player frequently
+    // replaces that media element while its controls are being used.
     //
     // Resolved before anything is claimed or displayed. Nothing is in flight
     // yet, so the unresolvable case below can simply return: taking the
     // in-flight flag first would mean every exit from here had to remember to
     // release it, and deactivateVideo() refuses to run while that flag is set,
     // so forgetting once pins the pill over the page until a reload.
-    const pageUrl = extractorPageUrl() || location.href;
-    const url = extractorPageUrl() || currentUrl || candidateUrl(activeVideo);
+    const pageUrl = sitePageUrl() || location.href;
+    const url = sitePageUrl() || currentUrl || candidateUrl(activeVideo);
 
     // Generated at the origin of the request so the same id can be followed
     // through the background, the native host and Cove itself.
@@ -483,7 +453,7 @@
 
   // ---- Playback detection (primary trigger, direct per-video listeners) ----
   //
-  // Manual testing on Reddit's dynamic player showed capture-phase
+  // Manual testing against a dynamic player showed capture-phase
   // document-level play/playing listeners alone are not reliably reaching
   // this script for every video (player re-creation/replacement timing).
   // Direct listeners attached to each discovered <video> element are used
@@ -500,7 +470,7 @@
     if (isCurrentlyPlaying(video)) lastKnownPlayingVideo = video;
     if (!pillEnabled) return;
     if (!isCurrentlyPlaying(video)) return;
-    scheduleDetectedStreamRefreshes();
+    scheduleAdapterStreamRefreshes();
     // A mostly off-screen video does not take the pill from a visible video
     // that is still playing: its own pill would be hidden on arrival, so the
     // handover would just make the pill vanish.
@@ -557,7 +527,7 @@
     // target.
     video.addEventListener("emptied", onVideoStopped);
     // The video may already be playing at the moment we discover it:
-    // Reddit's player can start playback in the same tick it's
+    // a dynamic player can start playback in the same tick it's
     // created/replaced, before this listener exists to observe a
     // play/playing event for it. Treat "already playing at registration"
     // as equivalent to a play event.
@@ -574,9 +544,9 @@
     registerVideosWithin(root);
   }
 
-  // Registers videos and open shadow roots in the added subtree. Reddit can
-  // mount its player below a custom element, where document queries and
-  // retargeted hover events cannot see the actual <video>.
+  // Registers videos and open shadow roots in the added subtree. A player can
+  // be mounted below a custom element, where document queries and retargeted
+  // hover events cannot see the actual <video>.
   function registerVideosWithin(node) {
     if (!node || (node.nodeType !== 1 && node.nodeType !== 11)) return;
     if (node.tagName === "VIDEO") attachVideoListeners(node);
@@ -599,7 +569,7 @@
         const removedActive =
           node === activeVideo ||
           (activeVideo && typeof node.contains === "function" && node.contains(activeVideo));
-        // Same grace period as a stopped preview: YouTube detaches the
+        // Same grace period as a stopped preview: a feed detaches its
         // inline player element on pointer-out, and hiding right then is
         // what makes the pill unclickable on the feed.
         if (removedActive) scheduleHide();
@@ -706,12 +676,12 @@
     }
   }
 
-  function refreshDetectedStreams() {
+  function refreshAdapterStreams() {
     try {
       Promise.resolve(browser.runtime.sendMessage({ type: "getDetectedStreams" }))
         .then((streams) => {
           if (!Array.isArray(streams)) return;
-          detectedStreams = streams;
+          adapterStreams = streams;
           scanForActiveVideo();
         })
         .catch(() => {});
@@ -720,12 +690,15 @@
     }
   }
 
-  function scheduleDetectedStreamRefreshes() {
+  function scheduleAdapterStreamRefreshes() {
+    // Nothing is observing streams without a site adapter, so the background
+    // is not asked for a list that would always come back empty.
+    if (!usesDetectedStreams) return;
     for (const timer of streamRefreshTimers) clearTimeout(timer);
     streamRefreshTimers = [];
-    refreshDetectedStreams();
+    refreshAdapterStreams();
     for (const delay of [250, 750, 1500, 3000]) {
-      streamRefreshTimers.push(setTimeout(refreshDetectedStreams, delay));
+      streamRefreshTimers.push(setTimeout(refreshAdapterStreams, delay));
     }
   }
 
@@ -835,25 +808,27 @@
     }
   });
 
-  // ---- Detected-stream sync with background (every frame) ----
+  // ---- Adapter stream sync with background (every frame) ----
 
-  browser.runtime.onMessage.addListener((msg) => {
-    if (msg && msg.type === "coveStreamsUpdated" && Array.isArray(msg.streams)) {
-      detectedStreams = msg.streams;
-      scheduleActiveVideoScans();
+  if (usesDetectedStreams) {
+    browser.runtime.onMessage.addListener((msg) => {
+      if (msg && msg.type === "coveStreamsUpdated" && Array.isArray(msg.streams)) {
+        adapterStreams = msg.streams;
+        scheduleActiveVideoScans();
+      }
+    });
+
+    try {
+      Promise.resolve(browser.runtime.sendMessage({ type: "getDetectedStreams" }))
+        .then((streams) => {
+          if (Array.isArray(streams)) {
+            adapterStreams = streams;
+            scheduleActiveVideoScans();
+          }
+        })
+        .catch(() => {});
+    } catch {
+      // Background unavailable; direct-src videos still work.
     }
-  });
-
-  try {
-    Promise.resolve(browser.runtime.sendMessage({ type: "getDetectedStreams" }))
-      .then((streams) => {
-        if (Array.isArray(streams)) {
-          detectedStreams = streams;
-          scheduleActiveVideoScans();
-        }
-      })
-      .catch(() => {});
-  } catch {
-    // Background unavailable; direct-src videos still work.
   }
 })();

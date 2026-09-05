@@ -119,7 +119,12 @@ function stubVideo({ top = 100, width = 640, height = 360 } = {}) {
   return video;
 }
 
+// `sites` mirrors the manifest: Firefox loads content/media-sites.js ahead of
+// the shared pill so its capability global is published before the pill reads
+// it. `sites: false` is the no-adapter configuration the shared pill must also
+// survive, which is what a bundle without a site adapter would run.
 function loadMediaTab({ href = "https://example.test/watch", videos = [],
+                       sites = true,
                        reply = { mediaPillEnabled: true } } = {}) {
   const timers = [];
   const documentElement = new StubNode("HTML");
@@ -219,8 +224,12 @@ function loadMediaTab({ href = "https://example.test/watch", videos = [],
   });
   context.globalThis = context;
 
-  const source = fs.readFileSync("extension/content/media-tab.js", "utf8");
-  vm.runInContext(source, context, { filename: "extension/content/media-tab.js" });
+  const scripts = sites
+    ? ["extension/content/media-sites.js", "extension/content/media-tab.js"]
+    : ["extension/content/media-tab.js"];
+  for (const script of scripts) {
+    vm.runInContext(fs.readFileSync(script, "utf8"), context, { filename: script });
+  }
 
   // The pill host is the only node the script itself appends to the body.
   const pillHost = () =>
@@ -656,7 +665,7 @@ test("an unresolvable video reports why instead of failing at the backend", asyn
 test("an extractor-backed page still downloads from its page address", async () => {
   // The fallback's stated purpose. YouTube replaces the media element while
   // its controls are used, so the page address is the stable target - and it
-  // is reached through extractorPageUrl, not through the removed fallback.
+  // is reached through the site adapter, not through the removed fallback.
   const video = blobVideo({ top: 200 });
   const harness = loadMediaTab({
     href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
@@ -710,6 +719,99 @@ test("an unresolvable video does not wedge the pill against later clicks", async
   const download = harness.sent.find((m) => m.type === "downloadMedia");
   assert.ok(download, "the second click must be allowed through");
   assert.equal(download.url, "https://v.redd.it/abc123/DASH_720.mp4");
+});
+
+// ---------------------------------------------------------------------------
+// The shared pill without a site adapter
+//
+// content/media-tab.js is destined for a bundle that ships no site adapter.
+// It must load and drive a direct media element there, while contributing
+// nothing that only the adapter knows: no extractor page address, no embedded
+// stream, and no detected-stream traffic.
+// ---------------------------------------------------------------------------
+
+test("the shared pill loads and downloads a direct video with no site adapter", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  await clickPill(harness, video);
+
+  const download = harness.sent.find((m) => m.type === "downloadMedia");
+  assert.ok(download, "a direct media element must still be downloadable");
+  assert.equal(download.url, "https://example.test/clip.mp4");
+});
+
+test("without a site adapter the extractor page address is never contributed", async () => {
+  // The same page that resolves to its watch address with the adapter loaded.
+  const video = blobVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    videos: [video],
+    reply: { ok: true },
+  });
+
+  const host = await clickPill(harness, video);
+
+  assert.equal(
+    harness.sent.find((m) => m.type === "downloadMedia"), undefined,
+    "the page address must not be handed over without the adapter",
+  );
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  assert.equal(pill.children[0].textContent, "No video found");
+});
+
+test("without a site adapter an embedded stream attribute is never read", async () => {
+  const owner = new StubNode("DIV");
+  owner["data-hls-url"] = "https://v.redd.it/first/HLSPlaylist.m3u8";
+  const video = blobVideo({ top: 200 });
+
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/feed",
+    videos: [video],
+    reply: { ok: true },
+  });
+  harness.body.appendChild(owner);
+  owner.appendChild(video);
+
+  await clickPill(harness, video);
+
+  assert.equal(
+    harness.sent.find((m) => m.type === "downloadMedia"), undefined,
+    "the embedded stream attribute belongs to the site adapter",
+  );
+});
+
+test("without a site adapter no detected-stream traffic is generated", () => {
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({
+    sites: false,
+    href: "https://example.test/watch",
+    videos: [video],
+  });
+  harness.runTimers();
+
+  assert.deepEqual(
+    harness.sent.filter((m) => m.type === "getDetectedStreams"), [],
+    "the stream list is the adapter's, so it must not be asked for",
+  );
+});
+
+test("with the site adapter the detected-stream fetch still happens", () => {
+  // The counterpart of the assertion above: the Firefox path is unchanged.
+  const video = stubVideo({ top: 200 });
+  const harness = loadMediaTab({ href: "https://example.test/watch", videos: [video] });
+
+  assert.ok(
+    harness.sent.some((m) => m.type === "getDetectedStreams"),
+    "Firefox must still fetch the tab's streams on startup",
+  );
 });
 
 test("a player does not borrow another player's stream", async () => {

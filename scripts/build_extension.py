@@ -23,27 +23,47 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "extension"
 DIST = ROOT / "dist"
 
-# Files/dirs in extension/ that must never ship in a bundle.
+# Files/dirs in extension/ that must never ship in a bundle. Entries are
+# POSIX paths relative to extension/, so a nested file can be named as
+# "content/media-sites.js" and a whole directory as "content".
 _EXCLUDE = {"manifest.chrome.json", "chrome-key.pem"}
 
-# Video handling, excluded from the Chrome bundle. The Chrome Web Store
+# Site handling, excluded from the Chrome bundle. The Chrome Web Store
 # rejected 1.3.5 under "Malicious and Prohibited Products" for facilitating
 # downloads of copyrighted media, naming YouTube, so the Chrome build ships
 # no in-page video pill, no HLS detection, and no page-extractor code.
-# background.js degrades to links and images when media.js is absent.
-# Firefox keeps all of it. Guarded by tests/test_extension_bundle.py.
-_CHROME_EXCLUDE = {"media.js", "content"}
+#
+# The exclusion is the site half only: media-core.js holds the browser-neutral
+# mechanics and is copied into the Chrome bundle, where the MV3 manifest does
+# not load it, so it is inert there. background.js degrades to links and
+# images whenever no media script is loaded. Firefox keeps all of it.
+# Guarded by tests/test_extension_bundle.py.
+#
+# content/media-sites.js is redundant while the whole content/ directory is
+# excluded. It is listed anyway so the site boundary stays explicit when that
+# directory stops being excluded wholesale.
+_CHROME_EXCLUDE = {"media-sites.js", "content/media-sites.js", "content"}
+
+
+def _is_excluded(rel: str, exclude) -> bool:
+    """True when `rel` is an excluded path or sits under an excluded one."""
+    for pattern in (*_EXCLUDE, *exclude):
+        if rel == pattern or rel.startswith(f"{pattern}/"):
+            return True
+    return False
 
 
 def _copy_shared(dest: Path, exclude: set[str] = frozenset()) -> None:
     dest.mkdir(parents=True, exist_ok=True)
-    for item in SRC.iterdir():
-        if item.name in _EXCLUDE or item.name in exclude:
+    for item in sorted(SRC.rglob("*")):
+        rel = item.relative_to(SRC).as_posix()
+        if _is_excluded(rel, exclude):
             continue
-        target = dest / item.name
+        target = dest / rel
         if item.is_dir():
-            shutil.copytree(item, target)
+            target.mkdir(parents=True, exist_ok=True)
         else:
+            target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
 
 

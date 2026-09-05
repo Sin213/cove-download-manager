@@ -30,14 +30,14 @@
   ],
 
   "background": {
-    "scripts": ["media.js", "background.js"],
+    "scripts": ["media-core.js", "media-sites.js", "background.js"],
     "persistent": true
   },
 
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content/media-tab.js"],
+      "js": ["content/media-sites.js", "content/media-tab.js"],
       "css": ["content/media-tab.css"],
       "run_at": "document_idle",
       "all_frames": true,
