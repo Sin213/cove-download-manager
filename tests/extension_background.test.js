@@ -6,6 +6,9 @@ const vm = require("node:vm");
 function event() {
   const listeners = [];
   return {
+    // Exposed so a test can count registrations. The real APIs do not offer
+    // this, which is why it is read only from tests and never by the extension.
+    listeners,
     addListener(listener) { listeners.push(listener); },
     emit(...args) { return listeners.map((listener) => listener(...args)); },
   };
@@ -2588,4 +2591,242 @@ test("Firefox reports a rejected native send as unavailable", async () => {
   assert.equal(responses.length, 1, "a rejection must still produce one answer");
   assert.equal(responses[0].ok, false);
   assert.equal(responses[0].error, "Native host has exited.");
+});
+
+// ---- Tab 3.3: an unknown browser size at the native payload boundary ----
+//
+// Firefox reports totalBytes -1 for a download whose length it does not know
+// yet, and `totalBytes || 0` forwarded that -1 verbatim. The primary's schema
+// takes a non-negative integer, so the download was refused outright. Unknown
+// is spelled 0 in this protocol, and every value that is not a usable byte
+// count is reported unknown rather than coerced, repaired, or guessed at.
+//
+// Admission is deliberately untouched: the minimum-size filter still applies
+// only when the browser states a usable positive size. A download reported as
+// unknown is still handed over, and may turn out to be smaller than the
+// configured minimum. That limitation is accepted, and it is pinned by the
+// tests below rather than papered over.
+
+const FIREFOX_UNKNOWN_SIZE = -1;
+const LARGE_BYTES = 3_145_728;
+const DEFAULT_MINIMUM_BYTES = 1024 * 1024;
+
+// A fresh, eligible, in-progress download on the shipped defaults. totalBytes
+// is the only variable, so nothing but the size can decide the outcome.
+function sizedItem(totalBytes, extra = {}) {
+  return {
+    id: 900,
+    url: "https://example.test/payload.zip",
+    filename: "payload.zip",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes,
+    ...extra,
+  };
+}
+
+test("the shipped defaults hand Firefox's unknown size over as 0", async () => {
+  // No settings argument: this is the real default path, minimum included.
+  const { calls, events, context } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  assert.equal(evalIn(context, "settings.minSizeBytes"), DEFAULT_MINIMUM_BYTES,
+               "the default minimum is in force, not disabled for this test");
+
+  events.downloadCreated.emit(sizedItem(FIREFOX_UNKNOWN_SIZE));
+  await settle();
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1, "an unstated size is not filtered by the minimum");
+  assert.ok(Object.is(sent[0].fileSize, 0),
+            "-1 means the length is unknown, and the protocol spells that 0");
+});
+
+test("an unknown size survives serialization as numeric 0", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(sizedItem(FIREFOX_UNKNOWN_SIZE));
+  await settle();
+
+  // JSON.stringify turns NaN and Infinity into null, so asserting only on the
+  // wire form would hide a normalizer that let them through.
+  const wire = JSON.parse(JSON.stringify(downloadsOf(calls)[0]));
+  assert.equal(wire.fileSize, 0);
+  assert.equal(typeof wire.fileSize, "number");
+});
+
+test("size metadata that is not a usable byte count is handed over as 0",
+     async () => {
+  // Every value here is admitted by the unchanged minimum-size filter and then
+  // reaches the payload. The fractional case is deliberately above the minimum
+  // so the filter admits it: a fractional value below the minimum is filtered
+  // by the existing known-size branch, which this repair does not touch.
+  const notByteCounts = [
+    ["negative one", FIREFOX_UNKNOWN_SIZE],
+    ["a larger negative", -4096],
+    ["negative zero", -0],
+    ["NaN", NaN],
+    ["Infinity", Infinity],
+    ["-Infinity", -Infinity],
+    ["true", true],
+    ["false", false],
+    ["a numeric string", "2048"],
+    ["a fractional byte count", 3_145_728.5],
+    ["an unsafe integer", Number.MAX_SAFE_INTEGER + 2],
+    ["null", null],
+  ];
+
+  for (const [label, value] of notByteCounts) {
+    const { calls, events } = loadBackground();
+    await settle();
+    calls.native.length = 0;
+
+    events.downloadCreated.emit(sizedItem(value));
+    await settle();
+
+    const sent = downloadsOf(calls);
+    assert.equal(sent.length, 1, `handed over once for ${label}`);
+    assert.ok(Object.is(sent[0].fileSize, 0),
+              `${label} is not a byte count, so the size is unknown`);
+    const wire = JSON.parse(JSON.stringify(sent[0]));
+    assert.equal(wire.fileSize, 0, `${label} serializes as 0`);
+  }
+});
+
+test("a missing size is handed over as 0", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  const item = sizedItem(0);
+  delete item.totalBytes;
+  events.downloadCreated.emit(item);
+  await settle();
+
+  assert.equal(downloadsOf(calls).length, 1);
+  assert.ok(Object.is(downloadsOf(calls)[0].fileSize, 0));
+});
+
+test("a known positive size reaches the native host unchanged", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(sizedItem(LARGE_BYTES));
+  await settle();
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].fileSize, LARGE_BYTES);
+  assert.deepEqual(
+    Object.keys(sent[0]).sort(),
+    ["action", "cookies", "fileSize", "filename", "referrer", "url", "userAgent"],
+    "the message shape is unchanged by the repair",
+  );
+  assert.ok(!("requestId" in sent[0]), "no request correlation is added");
+  assert.ok(!("statedSize" in sent[0]), "no header-provided size is added");
+});
+
+test("a large safe integer size is not rounded or truncated", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(sizedItem(Number.MAX_SAFE_INTEGER));
+  await settle();
+
+  assert.equal(downloadsOf(calls)[0].fileSize, Number.MAX_SAFE_INTEGER);
+});
+
+test("the minimum still filters a size the browser does state", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(sizedItem(20724));
+  await settle();
+
+  assert.deepEqual(downloadsOf(calls), [],
+                   "a stated size below the minimum is left to the browser");
+  assert.deepEqual(calls.cancel, []);
+});
+
+test("a stated size equal to the minimum is handed over", async () => {
+  const { calls, events } = loadBackground();
+  await settle();
+  calls.native.length = 0;
+
+  events.downloadCreated.emit(sizedItem(DEFAULT_MINIMUM_BYTES));
+  await settle();
+
+  assert.equal(downloadsOf(calls).length, 1, "the filter is strictly below");
+  assert.equal(downloadsOf(calls)[0].fileSize, DEFAULT_MINIMUM_BYTES);
+});
+
+test("Chrome keeps its stated sizes and normalizes an unstated one", async () => {
+  for (const [stated, expected] of [[LARGE_BYTES, LARGE_BYTES], [0, 0],
+                                    [FIREFOX_UNKNOWN_SIZE, 0]]) {
+    const { calls, events } = chromeWorker();
+    await settle();
+    calls.native.length = 0;
+
+    events.downloadCreated.emit(sizedItem(stated));
+    await settle();
+
+    const sent = downloadsOf(calls);
+    assert.equal(sent.length, 1, `handed over once for ${String(stated)}`);
+    assert.ok(Object.is(sent[0].fileSize, expected),
+              `${String(stated)} is sent as ${expected}`);
+  }
+
+  const { calls, events } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+  events.downloadCreated.emit(sizedItem(20724));
+  await settle();
+  assert.deepEqual(downloadsOf(calls), [],
+                   "Chrome's known-small filtering is unchanged");
+});
+
+test("normalizing an unknown size costs no lookup, listener or later message",
+     async () => {
+  let searches = 0;
+  const { calls, events, context, store } = loadBackground({
+    downloadSearch: () => { searches += 1; return []; },
+  });
+  await settle();
+  calls.native.length = 0;
+  const keysBefore = Object.keys(store.data).sort();
+
+  // media-sites.js registers exactly one onHeadersReceived listener for media
+  // detection on Firefox. That is pre-existing and unrelated to downloads; the
+  // claim here is that this repair adds none of its own.
+  const headerListeners =
+    evalIn(context, "browser.webRequest.onHeadersReceived.listeners.length");
+
+  events.downloadCreated.emit(sizedItem(FIREFOX_UNKNOWN_SIZE));
+  await settle();
+
+  assert.equal(downloadsOf(calls).length, 1);
+  assert.equal(searches, 0, "the size is not looked up after the fact");
+  assert.equal(
+    evalIn(context, "browser.webRequest.onHeadersReceived.listeners.length"),
+    headerListeners,
+    "no header listener is added to decide a download's size",
+  );
+
+  // Ten further turns of the loop: a deferred decision, a timer or a retry
+  // would surface as a second attempt here.
+  for (let i = 0; i < 10; i += 1) await settle();
+  assert.equal(downloadsOf(calls).length, 1, "exactly one native attempt, ever");
+  assert.equal(searches, 0);
+
+  // The accepted download's id is persisted by the committed ownership code.
+  // Nothing beyond that is written: no pending-decision state, no size cache.
+  const added = Object.keys(store.data).filter((k) => !keysBefore.includes(k));
+  assert.deepEqual(added.sort(), ["_interceptedIds"],
+                   "no new storage key is introduced for size admission");
 });

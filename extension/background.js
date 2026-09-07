@@ -274,6 +274,12 @@ function downloadExtension(item) {
   return name.substring(dot).toLowerCase();
 }
 
+// A browser-reported size the native protocol may repeat, or null when the
+// browser has not stated a usable one. Nothing is coerced or repaired here.
+function knownByteSize(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 browser.downloads.onCreated.addListener((downloadItem) => {
   // Don't await here; the handler kicks off async work itself.
   handleCreated(downloadItem);
@@ -468,7 +474,9 @@ async function interceptDownload(downloadItem) {
     filename: filename,
     referrer: downloadItem.referrer || "",
     cookies: cookieStr,
-    fileSize: downloadItem.totalBytes || 0,
+    // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
+    // not know yet, and the primary's schema refuses a negative size outright.
+    fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
     userAgent: navigator.userAgent,
   });
 
