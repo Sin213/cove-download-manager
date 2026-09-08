@@ -164,8 +164,45 @@ def test_chrome_manifest_permissions_and_version_are_untouched(bundles):
     built = json.loads((bundles / "chrome" / "manifest.json").read_text())
     assert built["permissions"] == source["permissions"]
     assert built["host_permissions"] == source["host_permissions"]
-    assert built["version"] == source["version"] == "1.3.8"
+    assert built["version"] == source["version"] == "1.3.9"
     assert built["manifest_version"] == 3
+
+
+def test_firefox_manifest_permissions_and_version_are_untouched(bundles):
+    """The Firefox half of the same guarantee, on its own version line.
+
+    Chrome and Firefox are versioned independently - they are separate store
+    items with separate histories - so a bump to one must not be readable as a
+    bump to the other.
+    """
+    source = json.loads((ROOT / "extension" / "manifest.json").read_text())
+    built = json.loads((bundles / "firefox" / "manifest.json").read_text())
+    assert built["permissions"] == source["permissions"]
+    assert built["version"] == source["version"] == "1.4.8"
+    assert built["manifest_version"] == 2
+    assert (built["browser_specific_settings"]["gecko"]["id"]
+            == source["browser_specific_settings"]["gecko"]["id"]
+            == "cove-dm@cove-download-manager.net")
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_each_zip_is_named_for_its_own_manifest_version(bundles, browser):
+    """The zip name has to come from the manifest it contains.
+
+    Both assertions matter. The first is the mechanism: a name derived from
+    anything other than the bundled manifest would drift from it. The second
+    is the outcome: a builder that emitted a name correctly but from a stale
+    tree would still satisfy the first.
+    """
+    zips = list(bundles.glob(f"cove-{browser}-*.zip"))
+    assert len(zips) == 1, f"expected exactly one {browser} zip, got {zips}"
+
+    built = json.loads((bundles / browser / "manifest.json").read_text())
+    source_manifest = "manifest.chrome.json" if browser == "chrome" else "manifest.json"
+    source = json.loads((ROOT / "extension" / source_manifest).read_text())
+
+    assert zips[0].name == f"cove-{browser}-{built['version']}.zip"
+    assert built["version"] == source["version"]
 
 
 def test_chrome_manifest_still_requests_no_webrequest(bundles):

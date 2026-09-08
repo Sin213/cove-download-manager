@@ -3,10 +3,13 @@
 Lives in `docs/` rather than `dist/`, which `scripts/build_extension.py`
 deletes on every build.
 
-**This is a draft, not a submission.** It describes the Chrome bundle as it is
-built from the current source. It does not name an upload artifact, because the
-version to upload and the artifact to upload have not been decided or built
-(Tab 4), and the live Store record has not been read (see
+**This is a release candidate, not a submission.** It describes the Chrome
+bundle as it is built from the current source, at the candidate version
+**1.3.9** (`dist/cove-chrome-1.3.9.zip`). That version is provisional: it is the
+next patch above both the repository source (1.3.8) and the highest version
+verifiably published on the Store (1.3.6), but the public listing cannot show an
+upload that was rejected, withdrawn, or is awaiting review. Confirm on the
+developer dashboard before uploading (see
 [Unresolved external evidence](#5-historical-rejection-context-and-unresolved-external-evidence)).
 
 Nothing here means Google has approved anything.
@@ -38,7 +41,7 @@ Features:
 
 • Session cookies, the referring page, and your browser's user-agent are passed along, so a file behind a session you are already signed in to still downloads
 
-• Interception can be toggled with a keyboard shortcut, restricted to chosen file types, switched off for domains you list, and held to a minimum file size whenever the browser reports one
+• Interception can be toggled with a keyboard shortcut, restricted to chosen file types, switched off for domains you list, and held to a minimum file size whenever the browser gives a usable size at the start of a download. When the browser reports the size as unknown, the minimum cannot be applied and a smaller file may still be taken over
 
 What this extension does not do:
 
@@ -74,17 +77,27 @@ What it cannot do, by construction:
   are Firefox-only, and Chrome does not request the `webRequest` permission.
 - It ships no detected-stream popup section and no stream download button
   (`popup/streams.js` and `popup/streams.css` are Firefox-only).
-- A media target whose path ends in `.m3u8`, `.m3u`, or `.mpd` is refused when
-  it is chosen from the context menu, and no link, page address, or fallback
-  stands in for it.
+- A media target whose path ends in `.m3u8`, `.m3u`, or `.mpd` is refused, and
+  no link, page address, or fallback stands in for it.
 
-  That refusal is enforced on the context-menu path only. The in-page button
-  goes through `handleMediaTabDownload` in `media-core.js`, which gates on the
-  HTTP(S) scheme and does not consult the refusal policy. In practice Chrome
-  cannot play an HLS playlist from a `video` element, so such an element never
-  becomes eligible for the button, which is what the browser check observed.
-  That is platform behaviour rather than an enforced invariant, so this
-  document does not claim the suffix refusal covers every path.
+  Both routes a media address can take now enforce it. The context menu
+  consults the refusal in `background.js`, and the in-page button's
+  `downloadMedia` handoff consults the same refusal in `handleMediaTabDownload`
+  (`media-core.js`), before the address is marked, before cookies are read, and
+  before anything reaches the native host. A refused request ends there and
+  reports that the address is unsupported.
+
+  What this does and does not establish. It is one pathname check on the
+  address that is about to be sent. It does not verify that an accepted address
+  is a direct media file, it does not recognise a playlist served without one of
+  those three suffixes, and it does not inspect where an address redirects. A
+  playable MP4 served under a `.m3u8` pathname is refused by it, which is the
+  chosen policy behaving as written and not evidence that anything decoded a
+  playlist. Downloads the browser itself starts, and ordinary link and image
+  targets, do not pass through this refusal at all.
+
+  Firefox publishes no such refusal, so nothing about its context menu or its
+  button changes.
 
 Limits to be honest about in any copy:
 
@@ -143,13 +156,13 @@ Every claim in section 1 that is about behaviour, and where it is enforced.
 | Claim | Code | Test |
 | --- | --- | --- |
 | Cove takes over browser-started downloads | `extension/background.js` `handleCreated`, `interceptDownload` | `tests/extension_background.test.js` |
-| Bounded by toggle, type, domain, and by size when the browser reports one | `extension/background.js` `handleCreated`, `DEFAULT_SETTINGS`. The size test is `typeof size === "number" && size > 0 && size < minSizeBytes`, so an unreported size is deliberately not filtered rather than treated as zero | `tests/extension_background.test.js` |
+| Bounded by toggle, type, domain, and by size when the browser gives a usable positive size at the start | `extension/background.js` `handleCreated`, `DEFAULT_SETTINGS`. The size test is `typeof size === "number" && size > 0 && size < minSizeBytes`, so a size the browser reports as unknown is deliberately not filtered rather than treated as zero. What the browser reports is the browser's decision: a declared `Content-Length` does not guarantee a usable size at that moment | `tests/extension_background.test.js` |
 | Link and image context targets | `extension/background.js` `registerContextMenu` | `tests/extension_background.test.js` |
 | Video and audio context targets exist in Chrome | `extension/media-core.js` `contexts`, `registerContextMenu` | `test_chrome_context_menu_derives_media_contexts_from_the_capability` |
 | The element's own source wins over an enclosing link | `extension/background.js` `contextMenus.onClicked` | `test_chrome_media_action_selects_the_element_source_over_a_link` |
 | In-page button on a direct video, in Chrome | `extension/content/media-tab.js` (shared), shipped by `_CHROME_EXCLUDE` not excluding it | `test_chrome_bundle_ships_the_shared_media_pill`, `tests/extension_media_tab.test.js` |
 | No extraction, no site handling in Chrome | `scripts/build_extension.py` `_CHROME_EXCLUDE`; `extension/media-chrome.js` publishes no site hooks | `test_chrome_bundle_has_no_extractor_module`, `test_chrome_capability_supplies_no_site_hooks` |
-| Playlist media targets refused on Chrome | `extension/media-chrome.js` `MANIFEST_SUFFIXES` | `test_chrome_capability_refuses_playlist_media_targets` |
+| Playlist media targets refused on Chrome, on both media routes | `extension/media-chrome.js` `MANIFEST_SUFFIXES` and `rejectMediaTarget`, consulted by `extension/background.js` for the context menu and by `handleMediaTabDownload` in `extension/media-core.js` for the in-page button | `test_chrome_capability_refuses_playlist_media_targets`, "Chrome refuses a pill handoff for the manifest ...", "a refused pill handoff leaves nothing behind it" |
 | No detected-stream popup section in Chrome | `scripts/build_extension.py` `_CHROME_EXCLUDE`, `_compose_popup` | `test_chrome_bundle_has_no_popup_stream_module`, `test_chrome_popup_markup_carries_no_stream_section`, `tests/extension_popup.test.js` |
 | No stream download route in Chrome | `extension/background.js` message dispatch; the send lives in `extension/media-sites.js` | "Chrome answers the legacy stream download instead of forwarding it" |
 | Chrome requests no `webRequest` | `extension/manifest.chrome.json` | `test_chrome_manifest_still_requests_no_webrequest` |
@@ -188,41 +201,74 @@ shipping no site handling at all. The superseded text remains in this
 repository's history. `docs/chrome-store-listing-1.3.4-archived.md` holds the
 older 1.3.4 copy and is left untouched.
 
-### Unresolved external evidence, required before any submission
+### External evidence: what has been read, and what has not
 
-None of the following has been read in this work. They cannot be inferred from
-the source tree and must not be guessed at:
+Read on 2026-09-07, from the public Store listing for item
+`liakghhamogjcmmgnmcpephlfecmilnf`:
+
+- The published version is **1.3.6**, last updated 10 August 2026, and the item
+  is live in the Tools category.
+
+That is the whole of what a public page can establish. The repository source was
+at 1.3.8, so 1.3.7 and 1.3.8 were bumped in this repository (`22f4122`,
+`444fabe`) and never became the published version. Whether either was uploaded
+and rejected, uploaded and withdrawn, or simply never uploaded is not visible
+publicly.
+
+Still unread, and not inferable from the source tree or the public page:
 
 - The exact current rejection text and its appeal state.
+- Which Chrome versions have actually been **uploaded**, including any draft,
+  in-review, or rejected upload. A public listing shows the published version
+  only, so it cannot rule out an upload at or above 1.3.9.
 - The live listing copy, screenshots, and promotional images.
-- Which Chrome versions have actually been uploaded and which are published.
-  The manifest version in this repository is what would be built next; it is
-  not evidence of the highest version ever uploaded.
 - The permission justifications currently recorded in the dashboard.
 - The privacy-practices declarations currently recorded in the dashboard.
 
-Firefox versioning is a separate question against AMO's own published record.
+Firefox versioning is a separate question against AMO's own record. Checked the
+same day: the public version of `cove-dm@cove-download-manager.net` is 1.4.7,
+matching the repository source, so 1.4.8 is the next patch. The same limit
+applies - an upload awaiting review is not public.
 
 ---
 
 ## 6. Submission checklist
 
-Nothing here is done, and none of it is in scope for this slice.
-
-- [ ] Read the live Store record: rejection text, published versions, listing
-      copy, screenshots, permission justifications, privacy declarations.
-- [ ] Tab 3: full validation of freshly built Chrome and Firefox artifacts.
-- [ ] Tab 4: decide the version, bump it, and rebuild. A Store upgrade is a new
-      zip containing every file, changed or not, so the artifact that is
-      validated must be the artifact that is uploaded.
+- [x] Read the public Store record: published version 1.3.6, last updated
+      10 August 2026. The dashboard-only facts below are still outstanding.
+- [x] Tab 3: full validation of freshly built Chrome and Firefox artifacts.
+- [x] Tab 4: version decided (1.3.9, provisional), bumped, and rebuilt. A Store
+      upgrade is a new zip containing every file, changed or not, so the
+      artifact that is validated must be the artifact that is uploaded.
+- [ ] Read the dashboard: rejection text and appeal state, uploaded-version
+      history including drafts and rejections, permission justifications,
+      privacy-practices declarations. Confirm 1.3.9 is unused before uploading.
 - [ ] Replace any screenshot that shows a feature this build does not have.
       Screenshots showing stream detection or extraction contradict the copy.
 - [ ] Point the dashboard's privacy policy field at the current `PRIVACY.md`.
+      The repository copy being updated does not update a Store URL.
+- [ ] Declare the Privacy practices data categories. The Chrome bundle reads
+      page content locally to place the in-page button, and reads cookies for
+      the download address, and local-only processing still requires disclosure.
 - [ ] Re-check the description against section 4 after any behaviour change.
+
+## 7. Release notes for 1.3.9
+
+The Store has no per-version release-notes field; this is the text to use if the
+description's "What's new" area or a changelog entry is updated.
+
+```text
+The refusal that already stopped a playlist address being sent from the right-click menu now also applies to the in-page Cove button, so both ways of handing a media address to Cove are held to it. A refused address is not marked, no cookies are read for it, nothing is sent to the desktop app, and no page address is substituted for it.
+
+The minimum file size description has been corrected: the minimum can only be applied when the browser gives a usable size at the start of a download, so a smaller file may still be taken over.
+
+No permission changes in this version.
+```
 
 ## Official policy references
 
-Read while drafting this document. Accessed 2026-09-05.
+Read while drafting this document. The first five were accessed 2026-09-05; the
+last two were accessed 2026-09-07 for this release candidate.
 
 | Page | What was taken from it |
 | --- | --- |
@@ -230,7 +276,8 @@ Read while drafting this document. Accessed 2026-09-05.
 | <https://developer.chrome.com/docs/webstore/program-policies/user-data-faq> | Disclosure is required even when data is only processed or stored locally and never transmitted. User data explicitly includes authentication cookies, website content and resources, and web browsing activity such as the domains or URLs the browser interacts with. |
 | <https://developer.chrome.com/docs/webstore/program-policies/unexpected-behavior> | Do not misrepresent functionality, and do not include non-obvious functionality that does not serve the product's primary purpose. |
 | <https://developer.chrome.com/docs/webstore/program-policies/malicious-and-prohibited/> | Do not facilitate unauthorized access to site content such as circumventing paywalls or login restrictions. Do not encourage, facilitate, or enable unauthorized access, download, or streaming of copyrighted content or media. |
-| <https://developer.chrome.com/docs/webstore/update> | An upgrade is a new zip containing all files, changed and unchanged, plus any changed listing metadata, resubmitted for review. |
+| <https://developer.chrome.com/docs/webstore/update> | An upgrade is a new zip containing all files, changed and unchanged, plus any changed listing metadata, resubmitted for review. Each new version must have a larger version number than the previous one, and the update is reviewed as a new item would be. |
+| <https://developer.chrome.com/docs/extensions/reference/manifest/version> | One to four dot-separated integers, each 0-65535, no leading zeros on a non-zero integer, not all zero. Comparison is leftmost-first, integer by integer, with a missing integer equal to zero - so versions are not compared as strings. |
 
 Note for the record: none of these pages bans a video format, and none bans
 HLS as a format. The prohibition is on facilitating unauthorized access to and

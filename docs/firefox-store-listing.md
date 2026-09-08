@@ -1,9 +1,9 @@
-# AMO listing - Cove Download Manager (Firefox) 1.4.7
+# AMO listing - Cove Download Manager (Firefox) 1.4.8
 
 Lives in `docs/` rather than `dist/`, which `scripts/build_extension.py`
 deletes on every build.
 
-Upload `dist/cove-firefox-1.4.7.zip` at
+Upload `dist/cove-firefox-1.4.8.zip` at
 <https://addons.mozilla.org/developers/>.
 
 The three blocks below map to the three AMO fields. They are plain text, not
@@ -40,21 +40,23 @@ Features:
 
 • Sends cookies, referrer, and user-agent information so authenticated downloads work
 
-• Toggle interception on or off with Alt+Shift+D, and set a minimum file size and excluded domains
+• Toggle interception on or off with Alt+Shift+D, and set excluded domains and a minimum file size, which applies whenever Firefox gives a usable size at the start of a download
 
 How interception works:
 
 When you start a download, Cove can take it over instead of leaving it to the browser: installers, archives, documents, and other direct file links.
 
-You decide what it touches. Interception can be switched off with a keyboard shortcut, limited by a minimum file size, restricted to specific file types, and disabled entirely on domains you list.
+You decide what it touches. Interception can be switched off with a keyboard shortcut, restricted to specific file types, disabled entirely on domains you list, and limited by a minimum file size.
+
+About that minimum: it can only be applied when Firefox gives a usable size at the moment a download starts. In the Firefox version and test files used for this release, Firefox reported the size as unknown at that moment for every download, including one whose server did declare a length, so the minimum did not filter any of them. Expect a download smaller than your minimum to be taken over anyway. Whether a size is available is Firefox's decision rather than the server's, and it may differ on other versions.
 
 Nothing is downloaded without an action you took, and the extension never collects or transmits your browsing history.
 
-What's new in version 1.4.7:
+What's new in version 1.4.8:
 
-The download button on videos is more accurate about what it can do. On a page where the video's address cannot be worked out, it now says "No video found" instead of quietly sending the page itself to Cove, which produced a download that failed for no visible reason. The button also stops getting stuck after that happens, and a video on a page with several players can no longer be sent using a different player's stream.
+Downloads whose size Firefox does not report are handed to Cove correctly. Firefox reports an unknown size as -1, and that value used to be passed straight through to Cove, which rejected the handoff. It is now sent as an unknown size, and the download goes through.
 
-Interception also cleans up after itself more reliably. A download the browser finished or cancelled while the extension was asleep used to stay on the tracking list for the rest of the session, which could misclassify a later download that reused the same id. And the toolbar badge now shows OFF whenever interception is disabled, instead of being overwritten by a count of videos found on the page.
+The description of the minimum file size has been corrected to match what actually happens: the minimum can only be applied when Firefox gives a usable size at the start of a download, so a smaller file may still be taken over.
 
 The free Cove Download Manager desktop app is required because it provides the download engine. Install Cove, launch it once, and then click "Test Connection to Cove" in the extension to link them.
 
@@ -65,20 +67,18 @@ https://github.com/Sin213/cove-download-manager
 ## Version -> Release Notes
 
 Shown on the add-on's detail page under this version. Keep it to what changed
-in 1.4.7 only.
+in 1.4.8 only.
 
 ```text
-Fixed: the video download button no longer sends the page instead of the video.
+Fixed: downloads whose size Firefox does not report now reach Cove instead of being rejected.
 
-On a page where the video's address cannot be determined - a player that streams through the browser rather than from a plain file address - the button used to fall back to sending the page's own address. Cove then tried to download a web page as if it were a video, which failed with an unhelpful error or, on sites that refuse unfamiliar clients, no explanation at all. The button now reports "No video found", which is the honest answer.
+Firefox reports an unknown size as -1, and that value was passed straight through to the desktop app, which rejected the handoff because a size cannot be negative. The size is now sent as unknown, and the download goes through. In testing, Firefox reported the size as unknown for every download, including one whose server declared a length, so this affected far more downloads than the wording "responses with no declared length" suggested.
 
-Fixed: the button no longer sticks on the page after that happens. It could previously stay pinned over the page until a reload, and ignore every later click.
+Fixed: the video download button is more careful about which source it sends. It now waits for the player's own address to be usable rather than acting on a partly resolved one, and prefers the address the element itself names over one inferred around it.
 
-Fixed: on a page with several video players, a player with no stream of its own can no longer be sent using the first player's stream. That produced a download that appeared to succeed and fetched the wrong video.
+Changed: the description of the minimum file size now matches what actually happens. The minimum can only be applied when Firefox gives a usable size at the moment a download starts, so a file smaller than your minimum may still be taken over. This is a wording correction, not a change in behaviour.
 
-Fixed: intercepted downloads are cleaned up even when the browser's completion event is missed, which can happen while the extension is suspended. A leftover entry used to persist for the whole session and could suppress or misclassify a later download that reused the same id.
-
-Fixed: the toolbar badge shows OFF while interception is disabled, rather than being replaced by a count of videos detected on the page.
+Internal: the add-on's media code is split into a browser-neutral part and the Firefox-only site handling, and the popup's detected-stream section moved into its own module. The scripts named in the manifest changed accordingly. Nothing the add-on does on a page changed because of it.
 
 No permission changes in this version.
 ```
@@ -102,29 +102,27 @@ To reproduce the uploaded file:
   cd cove-download-manager
   python scripts/build_extension.py
 
-This writes dist/cove-firefox-1.4.7.zip. Requires Python 3.9 or later, no other tooling. Three things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3); the browser-specific modules, which are media-sites.js, content/media-sites.js, popup/streams.js and popup/streams.css in the Firefox bundle only, and media-chrome.js in the Chrome bundle only; and the popup composition described above. That is why the Firefox bundle holds 21 files and the Chrome bundle holds 18. Chrome is not without video handling: it ships the same shared in-page button and the same video and audio context-menu entries for a media element whose own address is an ordinary HTTP(S) file. What the Chrome build excludes is the site-specific part, meaning page extractors, HLS stream detection, and the detected-stream popup section.
+This writes dist/cove-firefox-1.4.8.zip. Requires Python 3.9 or later, no other tooling. Three things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3); the browser-specific modules, which are media-sites.js, content/media-sites.js, popup/streams.js and popup/streams.css in the Firefox bundle only, and media-chrome.js in the Chrome bundle only; and the popup composition described above. That is why the Firefox bundle holds 21 files and the Chrome bundle holds 18. Chrome is not without video handling: it ships the same shared in-page button and the same video and audio context-menu entries for a media element whose own address is an ordinary HTTP(S) file. What the Chrome build excludes is the site-specific part, meaning page extractors, HLS stream detection, and the detected-stream popup section.
 
 Public source: https://github.com/Sin213/cove-download-manager
 
-What changed in 1.4.7
+What changed in 1.4.8
 
-Five fixes, in two files. No new permissions, no new APIs, no new hosts.
+No new permissions, no new APIs, no new hosts. The permission set in manifest.json is byte-identical to 1.4.7; only the version and the script lists differ.
 
-extension/content/media-tab.js - the in-page video button:
+A file reorganisation, so the manifest's script lists changed:
 
-1. It no longer falls back to sending the page's own address when it cannot determine the video's address. On a player that streams through the browser (a blob: source with no separate stream visible on the page), there is genuinely nothing to download, and sending the page address made the desktop app fetch an HTML page as if it were a video. It now reports "No video found" and sends nothing.
+extension/media.js was split into extension/media-core.js (browser-neutral mechanics: filename derivation, the in-page button's handoff, the media message surface) and extension/media-sites.js (the Firefox-only site handling: page extractors, site title rules, HLS stream observation). The manifest's background.scripts therefore names media-core.js, media-sites.js, background.js instead of media.js, background.js. Likewise the detected-stream part of the content script moved to content/media-sites.js, which now precedes content/media-tab.js, and the popup's stream section moved to popup/streams.js and popup/streams.css. This is a split of existing code, not new capability: the Firefox bundle still ships every part of it.
 
-2. The in-flight flag is released when there is no video to send. It was previously set before the address was resolved and cleared only on a path that this case returned before reaching, so the button pinned itself over the page until a reload and rejected every later click.
+The split exists because the same source tree also builds a Chrome bundle that ships none of the site handling. Files whose names end in -sites are the Firefox-only half, and the Chrome build excludes them.
 
-3. The lookup for a player's embedded stream address is now scoped to that player's own ancestors. It previously fell back to the first matching element anywhere in the document, so on a page with several players every one of them resolved to the first player's stream - a download that looked successful and fetched the wrong video.
+Behaviour fixes:
 
-extension/background.js and extension/media.js - interception bookkeeping:
+1. extension/background.js - a download size the browser reports as unknown is normalised before the handoff. Firefox reports -1 for an unknown size; that value reached the desktop app, which rejects a negative size, so those downloads were refused outright. It is now sent as 0, meaning unknown, which the app accepts.
 
-4. Intercepted download ids are pruned against the browser's own download list. Cleanup previously depended entirely on catching a terminal onChanged event, which is missed when it races the insertion or fires while the extension is suspended. A leftover id persisted for the whole session and could suppress or misclassify a later event for a reused id. Writes to the persisted set are chained rather than fired independently, because two overlapping writes could complete out of order and resurrect ids that had just been cleared.
+2. extension/content/media-tab.js - the in-page button now requires the player's own address to be usable before acting on it, and takes the address the element names over one inferred around it. This removes a case where a partly resolved player produced a handoff for the wrong source.
 
-5. The toolbar badge is rendered through a single function so the disabled OFF state takes priority over a media count. media.js previously painted the badge directly, which overwrote OFF and made a disabled extension look active.
-
-These are covered by tests/extension_background.test.js and tests/extension_media_tab.test.js in the repository, which run under node --test with no dependencies.
+These are covered by tests/extension_background.test.js, tests/extension_media_tab.test.js, and tests/test_extension_bundle.py in the repository, which run under node --test and pytest with no third-party dependencies.
 
 How the add-on works
 
@@ -180,9 +178,9 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 
 ## Before submitting
 
-- The feature bullets in the description carry over from 1.4.6 unchanged. Only
-  the "What's new" paragraph, the release notes, and the reviewer notes are new
-  copy for 1.4.7.
+- The feature bullets in the description carry over unchanged except for the
+  minimum-file-size bullet, which was corrected. The "What's new" paragraph, the
+  release notes, and the reviewer notes are new copy for 1.4.8.
 - Screenshots do not need replacing. This build still ships the video pill, so
   existing pill screenshots remain accurate.
 - `nativeMessaging`, `cookies`, `webRequest`, and `<all_urls>` are still
@@ -194,6 +192,11 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
   This has been outstanding since `0be8c3e` changed the script load order and
   no browser has executed the new layout yet. See the note in
   `project-firefox-release-check`.
-- 1.4.7 carries extension fixes from `c445cb1` that were written before the
+- 1.4.7 carried extension fixes from `c445cb1` that were written before the
   1.4.6 upload but never given a version bump, so the published 1.4.6 and the
-  repository's 1.4.6 source were not the same code. That is corrected here.
+  repository's 1.4.6 source were not the same code. That was corrected there.
+- 1.4.7 is the version currently public on AMO (verified 2026-09-07 against the
+  AMO API for add-on `cove-dm@cove-download-manager.net`), and the repository
+  source was also 1.4.7, so 1.4.8 is the next patch above both. That check reads
+  public versions only; it cannot see an upload awaiting review or an unlisted
+  one, so confirm on the developer dashboard before uploading.

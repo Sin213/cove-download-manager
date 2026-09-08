@@ -37,7 +37,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          worker = false, missingScripts = [],
                          installedMenus = new Map(), menuApi = "lenient" } = {}) {
   const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
-                  notifications: [] };
+                  notifications: [], cookies: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
@@ -133,7 +133,9 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       },
       onClicked: events.contextMenuClicked,
     },
-    cookies: { async getAll() { return cookies; } },
+    // The query is recorded, not just the jar returned: a refused target must
+    // not be looked up at all, and only the recorded query can show that.
+    cookies: { async getAll(query) { calls.cookies.push(query); return cookies; } },
     downloads: {
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
@@ -520,18 +522,36 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
 // CoveMediaCapability global - because that is the configuration Chrome will
 // run, not a special explicit one.
 
-function loadMediaCore({ capability } = {}) {
+function loadMediaCore({ capability, nativeResult = { status: "ok" } } = {}) {
   const noop = () => {};
+  // media-core.js calls back into background.js globals at call time. Standing
+  // in for them here is what lets the pill's handoff be driven against the
+  // core alone, with no browser bundle around it, and every call recorded.
+  const core = { native: [], cookies: [], marked: [], notifications: [], diag: [] };
+  const recentIntercepted = new Set();
   const context = vm.createContext({
     globalThis: undefined,
     browser: {
       webRequest: null,
+      cookies: {
+        async getAll(query) { core.cookies.push(query); return []; },
+      },
       tabs: {
         onRemoved: { addListener: noop },
         onUpdated: { addListener: noop },
         onActivated: { addListener: noop },
         query: () => Promise.resolve([]),
       },
+    },
+    recentIntercepted,
+    markIntercepted(url) { core.marked.push(url); recentIntercepted.add(url); },
+    async sendNativeMessage(message) {
+      core.native.push(message);
+      return nativeResult;
+    },
+    showNotification(title, body) { core.notifications.push({ title, body }); },
+    diagRecord(component, event, level, fields, requestId) {
+      core.diag.push({ component, event, level, fields, requestId });
     },
     console: { log: noop, error: noop, warn: noop },
     navigator: { userAgent: "test-agent" },
@@ -547,7 +567,38 @@ function loadMediaCore({ capability } = {}) {
   );
   // CoveMedia is a top-level const, so it lives in the context's lexical
   // scope rather than on the context object (see evalIn above).
-  return { context, CoveMedia: evalIn(context, "CoveMedia") };
+  return {
+    context,
+    core,
+    recentIntercepted,
+    CoveMedia: evalIn(context, "CoveMedia"),
+    // buildCoveMedia is a function declaration, so unlike CoveMedia it is a
+    // property of the context. Calling it with an explicit capability is the
+    // documented alternative to the global, and it has to honour the same
+    // hooks the global does.
+    buildCoveMedia: evalIn(context, "buildCoveMedia"),
+  };
+}
+
+// Drives one media message through a core surface exactly as background.js's
+// listener does, and resolves with what that listener would return alongside
+// the reply the caller received. `kept === true` is the "keep sendResponse
+// alive" contract, and `replies` proves it was answered exactly once.
+async function coreMediaMessage(media, msg, sender = {}) {
+  const replies = [];
+  let resolve = null;
+  const answered = new Promise((r) => { resolve = r; });
+  // The reply is built in the script's realm, so it is compared by structure
+  // rather than by identity - the same round-trip plain() does elsewhere.
+  const kept = media.handleMessage(msg, sender, (reply) => {
+    replies.push(plain(reply));
+    resolve();
+  });
+  await Promise.race([
+    answered,
+    new Promise((r) => setTimeout(r, 250)),
+  ]);
+  return { kept, replies };
 }
 
 test("the shared core offers video and audio contexts without any site adapter", () => {
@@ -653,6 +704,121 @@ test("the shared core has no page fallback and no stream list without an adapter
 test("the shared core leaves a message it does not own to the caller", () => {
   const { CoveMedia } = loadMediaCore();
   assert.equal(CoveMedia.handleMessage({ type: "somethingElse" }, {}, () => {}), false);
+});
+
+// ---- The optional media-target refusal ----
+//
+// rejectMediaTarget is a hook like every other: supplied by a capability, and
+// absent by default. These pin the three ways the core can be configured, so
+// the Chrome bundle's behaviour is not the only thing holding the contract up.
+
+const MANIFEST_PILL = {
+  type: "downloadMedia",
+  url: "https://cdn.example.test/v/stream.m3u8",
+  pageUrl: "https://example.test/watch",
+};
+
+test("the shared core hands over a manifest when no capability refuses one",
+     async () => {
+  // The default is not a refusal. Without a capability that publishes one,
+  // nothing here knows a playlist from a file, and the address is forwarded.
+  const loaded = loadMediaCore();
+  const { kept, replies } = await coreMediaMessage(loaded.CoveMedia, MANIFEST_PILL,
+                                                   { tab: { title: "Clip" } });
+
+  assert.equal(kept, true);
+  assert.deepEqual(replies, [{ ok: true }]);
+  assert.equal(loaded.core.native.length, 1);
+  assert.equal(loaded.core.native[0].url, MANIFEST_PILL.url);
+});
+
+test("an explicit factory capability's refusal is honoured", async () => {
+  const seen = [];
+  const loaded = loadMediaCore();
+  const media = loaded.buildCoveMedia({
+    rejectMediaTarget(value) { seen.push(value); return value.endsWith(".m3u8"); },
+  });
+
+  const { kept, replies } = await coreMediaMessage(media, MANIFEST_PILL,
+                                                   { tab: { title: "Clip" } });
+
+  assert.equal(kept, true);
+  assert.deepEqual(replies, [
+    { ok: false, reason: "unsupported", error: "Unsupported URL" },
+  ]);
+  assert.equal(loaded.core.native.length, 0);
+  assert.deepEqual(loaded.core.cookies, []);
+  assert.deepEqual(loaded.core.marked, []);
+  // The capability was asked about the address that was about to be sent, not
+  // about the message's raw url or the page it came from.
+  assert.deepEqual(seen, [MANIFEST_PILL.url]);
+});
+
+test("a global capability's refusal is honoured with no explicit argument",
+     async () => {
+  const loaded = loadMediaCore({
+    capability: { rejectMediaTarget: (value) => value.endsWith(".m3u8") },
+  });
+
+  const { replies } = await coreMediaMessage(loaded.CoveMedia, MANIFEST_PILL,
+                                             { tab: { title: "Clip" } });
+
+  assert.deepEqual(replies, [
+    { ok: false, reason: "unsupported", error: "Unsupported URL" },
+  ]);
+  assert.equal(loaded.core.native.length, 0);
+});
+
+test("a capability that refuses nothing leaves the handoff alone", async () => {
+  const loaded = loadMediaCore({
+    capability: { rejectMediaTarget: () => false },
+  });
+
+  const { replies } = await coreMediaMessage(loaded.CoveMedia, MANIFEST_PILL,
+                                             { tab: { title: "Clip" } });
+
+  assert.deepEqual(replies, [{ ok: true }]);
+  assert.equal(loaded.core.native.length, 1);
+});
+
+test("Firefox publishes no media-target refusal", async () => {
+  // Firefox's capability is media-sites.js, and it has no such hook.
+  const { context } = loadBackground();
+  assert.equal(
+    evalIn(context, "typeof CoveMediaCapability.rejectMediaTarget"),
+    "undefined",
+  );
+});
+
+test("Firefox still hands a playlist address to Cove from the pill", async () => {
+  // The behavioural half of the line above, and the one that matters: Firefox
+  // has stream handling, so a playlist address is something it can act on and
+  // must keep acting on. A refusal written into the shared core rather than
+  // published by a capability would take this with it, and the capability
+  // assertion alone would not notice.
+  const loaded = loadBackground();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  let done = null;
+  const replied = new Promise((resolve) => { done = resolve; });
+  loaded.events.message.emit(
+    {
+      type: "downloadMedia",
+      url: "https://cdn.example.test/v/stream.m3u8",
+      pageUrl: "https://neutral.example.test/watch",
+    },
+    { tab: { id: 7, url: "https://neutral.example.test/watch", title: "Clip" } },
+    done,
+  );
+  const reply = await replied;
+
+  assert.deepEqual(plain(reply), { ok: true });
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/v/stream.m3u8");
+  // The site adapter rejects a playlist extension for the *filename*, which is
+  // a separate rule and is unchanged: the download is still named .mp4.
+  assert.equal(loaded.calls.native[0].filename, "Clip.mp4");
 });
 
 // ---- Firefox filename parity across the split ----
@@ -1655,6 +1821,146 @@ test("a downloadMedia request the message calls eligible is still checked",
   await m.done;
 
   assert.equal(m.calls.native.length, 0);
+  assert.deepEqual(plain(m.reply()), {
+    ok: false, reason: "unsupported", error: "Unsupported URL",
+  });
+});
+
+// ---- The pill's half of Chrome's media-target policy ----
+//
+// media-chrome.js publishes one refusal, and the context menu has consulted it
+// since it was written. The pill's downloadMedia message is the other way a
+// media address reaches the native host, and these pin it to the same policy.
+// Everything below drives the real background listener, not the refusal helper
+// on its own: what matters is that the address is refused on the route the
+// pill actually uses.
+
+const MANIFEST_TARGETS = [
+  "https://cdn.example.test/v/stream.m3u8",
+  "https://cdn.example.test/v/stream.m3u",
+  "https://cdn.example.test/v/stream.mpd",
+  // Case is not part of the name: a server is free to serve either.
+  "https://cdn.example.test/v/STREAM.M3U8",
+  // The address is parsed, so what follows the path cannot hide the suffix.
+  "https://cdn.example.test/v/stream.m3u8?token=abc",
+  "https://cdn.example.test/v/stream.m3u8#t=10",
+  "https://cdn.example.test/v/stream.m3u8?token=abc#t=10",
+];
+
+for (const url of MANIFEST_TARGETS) {
+  test(`Chrome refuses a pill handoff for the manifest ${url}`, async () => {
+    const m = await chromeMediaMessage({
+      type: "downloadMedia",
+      url,
+      pageUrl: "https://example.test/watch",
+      requestId: "aaaabbbb",
+    });
+    await m.done;
+
+    assert.equal(m.calls.native.length, 0, "nothing may reach the native host");
+    assert.deepEqual(plain(m.reply()), {
+      ok: false, reason: "unsupported", error: "Unsupported URL",
+    });
+  });
+}
+
+// Positive controls. These are the addresses the policy must leave alone, and
+// they are what a refusal written too broadly would take with it.
+for (const [label, url] of [
+  ["a direct file", "https://cdn.example.test/v/clip.mp4"],
+  ["an extensionless resource", "https://cdn.example.test/v/clip"],
+  // The suffix is in the query, not the path. A search rather than a parse
+  // would refuse this ordinary MP4.
+  ["an mp4 whose query mentions a playlist",
+   "https://cdn.example.test/v/clip.mp4?src=playlist.m3u8"],
+  ["an mp4 whose path merely contains the text",
+   "https://cdn.example.test/m3u8/clip.mp4"],
+]) {
+  test(`Chrome still hands over ${label}`, async () => {
+    const m = await chromeMediaMessage({
+      type: "downloadMedia", url, pageUrl: "https://example.test/watch",
+    });
+    await m.done;
+
+    assert.deepEqual(plain(m.reply()), { ok: true });
+    assert.equal(m.calls.native.length, 1);
+    assert.equal(m.calls.native[0].url, url);
+  });
+}
+
+test("a refused pill handoff leaves nothing behind it", async () => {
+  const m = await chromeMediaMessage(
+    {
+      type: "downloadMedia",
+      url: "https://cdn.example.test/v/stream.m3u8",
+      pageUrl: "https://example.test/watch",
+      requestId: "ccccdddd",
+    },
+    { cookies: [{ name: "session", value: "value" }] },
+  );
+  await m.done;
+
+  assert.equal(m.calls.native.length, 0, "no native download");
+  assert.deepEqual(m.calls.cookies, [], "no cookie lookup for a refused target");
+  assert.deepEqual(m.browserDownloads, [], "no browser fallback download");
+  assert.deepEqual(m.calls.notifications, [], "nothing succeeded, so nothing is announced");
+  assert.equal(
+    evalIn(m.context, "recentIntercepted.has('https://cdn.example.test/v/stream.m3u8')"),
+    false,
+    "a refused address must not be marked as intercepted",
+  );
+});
+
+test("a refusal does not poison the request that follows it", async () => {
+  const loaded = chromeWorker();
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await chromePillSend(loaded, "https://cdn.example.test/v/stream.m3u8");
+  assert.equal(loaded.calls.native.length, 0);
+
+  await chromePillSend(loaded, "https://cdn.example.test/v/clip.mp4");
+  assert.equal(loaded.calls.native.length, 1);
+  assert.equal(loaded.calls.native[0].url, "https://cdn.example.test/v/clip.mp4");
+});
+
+test("a refused pill handoff answers once and keeps the channel open", async () => {
+  const loaded = chromeWorker();
+  await settle();
+
+  const replies = [];
+  let resolve = null;
+  const answered = new Promise((r) => { resolve = r; });
+  const kept = loaded.events.message.emit(
+    {
+      type: "downloadMedia",
+      url: "https://cdn.example.test/v/stream.m3u8",
+      pageUrl: "https://example.test/watch",
+    },
+    { tab: CHROME_TAB },
+    (reply) => { replies.push(reply); resolve(); },
+  );
+  await answered;
+  await settle();
+
+  // true is what the listener must return for an answer that arrives later,
+  // and it is what the pill's sendMessage is waiting on.
+  assert.deepEqual(kept, [true]);
+  assert.equal(replies.length, 1, "the pill must be answered exactly once");
+});
+
+test("a refused media address never becomes a download of its page", async () => {
+  // Everything a fallback would need is present: a page address on the
+  // message, a page address on the sender, and a titled tab.
+  const m = await chromeMediaMessage({
+    type: "downloadMedia",
+    url: "https://cdn.example.test/v/stream.m3u8",
+    pageUrl: "https://example.test/watch",
+  });
+  await m.done;
+
+  assert.equal(m.calls.native.length, 0);
+  assert.deepEqual(m.browserDownloads, []);
   assert.deepEqual(plain(m.reply()), {
     ok: false, reason: "unsupported", error: "Unsupported URL",
   });

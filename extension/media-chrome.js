@@ -49,8 +49,9 @@ const MANIFEST_SUFFIXES = [".m3u8", ".m3u", ".mpd"];
 // Enabling the video and audio context targets put a new kind of address
 // within reach of the menu. Chrome ships no stream handling, so forwarding a
 // playlist would hand over a description of a stream while presenting it as
-// the media the user pointed at. background.js consults this before the new
-// media action reaches the native host.
+// the media the user pointed at. Both routes a media address can take consult
+// this before it reaches the native host: background.js for the context-menu
+// action, and media-core.js for the pill's downloadMedia handoff.
 //
 // The address is parsed rather than searched, so a query string or fragment
 // after the suffix does not hide it and a suffix appearing anywhere else in
@@ -77,10 +78,11 @@ function rejectMediaTarget(value) {
 // worker script is not a global property, and media-core.js looks the
 // capability up there. Frozen so the shape cannot be extended at runtime.
 //
-// media-core.js knows none of the keys below, so it keeps every neutral
-// default. background.js reads the refusal directly, which is what confines
-// it to the browser that publishes it: Firefox's capability has no such key
-// and its menu behaves exactly as it did.
+// media-core.js supplies a neutral default for every hook it knows, so the
+// keys absent below leave each of those at its default and the one key present
+// is the only behaviour this file contributes. Publishing the refusal is what
+// confines it to the browser that publishes it: Firefox's capability has no
+// such key, so neither its menu nor its pill behaves any differently.
 globalThis.CoveMediaCapability = Object.freeze({
   rejectMediaTarget,
 });

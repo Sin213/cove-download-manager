@@ -1,6 +1,6 @@
 # Privacy Policy - Cove Download Manager (browser extension)
 
-_Last updated: 2026-09-05_
+_Last updated: 2026-09-07_
 
 Cove Download Manager is a browser extension that hands downloads off to the
 Cove Download Manager desktop application running on the same computer. This
@@ -79,10 +79,18 @@ record of it: the address, the suggested filename, the referring page address,
 and the size. It acts on it only when interception is enabled, the address is
 not on a domain you excluded, and the file type is one you allowed.
 
-Your minimum size applies whenever the browser reports a size for the
-download. When the browser reports no size, which happens on responses that do
-not declare a length, the minimum cannot be applied and the download is not
-filtered by it.
+Your minimum size applies when the browser gives a usable positive size at the
+moment the download starts. When the browser reports the size as unknown, the
+minimum cannot be applied, and Cove may take over a download that later turns
+out to be smaller than that minimum.
+
+Whether a size is available at that moment is the browser's decision, not the
+server's. A server declaring a `Content-Length` does not guarantee that the
+browser exposes that length when the download starts. In the Firefox version
+and fixtures tested for this release, the size was reported as unknown at that
+moment for every download, including one whose server did declare a length, so
+the minimum did not apply to any of them. This is a limit of what the browser
+reports, and it may differ on other versions.
 
 ### Right-click downloads
 
@@ -91,8 +99,21 @@ image, or media element you clicked, the address of the page it is on, and the
 page title, which is used to suggest a filename.
 
 On Chrome, a media address whose path ends in `.m3u8`, `.m3u`, or `.mpd` is
-refused at this point and nothing is handed off. That refusal is narrow and
-based on the address path; it is not a general block on any category of site.
+refused at this point and nothing is handed off. The same refusal now also
+applies to the Cove button described above, so both ways of handing a media
+address to Cove on Chrome are held to it.
+
+That refusal is narrow. It reads the address path and nothing else, so it
+catches only an address that names one of those three suffixes. It is not a
+general block on any category of site, and it is not a check that an address is
+a direct media file: a playlist served without one of those suffixes is not
+recognised, and where an address redirects is not inspected. Refusal means
+nothing is handed off and no alternative address is substituted; the request
+simply ends. Ordinary link and image downloads, and downloads the browser
+itself starts, do not go through this refusal at all.
+
+Firefox ships no such refusal, and its right-click and Cove button behaviour is
+unchanged.
 
 ### Cookies
 

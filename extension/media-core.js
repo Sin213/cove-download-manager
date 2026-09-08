@@ -22,6 +22,7 @@
 //   sitePageUrl(value)          page address to download instead of the media
 //   titleCleanup(title, url)    site-specific title rewrite, pre-sanitation
 //   rejectExtension(ext)        true for an extension that must not be used
+//   rejectMediaTarget(url)      true for an address that must not be sent
 //   pageFallbackUrl(tab, info)  context-menu fallback for an unusable target
 //   handleMessage(...)          extra message types, false when not its own
 function buildCoveMedia(capability) {
@@ -72,7 +73,22 @@ function buildCoveMedia(capability) {
 
     const url = sitePageUrl(sender.tab && sender.tab.url) ||
       sitePageUrl(msg.pageUrl) || msg.url || "";
-    if (!/^https?:\/\//i.test(url)) {
+
+    // A capability may refuse the address that was chosen. Chrome publishes
+    // such a refusal because it ships no stream handling and a media element's
+    // src is allowed to name a playlist; Firefox publishes none and this is
+    // the neutral false for it, exactly as every other hook here defaults.
+    //
+    // Asked about the resolved address rather than msg.url, so it is the thing
+    // actually about to be sent that was judged. Asked here, before anything
+    // is marked, looked up or sent, so a refused address leaves no dedup mark,
+    // no cookie read and no native request behind it. The refusal is not a
+    // reason to look for a different address: it ends the request.
+    const adapter = sites();
+    const refused = !!(adapter && adapter.rejectMediaTarget &&
+      adapter.rejectMediaTarget(url));
+
+    if (refused || !/^https?:\/\//i.test(url)) {
       diagRecord("extension.native_bridge", "request_failed", "WARNING",
                  { reason: "unsupported" }, requestId);
       return { ok: false, reason: "unsupported", error: "Unsupported URL" };
