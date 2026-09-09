@@ -1764,3 +1764,291 @@ def test_the_resolver_adds_no_database_schema(queue_env, monkeypatch, tmp_path):
     assert not any("magnet" in name or "resolver" in name or "metadata" in name
                    for name in tables)
     assert _rows(db_path) == []
+
+
+# ---------------------------------------------------------------------------
+# Aria2RPC.remove: what a successful return is allowed to mean (Tab 2B)
+#
+# The wrapper is shared with the resolver above, which is why these live
+# here. Its forceRemove -> removeDownloadResult fallback existed for one
+# real case: aria2 refusing to remove a download that is no longer active,
+# leaving only its result entry to clean. It was reached from *any*
+# Aria2Error, so a timeout or a malformed body - both of which mean "no
+# answer" - were quietly retried as "already gone" and reported as a
+# successful removal to a caller about to delete files under a live job.
+# ---------------------------------------------------------------------------
+
+
+def _remove_wrapper(*outcomes):
+    """A real Aria2RPC whose transport is scripted, recording every call.
+
+    `_call` is the only seam: everything the classification under test does
+    with aria2's answer is the production wrapper's own code.
+    """
+    settings = config.Settings()
+    settings.rpc_port = 16800
+    settings.rpc_secret = "test-secret"
+    rpc = Aria2RPC(settings)
+    calls = []
+    scripted = list(outcomes)
+
+    def _call(method, params=(), **_kw):
+        calls.append((method, list(params)))
+        # A call the script did not expect answers "OK": an unwanted fallback
+        # then shows up as the removal wrongly reporting success, rather than
+        # as the harness running out of lines.
+        outcome = scripted.pop(0) if scripted else "OK"
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    rpc._call = _call
+    return rpc, calls
+
+
+def test_force_remove_that_aria2_accepts_needs_no_result_cleanup():
+    """Already-green control: the ordinary live-transfer removal."""
+    rpc, calls = _remove_wrapper("OK")
+
+    assert rpc.remove("gid-1") == "OK"
+    assert calls == [("aria2.forceRemove", ["gid-1"])]
+
+
+def test_a_download_aria2_refuses_to_remove_still_has_its_result_cleaned():
+    """Already-green control, and the reason the fallback exists.
+
+    A finished download is not active, so forceRemove is refused with an
+    error object; the download itself is already stopped and only the
+    stopped-result entry is left to clear.
+    """
+    rpc, calls = _remove_wrapper(
+        Aria2RpcError("aria2.forceRemove", 1, "GID gid-1 is not found"),
+        "OK",
+    )
+
+    assert rpc.remove("gid-1") == "OK"
+    assert calls == [
+        ("aria2.forceRemove", ["gid-1"]),
+        ("aria2.removeDownloadResult", ["gid-1"]),
+    ]
+
+
+def test_a_transport_failure_is_not_reported_as_a_removed_download():
+    """No answer is not "already gone". The daemon may still be running it."""
+    rpc, calls = _remove_wrapper(
+        Aria2Error("RPC transport error: connection refused")
+    )
+
+    with pytest.raises(Aria2Error):
+        rpc.remove("gid-1")
+    # Crucially not retried as a result cleanup: a removeDownloadResult that
+    # happened to succeed would have turned this into a false success.
+    assert calls == [("aria2.forceRemove", ["gid-1"])]
+
+
+def test_a_malformed_response_is_not_reported_as_a_removed_download():
+    rpc, calls = _remove_wrapper(Aria2Error("RPC bad response: no json"))
+
+    with pytest.raises(Aria2Error):
+        rpc.remove("gid-1")
+    assert calls == [("aria2.forceRemove", ["gid-1"])]
+
+
+def test_a_gid_aria2_states_it_does_not_have_counts_as_removed():
+    """Both calls answered, both said the download is unknown: there is
+    nothing left that could still be writing, which is the whole request."""
+    rpc, calls = _remove_wrapper(
+        Aria2RpcError("aria2.forceRemove", 1, "GID gid-1 is not found"),
+        Aria2RpcError("aria2.removeDownloadResult", 1, "GID gid-1 is not found"),
+    )
+
+    assert rpc.remove("gid-1") == "OK"
+    assert len(calls) == 2
+
+
+def test_a_result_cleanup_aria2_refuses_for_another_reason_still_fails():
+    """Already-green control: only "not found" is terminal, not any error."""
+    rpc, calls = _remove_wrapper(
+        Aria2RpcError("aria2.forceRemove", 1, "GID gid-1 is not found"),
+        Aria2RpcError("aria2.removeDownloadResult", 1, "Cannot remove GID gid-1"),
+    )
+
+    with pytest.raises(Aria2Error):
+        rpc.remove("gid-1")
+    assert len(calls) == 2
+
+
+def test_the_unforced_removal_keeps_the_same_classification():
+    """Default-adjacent control: force=False takes the identical path."""
+    rpc, calls = _remove_wrapper(
+        Aria2Error("RPC transport error: connection refused")
+    )
+
+    with pytest.raises(Aria2Error):
+        rpc.remove("gid-1", force=False)
+    assert calls == [("aria2.remove", ["gid-1"])]
+
+
+def test_child_discovery_takes_one_atomic_snapshot_of_both_listings():
+    """Codex round 3 #1. Active and waiting are separate aria2 listings, so
+    two sequential calls are two snapshots: a child that is waiting during the
+    first and promoted to active before the second appears in neither answer,
+    which is exactly what the freed slot after a parent removal provokes.
+
+    aria2 handles one `system.multicall` as a single batch, so no download can
+    change queue state between the halves and be lost by both.
+    """
+    rpc, calls = _remove_wrapper(
+        [[[{"gid": "a"}]], [[{"gid": "b"}]], [[{"gid": "c"}]]]
+    )
+
+    assert rpc.tell_all_downloads() == [
+        {"gid": "a"}, {"gid": "b"}, {"gid": "c"},
+    ]
+
+    (method, params), = calls               # one round trip, not three
+    assert method == "system.multicall"
+    batch, = params
+    assert [c["methodName"] for c in batch] == [
+        "aria2.tellActive", "aria2.tellWaiting", "aria2.tellStopped",
+    ]
+    # A listing without the relationship keys names no parent, so it could
+    # not attribute a child to the gid being removed.
+    for call in batch:
+        keys = call["params"][-1]
+        assert "following" in keys and "followedBy" in keys
+        assert "gid" in keys and "status" in keys
+    assert batch[1]["params"][1:3] == [0, 1000]
+    # Codex round 7 #3, verified against aria2 1.37.0: tellStopped orders
+    # oldest-first, so offset 0 reads the far end from where a child that just
+    # finished during the removal actually is. Offset -1 walks back from the
+    # newest, which is the only end worth asking about here.
+    assert batch[2]["params"][1:3] == [-1, 1000]
+
+
+def test_the_batched_snapshot_carries_its_token_the_way_aria2_expects():
+    """Codex round 3 #1. `system.multicall` takes exactly one argument - the
+    batch - and authenticates per sub-call. Prepending a token to the multicall
+    itself, as every other method needs, makes aria2 reject the whole request.
+    This is the one part of the batch no stubbed `_call` can check, and getting
+    it wrong would fail only against a real daemon.
+    """
+    settings = config.Settings()
+    settings.rpc_port = 16800
+    settings.rpc_secret = "test-secret"
+    rpc = Aria2RPC(settings)
+    sent = {}
+
+    class _Response:
+        @staticmethod
+        def json():
+            return {"result": [[[]], [[]], [[]]]}
+
+    class _Session:
+        @staticmethod
+        def post(url, json, timeout):
+            sent.update(json)
+            return _Response()
+
+    rpc._session = lambda: _Session()
+
+    assert rpc.tell_all_downloads() == []
+    assert sent["method"] == "system.multicall"
+    batch, = sent["params"]                  # the batch, and nothing before it
+    assert all(c["params"][0] == "token:test-secret" for c in batch)
+
+
+@pytest.mark.parametrize("answers, why", [
+    (None, "not a list at all"),
+    ([], "no results for three sub-calls"),
+    ([[[]], [[]]], "one sub-result short"),
+    ([[[]], [[]], "nonsense"], "a part that is not a wrapped list"),
+    ([[[]], [[]], []], "an empty wrapper naming no listing"),
+])
+def test_a_multicall_answer_that_is_not_whole_fails_closed(answers, why):
+    """Codex round 6 #2. Child discovery is a cancellation safety boundary, so
+    a malformed or truncated batch answer has to fail the same way an explicit
+    sub-call fault does. Skipping the parts that did not parse turned a missing
+    queued listing into "no child" and retired a task whose payload was still
+    there.
+    """
+    rpc, _calls = _remove_wrapper(answers)
+
+    with pytest.raises(Aria2Error):
+        rpc.tell_all_downloads()
+
+
+def test_a_full_page_of_queued_downloads_refuses_to_pose_as_a_whole_snapshot():
+    """Codex round 5 #1. The batch asks for a bounded page. If the queued
+    listing comes back exactly full, aria2 may be holding more, and this is no
+    longer the complete picture the caller's whole contract rests on - a child
+    beyond the page would read as "no child" and the removal would finalise on
+    it, leaving an unowned transfer free to start.
+
+    So it fails closed. The caller refuses the removal and keeps the task,
+    which is recoverable; silently finalising is not. Paginating instead would
+    hand back the split snapshot the batch exists to avoid.
+    """
+    page = [{"gid": f"g{i}"} for i in range(1000)]
+    rpc, _calls = _remove_wrapper([[[]], [page], [[]]])
+
+    with pytest.raises(Aria2Error):
+        rpc.tell_all_downloads()
+
+
+def test_a_full_page_of_stopped_downloads_is_not_treated_as_incomplete():
+    """Codex round 5 #1, the other half. A busy daemon's stopped list sits at
+    the cap routinely, and a child found there is already terminal: missing it
+    risks a stale result, not a transfer that can start. Failing closed on that
+    would refuse ordinary removals for no safety gain, so only the queued
+    listing is held to completeness.
+
+    Already-green control: it pins the boundary of the change above rather
+    than driving new behaviour.
+    """
+    page = [{"gid": f"g{i}"} for i in range(1000)]
+    rpc, _calls = _remove_wrapper([[[{"gid": "live"}]], [[]], [page]])
+
+    jobs = rpc.tell_all_downloads()
+    assert len(jobs) == 1001
+    assert jobs[0] == {"gid": "live"}
+
+
+def test_both_aria2_phrasings_for_an_unknown_gid_are_recognised():
+    """Round 4, found live. aria2 1.37.0 does not use one wording for "no such
+    download". Removal methods say "GID <gid> is not found"; `tellStatus` says
+    "No such download for GID#<gid>" once the result has been purged - which is
+    exactly the state a successful removal leaves the parent in.
+
+    Both strings below are verbatim from the live harness. Matching only the
+    first made the post-removal re-check treat a purged parent as aria2
+    declining to answer: the removal was refused and the payload child was
+    left downloading, unowned.
+    """
+    purged = Aria2RpcError(
+        "aria2.tellStatus", 1,
+        "No such download for GID#8eb86c007d73440c",
+    )
+    removed = Aria2RpcError(
+        "aria2.forceRemove", 1, "GID gid-1 is not found",
+    )
+    other = Aria2RpcError("aria2.tellStatus", 1, "Internal error")
+
+    assert purged.gid_not_found()
+    assert removed.gid_not_found()
+    assert not other.gid_not_found(), "only absence, not any failure"
+
+
+def test_a_failed_part_of_the_snapshot_is_not_read_as_an_empty_listing():
+    """Codex round 3 #1. `system.multicall` reports a failed sub-call in-band,
+    as a fault struct rather than an error response. Reading that as "no
+    downloads" would be the same unproven leap as reading a transport failure
+    as "no child", so it is raised as what it is: aria2 declining to answer.
+    """
+    rpc, _calls = _remove_wrapper(
+        [[[{"gid": "a"}]], {"faultCode": 1, "faultString": "Unauthorized"},
+         [[{"gid": "c"}]]]
+    )
+
+    with pytest.raises(Aria2Error):
+        rpc.tell_all_downloads()

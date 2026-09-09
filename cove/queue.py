@@ -852,6 +852,9 @@ class QueueManager(QObject):
         # this window, because until aria2 answers, the download is still
         # running and Cove is the only thing that knows about it.
         self._removing: dict[int, dict] = {}
+        # Removals a previous run left unfinished, held until the daemon is
+        # confirmed up; filled by _load_persisted, drained by resume_persisted.
+        self._recovered_removals: list[tuple[int, str, bool]] = []
         # Per-task command generation for pause/unpause. Two RPCs issued back
         # to back run on independent pool threads and can reach aria2 in the
         # opposite order, which would leave aria2 downloading a task Cove
@@ -959,9 +962,30 @@ class QueueManager(QObject):
             )
             # A removal the previous run never saw confirmed. The user asked
             # for it and the row is only still here because Cove exited inside
-            # the aria2 round trip, so finish the job rather than restoring a
-            # download that was already on its way out.
-            conn.execute("DELETE FROM downloads WHERE status='removing'")
+            # the aria2 round trip, so it is never restored as a task and
+            # never relaunched. It is not deleted here either: aria2 can
+            # outlive Cove, and this row is the last record of the gid that
+            # can stop the transfer. It is dropped in
+            # _finish_recovered_removal, once aria2 confirms - so a launch
+            # that happens before the daemon is up leaves the job for the
+            # next one instead of discarding a transfer still running.
+            conn.execute(
+                "DELETE FROM downloads WHERE status='removing' "
+                "AND (gid IS NULL OR gid='')"
+            )
+            pending_removals = [
+                (row["id"], row["gid"],
+                 _row_get(row, "source_type", "") == SOURCE_TORRENT,
+                 # Carried so a recovered removal can finish the same way an
+                 # uninterrupted one does: the managed .torrent is discarded
+                 # once nothing needs it. Left behind it keeps a private
+                 # tracker's passkey on disk for a download already removed.
+                 _row_get(row, "torrent_path", "") or "",
+                 _row_get(row, "info_hash", "") or "")
+                for row in conn.execute(
+                    "SELECT * FROM downloads WHERE status='removing'"
+                ).fetchall()
+            ]
             rows = conn.execute(
                 "SELECT * FROM downloads WHERE status IN ('queued','active','paused')"
             ).fetchall()
@@ -978,6 +1002,11 @@ class QueueManager(QObject):
                 unreadable.append(row["id"])
                 continue
             self.tasks[t.id] = t
+        # Held, not sent: this runs inside __init__, before startup has even
+        # begun starting the daemon, so cancelling here would fail on every
+        # launch alike. `resume_persisted` is the first moment aria2 is known
+        # to be reachable, and it is where these are drained.
+        self._recovered_removals = pending_removals
         for tid in unreadable:
             with db.connect() as conn:
                 conn.execute(
@@ -3544,6 +3573,23 @@ class QueueManager(QObject):
         self.task_removed.emit(tid)
         self._maybe_start_next()
 
+    def _finish_recovered_removal(
+        self, tid: int, torrent_path: str = "", info_hash: str = ""
+    ) -> None:
+        """Drop a marked row once aria2 confirms its transfer is stopped.
+
+        The counterpart to keeping it in _load_persisted: the row exists only
+        to carry the gid across a restart, so confirmation is the one thing
+        that retires it.
+        """
+        with db.connect() as conn:
+            conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
+        # The same terminal cleanup an uninterrupted removal performs. Checked
+        # after the row is gone so it cannot count itself as a user, and
+        # through the shared in-use guard so a second task on the same info
+        # hash still keeps the copy.
+        self._discard_managed_copy(info_hash, torrent_path)
+
     def _restore_removal(self, tid: int) -> None:
         """Put a task back after aria2 refused to cancel it.
 
@@ -3612,21 +3658,29 @@ class QueueManager(QObject):
         tid = t.id
         gid = t.gid
         base = t.out_dir
-        self.tasks.pop(tid, None)
-        self._awaiting_consent.discard(tid)
-        self._consent_granted.discard(tid)
-        with db.connect() as conn:
-            conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
-        self.task_removed.emit(tid)
-        # The managed .torrent belongs to this torrent, not to this row;
-        # another live task for the same info hash still needs it.
-        if t.torrent_path and not self._info_hash_in_use(t.info_hash):
-            torrent.discard_managed_torrent(t.torrent_path)
+
+        # A second click while aria2 is still deciding must not start a
+        # second teardown for the same task.
+        if tid in self._removing:
+            return
 
         if not gid:
+            # Nothing has been handed to aria2 yet, so there is no transfer
+            # that could outlive the row. Letting go here is safe, and an add
+            # still in flight is covered by the tombstone below.
+            self.tasks.pop(tid, None)
+            self._awaiting_consent.discard(tid)
+            self._consent_granted.discard(tid)
+            with db.connect() as conn:
+                conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
+            self.task_removed.emit(tid)
+            # The managed .torrent belongs to this torrent, not to this row;
+            # another live task for the same info hash still needs it.
+            if t.torrent_path and not self._info_hash_in_use(t.info_hash):
+                torrent.discard_managed_torrent(t.torrent_path)
             if tid in self._pending_launch:
                 # The add RPC is still on its way back. Leave a tombstone so
-                # the gid callback can finish the job — including the delete
+                # the gid callback can finish the job - including the delete
                 # the user asked for, which would otherwise be dropped along
                 # with any partial data aria2 wrote in the meantime.
                 self._pending_launch[tid] = {
@@ -3637,25 +3691,197 @@ class QueueManager(QObject):
             self._maybe_start_next()
             return
 
-        def _drop_gid(paths=()):
-            def _after(*_args):
-                if delete_file:
-                    self._delete_torrent_files(paths, base)
-                self._maybe_start_next()
-
-            self._spawn(self.rpc.remove, gid, on_done=_after, on_fail=_after)
-
-        if not delete_file:
-            _drop_gid()
-            return
-        # Ask aria2 what it wrote *before* removing the gid; afterwards it
-        # no longer knows.
+        # A gid means aria2 may still be writing, and this row holds the only
+        # identity that can stop it. Everything stays owned - the task, the
+        # database row, the gid and the managed .torrent copy - until aria2
+        # confirms the cancellation. Deleting the payload here would race
+        # aria2 into recreating it, and dropping the gid would leave a live
+        # transfer with nothing left pointing at it.
+        self._removing[tid] = {
+            "gid": gid,
+            "delete_file": bool(delete_file),
+            "out_dir": base,
+        }
+        # The row still has to record that it is on its way out: being in
+        # `_removing` is what makes _persist write the durable marker, so a
+        # crash inside the round trip cannot restore a removed download.
+        self._persist(t)
+        self.task_changed.emit(tid)
         self._spawn(
-            self.rpc.get_files,
-            gid,
-            on_done=lambda files: _drop_gid(self._torrent_file_paths(files)),
-            on_fail=lambda *_: _drop_gid(),
+            self._cancel_torrent_transfer,
+            self._removing[tid],
+            t.phase == PHASE_METADATA,
+            bool(delete_file),
+            on_done=lambda paths, tid=tid: self._finish_torrent_removal(tid, paths),
+            on_fail=lambda *args, tid=tid: self._refuse_torrent_removal(tid, *args),
         )
+
+    def _cancel_torrent_transfer(
+        self, entry: dict, follow_children: bool, delete_file: bool
+    ) -> tuple[str, ...]:
+        """Stop the transfer `entry` owns, and anything it spawned.
+
+        Runs on a QThreadPool worker, which is why it reads as a straight
+        sequence: aria2 has to be asked what exists *before* the removal,
+        because afterwards it no longer knows. Raising is the whole error
+        contract - the caller keeps the task whenever this does not return -
+        and `entry["gid"]` is kept pointing at whatever still needs stopping,
+        so a failure part-way through hands ownership back naming a live
+        transfer rather than one that is already gone.
+        """
+        parent = entry["gid"]
+        children = self._torrent_children(parent) if follow_children else []
+        paths: tuple[str, ...] = ()
+        if delete_file:
+            for owned in [parent, *children]:
+                paths += self._owned_file_paths(owned)
+        # The parent goes first, always. A parent that already has a child is
+        # terminal and can spawn no more, so nothing is lost by stopping it
+        # first; a parent that has none can still create one, and removing it
+        # is what closes that window. Doing it in this order also means a
+        # failure here has destroyed nothing: the task keeps the parent it
+        # already owns, its children are untouched, and the parent still names
+        # them for the retry. Stopping the children first left the opposite -
+        # a task restored in the metadata phase whose payload was already gone.
+        self.rpc.remove(parent)
+        if not follow_children:
+            return paths
+        # aria2 can finish the metadata and create the payload child in the
+        # gap between the look above and the removal just issued, so a single
+        # pre-removal snapshot is no proof that no child exists. The parent is
+        # gone now and can spawn nothing further, which is exactly what makes
+        # one re-check enough rather than a loop.
+        if children:
+            # The parent is gone and these are still running, so ownership
+            # moves now - before the re-check, which can fail. A failure after
+            # this point hands the task back naming a live transfer instead of
+            # a gid aria2 has already forgotten.
+            entry["gid"] = children[0]
+        owned = list(children)
+        for child in self._torrent_children(parent):
+            if child not in owned:
+                owned.append(child)
+        for child in owned:
+            entry["gid"] = child
+            if delete_file and child not in children:
+                # The children known before the removal were inventoried above.
+                paths += self._owned_file_paths(child)
+            self.rpc.remove(child)
+        return paths
+
+    def _torrent_children(self, parent: str) -> list[str]:
+        """Transfers aria2 itself attributes to `parent`.
+
+        Two sources, both aria2's own statement about this one gid: the
+        parent's `followedBy`, and any transfer reporting that it is
+        `following` it. Never a match on info hash, output directory or
+        filename - those would cancel jobs this task does not own.
+        """
+        try:
+            status = self.rpc.tell_status(parent)
+        except Aria2RpcError as answered:
+            # Only "GID is not found" is aria2 stating there is no such
+            # download; not knowing the parent is not knowing there is no
+            # child, so the relationship scan below still runs. Any other RPC
+            # error is aria2 declining to answer this question, and a
+            # transport failure is no answer at all - neither can establish a
+            # cancellation boundary, so both are left to propagate.
+            if not answered.gid_not_found():
+                raise
+            status = None
+        kids: list[str] = []
+        if isinstance(status, dict):
+            followed = status.get("followedBy")
+            if isinstance(followed, list):
+                kids = [g for g in followed if isinstance(g, str) and g]
+        if kids:
+            return kids
+        # Every non-terminal download in one snapshot: a child created at the
+        # removal boundary can be queued or paused rather than running, and
+        # asking for the two listings separately would lose one promoted
+        # between the answers. Missing it retires the task while the payload
+        # lives on.
+        for job in self.rpc.tell_all_downloads():
+            if not isinstance(job, dict) or job.get("following") != parent:
+                continue
+            gid = job.get("gid")
+            if isinstance(gid, str) and gid and gid not in kids:
+                kids.append(gid)
+        return kids
+
+    def _owned_file_paths(self, gid: str) -> tuple[str, ...]:
+        """What aria2 says it writes for `gid`, or nothing at all.
+
+        No inventory is no authority to delete: the removal still goes ahead,
+        and only paths aria2 actually named are ever unlinked.
+        """
+        try:
+            return self._torrent_file_paths(self.rpc.get_files(gid))
+        except Aria2Error:
+            return ()
+
+    def _finish_torrent_removal(self, tid: int, paths=()) -> None:
+        """Let go of a torrent aria2 has confirmed it no longer runs."""
+        entry = self._removing.pop(tid, None)
+        if entry is None:
+            return
+        t = self.tasks.pop(tid, None)
+        self._awaiting_consent.discard(tid)
+        self._consent_granted.discard(tid)
+        self._cmd_gen.pop(tid, None)
+        self._desired_paused.pop(tid, None)
+        self._backend_state.pop(tid, None)
+        self._cmd_pending.pop(tid, None)
+        self._cmd_queued.pop(tid, None)
+        with db.connect() as conn:
+            conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
+        self.task_removed.emit(tid)
+        # The managed .torrent belongs to this torrent, not to this row;
+        # another live task for the same info hash still needs it. Checked
+        # once the task is gone, so this row no longer counts as a user.
+        if t is not None and t.torrent_path and not self._info_hash_in_use(t.info_hash):
+            torrent.discard_managed_torrent(t.torrent_path)
+        # Ordering below is load-bearing: aria2 has forgotten every owned gid,
+        # so nothing can recreate what is about to be deleted.
+        if entry.get("delete_file"):
+            self._delete_torrent_files(paths, entry.get("out_dir") or "")
+        self._maybe_start_next()
+
+    def _refuse_torrent_removal(self, tid: int, *args) -> None:
+        """Put a torrent back when aria2 did not confirm the cancellation.
+
+        Nothing was deleted and nothing was forgotten, so the task simply
+        stops being treated as doomed. The failure is surfaced through the
+        existing error convention rather than retried: an unattended retry
+        loop against a daemon that is not answering is worse than a removal
+        the user can see failed and ask for again.
+        """
+        anchor = self._removing.get(tid, {}).get("gid")
+        t = self.tasks.get(tid)
+        if t is not None and anchor and t.gid != anchor:
+            # Ownership moved during the teardown: the metadata parent was
+            # stopped and its payload child was not. The task takes the gid
+            # that still names a running transfer, or the only thing pointing
+            # at it would be a gid aria2 has already forgotten.
+            t.gid = anchor
+            if t.phase == PHASE_METADATA:
+                # This is the same parent-to-child handoff the poll performs,
+                # so it has to leave the same state behind. A payload gid still
+                # wearing the metadata phase is read as a metadata fetch, and
+                # the child's eventual completion - which names nothing to
+                # follow, because it is itself the torrent - would be recorded
+                # as a metadata failure on a download that finished. The
+                # parent's length and rate describe the torrent file, not this
+                # transfer, so they are cleared rather than left as the
+                # progress bar's denominator.
+                self._seen_gids.add(anchor)
+                t.phase = ""
+                t.completed_bytes = 0
+                t.total_bytes = 0
+                t.download_speed = 0
+                t.last_status_at = 0.0
+        self.error.emit(*args)
+        self._restore_removal(tid)
 
     def _finish_inflight_torrent_removal(
         self, gid: str, base: str, delete_file: bool
@@ -3765,6 +3991,26 @@ class QueueManager(QObject):
         queued/active/paused at the previous shutdown would sit forever
         until the user touched the queue.
         """
+        # Removals interrupted by a crash go first, and unconditionally: a
+        # transfer the user already asked to stop must not be left running
+        # because the queue happens to be paused or stopped. One attempt per
+        # launch and no retry loop - a failure leaves the marked row in place,
+        # so the next launch tries again and the gid is never discarded.
+        # Files are kept: the delete intent was never durable, and keeping the
+        # payload is the safe half of that contract.
+        for tid, gid, is_torrent, torrent_path, info_hash in (
+            self._recovered_removals
+        ):
+            self._spawn(
+                self._cancel_torrent_transfer,
+                {"gid": gid},
+                is_torrent,
+                False,
+                on_done=lambda _paths, tid=tid, path=torrent_path,
+                ih=info_hash: self._finish_recovered_removal(tid, path, ih),
+                on_fail=lambda *_: None,
+            )
+        self._recovered_removals = []
         if self._running and self._scheduler_allows:
             self._maybe_start_next()
 

@@ -22,7 +22,7 @@ from PySide6.QtCore import QCoreApplication
 
 from cove import config, db, debrid
 from cove.config import CategoryDirs, Settings
-from cove.aria2 import Aria2Error
+from cove.aria2 import Aria2Error, Aria2RpcError
 from cove.debrid import ALL_DEBRID, DebridError, Unrestricted
 from cove.extractor import FINAL_PATH_MARKER
 import cove.output_paths as output_paths
@@ -225,7 +225,8 @@ class _FakeRpc:
         # Torrent state lives in lazily created lists so the plain HTTP
         # tests above keep their tiny stub.
         if name in ("magnets", "torrents", "removed", "unpaused", "version_calls",
-                    "paused_all", "status_calls"):
+                    "paused_all", "status_calls", "active_jobs", "waiting_jobs",
+                    "stopped_jobs", "files_calls"):
             value = []
             setattr(self, name, value)
             return value
@@ -247,11 +248,34 @@ class _FakeRpc:
         return "gid-file"
 
     def get_files(self, gid):
+        self.files_calls.append(gid)
         return getattr(self, "files_result", [])
 
     def remove(self, gid, force=True):
+        # `remove_errors` models the wrapper's own outward contract: a gid
+        # aria2 never confirmed raises, and nothing is recorded as removed.
+        err = getattr(self, "remove_errors", {}).get(gid)
+        if err is not None:
+            raise err
         self.removed.append(gid)
+        hook = getattr(self, "on_removed", None)
+        if hook is not None:
+            # Models aria2 acting on the removal: a metadata parent that
+            # finishes and spawns its payload child in the same instant.
+            hook(self, gid)
         return gid
+
+    def tell_active(self):
+        return [dict(job) for job in getattr(self, "active_jobs", [])]
+
+    def tell_all_downloads(self):
+        # One snapshot of all three listings: running, queued or paused, and
+        # already finished - the two latter groups being what tellActive alone
+        # cannot see.
+        return [dict(job) for job in
+                [*getattr(self, "active_jobs", []),
+                 *getattr(self, "waiting_jobs", []),
+                 *getattr(self, "stopped_jobs", [])]]
 
     def unpause(self, gid):
         self.unpaused.append(gid)
@@ -7414,10 +7438,17 @@ def test_a_crash_during_removal_does_not_resurrect_the_download(queue_env, tmp_p
     assert tid in queue.tasks
     assert _persisted_row(db_path, tid)["status"] == "removing"
 
-    queue2, _rpc2, _db2 = queue_env()      # the next launch
+    queue2, rpc2, _db2 = queue_env()       # the next launch
 
     assert tid not in queue2.tasks, "a removed download must not come back"
-    assert _persisted_row(db_path, tid) is None, "the row is finished off"
+    # The row is no longer dropped on sight: it carries the only gid that can
+    # still stop the transfer, so it is retired once aria2 confirms and not
+    # before. It is never restored as a task in the meantime. The cancellation
+    # waits for the daemon to be confirmed up, which is resume_persisted.
+    queue2.resume_persisted()
+    _drain()
+    assert rpc2.removed == ["gid-1"], "the orphaned transfer is cancelled"
+    assert _persisted_row(db_path, tid) is None, "and only then is it finished off"
 
 
 def test_a_refused_removal_clears_the_durable_removal_marker(queue_env, tmp_path):
@@ -9267,3 +9298,967 @@ def test_no_selection_is_not_subjected_to_manifest_mapping(
         "one.bin", "two.bin",
     ]
     assert rpc.torrents == []
+
+
+# ---------------------------------------------------------------------------
+# Torrent removal ownership and cancellation (Tab 2B)
+#
+# The defect these cover: Remove let go of the only identity Cove had for a
+# torrent - the task, its row and its gid - before aria2 had been asked to
+# stop anything, and then treated the answer as irrelevant by wiring success
+# and failure to the same callback. A refused cancellation therefore left a
+# live transfer with nothing pointing at it, and a magnet removed during its
+# metadata phase left the payload child aria2 had already started.
+# ---------------------------------------------------------------------------
+
+
+def _held_spawn(queue):
+    """Queue every worker call instead of running it.
+
+    Installed immediately before a removal so the test owns the moment aria2
+    answers. Whatever Cove is still holding while the cancellation is
+    outstanding then becomes observable, and anything it let go of on trust
+    shows up as a missing task, a deleted row or a vanished file.
+    """
+    held = []
+    queue._spawn = lambda fn, *a, on_done=None, on_fail=None, **kw: held.append(
+        (fn, a, kw, on_done, on_fail)
+    )
+    return held
+
+
+def _drain(timeout_ms=5000):
+    """Let real pool workers finish and their callbacks be delivered.
+
+    Startup recovery is the one path a test cannot drive through a stubbed
+    `_spawn`: it runs inside `QueueManager.__init__`. Its results come back
+    as queued signals, so the event loop has to be turned over too.
+    """
+    from PySide6.QtCore import QThreadPool
+
+    QThreadPool.globalInstance().waitForDone(timeout_ms)
+    app = QCoreApplication.instance()
+    for _ in range(5):
+        app.processEvents()
+
+
+def _release(held):
+    """Run the queued worker calls, and anything they queue in turn."""
+    ran = 0
+    while held:
+        fn, args, kwargs, on_done, on_fail = held.pop(0)
+        ran += 1
+        try:
+            result = fn(*args, **kwargs)
+        except (Aria2Error, DebridError, TorrentError) as exc:
+            if on_fail is not None:
+                on_fail(str(exc))
+        else:
+            if on_done is not None:
+                on_done(result)
+    return ran
+
+
+# --- R1 / R3 / R4: ownership survives until aria2 confirms ------------------
+
+
+def test_a_torrent_stays_owned_until_aria2_confirms_the_removal(
+    queue_env, monkeypatch, tmp_path
+):
+    """RC1. Nothing is let go of while the cancellation is outstanding.
+
+    aria2 may still be writing into the payload tree, so the task, its row,
+    its gid and its files all have to survive the round trip; only the answer
+    authorises the teardown.
+    """
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    removed_signals = []
+    queue.task_removed.connect(removed_signals.append)
+    held = _held_spawn(queue)
+
+    queue.remove(tid, delete_file=True)
+
+    # aria2 has not answered yet.
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-child"
+    assert queue.is_pending_removal(tid)
+    row = _persisted_row(db_path, tid)
+    assert row is not None
+    assert row["status"] == "removing"          # durable marker, existing field
+    assert row["gid"] == "gid-child"            # the only identity that can stop it
+    assert (root / "ep1.mkv").exists()          # no unlink before the stop
+    assert removed_signals == []                # no false confirmed-removal event
+    assert rpc.removed == []
+
+    _release(held)
+
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+    assert removed_signals == [tid]
+    assert rpc.removed == ["gid-child"]
+    assert not (root / "ep1.mkv").exists()
+    assert not (root / "ep1.mkv.aria2").exists()
+
+
+def test_a_refused_torrent_removal_keeps_the_task_its_gid_and_its_payload(
+    queue_env, monkeypatch, tmp_path
+):
+    """RC1. A cancellation aria2 never confirmed is not a removal.
+
+    The transport failure below is the case that matters: aria2 said nothing
+    at all, so the transfer may well still be running, and Cove is the only
+    thing that knows its gid.
+    """
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    bystander = root / "my notes.txt"
+    bystander.write_text("mine")
+    rpc.remove_errors = {
+        "gid-child": Aria2Error("RPC transport error: connection refused")
+    }
+    removed_signals = []
+    errors = []
+    queue.task_removed.connect(removed_signals.append)
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=True)
+
+    assert tid in queue.tasks                   # ownership retained
+    assert queue.tasks[tid].gid == "gid-child"  # and the identity with it
+    assert not queue.is_pending_removal(tid)    # live again, not on its way out
+    assert errors                               # failure is visible
+    assert removed_signals == []                # no false success
+    row = _persisted_row(db_path, tid)
+    assert row is not None and row["status"] != "removing"
+    assert (root / "ep1.mkv").exists()          # nothing deleted under a live job
+    assert (root / "extras" / "ep2.mkv").exists()
+    assert bystander.exists()
+
+
+def test_a_refused_torrent_removal_keeps_the_managed_torrent_copy(
+    queue_env, monkeypatch, tmp_path
+):
+    """R9. The managed .torrent is how the task is relaunched; a failed
+    cancellation must not strand a live task without it."""
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    managed = queue.tasks[tid].torrent_path
+    queue._launch(queue.tasks[tid])
+    rpc.remove_errors = {
+        "gid-file": Aria2Error("RPC transport error: connection refused")
+    }
+
+    queue.remove(tid, delete_file=False)
+
+    assert tid in queue.tasks
+    assert os.path.exists(managed)
+
+
+def test_a_pending_torrent_removal_still_holds_the_managed_torrent_copy(
+    queue_env, monkeypatch, tmp_path
+):
+    """R9. Held open, the copy is still owned: the row is not gone yet."""
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    managed = queue.tasks[tid].torrent_path
+    queue._launch(queue.tasks[tid])
+    held = _held_spawn(queue)
+
+    queue.remove(tid, delete_file=False)
+    assert os.path.exists(managed)
+
+    _release(held)
+    assert not os.path.exists(managed)
+
+
+# --- R5: the metadata parent / payload child transition --------------------
+
+
+def test_removing_a_magnet_mid_metadata_also_stops_the_payload_child(
+    queue_env, monkeypatch
+):
+    """RC2. aria2 has already started the payload; Cove has not polled yet.
+
+    The child is a transfer of its own. Removing only the metadata parent
+    Cove happens to be holding leaves it downloading, owned by nothing.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    assert queue.tasks[tid].phase == queue_module.PHASE_METADATA
+    assert queue.tasks[tid].gid == "gid-meta"
+    # What aria2 answers in the transition window.
+    rpc.status_result = {
+        "gid": "gid-meta", "status": "complete", "followedBy": ["gid-child"],
+    }
+
+    queue.remove(tid, delete_file=False)
+
+    # Parent first (Codex round 4 #1): it is terminal once a child exists, so
+    # stopping it first costs nothing, and a failure there destroys no
+    # descendant. The child is stopped straight after, in the same round trip.
+    assert rpc.removed == ["gid-meta", "gid-child"]
+    # Looked at once before the removal and once after: the re-check runs
+    # whether or not a child was already known, because the pre-removal answer
+    # cannot prove another was not created in the gap.
+    assert rpc.status_calls == ["gid-meta", "gid-meta"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+
+
+def test_a_child_that_cannot_be_stopped_keeps_ownership_of_the_child(
+    queue_env, monkeypatch
+):
+    """RC2. Partial cleanup is accounted for by re-anchoring, not guessing.
+
+    A child that would not stop is the only transfer still running - the
+    parent whose metadata already completed is not. So the task is kept and
+    takes the child's gid.
+
+    The parent is stopped first and stays stopped (Codex round 4 #1). It is
+    terminal, so nothing is lost by that, and the alternative - stopping the
+    child first - is what used to strand a task in the metadata phase whose
+    payload had already been destroyed.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {
+        "gid": "gid-meta", "status": "complete", "followedBy": ["gid-child"],
+    }
+    rpc.remove_errors = {
+        "gid-child": Aria2Error("RPC transport error: connection refused")
+    }
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta"]           # the terminal parent, and only it
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-child"   # owns what is still running
+    assert queue.tasks[tid].phase == ""          # and no longer a metadata fetch
+    assert _persisted_row(db_path, tid)["gid"] == "gid-child"
+    assert errors
+    assert len(_rows(db_path)) == 1
+
+
+def test_a_metadata_status_cove_cannot_read_does_not_authorise_removal(
+    queue_env, monkeypatch
+):
+    """RC2. Failing to learn what exists is not proof that nothing does."""
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    def _unreachable(gid):
+        rpc.status_calls.append(gid)
+        raise Aria2Error("RPC transport error: connection refused")
+
+    rpc.tell_status = _unreachable
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == []
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert errors
+
+
+def test_a_settled_torrent_removal_asks_aria2_nothing_it_does_not_need(
+    queue_env, monkeypatch, tmp_path
+):
+    """R5 negative control. Past the transition there is no child to find,
+    so the extra status call is not made at all."""
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    assert queue.tasks[tid].phase == ""
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.status_calls == []
+    assert rpc.removed == ["gid-child"]
+
+
+# --- R7: repeated removal ---------------------------------------------------
+
+
+def test_a_second_remove_during_a_pending_cancellation_starts_no_second_teardown(
+    queue_env, monkeypatch, tmp_path
+):
+    """R7. One teardown per owned operation.
+
+    The ownership half is the load-bearing part: the task has to still be
+    there for the second click to be refused at all.
+    """
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    held = _held_spawn(queue)
+
+    queue.remove(tid, delete_file=True)
+    assert tid in queue.tasks                   # still owned, so still clickable
+    queue.remove(tid, delete_file=True)
+
+    assert len(held) == 1
+    _release(held)
+    assert rpc.removed == ["gid-child"]
+    assert _rows(db_path) == []
+
+
+# --- R9: isolation ----------------------------------------------------------
+
+
+def test_removing_one_torrent_leaves_an_unrelated_transfer_alone(
+    queue_env, monkeypatch, tmp_path
+):
+    """R9. Only gids this task's own launch established are cancelled."""
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    other = queue.add_url("https://example.com/unrelated.zip")
+    queue.tasks[other].gid = "gid-stranger"
+    queue.tasks[other].status = "active"
+
+    queue.remove(tid, delete_file=True)
+
+    assert rpc.removed == ["gid-child"]
+    assert other in queue.tasks
+    assert queue.tasks[other].gid == "gid-stranger"
+
+
+# --- R10: restart -----------------------------------------------------------
+
+
+def test_a_crash_during_a_torrent_removal_still_cancels_the_transfer(
+    queue_env, monkeypatch, tmp_path
+):
+    """R10. aria2 outlives Cove, so the marked row's gid is the last thing
+    that can stop the transfer. The row must not be dropped without it being
+    used, and the torrent must never be relaunched."""
+
+
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+    row = _persisted_row(db_path, tid)
+    assert row is not None, "the marked row is the last record of the gid"
+    assert row["status"] == "removing" and row["gid"] == "gid-child"
+    held.clear()                                # Cove exits inside the round trip
+
+    queue2, rpc2 = _restart(queue_env, db_path, monkeypatch)
+    queue2.resume_persisted()                   # startup, once aria2 is up
+    _drain()
+
+    assert list(queue2.tasks) == []             # not relaunched
+    assert _rows(db_path) == []
+    assert rpc2.removed == ["gid-child"]        # not orphaned either
+    assert rpc2.magnets == [] and rpc2.torrents == []
+
+
+def test_a_metadata_status_landing_mid_removal_cannot_swap_the_owned_gid(
+    queue_env, monkeypatch
+):
+    """R6/R7. A poll answer already in flight when Remove was clicked must
+    not hand the task the child gid: the cancellation is anchored on the
+    parent, and replacing it mid-flight loses the identity a refusal has to
+    give back."""
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+
+    # The transition status aria2 answered before the removal was asked for.
+    queue._apply_status(tid, {
+        "status": "complete", "totalLength": "0", "completedLength": "0",
+        "downloadSpeed": "0", "followedBy": ["gid-child"],
+    })
+
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert queue.tasks[tid].phase == queue_module.PHASE_METADATA
+    assert rpc.paused == []                     # nothing re-driven either
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    _release(held)
+    assert tid not in queue.tasks
+
+
+# --- Codex round 1: races the first repair did not close --------------------
+
+
+def test_a_child_born_after_the_snapshot_is_still_cancelled(
+    queue_env, monkeypatch
+):
+    """Codex #1. One pre-removal status is not proof that no child exists.
+
+    aria2 can finish the metadata and create the payload child in the gap
+    between Cove looking and Cove removing. Once the parent is gone it can
+    spawn nothing further, so the re-check after the removal is what closes
+    the window - and it is a single bounded look, not a loop.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    # The look before the removal sees no child at all.
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+
+    def _spawn_child(fake, gid):
+        if gid == "gid-meta":
+            fake.active_jobs.append({"gid": "gid-late", "following": "gid-meta"})
+
+    rpc.on_removed = _spawn_child
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta", "gid-late"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+
+
+def test_a_late_child_that_cannot_be_stopped_keeps_the_task_owning_it(
+    queue_env, monkeypatch
+):
+    """Codex #1. The parent is already gone, so the child is the only thing
+    left worth pointing at. The task is kept, and kept naming the child."""
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+    rpc.remove_errors = {
+        "gid-late": Aria2Error("RPC transport error: connection refused")
+    }
+
+    def _spawn_child(fake, gid):
+        if gid == "gid-meta":
+            fake.active_jobs.append({"gid": "gid-late", "following": "gid-meta"})
+
+    rpc.on_removed = _spawn_child
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta"]
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-late"
+    assert _persisted_row(db_path, tid)["gid"] == "gid-late"
+    assert not queue.is_pending_removal(tid)
+    assert errors
+
+
+def _relaunch(tmp_path, rpc, **extra):
+    """A QueueManager over the same database, with a chosen aria2 stub.
+
+    The fixture builds its own recording stub, and these tests need one that
+    refuses, so the manager is constructed the same way by hand.
+    """
+    settings = Settings(
+        download_dir=str(tmp_path), category_dirs=CategoryDirs(),
+        **_local_settings(**extra),
+    )
+    q = QueueManager(settings, rpc)
+    q._scheduler_allows = False
+    q._poll.stop()
+    q._ext_poll.stop()
+    return q
+
+
+def test_a_recovered_removal_survives_a_launch_where_aria2_is_not_answering(
+    queue_env, monkeypatch, tmp_path
+):
+    """Codex #2. Startup constructs the queue before aria2 is confirmed up.
+
+    A recovery attempt that gets no answer must leave the marked row exactly
+    where it is: it is the last record of the gid, and discarding it would
+    orphan a transfer aria2 can resume from its own session. The next launch
+    finishes the job.
+    """
+
+
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+    held.clear()                                # Cove exits mid-round-trip
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    # Launch 1: the daemon is not answering yet.
+    dead = _FakeRpc()
+    dead.remove_errors = {
+        "gid-child": Aria2Error("RPC transport error: connection refused")
+    }
+    q1 = _relaunch(tmp_path, dead)
+
+    q1.resume_persisted()
+    _drain()
+    assert list(q1.tasks) == []                 # never restored, never relaunched
+    assert dead.magnets == [] and dead.torrents == []
+    row = _persisted_row(db_path, tid)
+    assert row is not None, "a failed launch must not discard the gid"
+    assert row["status"] == "removing" and row["gid"] == "gid-child"
+    assert (root / "ep1.mkv").exists()          # and nothing was deleted
+
+    # Launch 2: aria2 is back.
+    alive = _FakeRpc()
+    q2 = _relaunch(tmp_path, alive)
+
+    q2.resume_persisted()
+    _drain()
+    assert alive.removed == ["gid-child"]
+    assert list(q2.tasks) == []
+    assert _rows(db_path) == []
+
+
+def test_a_recovered_torrent_removal_also_stops_the_payload_child(
+    queue_env, monkeypatch, tmp_path
+):
+    """Codex #2. A crash during the magnet handoff leaves a row naming only
+    the metadata parent; recovery has to follow it to the payload child."""
+
+
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+    held.clear()
+    assert _persisted_row(db_path, tid)["gid"] == "gid-meta"
+
+    fresh = _FakeRpc()
+    fresh.status_result = {
+        "gid": "gid-meta", "status": "complete", "followedBy": ["gid-child"],
+    }
+    q = _relaunch(tmp_path, fresh)
+
+    q.resume_persisted()
+    _drain()
+    assert fresh.removed == ["gid-meta", "gid-child"]   # parent first, as above
+    assert _rows(db_path) == []
+
+
+# --- Codex round 2 ----------------------------------------------------------
+
+
+def test_a_recovered_removal_waits_until_the_daemon_is_confirmed_up(
+    queue_env, monkeypatch, tmp_path
+):
+    """Codex round 2 #1. `QueueManager` is constructed before the daemon is
+    started, and `resume_persisted()` is the first moment aria2 is known to be
+    reachable. Cancelling at construction time is not "one attempt per launch"
+    but the same doomed attempt on every launch, which never cancels anything.
+    """
+    queue, rpc, db_path, tid, root = _finished_local_torrent(
+        queue_env, monkeypatch, tmp_path
+    )
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+    held.clear()                                # Cove exits mid-round-trip
+
+    fresh = _FakeRpc()
+    q = _relaunch(tmp_path, fresh)
+    _drain()
+
+    # Construction alone must send nothing: the daemon is not up yet.
+    assert fresh.removed == []
+    assert list(q.tasks) == []                  # still never relaunched
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    q.resume_persisted()
+    _drain()
+
+    assert fresh.removed == ["gid-child"]
+    assert _rows(db_path) == []
+
+
+def test_a_waiting_payload_child_is_still_found_and_cancelled(
+    queue_env, monkeypatch
+):
+    """Codex round 2 #2. A child born at the removal boundary can be queued or
+    paused rather than running. `tellActive` cannot see either, so a scan that
+    only asks it reports a clean removal while the payload survives, ready to
+    start with nothing in Cove owning it.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+
+    def _spawn_waiting_child(fake, gid):
+        if gid == "gid-meta":
+            # aria2 created the payload but has not started it.
+            fake.waiting_jobs.append({"gid": "gid-idle", "following": "gid-meta"})
+
+    rpc.on_removed = _spawn_waiting_child
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta", "gid-idle"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+
+
+def test_child_discovery_never_splits_the_listings_into_two_snapshots(
+    queue_env, monkeypatch
+):
+    """Codex round 3 #1. The gap between a `tellActive` and a `tellWaiting` is
+    where a child promoted out of the queue disappears - absent from the first
+    because it was still waiting, absent from the second because it is now
+    running. Removing the parent frees the slot that provokes exactly that
+    promotion, so the removal path must not ask for the two listings
+    separately at all.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+
+    def _split(*_args, **_kwargs):
+        raise AssertionError("child discovery must take one atomic snapshot")
+
+    rpc.tell_active = _split
+    rpc.tell_waiting = _split
+
+    def _spawn_waiting_child(fake, gid):
+        if gid == "gid-meta":
+            fake.waiting_jobs.append({"gid": "gid-idle", "following": "gid-meta"})
+
+    rpc.on_removed = _spawn_waiting_child
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta", "gid-idle"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+
+
+def test_a_refused_removal_hands_back_a_payload_child_not_a_metadata_parent(
+    queue_env, monkeypatch
+):
+    """Codex round 3 #2. Re-anchoring `t.gid` to the payload child without
+    also completing the phase transition leaves a payload gid wearing the
+    metadata parent's phase. The child's eventual `complete` - which names no
+    torrent to follow, because it *is* the torrent - then reads as a metadata
+    download that produced nothing, and a finished download is stored and
+    shown as an error.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+    rpc.remove_errors = {
+        "gid-late": Aria2Error("RPC transport error: connection refused")
+    }
+
+    def _spawn_child(fake, gid):
+        if gid == "gid-meta":
+            fake.active_jobs.append({"gid": "gid-late", "following": "gid-meta"})
+
+    rpc.on_removed = _spawn_child
+    queue.error.connect(lambda *_: None)
+
+    queue.remove(tid, delete_file=False)
+
+    # The task is retained, naming the transfer that is still running.
+    assert queue.tasks[tid].gid == "gid-late"
+    assert queue.tasks[tid].phase == "", "a payload gid must not keep the metadata phase"
+
+    # That payload finishes. It names nothing to follow because it is itself
+    # the torrent, which is indistinguishable from a failed metadata fetch to
+    # anything still reading the old phase.
+    queue._apply_status(tid, {
+        "status": "complete", "totalLength": "1024", "completedLength": "1024",
+        "downloadSpeed": "0",
+    })
+
+    assert queue.tasks[tid].error is None
+    assert queue.tasks[tid].status == "completed"
+
+
+# --- Codex round 6 ----------------------------------------------------------
+
+
+def test_a_recheck_that_fails_after_the_parent_is_gone_still_owns_the_child(
+    queue_env, monkeypatch
+):
+    """Codex round 6 #1. The parent is removed before the re-check, and the
+    re-check can fail - a transport blip, or the new full-page refusal, which
+    made this path likelier rather than rarer.
+
+    At that moment the parent is already gone and the known child is still
+    running, so the anchor must have moved before anything else can fail.
+    Otherwise the task is handed back naming a gid aria2 has forgotten: polls
+    and controls address the dead parent while the payload downloads on.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    calls = []
+
+    def _status(gid):
+        calls.append(gid)
+        if len(calls) == 1:
+            return {
+                "gid": "gid-meta", "status": "complete",
+                "followedBy": ["gid-child"],
+            }
+        raise Aria2Error("RPC transport error: connection refused")
+
+    rpc.tell_status = _status
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta"]            # the parent, and only it
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-child"    # owns what is still running
+    assert queue.tasks[tid].phase == ""
+    assert _persisted_row(db_path, tid)["gid"] == "gid-child"
+    assert errors
+
+
+# --- Codex round 5 ----------------------------------------------------------
+
+
+def test_a_recovered_removal_discards_the_managed_torrent_copy(
+    queue_env, monkeypatch, tmp_path
+):
+    """Codex round 5 #2. An uninterrupted removal discards Cove's managed
+    `.torrent` once nothing else needs it. A removal finished by crash recovery
+    used to skip that entirely, because the marked row carried only the gid.
+
+    The file is not inert: a `.torrent` from a private tracker embeds an
+    announce URL with the user's passkey, so leaving it behind keeps a
+    credential on disk for a download the user already removed.
+    """
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    managed = queue.tasks[tid].torrent_path
+    assert managed and Path(managed).exists(), "the managed copy exists first"
+    queue._launch(queue.tasks[tid])
+    gid = queue.tasks[tid].gid
+
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+    held.clear()                                # Cove exits mid-round-trip
+    assert Path(managed).exists(), "and survives the crash itself"
+    assert _persisted_row(db_path, tid)["status"] == "removing"
+
+    fresh = _FakeRpc()
+    q = _relaunch(tmp_path, fresh)
+    q.resume_persisted()
+    _drain()
+
+    assert fresh.removed == [gid]
+    assert _rows(db_path) == []
+    assert not Path(managed).exists(), "recovery discards it like any removal"
+
+
+def test_a_recovered_removal_keeps_a_managed_copy_another_task_still_needs(
+    queue_env, monkeypatch, tmp_path
+):
+    """Codex round 5 #2, the guard half. The managed copy belongs to the
+    torrent, not to the row being retired, so a second task on the same info
+    hash must keep it. Recovery reuses the same in-use check rather than a
+    second, looser rule.
+    """
+    queue, rpc, db_path, tid, _raw, _calls = _local_torrent_file(
+        queue_env, monkeypatch, tmp_path
+    )
+    managed = queue.tasks[tid].torrent_path
+    info_hash = queue.tasks[tid].info_hash
+    queue._launch(queue.tasks[tid])
+    gid = queue.tasks[tid].gid
+    # A second task on the same torrent, established before the crash.
+    twin = queue.add_url(
+        torrent_mod.minimal_magnet(info_hash),
+        source_type=SOURCE_TORRENT,
+        info_hash=info_hash,
+        torrent_path=managed,
+    )
+    assert twin is not None
+
+    held = _held_spawn(queue)
+    queue.remove(tid, delete_file=False)
+    held.clear()
+
+    fresh = _FakeRpc()
+    q = _relaunch(tmp_path, fresh)
+    q.resume_persisted()
+    _drain()
+
+    assert fresh.removed == [gid]
+    assert twin in q.tasks, "the other task is restored and still needs it"
+    assert Path(managed).exists(), "so the copy is kept"
+
+
+# --- Codex round 4 ----------------------------------------------------------
+
+
+def test_a_parent_that_cannot_be_stopped_keeps_its_children_and_its_phase(
+    queue_env, monkeypatch
+):
+    """Codex round 4 #1. Stopping known children before the parent meant a
+    parent-cleanup failure restored a task that was still in the metadata
+    phase but whose payload child had already been destroyed: it could re-adopt
+    the dead child from `followedBy`, sit active forever, or relaunch the
+    torrent after a restart.
+
+    The parent goes first in every case now. A parent that already has children
+    is terminal and can spawn no more, so nothing is lost by stopping it first,
+    and a failure there leaves the whole relationship untouched for the retry.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {
+        "gid": "gid-meta", "status": "complete", "followedBy": ["gid-child"],
+    }
+    rpc.remove_errors = {
+        "gid-meta": Aria2Error("RPC transport error: connection refused")
+    }
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == [], "no child may be destroyed for a parent we cannot stop"
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert queue.tasks[tid].phase == queue_module.PHASE_METADATA
+    assert _persisted_row(db_path, tid)["gid"] == "gid-meta"
+    assert errors
+
+
+def test_a_deleting_removal_inventories_each_owned_transfer_once(
+    queue_env, monkeypatch
+):
+    """Codex round 4 #1 follow-on. With the parent stopped first, the re-check
+    now runs even when a child was already known, and it re-reports that same
+    child. The owned set is deduplicated so each transfer is inventoried and
+    stopped exactly once - otherwise the extra pass is duplicate `get_files`
+    round trips feeding duplicate paths into the deletion.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {
+        "gid": "gid-meta", "status": "complete", "followedBy": ["gid-child"],
+    }
+
+    queue.remove(tid, delete_file=True)
+
+    assert rpc.removed == ["gid-meta", "gid-child"]
+    assert rpc.files_calls == ["gid-meta", "gid-child"]
+    assert tid not in queue.tasks
+
+
+def test_a_removal_is_refused_when_child_discovery_could_not_see_everything(
+    queue_env, monkeypatch
+):
+    """Codex round 5 #1. An incomplete snapshot cannot authorise finalising a
+    removal: a child past the page boundary would look exactly like no child at
+    all, and the task holding it would be deleted while the transfer stayed
+    ready to start. The removal is refused and the task kept, which is the
+    recoverable outcome.
+
+    Already-green control: refusal on a raising discovery call was existing
+    behaviour. It is recorded here because it is the half of the wrapper's new
+    fail-closed contract that the queue actually depends on.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+
+    def _too_many(*_args, **_kwargs):
+        raise Aria2Error(
+            "aria2 has more queued downloads than one page can report"
+        )
+
+    rpc.tell_all_downloads = _too_many
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert len(_rows(db_path)) == 1
+    assert errors
+
+
+def test_a_parent_purged_by_its_own_removal_still_yields_its_child(
+    queue_env, monkeypatch
+):
+    """Round 4, found by the live harness. Removing the parent can purge its
+    result, after which `tellStatus` answers "No such download for GID#..." -
+    aria2 stating there is no such download, not aria2 declining to answer.
+
+    Reading that as a refusal is what the live run caught: Cove reported the
+    removal as failed and left the payload child downloading at 1.1 MB/s,
+    owned by nothing. The unit suite missed it because the fakes used the
+    other phrasing.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    def _status(gid):
+        rpc.status_calls.append(gid)
+        if len(rpc.status_calls) == 1:
+            return {"gid": "gid-meta", "status": "active"}
+        # Verbatim from aria2 1.37.0 once the result has been purged.
+        raise Aria2RpcError(
+            "aria2.tellStatus", 1, f"No such download for GID#{gid}"
+        )
+
+    rpc.tell_status = _status
+
+    def _spawn_child(fake, gid):
+        if gid == "gid-meta":
+            fake.active_jobs.append({"gid": "gid-late", "following": "gid-meta"})
+
+    rpc.on_removed = _spawn_child
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta", "gid-late"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+
+
+def test_a_child_that_finished_before_the_recheck_is_still_cleaned_up(
+    queue_env, monkeypatch
+):
+    """Codex round 4 #3. A payload child can be created and reach a terminal
+    state before the post-removal re-check ever runs. It then exists in neither
+    the active nor the waiting listing, only among aria2's stopped results.
+    Leaving it there strands the download result, and when the user asked for
+    deletion, its files with it.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+    rpc.status_result = {"gid": "gid-meta", "status": "active"}
+
+    def _spawn_finished_child(fake, gid):
+        if gid == "gid-meta":
+            fake.stopped_jobs.append({
+                "gid": "gid-done", "following": "gid-meta", "status": "complete",
+            })
+
+    rpc.on_removed = _spawn_finished_child
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == ["gid-meta", "gid-done"]
+    assert tid not in queue.tasks
+    assert _rows(db_path) == []
+
+
+def test_a_parent_status_error_other_than_a_missing_gid_refuses_the_removal(
+    queue_env, monkeypatch
+):
+    """Codex round 2 #2. Only "GID is not found" means aria2 has stated there
+    is no such parent. Any other RPC error is aria2 declining to answer this
+    question, and inferring "then it has no children" from it is the same
+    unproven leap a transport failure is already barred from making.
+    """
+    queue, rpc, db_path, tid = _start_local_magnet(queue_env, monkeypatch)
+
+    def _server_error(gid):
+        rpc.status_calls.append(gid)
+        raise Aria2RpcError("aria2.tellStatus", 1, "Internal error")
+
+    rpc.tell_status = _server_error
+    errors = []
+    queue.error.connect(errors.append)
+
+    queue.remove(tid, delete_file=False)
+
+    assert rpc.removed == []
+    assert tid in queue.tasks
+    assert queue.tasks[tid].gid == "gid-meta"
+    assert errors

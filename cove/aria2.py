@@ -42,12 +42,16 @@ class Aria2RpcError(Aria2Error):
     The distinction is the point. A transport failure, a timeout or a
     malformed body all mean "no answer", and a caller must not read anything
     into them; only a JSON-RPC error object is aria2 stating a fact about the
-    request. Measured against 1.37.0, an unknown gid answers
-    `{code: 1, message: "GID <gid> is not found"}` on tellStatus, forceRemove
-    and removeDownloadResult alike, while an unreachable daemon produces no
-    error object at all - so cleanup can tell "this download is gone" from
-    "aria2 did not answer" without guessing at message text.
+    request. An unreachable daemon produces no error object at all, so cleanup
+    can tell "this download is gone" from "aria2 did not answer".
     """
+
+    # aria2 1.37.0 has more than one phrasing for an unknown gid, and which one
+    # it uses depends on the method and on whether a download result is still
+    # held. Both observed live: removal methods answer "GID <gid> is not
+    # found", while tellStatus answers "No such download for GID#<gid>" once
+    # the result has been purged.
+    _GID_ABSENT = ("is not found", "no such download")
 
     def __init__(self, method: str, code, message: str):
         super().__init__(f"RPC {method} failed: {message}")
@@ -55,8 +59,15 @@ class Aria2RpcError(Aria2Error):
         self.rpc_message = message
 
     def gid_not_found(self) -> bool:
-        """True when aria2 said it has no such download."""
-        return "is not found" in str(self.rpc_message).lower()
+        """True when aria2 said it has no such download.
+
+        Matching only the removal-method phrasing made a purged parent look
+        like aria2 declining to answer, which refused the removal and left the
+        payload child running. Found by the live harness, not by reasoning
+        about the text.
+        """
+        message = str(self.rpc_message).lower()
+        return any(phrase in message for phrase in self._GID_ABSENT)
 
 
 class Aria2InterfaceError(Aria2Error):
@@ -451,12 +462,18 @@ class Aria2RPC:
         except Exception:
             pass
 
-    def _call(self, method: str, params: Iterable[Any] = ()) -> Any:
+    def _call(
+        self, method: str, params: Iterable[Any] = (), *, with_token: bool = True
+    ) -> Any:
+        # `system.multicall` takes exactly one argument - the batch - and each
+        # sub-call carries its own token, so it is the one method that must not
+        # have one prepended here.
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
             "method": method,
-            "params": [f"token:{self.secret}", *params],
+            "params": [f"token:{self.secret}", *params] if with_token
+            else [*params],
         }
         try:
             r = self._session().post(self.url, json=payload, timeout=self.timeout)
@@ -607,12 +624,29 @@ class Aria2RPC:
         return self._call("aria2.unpauseAll")
 
     def remove(self, gid: str, force: bool = True) -> str:
+        """Stop `gid`, or establish that aria2 no longer has it.
+
+        Returning normally is a promise the caller acts on: it deletes files
+        and forgets the gid. So only aria2's own refusal justifies the
+        removeDownloadResult fallback - that answer means the download is not
+        active, and the stopped-result entry is all there is left to clean.
+        A transport failure, a timeout or a malformed body are "no answer",
+        and retrying them as a result cleanup that happens to succeed is how
+        a live transfer outlives the row that owned it. They stay failures.
+        """
         method = "aria2.forceRemove" if force else "aria2.remove"
         try:
             return self._call(method, [gid])
-        except Aria2Error:
-            # Already finished/removed; clean up the result entry.
-            return self._call("aria2.removeDownloadResult", [gid])
+        except Aria2RpcError as refused:
+            try:
+                return self._call("aria2.removeDownloadResult", [gid])
+            except Aria2RpcError as absent:
+                if absent.gid_not_found():
+                    # Both calls were answered and both said there is no such
+                    # download. Nothing is left that could still be writing,
+                    # which is exactly what was asked for.
+                    return "OK"
+                raise absent from refused
 
     def remove_download_result(self, gid: str) -> str:
         return self._call("aria2.removeDownloadResult", [gid])
@@ -655,6 +689,86 @@ class Aria2RPC:
 
     def tell_active(self) -> list[dict]:
         return self._call("aria2.tellActive", [self._EXTERNAL_KEYS])
+
+    def tell_all_downloads(self, num: int = 1000) -> list[dict]:
+        """Every download aria2 knows, as one point-in-time snapshot.
+
+        aria2 splits these across three methods: `tellActive` for what is
+        running, `tellWaiting` for what is queued or paused, and `tellStopped`
+        for what has finished, errored or been removed. Calling them one after
+        another yields separate snapshots, and a download that changes state in
+        a gap can be absent from every answer - which is precisely what freeing
+        a slot, or a child completing quickly, provokes. `system.multicall` is
+        handled as a single batch, so nothing can cross between the parts and
+        be lost by all of them.
+
+        The two paged listings ask for `num` entries. If the queued listing
+        comes back exactly full this is no longer a whole snapshot, and since
+        the caller uses it to decide that a download has no children, it raises
+        rather than answer with a picture it cannot vouch for. Paginating
+        instead would reintroduce the split snapshot this method exists to
+        avoid. A full stopped listing is not treated the same way: it sits at
+        the cap routinely on a busy daemon, anything found there is already
+        terminal, and it is read from the newest end where a boundary-created
+        child lands, so a full page is not evidence of having missed one.
+        """
+        token = f"token:{self.secret}"
+        batch = [
+            {"methodName": "aria2.tellActive",
+             "params": [token, self._EXTERNAL_KEYS]},
+            {"methodName": "aria2.tellWaiting",
+             "params": [token, 0, num, self._EXTERNAL_KEYS]},
+            # Offset -1, not 0: aria2 orders stopped results oldest-first, and
+            # a child that finished during the removal is the newest of them.
+            # A negative offset walks back from the end, so this is the page
+            # the boundary case actually lands in. Verified against 1.37.0.
+            {"methodName": "aria2.tellStopped",
+             "params": [token, -1, num, self._EXTERNAL_KEYS]},
+        ]
+        answers = self._call("system.multicall", [batch], with_token=False)
+        # Every sub-call must have answered. A truncated or non-list batch
+        # result is not a daemon with nothing to report: skipping the parts
+        # that did not parse would turn a missing queued listing into "no
+        # child" and retire a task whose payload is still there.
+        if not isinstance(answers, list) or len(answers) != len(batch):
+            raise Aria2Error(
+                f"RPC system.multicall answered for {len(batch)} sub-calls "
+                "with something else entirely"
+            )
+        jobs: list[dict] = []
+        for index, answer in enumerate(answers):
+            # A sub-call that failed is reported in-band, as a fault struct
+            # rather than an error response. Reading that as "no downloads"
+            # would be the same unproven leap as reading a transport failure
+            # as "no child", so it is surfaced as aria2 declining to answer.
+            if isinstance(answer, dict):
+                raise Aria2RpcError(
+                    "system.multicall",
+                    answer.get("faultCode"),
+                    answer.get("faultString", answer),
+                )
+            # Each successful sub-call answers with its result wrapped in a
+            # one-element array. Anything else is not a listing, and is not
+            # read as an empty one.
+            if not (isinstance(answer, list) and len(answer) == 1
+                    and isinstance(answer[0], list)):
+                raise Aria2Error(
+                    f"RPC {batch[index]['methodName']} answered in a shape "
+                    "that is not a download listing"
+                )
+            part = [job for job in answer[0] if isinstance(job, dict)]
+            if (batch[index]["methodName"] == "aria2.tellWaiting"
+                    and len(part) >= num):
+                # A queued listing at the cap may not be all of it, and this
+                # answer is used to conclude that a download has no children.
+                # Refusing to answer keeps the caller's task recoverable; a
+                # short answer would retire it.
+                raise Aria2Error(
+                    f"RPC aria2.tellWaiting returned a full page ({num}); "
+                    "the snapshot of queued downloads is not complete"
+                )
+            jobs += part
+        return jobs
 
     def tell_stopped(self, offset: int = 0, num: int = 1000) -> list[dict]:
         return self._call("aria2.tellStopped", [offset, num, self._EXTERNAL_KEYS])
