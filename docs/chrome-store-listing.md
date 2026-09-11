@@ -5,10 +5,10 @@ deletes on every build.
 
 **This is a release candidate, not a submission.** It describes the Chrome
 bundle as it is built from the current source, at the candidate version
-**1.3.9** (`dist/cove-chrome-1.3.9.zip`). That version is provisional: it is the
-next patch above both the repository source (1.3.8) and the highest version
-verifiably published on the Store (1.3.6), but the public listing cannot show an
-upload that was rejected, withdrawn, or is awaiting review. Confirm on the
+**1.3.10** (`dist/cove-chrome-1.3.10.zip`). That version is provisional: it is
+the next patch above 1.3.9, which was uploaded to the Store from this
+repository, but the public listing cannot show an upload that was rejected,
+withdrawn, or is awaiting review. Confirm on the
 developer dashboard before uploading (see
 [Unresolved external evidence](#5-historical-rejection-context-and-unresolved-external-evidence)).
 
@@ -220,15 +220,15 @@ Still unread, and not inferable from the source tree or the public page:
 - The exact current rejection text and its appeal state.
 - Which Chrome versions have actually been **uploaded**, including any draft,
   in-review, or rejected upload. A public listing shows the published version
-  only, so it cannot rule out an upload at or above 1.3.9.
+  only, so it cannot rule out an upload at or above 1.3.10.
 - The live listing copy, screenshots, and promotional images.
 - The permission justifications currently recorded in the dashboard.
 - The privacy-practices declarations currently recorded in the dashboard.
 
 Firefox versioning is a separate question against AMO's own record. Checked the
-same day: the public version of `cove-dm@cove-download-manager.net` is 1.4.7,
-matching the repository source, so 1.4.8 is the next patch. The same limit
-applies - an upload awaiting review is not public.
+same day: the public version of `cove-dm@cove-download-manager.net` was 1.4.7,
+and 1.4.8 has since been uploaded to AMO from this repository, so 1.4.9 is the
+next patch. The same limit applies - an upload awaiting review is not public.
 
 ---
 
@@ -239,10 +239,14 @@ applies - an upload awaiting review is not public.
 - [x] Tab 3: full validation of freshly built Chrome and Firefox artifacts.
 - [x] Tab 4: version decided (1.3.9, provisional), bumped, and rebuilt. A Store
       upgrade is a new zip containing every file, changed or not, so the
-      artifact that is validated must be the artifact that is uploaded.
+      artifact that is validated must be the artifact that is uploaded. 1.3.9
+      was subsequently uploaded to the dashboard.
+- [x] Follow-up release: 1.3.10 bumped and rebuilt for the excluded-domains fix
+      to the in-page button. 1.3.9 is an immutable submission and is not
+      rebuilt or relabelled.
 - [ ] Read the dashboard: rejection text and appeal state, uploaded-version
       history including drafts and rejections, permission justifications,
-      privacy-practices declarations. Confirm 1.3.9 is unused before uploading.
+      privacy-practices declarations. Confirm 1.3.10 is unused before uploading.
 - [ ] Replace any screenshot that shows a feature this build does not have.
       Screenshots showing stream detection or extraction contradict the copy.
 - [ ] Point the dashboard's privacy policy field at the current `PRIVACY.md`.
@@ -252,15 +256,15 @@ applies - an upload awaiting review is not public.
       the download address, and local-only processing still requires disclosure.
 - [ ] Re-check the description against section 4 after any behaviour change.
 
-## 7. Release notes for 1.3.9
+## 7. Release notes for 1.3.10
 
 The Store has no per-version release-notes field; this is the text to use if the
 description's "What's new" area or a changelog entry is updated.
 
 ```text
-The refusal that already stopped a playlist address being sent from the right-click menu now also applies to the in-page Cove button, so both ways of handing a media address to Cove are held to it. A refused address is not marked, no cookies are read for it, nothing is sent to the desktop app, and no page address is substituted for it.
+The in-page Download with Cove button now respects Excluded Domains. On a site you have excluded, the button is not shown and nothing is handed to the desktop app from it.
 
-The minimum file size description has been corrected: the minimum can only be applied when the browser gives a usable size at the start of a download, so a smaller file may still be taken over.
+Changes to the excluded-domains list take effect on pages that are already open, without needing a reload.
 
 No permission changes in this version.
 ```

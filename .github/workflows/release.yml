@@ -342,15 +342,14 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.6.1
+          ## What's new in 3.6.2
 
-          A follow-up to Search: you can now review what's inside a torrent before it downloads, and sort search results by column - the latter suggested by QB, thank you.
+          A maintenance release with two reliability fixes around the aria2 backend.
 
-          ### Added
+          ### Fixed
 
-          - **Torrent contents selection dialog.** Before a torrent starts, see the full list of files it contains and choose which ones to actually download, for both manually added magnets and magnets picked from Search.
-          - **Magnet metadata resolver.** Cove fetches a magnet's file list itself so the contents dialog has something to show, without needing an external site or client.
-          - **Search results can be sorted by column** (suggested by QB) - click a column header to reorder results by that field.
+          - **Removing a torrent now stops its backend transfer.** Removing a torrent from Cove could leave the underlying transfer running in the background; Cove now keeps ownership of the transfer until the backend confirms the removal. Choosing to keep the files still keeps them.
+          - **Cove now tells you when the aria2 backend stops.** If aria2 exits partway through a session, Cove no longer sits there looking idle while every download fails - it reports the outage once and tells you to restart Cove. The underlying error is also written to the diagnostics log instead of being discarded.
 
           ### Notes
 

@@ -164,7 +164,7 @@ def test_chrome_manifest_permissions_and_version_are_untouched(bundles):
     built = json.loads((bundles / "chrome" / "manifest.json").read_text())
     assert built["permissions"] == source["permissions"]
     assert built["host_permissions"] == source["host_permissions"]
-    assert built["version"] == source["version"] == "1.3.9"
+    assert built["version"] == source["version"] == "1.3.10"
     assert built["manifest_version"] == 3
 
 
@@ -178,7 +178,7 @@ def test_firefox_manifest_permissions_and_version_are_untouched(bundles):
     source = json.loads((ROOT / "extension" / "manifest.json").read_text())
     built = json.loads((bundles / "firefox" / "manifest.json").read_text())
     assert built["permissions"] == source["permissions"]
-    assert built["version"] == source["version"] == "1.4.8"
+    assert built["version"] == source["version"] == "1.4.9"
     assert built["manifest_version"] == 2
     assert (built["browser_specific_settings"]["gecko"]["id"]
             == source["browser_specific_settings"]["gecko"]["id"]
@@ -614,3 +614,41 @@ def test_no_signing_key_reaches_either_artifact(bundles, browser):
     zips = list(bundles.glob(f"cove-{browser}-*.zip"))
     assert "chrome-key.pem" not in _zip_members(zips[0])
     assert "chrome-key.pem" not in _files(bundles / browser)
+
+
+# ---- Store listing copy tracks the manifest it describes ----
+#
+# The two listing documents are what gets pasted into the dashboards, and each
+# names the version and the ZIP filename the reviewer will receive. A manifest
+# bump without a copy update hands a reviewer notes for the previous release,
+# so the candidate version is read from the manifest rather than written twice.
+
+_LISTINGS = {
+    "chrome": (ROOT / "docs" / "chrome-store-listing.md", "manifest.chrome.json"),
+    "firefox": (ROOT / "docs" / "firefox-store-listing.md", "manifest.json"),
+}
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_store_listing_names_the_current_candidate_version(browser):
+    doc, manifest_name = _LISTINGS[browser]
+    version = json.loads((ROOT / "extension" / manifest_name).read_text())["version"]
+    text = doc.read_text(encoding="utf-8")
+
+    assert f"dist/cove-{browser}-{version}.zip" in text
+    assert f"What's new in version {version}" in text or f"Release notes for {version}" in text
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_store_listing_does_not_offer_an_already_uploaded_version(browser):
+    """1.3.9 and 1.4.8 are immutable submissions; neither may be the candidate."""
+    doc, manifest_name = _LISTINGS[browser]
+    version = json.loads((ROOT / "extension" / manifest_name).read_text())["version"]
+    text = doc.read_text(encoding="utf-8")
+
+    for uploaded in ("1.3.9", "1.4.8"):
+        if uploaded == version:
+            continue
+        assert f"dist/cove-{browser}-{uploaded}.zip" not in text
+        assert f"What's new in version {uploaded}" not in text
+        assert f"Release notes for {uploaded}" not in text

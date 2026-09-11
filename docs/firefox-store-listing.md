@@ -1,9 +1,9 @@
-# AMO listing - Cove Download Manager (Firefox) 1.4.8
+# AMO listing - Cove Download Manager (Firefox) 1.4.9
 
 Lives in `docs/` rather than `dist/`, which `scripts/build_extension.py`
 deletes on every build.
 
-Upload `dist/cove-firefox-1.4.8.zip` at
+Upload `dist/cove-firefox-1.4.9.zip` at
 <https://addons.mozilla.org/developers/>.
 
 The three blocks below map to the three AMO fields. They are plain text, not
@@ -52,11 +52,9 @@ About that minimum: it can only be applied when Firefox gives a usable size at t
 
 Nothing is downloaded without an action you took, and the extension never collects or transmits your browsing history.
 
-What's new in version 1.4.8:
+What's new in version 1.4.9:
 
-Downloads whose size Firefox does not report are handed to Cove correctly. Firefox reports an unknown size as -1, and that value used to be passed straight through to Cove, which rejected the handoff. It is now sent as an unknown size, and the download goes through.
-
-The description of the minimum file size has been corrected to match what actually happens: the minimum can only be applied when Firefox gives a usable size at the start of a download, so a smaller file may still be taken over.
+The in-page Download with Cove button now respects Excluded Domains. On a site you have excluded, the button is not shown and nothing is handed to the desktop app from it. Changes to the excluded-domains list take effect on pages that are already open, without needing a reload.
 
 The free Cove Download Manager desktop app is required because it provides the download engine. Install Cove, launch it once, and then click "Test Connection to Cove" in the extension to link them.
 
@@ -67,18 +65,14 @@ https://github.com/Sin213/cove-download-manager
 ## Version -> Release Notes
 
 Shown on the add-on's detail page under this version. Keep it to what changed
-in 1.4.8 only.
+in 1.4.9 only.
 
 ```text
-Fixed: downloads whose size Firefox does not report now reach Cove instead of being rejected.
+Fixed: the in-page Download with Cove button now respects Excluded Domains.
 
-Firefox reports an unknown size as -1, and that value was passed straight through to the desktop app, which rejected the handoff because a size cannot be negative. The size is now sent as unknown, and the download goes through. In testing, Firefox reported the size as unknown for every download, including one whose server declared a length, so this affected far more downloads than the wording "responses with no declared length" suggested.
+On a site listed under Excluded Domains, the button is no longer shown and nothing is handed to the desktop app from it. The right-click menu entries already honoured the list; the in-page button did not.
 
-Fixed: the video download button is more careful about which source it sends. It now waits for the player's own address to be usable rather than acting on a partly resolved one, and prefers the address the element itself names over one inferred around it.
-
-Changed: the description of the minimum file size now matches what actually happens. The minimum can only be applied when Firefox gives a usable size at the moment a download starts, so a file smaller than your minimum may still be taken over. This is a wording correction, not a change in behaviour.
-
-Internal: the add-on's media code is split into a browser-neutral part and the Firefox-only site handling, and the popup's detected-stream section moved into its own module. The scripts named in the manifest changed accordingly. Nothing the add-on does on a page changed because of it.
+Changes to the excluded-domains list take effect on pages that are already open, so adding or removing a site no longer needs a reload to take hold.
 
 No permission changes in this version.
 ```
@@ -102,27 +96,21 @@ To reproduce the uploaded file:
   cd cove-download-manager
   python scripts/build_extension.py
 
-This writes dist/cove-firefox-1.4.8.zip. Requires Python 3.9 or later, no other tooling. Three things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3); the browser-specific modules, which are media-sites.js, content/media-sites.js, popup/streams.js and popup/streams.css in the Firefox bundle only, and media-chrome.js in the Chrome bundle only; and the popup composition described above. That is why the Firefox bundle holds 21 files and the Chrome bundle holds 18. Chrome is not without video handling: it ships the same shared in-page button and the same video and audio context-menu entries for a media element whose own address is an ordinary HTTP(S) file. What the Chrome build excludes is the site-specific part, meaning page extractors, HLS stream detection, and the detected-stream popup section.
+This writes dist/cove-firefox-1.4.9.zip. Requires Python 3.9 or later, no other tooling. Three things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3); the browser-specific modules, which are media-sites.js, content/media-sites.js, popup/streams.js and popup/streams.css in the Firefox bundle only, and media-chrome.js in the Chrome bundle only; and the popup composition described above. That is why the Firefox bundle holds 21 files and the Chrome bundle holds 18. Chrome is not without video handling: it ships the same shared in-page button and the same video and audio context-menu entries for a media element whose own address is an ordinary HTTP(S) file. What the Chrome build excludes is the site-specific part, meaning page extractors, HLS stream detection, and the detected-stream popup section.
 
 Public source: https://github.com/Sin213/cove-download-manager
 
-What changed in 1.4.8
+What changed in 1.4.9
 
-No new permissions, no new APIs, no new hosts. The permission set in manifest.json is byte-identical to 1.4.7; only the version and the script lists differ.
+No new permissions, no new APIs, no new hosts, and no change to the script lists. The permission set in manifest.json is byte-identical to 1.4.8; only the version line differs. This is a single behaviour fix.
 
-A file reorganisation, so the manifest's script lists changed:
+Behaviour fix:
 
-extension/media.js was split into extension/media-core.js (browser-neutral mechanics: filename derivation, the in-page button's handoff, the media message surface) and extension/media-sites.js (the Firefox-only site handling: page extractors, site title rules, HLS stream observation). The manifest's background.scripts therefore names media-core.js, media-sites.js, background.js instead of media.js, background.js. Likewise the detected-stream part of the content script moved to content/media-sites.js, which now precedes content/media-tab.js, and the popup's stream section moved to popup/streams.js and popup/streams.css. This is a split of existing code, not new capability: the Firefox bundle still ships every part of it.
+extension/background.js, extension/media-core.js and extension/content/media-tab.js - the in-page "Download with Cove" button now honours the user's Excluded Domains setting. The right-click menu entries already consulted that list before acting; the in-page button did not, so on an excluded site the button was still drawn and could still hand an address to the desktop app. The button is now withheld on an excluded site, and the setting is re-read when it changes, so an already-open page follows the new list without a reload.
 
-The split exists because the same source tree also builds a Chrome bundle that ships none of the site handling. Files whose names end in -sites are the Firefox-only half, and the Chrome build excludes them.
+The scope of the fix is the in-page button only. The add-on's content scripts still run on an excluded site, as they did before, and the excluded list is not a substitute for removing a host permission.
 
-Behaviour fixes:
-
-1. extension/background.js - a download size the browser reports as unknown is normalised before the handoff. Firefox reports -1 for an unknown size; that value reached the desktop app, which rejects a negative size, so those downloads were refused outright. It is now sent as 0, meaning unknown, which the app accepts.
-
-2. extension/content/media-tab.js - the in-page button now requires the player's own address to be usable before acting on it, and takes the address the element names over one inferred around it. This removes a case where a partly resolved player produced a handoff for the wrong source.
-
-These are covered by tests/extension_background.test.js, tests/extension_media_tab.test.js, and tests/test_extension_bundle.py in the repository, which run under node --test and pytest with no third-party dependencies.
+This is covered by tests/extension_background.test.js and tests/extension_media_tab.test.js in the repository, which run under node --test with no third-party dependencies.
 
 How the add-on works
 
@@ -178,9 +166,8 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 
 ## Before submitting
 
-- The feature bullets in the description carry over unchanged except for the
-  minimum-file-size bullet, which was corrected. The "What's new" paragraph, the
-  release notes, and the reviewer notes are new copy for 1.4.8.
+- The feature bullets in the description carry over unchanged. The "What's new"
+  paragraph, the release notes, and the reviewer notes are new copy for 1.4.9.
 - Screenshots do not need replacing. This build still ships the video pill, so
   existing pill screenshots remain accurate.
 - `nativeMessaging`, `cookies`, `webRequest`, and `<all_urls>` are still
@@ -195,8 +182,10 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 - 1.4.7 carried extension fixes from `c445cb1` that were written before the
   1.4.6 upload but never given a version bump, so the published 1.4.6 and the
   repository's 1.4.6 source were not the same code. That was corrected there.
-- 1.4.7 is the version currently public on AMO (verified 2026-09-07 against the
-  AMO API for add-on `cove-dm@cove-download-manager.net`), and the repository
-  source was also 1.4.7, so 1.4.8 is the next patch above both. That check reads
-  public versions only; it cannot see an upload awaiting review or an unlisted
-  one, so confirm on the developer dashboard before uploading.
+- 1.4.7 was the version public on AMO when this document was drafted (verified
+  2026-09-07 against the AMO API for add-on `cove-dm@cove-download-manager.net`)
+  and 1.4.8 was subsequently uploaded from this repository, so 1.4.9 is the next
+  patch above both. 1.4.8 is an immutable submission: it is not rebuilt or
+  relabelled here. That check reads public versions only; it cannot see an
+  upload awaiting review or an unlisted one, so confirm on the developer
+  dashboard before uploading.

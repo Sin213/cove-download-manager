@@ -85,6 +85,25 @@ def test_release_notes_keep_dynamic_version_placeholders():
     assert app_version() not in body.split("## Downloads", 1)[1]
 
 
+def test_release_notes_keep_the_browser_extension_separate():
+    # Desktop releases neither contain nor update the extension, and the two
+    # ship on different schedules. Dropping this line while editing the notes
+    # would let a desktop release look like it carries extension fixes.
+    body = release_notes_body()
+
+    assert "browser extension is published separately" in body
+    assert "neither contains nor updates it" in body
+
+
+def test_github_release_is_created_as_a_draft():
+    # The user decides when a release goes public; the workflow only stages it.
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+
+    create = re.search(r"gh release create .*?(?=\n\s*\n|\Z)", workflow, re.DOTALL)
+    assert create, "publish job no longer creates a release"
+    assert "--draft" in create.group(0)
+
+
 def test_publish_job_stays_tag_only():
     workflow = WORKFLOW.read_text(encoding="utf-8")
 
