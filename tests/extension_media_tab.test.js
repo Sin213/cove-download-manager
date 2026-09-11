@@ -149,8 +149,13 @@ function stubVideo({ top = 100, width = 640, height = 360, readyState = 4 } = {}
 // survive, which is what a bundle without a site adapter would run.
 // `chromeOnly` drops the `browser` global. Chrome exposes `chrome` alone, and
 // the shared pill has to run there off the same file Firefox loads.
-function loadMediaTab({ href = "https://example.test/watch", videos = [],
+// Async because the pill now starts suppressed and is only enabled by the
+// background's answer, which is a message round-trip. Returning before that
+// settles would hand every test a page whose permission is still unknown -
+// which is a real state, but not the one most of these tests are about.
+async function loadMediaTab({ href = "https://example.test/watch", videos = [],
                        sites = true, chromeOnly = false,
+                       settingsReply = { mediaPillEnabled: true, pillAllowed: true },
                        reply = { mediaPillEnabled: true } } = {}) {
   const timers = [];
   const documentElement = new StubNode("HTML");
@@ -192,20 +197,39 @@ function loadMediaTab({ href = "https://example.test/watch", videos = [],
   // Every message the content script sends, so the diagnostics it reports
   // can be inspected exactly as the background would receive them.
   const sent = [];
+  // Set by a test to make the very next sendMessage fail the way the real API
+  // can: a synchronous throw when the background is gone, or a rejection.
+  let sendThrows = false;
+  const storageListeners = [];
+  const runtimeListeners = [];
   const browser = {
     runtime: {
       id: "cove-test",
-      async sendMessage(message) {
+      // Not an async function: a synchronous throw and a rejected promise are
+      // different failures, and the pill has to survive both. An async
+      // function can only ever produce the second.
+      sendMessage(message) {
         sent.push(message);
-        if (typeof reply === "function") return reply(message);
-        if (message && message.type === "getSettings") {
-          return { mediaPillEnabled: true };
+        if (sendThrows === "sync") throw new Error("Could not establish connection");
+        if (sendThrows === "reject") {
+          return Promise.reject(new Error("Could not establish connection"));
         }
-        return reply;
+        // The permission answer is its own fake. A test about the download
+        // handoff should not have to restate the pill's permission, and a test
+        // about permission should not have to restate the handoff.
+        if (message && message.type === "getSettings") {
+          return typeof settingsReply === "function"
+            ? Promise.resolve(settingsReply(message))
+            : Promise.resolve(settingsReply);
+        }
+        if (typeof reply === "function") return Promise.resolve(reply(message));
+        return Promise.resolve(reply);
       },
-      onMessage: { addListener() {} },
+      onMessage: { addListener(listener) { runtimeListeners.push(listener); } },
     },
-    storage: { onChanged: { addListener() {} } },
+    storage: {
+      onChanged: { addListener(listener) { storageListeners.push(listener); } },
+    },
   };
 
   const context = vm.createContext({
@@ -264,7 +288,37 @@ function loadMediaTab({ href = "https://example.test/watch", videos = [],
     const pending = timers.splice(0, timers.length);
     for (const handle of pending) handle.fn();
   };
-  return { doc, win, body, pillHost, runTimers, timers, sent };
+  // Fires a storage.onChanged the way the options page's save does, then lets
+  // the resulting permission requery settle. `area` and `changes` are open so
+  // a test can also deliver an event the pill must ignore entirely.
+  const changeSettings = async (changes = { settings: { newValue: {} } },
+                                area = "local") => {
+    for (const listener of storageListeners) listener(changes, area);
+    await settle();
+  };
+
+  // The permission round-trip is a message, so nothing about the pill is
+  // decided until the microtask queue has run.
+  await settle();
+
+  return {
+    doc, win, body, pillHost, runTimers, timers, sent,
+    changeSettings,
+    storageListeners,
+    // Delivers a background push, e.g. the adapter's coveStreamsUpdated, which
+    // is one of the paths that can schedule a scan after a pill was taken away.
+    pushMessage: (message) => {
+      for (const listener of runtimeListeners) listener(message);
+    },
+    settle,
+    setSendFailure: (mode) => { sendThrows = mode; },
+    // How many permission requests the content script has made so far. The
+    // pill must not ask again per play, hover, scan or resize.
+    permissionRequests: () =>
+      sent.filter((m) => m && m.type === "getSettings").length,
+    downloadMessages: () =>
+      sent.filter((m) => m && m.type === "downloadMedia"),
+  };
 }
 
 // Brings a video up as the active pill target through the hover path.
@@ -276,9 +330,9 @@ function hover(harness, video) {
   return harness.pillHost();
 }
 
-test("the pill is anchored above its video while the video is in view", () => {
+test("the pill is anchored above its video while the video is in view", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
 
   assert.ok(host, "expected a pill host to be created");
@@ -287,9 +341,9 @@ test("the pill is anchored above its video while the video is in view", () => {
   assert.equal(host.style.top, "162px");
 });
 
-test("the pill hides instead of pinning itself to the top of the viewport", () => {
+test("the pill hides instead of pinning itself to the top of the viewport", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
   assert.equal(host.style.display, "block");
 
@@ -301,9 +355,9 @@ test("the pill hides instead of pinning itself to the top of the viewport", () =
   assert.notEqual(host.style.top, "4px");
 });
 
-test("the pill comes back when its video scrolls into view again", () => {
+test("the pill comes back when its video scrolls into view again", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
 
   video.scrollTo(-400);
@@ -317,9 +371,9 @@ test("the pill comes back when its video scrolls into view again", () => {
   assert.equal(host.style.top, "162px");
 });
 
-test("a video that starts playing off-screen gets its pill on scroll-in", () => {
+test("a video that starts playing off-screen gets its pill on scroll-in", async () => {
   const video = stubVideo({ top: 900 }); // below a 720px viewport
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   harness.doc.dispatch("mouseover", { target: video });
   assert.equal(harness.pillHost(), null, "no pill host is created off-screen");
 
@@ -331,13 +385,13 @@ test("a video that starts playing off-screen gets its pill on scroll-in", () => 
   assert.equal(host.style.display, "block");
 });
 
-test("a visible playing video wins the pill over a bigger off-screen one", () => {
+test("a visible playing video wins the pill over a bigger off-screen one", async () => {
   const visible = stubVideo({ top: 100, width: 640, height: 360 });
   const offscreen = stubVideo({ top: 900, width: 1280, height: 720 });
   for (const video of [visible, offscreen]) video.readyState = 4;
   // Registration order makes the off-screen video the last one to claim the
   // pill, so the bounded startup scans are what must hand it back.
-  const harness = loadMediaTab({ videos: [visible, offscreen] });
+  const harness = await loadMediaTab({ videos: [visible, offscreen] });
   harness.runTimers();
 
   const host = harness.pillHost();
@@ -347,12 +401,12 @@ test("a visible playing video wins the pill over a bigger off-screen one", () =>
   assert.equal(host.style.top, "62px");
 });
 
-test("a stopped video hands the pill to a visible video, not an off-screen one", () => {
+test("a stopped video hands the pill to a visible video, not an off-screen one", async () => {
   const offscreen = stubVideo({ top: 900, width: 1280, height: 720 });
   const visible = stubVideo({ top: 300, width: 640, height: 360 });
   const active = stubVideo({ top: 100, width: 640, height: 360 });
   for (const video of [offscreen, visible, active]) video.readyState = 4;
-  const harness = loadMediaTab({ videos: [offscreen, visible, active] });
+  const harness = await loadMediaTab({ videos: [offscreen, visible, active] });
 
   active.paused = true;
   active.dispatch("pause", { target: active });
@@ -363,13 +417,13 @@ test("a stopped video hands the pill to a visible video, not an off-screen one",
   assert.equal(host.style.top, "262px");
 });
 
-test("a small fully visible video outranks a large mostly off-screen one", () => {
+test("a small fully visible video outranks a large mostly off-screen one", async () => {
   // 1920x1080 with only ~40% on screen still has more visible pixels than a
   // fully visible 640x360, so visible area alone would pick the wrong one.
   const big = stubVideo({ top: 260, width: 1920, height: 1080 });
   const small = stubVideo({ top: 100, width: 640, height: 360 });
   for (const video of [big, small]) video.readyState = 4;
-  const harness = loadMediaTab({ videos: [small, big] });
+  const harness = await loadMediaTab({ videos: [small, big] });
   harness.runTimers();
 
   const host = harness.pillHost();
@@ -378,13 +432,13 @@ test("a small fully visible video outranks a large mostly off-screen one", () =>
   assert.equal(host.style.top, "62px");
 });
 
-test("an off-screen video starting playback does not steal the pill", () => {
+test("an off-screen video starting playback does not steal the pill", async () => {
   const visible = stubVideo({ top: 100, width: 640, height: 360 });
   const offscreen = stubVideo({ top: 900, width: 1280, height: 720 });
   visible.readyState = 4;
   offscreen.readyState = 4;
   offscreen.paused = true;
-  const harness = loadMediaTab({ videos: [visible, offscreen] });
+  const harness = await loadMediaTab({ videos: [visible, offscreen] });
 
   offscreen.paused = false;
   offscreen.dispatch("playing", { target: offscreen });
@@ -395,12 +449,12 @@ test("an off-screen video starting playback does not steal the pill", () => {
   assert.equal(host.style.top, "62px");
 });
 
-test("hovering a visible video takes the pill from an off-screen player", () => {
+test("hovering a visible video takes the pill from an off-screen player", async () => {
   const playing = stubVideo({ top: 100, width: 640, height: 360 });
   const hovered = stubVideo({ top: 300, width: 640, height: 360 });
   playing.readyState = 4;
   hovered.paused = true;
-  const harness = loadMediaTab({ videos: [playing, hovered] });
+  const harness = await loadMediaTab({ videos: [playing, hovered] });
 
   // The playing video scrolls away but keeps playing, so it stays active.
   playing.scrollTo(-400);
@@ -415,11 +469,11 @@ test("hovering a visible video takes the pill from an off-screen player", () => 
   assert.equal(host.style.top, "262px");
 });
 
-test("a partly scrolled video keeps the pill inside its visible band", () => {
+test("a partly scrolled video keeps the pill inside its visible band", async () => {
   // 260 of 360 px still on screen: eligible, but "above the video" is off
   // the top of the viewport.
   const video = stubVideo({ top: 200, height: 360 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   hover(harness, video);
 
   video.scrollTo(-100);
@@ -431,12 +485,12 @@ test("a partly scrolled video keeps the pill inside its visible band", () => {
   assert.equal(host.style.top, "8px");
 });
 
-test("scrolling the active video away hands the pill to a visible one", () => {
+test("scrolling the active video away hands the pill to a visible one", async () => {
   const active = stubVideo({ top: 100, width: 640, height: 360 });
   const other = stubVideo({ top: 400, width: 640, height: 360 });
   active.readyState = 4;
   other.readyState = 4;
-  const harness = loadMediaTab({ videos: [other, active] });
+  const harness = await loadMediaTab({ videos: [other, active] });
 
   active.scrollTo(-400);
   harness.win.dispatch("scroll");
@@ -447,9 +501,9 @@ test("scrolling the active video away hands the pill to a visible one", () => {
   assert.equal(host.style.top, "362px");
 });
 
-test("a video scrolled just past the halfway mark hides the pill", () => {
+test("a video scrolled just past the halfway mark hides the pill", async () => {
   const video = stubVideo({ top: 0, height: 360 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
   assert.equal(host.style.display, "block");
 
@@ -459,9 +513,9 @@ test("a video scrolled just past the halfway mark hides the pill", () => {
   assert.equal(host.style.display, "none");
 });
 
-test("a paused feed preview keeps the pill up long enough to click it", () => {
+test("a paused feed preview keeps the pill up long enough to click it", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
   assert.equal(host.style.display, "block");
 
@@ -473,9 +527,9 @@ test("a paused feed preview keeps the pill up long enough to click it", () => {
   assert.equal(host.style.display, "block");
 });
 
-test("a torn-down feed preview hides the pill once the grace period expires", () => {
+test("a torn-down feed preview hides the pill once the grace period expires", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
 
   video.paused = true;
@@ -485,9 +539,9 @@ test("a torn-down feed preview hides the pill once the grace period expires", ()
   assert.equal(host.style.display, "none");
 });
 
-test("a detached preview that never paused still times out", () => {
+test("a detached preview that never paused still times out", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
 
   // YouTube removes the inline preview element without pausing it first.
@@ -498,9 +552,9 @@ test("a detached preview that never paused still times out", () => {
   assert.equal(host.style.display, "none");
 });
 
-test("hovering the pill itself cancels the pending hide", () => {
+test("hovering the pill itself cancels the pending hide", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ videos: [video] });
+  const harness = await loadMediaTab({ videos: [video] });
   const host = hover(harness, video);
 
   video.paused = true;
@@ -538,7 +592,7 @@ async function clickPill(harness, video) {
 
 test("a pill download records a request with a generated request id", async () => {
   const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
-  const harness = loadMediaTab({ videos: [video], reply: { ok: true } });
+  const harness = await loadMediaTab({ videos: [video], reply: { ok: true } });
   await clickPill(harness, video);
 
   const download = harness.sent.find((m) => m.type === "downloadMedia");
@@ -554,7 +608,7 @@ test("a pill download records a request with a generated request id", async () =
 
 test("a pill result is recorded with the same request id", async () => {
   const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
-  const harness = loadMediaTab({ videos: [video], reply: { ok: true } });
+  const harness = await loadMediaTab({ videos: [video], reply: { ok: true } });
   await clickPill(harness, video);
 
   const download = harness.sent.find((m) => m.type === "downloadMedia");
@@ -565,7 +619,7 @@ test("a pill result is recorded with the same request id", async () => {
 
 test("an unavailable Cove is recorded as such by the pill", async () => {
   const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     reply: { ok: false, reason: "unavailable" },
   });
@@ -577,7 +631,7 @@ test("an unavailable Cove is recorded as such by the pill", async () => {
 
 test("a background script that never answers is recorded as unavailable", async () => {
   const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     reply: (message) => {
       if (message.type === "downloadMedia") throw new Error("no background");
@@ -596,7 +650,7 @@ test("no page url, media url or title is sent with a pill diagnostic", async () 
     top: 200,
     src: "https://cdn.example.test/v/secret-movie.mp4",
   });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     href: "https://news.example.test/private-article",
     reply: { ok: true },
@@ -612,7 +666,7 @@ test("no page url, media url or title is sent with a pill diagnostic", async () 
 
 test("the pill wording is unchanged by diagnostics", async () => {
   const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     reply: { ok: false, reason: "unavailable" },
   });
@@ -624,7 +678,7 @@ test("the pill wording is unchanged by diagnostics", async () => {
 
 test("a diagnostics send failure never breaks a pill download", async () => {
   const video = stubVideo({ top: 200, src: "https://cdn.example.test/v/movie.mp4" });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     reply: (message) => {
       if (message.type === "coveDiag") throw new Error("diagnostics exploded");
@@ -658,7 +712,7 @@ function blobVideo(options = {}) {
 
 test("a video with no resolvable address does not fall back to the page", async () => {
   const video = blobVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/",
     videos: [video],
     reply: { ok: true },
@@ -675,7 +729,7 @@ test("a video with no resolvable address does not fall back to the page", async 
 
 test("an unresolvable video reports why instead of failing at the backend", async () => {
   const video = blobVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/",
     videos: [video],
     reply: { ok: true },
@@ -693,7 +747,7 @@ test("an extractor-backed page still downloads from its page address", async () 
   // its controls are used, so the page address is the stable target - and it
   // is reached through the site adapter, not through the removed fallback.
   const video = blobVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     videos: [video],
     reply: { ok: true },
@@ -712,7 +766,7 @@ test("an unresolvable video leaves the pill able to hide again", async () => {
   // pending, so a flag left set pins the pill over the feed until the page is
   // reloaded - and blocks every later click on it too.
   const video = blobVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/",
     videos: [video],
     reply: { ok: true },
@@ -729,7 +783,7 @@ test("an unresolvable video leaves the pill able to hide again", async () => {
 
 test("an unresolvable video does not wedge the pill against later clicks", async () => {
   const video = blobVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/",
     videos: [video],
     reply: { ok: true },
@@ -758,7 +812,7 @@ test("an unresolvable video does not wedge the pill against later clicks", async
 
 test("the shared pill loads and downloads a direct video with no site adapter", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -775,7 +829,7 @@ test("the shared pill loads and downloads a direct video with no site adapter", 
 test("without a site adapter the extractor page address is never contributed", async () => {
   // The same page that resolves to its watch address with the adapter loaded.
   const video = blobVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     videos: [video],
@@ -797,7 +851,7 @@ test("without a site adapter an embedded stream attribute is never read", async 
   owner["data-hls-url"] = "https://v.redd.it/first/HLSPlaylist.m3u8";
   const video = blobVideo({ top: 200 });
 
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/feed",
     videos: [video],
@@ -814,9 +868,9 @@ test("without a site adapter an embedded stream attribute is never read", async 
   );
 });
 
-test("without a site adapter no detected-stream traffic is generated", () => {
+test("without a site adapter no detected-stream traffic is generated", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -829,10 +883,10 @@ test("without a site adapter no detected-stream traffic is generated", () => {
   );
 });
 
-test("with the site adapter the detected-stream fetch still happens", () => {
+test("with the site adapter the detected-stream fetch still happens", async () => {
   // The counterpart of the assertion above: the Firefox path is unchanged.
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({ href: "https://example.test/watch", videos: [video] });
+  const harness = await loadMediaTab({ href: "https://example.test/watch", videos: [video] });
 
   assert.ok(
     harness.sent.some((m) => m.type === "getDetectedStreams"),
@@ -850,7 +904,7 @@ test("a player does not borrow another player's stream", async () => {
   const bare = new StubNode("DIV");
   const bareVideo = blobVideo({ top: 200 });
 
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://example.test/feed",
     videos: [ownerVideo, bareVideo],
   });
@@ -909,7 +963,7 @@ function downloads(harness) {
   return harness.sent.filter((m) => m.type === "downloadMedia");
 }
 
-test("the stale-markup fixture really does expose a source element", () => {
+test("the stale-markup fixture really does expose a source element", async () => {
   // Guard for the guards: the stub answered every source[src] lookup with
   // null before, so a stale-source regression could pass without the branch
   // it names ever being reached.
@@ -924,7 +978,7 @@ test("the stale-markup fixture really does expose a source element", () => {
 
 test("an ineligible active resource is not swapped for a stale source element", async () => {
   const video = staleMarkupVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/player",
     videos: [video],
@@ -945,7 +999,7 @@ test("an ineligible active resource is not swapped for a stale src attribute", a
   // not the active resource.
   const video = blobVideo({ top: 200 });
   video.src = STALE_ATTR;
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/player",
     videos: [video],
@@ -960,7 +1014,7 @@ test("an ineligible active resource is not swapped for a stale src attribute", a
 for (const readyState of [0, 1]) {
   test(`a video with readyState ${readyState} is not handed over`, async () => {
     const video = stubVideo({ top: 200, readyState });
-    const harness = loadMediaTab({
+    const harness = await loadMediaTab({
       sites: false,
       href: "https://example.test/watch",
       videos: [video],
@@ -979,7 +1033,7 @@ for (const readyState of [0, 1]) {
 test("readyState 2 is enough for a direct resource", async () => {
   // The boundary itself: HAVE_CURRENT_DATA is the point the gate admits.
   const video = stubVideo({ top: 200, readyState: 2 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -998,7 +1052,7 @@ test("an eligible active resource outranks every stale DOM alternative", async (
   video.currentSrc = "https://example.test/active.mp4";
   video.src = STALE_ATTR;
   video.appendChild(sourceChild(STALE_SOURCE));
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1017,7 +1071,7 @@ test("an element with no currentSrc yet still uses its src attribute", async () 
   const video = stubVideo({ top: 200 });
   video.currentSrc = "";
   video.src = "https://example.test/from-attribute.mp4";
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1036,7 +1090,7 @@ test("an element with no currentSrc or src falls back to its source child", asyn
   video.currentSrc = "";
   video.src = "";
   video.appendChild(sourceChild("https://example.test/from-source.mp4"));
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1055,7 +1109,7 @@ test("an extensionless direct resource is still eligible", async () => {
   const video = stubVideo({ top: 200 });
   video.currentSrc = "https://example.test/media/stream";
   video.src = "https://example.test/media/stream";
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1071,7 +1125,7 @@ test("an extensionless direct resource is still eligible", async () => {
 
 test("a replaced resource is re-resolved at click time", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1123,7 +1177,7 @@ async function settle() {
 
 test("a stale source element never displaces the adapter's embedded stream", async () => {
   const video = staleMarkupVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/feed",
     videos: [video],
     reply: streamReply([]),
@@ -1141,7 +1195,7 @@ test("a stale source element never displaces the adapter's embedded stream", asy
 
 test("a stale source element never displaces the adapter's detected stream", async () => {
   const video = staleMarkupVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/feed",
     videos: [video],
     reply: streamReply([{ url: DETECTED_STREAM }]),
@@ -1155,7 +1209,7 @@ test("a stale source element never displaces the adapter's detected stream", asy
 
 test("the embedded stream still outranks the detected stream", async () => {
   const video = staleMarkupVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/feed",
     videos: [video],
     reply: streamReply([{ url: DETECTED_STREAM }]),
@@ -1178,7 +1232,7 @@ for (const readyState of [0, 1]) {
     // only usable answer. A readiness gate placed ahead of the adapter block
     // would take it away.
     const video = staleMarkupVideo({ top: 200, readyState });
-    const harness = loadMediaTab({
+    const harness = await loadMediaTab({
       href: "https://www.reddit.com/feed",
       videos: [video],
       reply: streamReply([]),
@@ -1193,7 +1247,7 @@ for (const readyState of [0, 1]) {
 
   test(`the adapter's detected stream survives readyState ${readyState}`, async () => {
     const video = staleMarkupVideo({ top: 200, readyState });
-    const harness = loadMediaTab({
+    const harness = await loadMediaTab({
       href: "https://www.reddit.com/feed",
       videos: [video],
       reply: streamReply([{ url: DETECTED_STREAM }]),
@@ -1210,7 +1264,7 @@ test("the adapter's page address still wins over everything", async () => {
   // sitePageUrl is resolved before candidateUrl is ever consulted, so the
   // direct-branch gate must be invisible to it.
   const video = staleMarkupVideo({ top: 200, readyState: 0 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
     videos: [video],
     reply: streamReply([{ url: DETECTED_STREAM }]),
@@ -1227,7 +1281,7 @@ test("the adapter's page address still wins over everything", async () => {
 
 test("with the adapter loaded and no stream of any kind nothing is handed over", async () => {
   const video = staleMarkupVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/feed",
     videos: [video],
     reply: streamReply([]),
@@ -1264,7 +1318,7 @@ async function clickWithoutReactivating(host) {
 
 test("a cached direct URL is dropped when the resource becomes ineligible", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1288,7 +1342,7 @@ test("a cached direct URL is dropped when the resource becomes ineligible", asyn
 
 test("a cached direct URL is dropped when the resource stops being ready", async () => {
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1314,7 +1368,7 @@ test("a detached element still falls back to the URL it was activated on", async
   // still holds its own resolvable source would be answered identically with
   // or without the cache, so the cache would not be under test at all.
   const video = stubVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     sites: false,
     href: "https://example.test/watch",
     videos: [video],
@@ -1338,7 +1392,7 @@ test("a cached adapter stream survives an element that is still a blob", async (
   // blob: is the normal steady state there, not a transition. Re-resolving
   // must return the same stream rather than throwing the candidate away.
   const video = staleMarkupVideo({ top: 200 });
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     href: "https://www.reddit.com/feed",
     videos: [video],
     reply: streamReply([{ url: DETECTED_STREAM }]),
@@ -1368,7 +1422,7 @@ test("the shared pill runs and hands over a direct video with chrome alone",
   const video = stubVideo({ top: 200 });
   video.currentSrc = "https://cdn.example.test/v/clip.mp4";
   video.src = "https://cdn.example.test/v/clip.mp4";
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     sites: false,
     chromeOnly: true,
@@ -1389,7 +1443,7 @@ test("the shared pill stays inert with chrome alone when nothing is eligible",
   const video = stubVideo({ top: 200 });
   video.currentSrc = "blob:https://example.test/abcd";
   video.src = "blob:https://example.test/abcd";
-  const harness = loadMediaTab({
+  const harness = await loadMediaTab({
     videos: [video],
     sites: false,
     chromeOnly: true,
@@ -1401,4 +1455,344 @@ test("the shared pill stays inert with chrome alone when nothing is eligible",
     downloads(harness).map((m) => m.url), [],
     "a blob player has no direct candidate and no adapter behind it",
   );
+});
+
+// ---- Excluded domains and the in-page pill (issue #16 A1) ----
+//
+// The pill starts suppressed and is only turned on by an explicit, current
+// allowing answer. These assert what the page shows, not an internal flag:
+// a suppressed pill has no visible host at all.
+
+const DENIED = { mediaPillEnabled: true, pillAllowed: false };
+const ALLOWED = { mediaPillEnabled: true, pillAllowed: true };
+
+function visiblePill(harness) {
+  const host = harness.pillHost();
+  return !!host && host.style.display === "block";
+}
+
+test("an excluded page shows no pill for a video already playing", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: DENIED });
+
+  assert.equal(harness.pillHost(), null, "no pill host is created at all");
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+  assert.deepEqual(harness.downloadMessages(), []);
+});
+
+test("an excluded page shows no pill for a video that starts later", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: DENIED });
+
+  video.dispatch("playing", { target: video });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+  assert.equal(hover(harness, video), null, "hover cannot force it either");
+  assert.deepEqual(harness.downloadMessages(), []);
+});
+
+test("no pill appears while the permission answer is still outstanding", async () => {
+  const video = stubVideo({ top: 200 });
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => held,
+  });
+
+  // The answer has not arrived. Permission is unknown, which is not permission.
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false,
+               "an excluded page must not flash a pill during the round-trip");
+
+  release(DENIED);
+  await harness.settle();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+});
+
+test("a permission answer that never arrives leaves the pill suppressed", async () => {
+  // Four separate transport failures. None of them is permission, and none of
+  // them may be reported to the user as a broken Cove: an excluded page is a
+  // setting, not a fault.
+  const cases = [
+    ["synchronous throw", null, "sync"],
+    ["rejected promise", null, "reject"],
+    ["a reply that is not an object", "not an object", false],
+    ["a reply with no decision in it", { mediaPillEnabled: true }, false],
+  ];
+  for (const [name, reply, failure] of cases) {
+    const video = stubVideo({ top: 200 });
+    const harness = await loadMediaTab({
+      videos: [video],
+      settingsReply: reply === null ? ALLOWED : reply,
+    });
+    if (failure) {
+      harness.setSendFailure(failure);
+      await harness.changeSettings();
+    }
+    if (failure) {
+      harness.runTimers();
+      assert.equal(visiblePill(harness), false, name);
+    } else {
+      // The malformed reply was the answer to the initial request.
+      harness.runTimers();
+      assert.equal(visiblePill(harness), false, name);
+    }
+  }
+});
+
+test("an allowed page still gets exactly one pill", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: ALLOWED });
+  harness.runTimers();
+
+  assert.equal(visiblePill(harness), true);
+  const hosts = harness.body.children.filter(
+    (node) => node.className === "cove-media-tab-host");
+  assert.equal(hosts.length, 1);
+});
+
+test("excluding a page hides its pill without a reload", async () => {
+  const video = stubVideo({ top: 200 });
+  let answer = ALLOWED;
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => answer,
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), true, "precondition: the pill is up");
+
+  answer = DENIED;
+  await harness.changeSettings();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+});
+
+test("removing an exclusion brings back exactly one pill", async () => {
+  const video = stubVideo({ top: 200 });
+  let answer = DENIED;
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => answer,
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+
+  answer = ALLOWED;
+  await harness.changeSettings();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), true);
+  const hosts = harness.body.children.filter(
+    (node) => node.className === "cove-media-tab-host");
+  assert.equal(hosts.length, 1, "one pill, not one per settings change");
+});
+
+test("an allowing answer from before an exclusion cannot resurrect the pill", async () => {
+  const video = stubVideo({ top: 200 });
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let call = 0;
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => {
+      call += 1;
+      return call === 1 ? held : DENIED;
+    },
+  });
+
+  // The exclusion lands while the first answer is still in flight, and the
+  // requery it triggers is answered first.
+  await harness.changeSettings();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+
+  // Only now does the older, allowing answer arrive.
+  release(ALLOWED);
+  await harness.settle();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false,
+               "an answer to a superseded question is not permission");
+});
+
+test("an unrelated settings write cannot bypass an active exclusion", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: DENIED });
+
+  // The user changes the minimum size. Nothing about the exclusion changed,
+  // and re-asking is what keeps that true.
+  await harness.changeSettings({
+    settings: { newValue: { minSizeBytes: 4096, excludedDomains: ["example.test"] } },
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+});
+
+test("a storage event the pill does not own costs nothing", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: ALLOWED });
+  const before = harness.permissionRequests();
+
+  await harness.changeSettings({ coveDiag: { newValue: [] } });
+  await harness.changeSettings({ settings: { newValue: {} } }, "sync");
+  assert.equal(harness.permissionRequests(), before,
+               "only a local settings change revalidates");
+});
+
+test("late activity cannot revive a pill an exclusion took away", async () => {
+  const video = stubVideo({ top: 200 });
+  let answer = ALLOWED;
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => answer,
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), true);
+
+  answer = DENIED;
+  await harness.changeSettings();
+
+  // Every path that can put the pill up, delivered after the exclusion.
+  harness.runTimers();
+  video.dispatch("play", { target: video });
+  video.dispatch("playing", { target: video });
+  harness.pushMessage({ type: "coveStreamsUpdated", streams: [] });
+  harness.win.dispatch("resize");
+  harness.win.dispatch("scroll");
+  hover(harness, video);
+  harness.runTimers();
+
+  assert.equal(visiblePill(harness), false);
+  assert.deepEqual(harness.downloadMessages(), []);
+});
+
+test("a click on a pill an exclusion invalidated sends nothing", async () => {
+  const video = stubVideo({ top: 200 });
+  let answer = ALLOWED;
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => answer,
+  });
+  harness.runTimers();
+  const host = harness.pillHost();
+  assert.ok(host, "precondition: the pill is up");
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  assert.ok(pill, "precondition: the pill element exists");
+
+  answer = DENIED;
+  await harness.changeSettings();
+
+  // The pill element is still in the shadow root; the user clicks it.
+  pill.dispatch("click", {});
+  await harness.settle();
+
+  assert.deepEqual(harness.downloadMessages(), [],
+                   "an invalidated pill does not hand anything over");
+});
+
+test("a click on an allowed pill still hands over", async () => {
+  // The control for the case above: the same gesture, on the same element, on
+  // a page nothing excluded. Without this, "sent nothing" could just mean the
+  // click never reached the handler.
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: ALLOWED,
+  });
+  harness.runTimers();
+  const host = harness.pillHost();
+  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  pill.dispatch("click", {});
+  await harness.settle();
+
+  assert.equal(harness.downloadMessages().length, 1);
+});
+
+test("the pill toggle being off suppresses an otherwise allowed page", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: { mediaPillEnabled: false, pillAllowed: true },
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false);
+});
+
+test("ordinary interception being off does not suppress the pill", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: { enabled: false, mediaPillEnabled: true, pillAllowed: true },
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), true,
+               "the interception switch is not a pill master switch");
+});
+
+test("the pill asks the background a pill question", async () => {
+  const harness = await loadMediaTab({ videos: [stubVideo({ top: 200 })] });
+  const asked = harness.sent.filter((m) => m && m.type === "getSettings");
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].forPill, true,
+               "the popup's answer is a different thing and must stay so");
+});
+
+test("permission is asked once, not per play, hover, scan or resize", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: ALLOWED });
+  const after = harness.permissionRequests();
+  assert.equal(after, 1);
+
+  harness.runTimers();
+  video.dispatch("play", { target: video });
+  video.dispatch("playing", { target: video });
+  hover(harness, video);
+  harness.win.dispatch("resize");
+  harness.win.dispatch("scroll");
+  harness.runTimers();
+  await harness.settle();
+
+  assert.equal(harness.permissionRequests(), 1,
+               "nothing about ordinary playback re-asks");
+});
+
+test("repeated identical settings notifications do not stack up pills", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], settingsReply: ALLOWED });
+  for (let i = 0; i < 3; i += 1) await harness.changeSettings();
+  harness.runTimers();
+
+  const hosts = harness.body.children.filter(
+    (node) => node.className === "cove-media-tab-host");
+  assert.equal(hosts.length, 1);
+  assert.equal(harness.permissionRequests(), 4);
+});
+
+test("the pill goes down the moment settings change, not when the answer arrives", async () => {
+  // The gap between a settings write and the background's answer is the whole
+  // problem: a pill left up across it is a pill the user already excluded.
+  const video = stubVideo({ top: 200 });
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let call = 0;
+  const harness = await loadMediaTab({
+    videos: [video],
+    settingsReply: () => {
+      call += 1;
+      return call === 1 ? ALLOWED : held;
+    },
+  });
+  harness.runTimers();
+  assert.equal(visiblePill(harness), true, "precondition: the pill is up");
+
+  await harness.changeSettings();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), false,
+               "suppressed while the new decision is still outstanding");
+
+  release(ALLOWED);
+  await harness.settle();
+  harness.runTimers();
+  assert.equal(visiblePill(harness), true, "and back once it is allowed again");
 });

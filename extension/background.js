@@ -215,24 +215,40 @@ function ensureSettings() {
 }
 
 // Keep the in-memory copy fresh if another context (the options page) writes.
+// Counts committed settings changes. A permission answer is a snapshot, and a
+// write can commit after that snapshot was taken but before the thing it
+// authorized has been sent. Comparing this counter across that window gives the
+// missing ordering: either the send happened first, or the newer settings cancel
+// it. Bumped from the change notification and from saveSettings, since a write
+// made in this context is not guaranteed to notify it.
+let settingsGeneration = 0;
+
+// How many times a pill permission read may be re-taken because settings changed
+// under it. Small on purpose: each retry is one storage read, and a user cannot
+// save settings fast enough to exhaust this, so reaching the end means something
+// is writing settings continuously and no answer can be trusted.
+const PILL_PERMISSION_ATTEMPTS = 3;
+
 browser.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes.settings) {
     settings = { ...DEFAULT_SETTINGS, ...(changes.settings.newValue || {}) };
+    settingsGeneration += 1;
     updateBadge();
   }
 });
 
 async function saveSettings(newSettings) {
   settings = { ...DEFAULT_SETTINGS, ...newSettings };
+  settingsGeneration += 1;
   await browser.storage.local.set({ settings });
 }
 
 // ---- Download interception ----
 
-function isDomainExcluded(url) {
+function domainExcludedIn(url, excludedDomains) {
   try {
     const hostname = new URL(url).hostname;
-    return settings.excludedDomains.some(
+    return (excludedDomains || []).some(
       (d) => hostname === d || hostname.endsWith("." + d)
     );
   } catch {
@@ -240,24 +256,169 @@ function isDomainExcluded(url) {
   }
 }
 
+function isDomainExcluded(url) {
+  return domainExcludedIn(url, settings.excludedDomains);
+}
+
+// ---- In-page pill permission ----
+
+// A pill decision fails closed. isDomainExcluded() answers "not excluded" for
+// an address it cannot parse, which is right for interception - there is
+// nothing to compare - and wrong here: without a hostname the browser itself
+// vouched for, permission to show the pill was never established.
+function pillHostname(url) {
+  if (typeof url !== "string" || !url) return null;
+  try {
+    return new URL(url).hostname || null;
+  } catch {
+    return null;
+  }
+}
+
+// Both identities come from the browser's own sender record: the top-level
+// page on sender.tab.url and the frame that asked on sender.url. Content
+// scripts run in every frame, so those differ whenever a player is embedded,
+// and excluding either one is meant to take the pill away. Never the media
+// address and never a url carried in the message body - a page chooses those.
+function pillIdentityAllowed(sender, excludedDomains) {
+  const tabUrl = sender && sender.tab ? sender.tab.url : null;
+  const frameUrl = sender ? sender.url : null;
+  if (!pillHostname(tabUrl) || !pillHostname(frameUrl)) return false;
+  return !domainExcludedIn(tabUrl, excludedDomains) &&
+         !domainExcludedIn(frameUrl, excludedDomains);
+}
+
+// Read straight from storage rather than the cached `settings`: the content
+// script requeries the moment it sees storage.onChanged, and nothing orders
+// that notification against this context's own, so the cache can still hold
+// the value the user just replaced. A read that throws is not permission -
+// it means nothing was established, which is a different thing from a
+// successful read of a first install that has stored nothing yet.
+//
+// The result is a fresh object per request. It is never written into
+// `settings`, never persisted, and never reaches saveSettings.
+async function resolvePillPermission(sender) {
+  // The read itself is a window: a change can commit after storage has answered
+  // with the old value and before this resumes. An answer computed from settings
+  // that were already replaced is not an answer, and every caller acts on it -
+  // the pill shows, and the admission gate marks the url and reads cookies.
+  //
+  // Re-read rather than refuse. A refusal is indistinguishable from an exclusion
+  // to every caller, and the content script asks once per change notification,
+  // so refusing a crossed read would leave an allowed page with no pill until
+  // the next change or a reload. Bounded, because a system that never settles
+  // must not spin: after PILL_PERMISSION_ATTEMPTS tries nothing was established,
+  // and that is a refusal.
+  for (let attempt = 0; attempt < PILL_PERMISSION_ATTEMPTS; attempt += 1) {
+    const generationBefore = settingsGeneration;
+    let current;
+    try {
+      const stored = await browser.storage.local.get("settings");
+      current = stored && stored.settings
+        ? { ...DEFAULT_SETTINGS, ...stored.settings }
+        : { ...DEFAULT_SETTINGS };
+    } catch {
+      return { mediaPillEnabled: false, pillAllowed: false };
+    }
+    if (settingsGeneration === generationBefore) {
+      return {
+        mediaPillEnabled: current.mediaPillEnabled !== false,
+        pillAllowed: pillIdentityAllowed(sender, current.excludedDomains),
+      };
+    }
+  }
+  return { mediaPillEnabled: false, pillAllowed: false };
+}
+
+// The pill may show only when the page is allowed AND the explicit toggle is
+// on. settings.enabled is the ordinary-interception switch and is deliberately
+// not consulted here: the two have always been independent.
+function pillPermitted(permission) {
+  return permission.pillAllowed === true && permission.mediaPillEnabled !== false;
+}
+
 // Dedup guard: URLs intercepted recently (prevents re-intercept after
 // cancel). Timestamp-based + pruned on read, so it survives without a
 // setTimeout (unreliable in an MV3 service worker that may sleep).
 const DEDUP_WINDOW_MS = 5000;
-const recentIntercepted = new Map(); // url -> timestamp
+
+// An address is protected from re-interception for two different reasons, and
+// keeping them apart is what makes overlapping handoffs decidable without
+// caring about the order anything finishes in:
+//
+//   committed  - a download for this address WAS handed to Cove. Permanent for
+//                the window. Nothing withdraws it; it only expires.
+//   claims     - handoffs for this address that are still in flight. Each one
+//                suppresses interception while it runs and is released when it
+//                ends, whatever its outcome.
+//
+// Earlier attempts modelled this as a single mark that later handoffs displaced
+// and withdrawals restored. Three review rounds found three different orderings
+// where that restores something it should not, because a chain of displaced
+// marks cannot say which of them are still wanted. A claim says exactly one
+// thing about exactly one request, so none of those orderings exist here.
+//
+// Claims carry their own timestamp and expire with the same window: a handoff
+// that somehow never releases (an unexpected throw) stops suppressing after the
+// window rather than suppressing forever.
+const recentIntercepted = new Map();  // url -> committed timestamp
+const interceptClaims = new Map();    // url -> Map(token -> claimed-at)
+let interceptTokenSeq = 0;
+
+function sweepIntercepted(now) {
+  for (const [u, at] of recentIntercepted) {
+    if (now - at > DEDUP_WINDOW_MS) recentIntercepted.delete(u);
+  }
+  for (const [u, claims] of interceptClaims) {
+    for (const [token, at] of claims) {
+      if (now - at > DEDUP_WINDOW_MS) claims.delete(token);
+    }
+    if (claims.size === 0) interceptClaims.delete(u);
+  }
+}
+
+// A download for this address reached Cove. Also the interception path's own
+// mark, which has always meant exactly this.
 function markIntercepted(url) {
   const now = Date.now();
-  // Sweep expired entries so the Map can't grow unbounded over a long-lived
-  // (Firefox MV2) background page.
-  for (const [u, ts] of recentIntercepted) {
-    if (now - ts > DEDUP_WINDOW_MS) recentIntercepted.delete(u);
-  }
+  // Swept here so the maps can't grow unbounded over a long-lived (Firefox MV2)
+  // background page.
+  sweepIntercepted(now);
   recentIntercepted.set(url, now);
 }
+
+// Registers an in-flight handoff. Returns the token that releases it.
+function claimIntercepted(url) {
+  const now = Date.now();
+  sweepIntercepted(now);
+  interceptTokenSeq += 1;
+  const claims = interceptClaims.get(url) || new Map();
+  claims.set(interceptTokenSeq, now);
+  interceptClaims.set(url, claims);
+  return interceptTokenSeq;
+}
+
+// Ends one in-flight handoff. Never touches what was committed, and never
+// touches another request's claim, so a refusal, a failure and a success can
+// finish in any order.
+function releaseIntercepted(url, token) {
+  const claims = interceptClaims.get(url);
+  if (!claims || !claims.delete(token)) return false;
+  if (claims.size === 0) interceptClaims.delete(url);
+  return true;
+}
+
 function wasRecentlyIntercepted(url) {
-  const ts = recentIntercepted.get(url);
-  if (ts === undefined) return false;
-  if (Date.now() - ts > DEDUP_WINDOW_MS) {
+  const now = Date.now();
+  const claims = interceptClaims.get(url);
+  if (claims) {
+    for (const at of claims.values()) {
+      if (now - at <= DEDUP_WINDOW_MS) return true;
+    }
+  }
+  const at = recentIntercepted.get(url);
+  if (at === undefined) return false;
+  if (now - at > DEDUP_WINDOW_MS) {
     recentIntercepted.delete(url);
     return false;
   }
@@ -757,6 +918,13 @@ function showNotification(title, message) {
 
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "getSettings") {
+    // The pill asks a different question: not "what are the settings" but
+    // "may I show here". The popup and the options page keep the original
+    // answer - the whole settings object - unchanged.
+    if (msg.forPill === true) {
+      resolvePillPermission(sender).then(sendResponse);
+      return true;
+    }
     ensureSettings().then(() => sendResponse(settings));
     return true; // async: wait for settings to load before responding
   }
@@ -788,6 +956,33 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         error: "Video downloads are not available in this build",
       });
       return;
+    }
+    if (msg.type === "downloadMedia") {
+      // The pill that sent this may already have been invalidated: a click and
+      // an exclusion can cross. Checked here, before delegation, so a refused
+      // request leaves no dedup mark, no cookie read, no native request and no
+      // notification behind it. "unsupported" is the reason a refused media
+      // target already answers with, and the pill already renders it, so this
+      // needs no new vocabulary on either side.
+      resolvePillPermission(sender).then((permission) => {
+        if (!pillPermitted(permission)) {
+          sendResponse({
+            ok: false,
+            reason: "unsupported",
+            error: "Downloads are turned off for this site",
+          });
+          return;
+        }
+        const handled = CoveMedia.handleMessage(msg, sender, sendResponse);
+        if (handled === false) {
+          sendResponse({
+            ok: false,
+            reason: "unsupported",
+            error: "Stream downloads are not available in this build",
+          });
+        }
+      });
+      return true;
     }
     const handled = CoveMedia.handleMessage(msg, sender, sendResponse);
     // false is "nothing in this build owns it" - a legacy message whose

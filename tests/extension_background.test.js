@@ -29,11 +29,13 @@ function evalIn(context, source) {
 // surviving context-menu state, which is what makes a second load an upgrade
 // or a worker restart rather than a fresh install.
 function loadBackground({ nativeResult = { status: "ok" }, settings,
+                         rejectSettingsRead = false,
                          breakStorage = false, slowStorage = false,
                          storedDiag = null, media = true, cookies = [],
                          tabs = [], downloadSearch = () => [],
                          storedIntercepted = null, eraseThrows = false,
                          slowInterceptedIds = false,
+                         cookieHook = null, settingsReadHook = null,
                          worker = false, missingScripts = [],
                          installedMenus = new Map(), menuApi = "lenient" } = {}) {
   const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
@@ -44,15 +46,34 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     contextMenuClicked: event(),
     downloadErased: event(),
     message: event(),
+    // A real recorded event, not a silent stub: the pill's whole lifecycle
+    // hangs off this notification, so a test has to be able to fire it.
+    storageChanged: event(),
   };
   const browserDownloads = [];
   const quietEvent = () => event();
   // A real key/value store, so the diagnostics ring can be inspected the way
   // the popup would read it back.
+  // The stored settings are mutable so a test can model the options page
+  // saving new ones while a page is open. Reading `settings` directly would
+  // hand every read the original fixture forever, which is the one thing a
+  // live settings change must not do.
+  let storedSettings = settings;
   const store = {
     data: {},
     async get(key) {
-      if (key === "settings") return settings ? { settings } : {};
+      if (key === "settings") {
+        // A real storage read can fail. background.js swallows that failure
+        // and resolves with defaults, so a test cannot infer the failure from
+        // the resolved value and has to produce it here instead.
+        if (rejectSettingsRead) throw new Error("storage unavailable");
+        // The value is snapshotted BEFORE the hook runs, so a hook that commits
+        // new settings models the one ordering that matters: an answer computed
+        // from settings that were already superseded by the time it arrived.
+        const snapshot = storedSettings;
+        if (settingsReadHook) await settingsReadHook();
+        return snapshot ? { settings: snapshot } : {};
+      }
       if (slowInterceptedIds && key === "_interceptedIds") {
         for (let i = 0; i < 8; i += 1) await Promise.resolve();
       }
@@ -135,7 +156,15 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     },
     // The query is recorded, not just the jar returned: a refused target must
     // not be looked up at all, and only the recorded query can show that.
-    cookies: { async getAll(query) { calls.cookies.push(query); return cookies; } },
+    // cookieHook runs while this read is still pending, which is the only place
+    // a test can land a settings change inside the handoff's own await.
+    cookies: {
+      async getAll(query) {
+        calls.cookies.push(query);
+        if (cookieHook) await cookieHook(query);
+        return cookies;
+      },
+    },
     downloads: {
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
@@ -162,7 +191,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     storage: {
       local: store,
       session: store,
-      onChanged: quietEvent(),
+      onChanged: events.storageChanged,
     },
     tabs: {
       async query() { return tabs; },
@@ -228,7 +257,18 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   }
   const source = fs.readFileSync("extension/background.js", "utf8");
   vm.runInContext(source, context, { filename: "extension/background.js" });
-  return { calls, events, browserDownloads, store, context, badge, installedMenus };
+  // Models the options page saving: the stored value changes and only then
+  // does the change notification fire, which is the order storage produces and
+  // the order the stale-decision cases depend on.
+  function setSettings(next) {
+    const oldValue = storedSettings;
+    storedSettings = next;
+    events.storageChanged.emit(
+      { settings: { newValue: next, oldValue } }, "local",
+    );
+  }
+  return { calls, events, browserDownloads, store, context, badge, installedMenus,
+           setSettings, readSettings: () => storedSettings };
 }
 
 async function settle() {
@@ -528,7 +568,11 @@ function loadMediaCore({ capability, nativeResult = { status: "ok" } } = {}) {
   // in for them here is what lets the pill's handoff be driven against the
   // core alone, with no browser bundle around it, and every call recorded.
   const core = { native: [], cookies: [], marked: [], notifications: [], diag: [] };
-  const recentIntercepted = new Set();
+  // url -> committed timestamp, and url -> Map(token -> claimed-at): the same
+  // two structures the background keeps.
+  const recentIntercepted = new Map();
+  const interceptClaims = new Map();
+  let coreTokenSeq = 0;
   const context = vm.createContext({
     globalThis: undefined,
     browser: {
@@ -544,7 +588,38 @@ function loadMediaCore({ capability, nativeResult = { status: "ok" } } = {}) {
       },
     },
     recentIntercepted,
-    markIntercepted(url) { core.marked.push(url); recentIntercepted.add(url); },
+    // markIntercepted answers with the token identifying the mark it just set,
+    // exactly as the background's does, and releaseIntercepted withdraws it only
+    // while that is still the mark present. Modelling the token as production
+    // does is what lets the core's own withdrawal logic be exercised here at
+    // all; a marker that returned nothing would make every withdrawal look
+    // valid.
+    // Committing and claiming are modelled as two separate things, as in
+    // production: `core.marked` records only what actually reached Cove, and a
+    // claim suppresses interception while a handoff runs without committing
+    // anything. A stub that merged them would let the core's commit-on-success
+    // ordering pass untested.
+    markIntercepted(url) {
+      core.marked.push(url);
+      recentIntercepted.set(url, Date.now());
+    },
+    claimIntercepted(url) {
+      coreTokenSeq += 1;
+      const claims = interceptClaims.get(url) || new Map();
+      claims.set(coreTokenSeq, Date.now());
+      interceptClaims.set(url, claims);
+      return coreTokenSeq;
+    },
+    releaseIntercepted(url, token) {
+      const claims = interceptClaims.get(url);
+      if (!claims || !claims.delete(token)) return false;
+      if (claims.size === 0) interceptClaims.delete(url);
+      return true;
+    },
+    wasRecentlyIntercepted(url) {
+      return recentIntercepted.has(url) ||
+             (interceptClaims.get(url) || new Map()).size > 0;
+    },
     async sendNativeMessage(message) {
       core.native.push(message);
       return nativeResult;
@@ -808,7 +883,7 @@ test("Firefox still hands a playlist address to Cove from the pill", async () =>
       url: "https://cdn.example.test/v/stream.m3u8",
       pageUrl: "https://neutral.example.test/watch",
     },
-    { tab: { id: 7, url: "https://neutral.example.test/watch", title: "Clip" } },
+    completeSender({ tab: { id: 7, url: "https://neutral.example.test/watch", title: "Clip" } }),
     done,
   );
   const reply = await replied;
@@ -997,11 +1072,20 @@ test("without media.js a media download request is refused cleanly", async () =>
 
 // Drives the onMessage listener the in-page pill talks to and returns the
 // single reply it sends back.
-async function pillDownload(events, msg) {
+// A production-shaped sender: the top-level page on `tab.url`, the frame that
+// actually sent the message on `url`, and the frame id beside it. Passing
+// `sender` replaces the whole record, so a test can also model a frame on a
+// different origin, or an identity the browser did not supply at all.
+function pillSender(pageUrl, sender) {
+  if (sender !== undefined) return sender;
+  return { tab: { id: 42, url: pageUrl }, url: pageUrl, frameId: 0 };
+}
+
+async function pillDownload(events, msg, sender) {
   let reply;
   events.message.emit(
     { type: "downloadMedia", url: msg.url, pageUrl: msg.pageUrl || msg.url },
-    { tab: { url: msg.pageUrl || msg.url } },
+    pillSender(msg.pageUrl || msg.url, sender),
     (response) => { reply = response; }
   );
   await settle();
@@ -1094,9 +1178,20 @@ test("the pill never labels a failure as a problem with the video", () => {
 
 // The listeners answer through sendResponse, not through their return value
 // (which is the "reply asynchronously" flag), so capture the callback.
+// The browser supplies both identities for a content-script message: the
+// top-level page on tab.url and the frame that actually sent it on url. A test
+// that names only the page means "sent by that page's own top frame", which is
+// what this fills in. A test that means "the browser could not identify this"
+// builds the sender itself and is left exactly as written.
+function completeSender(sender) {
+  if (!sender || !sender.tab || typeof sender.tab.url !== "string") return sender;
+  if (typeof sender.url === "string") return sender;
+  return { frameId: 0, ...sender, url: sender.tab.url };
+}
+
 async function sendToBackground(events, msg, sender = {}) {
   let captured;
-  events.message.emit(msg, sender, (reply) => { captured = reply; });
+  events.message.emit(msg, completeSender(sender), (reply) => { captured = reply; });
   await settle();
   return captured;
 }
@@ -1763,7 +1858,7 @@ async function chromeMediaMessage(msg, options = {}) {
   let reply;
   let resolved = null;
   const done = new Promise((resolve) => { resolved = resolve; });
-  const kept = loaded.events.message.emit(msg, { tab: CHROME_TAB }, (r) => {
+  const kept = loaded.events.message.emit(msg, completeSender({ tab: CHROME_TAB }), (r) => {
     reply = r;
     resolved();
   });
@@ -2034,8 +2129,8 @@ test("Chrome and Firefox send the same native message for the same direct media"
     pageUrl: "https://neutral.example.test/watch",
     requestId: "abcd1234",
   };
-  const sender = { tab: { id: 7, url: "https://neutral.example.test/watch",
-                          title: "Neutral clip" } };
+  const sender = completeSender({ tab: { id: 7, url: "https://neutral.example.test/watch",
+                                         title: "Neutral clip" } });
 
   const messages = [];
   for (const loaded of [chromeWorker(), loadBackground()]) {
@@ -2120,7 +2215,7 @@ async function chromePillSend(loaded, url, requestId = "aaaaaaaa") {
   const replied = new Promise((resolve) => { done = resolve; });
   loaded.events.message.emit(
     { type: "downloadMedia", url, pageUrl: "https://example.test/watch", requestId },
-    { tab: CHROME_TAB },
+    completeSender({ tab: CHROME_TAB }),
     done,
   );
   return replied;
@@ -3135,4 +3230,725 @@ test("normalizing an unknown size costs no lookup, listener or later message",
   const added = Object.keys(store.data).filter((k) => !keysBefore.includes(k));
   assert.deepEqual(added.sort(), ["_interceptedIds"],
                    "no new storage key is introduced for size admission");
+});
+
+// ---- Excluded domains and the in-page pill (issue #16 A1) ----
+//
+// The pill asks a different question from the popup: not "what are the
+// settings" but "may I show on this page, in this frame". The answer is
+// computed per request from the browser's own sender record and is never
+// stored, so these drive the real onMessage listener rather than reaching
+// into the background's state.
+
+// One pill permission request through the real listener, with a
+// production-shaped sender unless the test supplies its own.
+async function pillPermission(events, pageUrl, sender) {
+  let reply;
+  events.message.emit(
+    { type: "getSettings", forPill: true },
+    pillSender(pageUrl, sender),
+    (response) => { reply = response; }
+  );
+  await settle();
+  await settle();
+  return reply;
+}
+
+// A sender whose top-level page and requesting frame are different origins,
+// which is what an embedded player produces and what `all_frames: true` in
+// both manifests makes reachable.
+function framedSender(pageUrl, frameUrl) {
+  return { tab: { id: 7, url: pageUrl }, url: frameUrl, frameId: 3 };
+}
+
+test("an excluded page is refused the pill", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  const reply = await pillPermission(events, "https://example.test/watch");
+  assert.equal(reply.pillAllowed, false);
+});
+
+test("a subdomain of an excluded domain is refused the pill", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  const reply = await pillPermission(events, "https://sub.example.test/watch");
+  assert.equal(reply.pillAllowed, false);
+});
+
+test("a lookalike hostname is not caught by an exclusion", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  // Neither of these is example.test and neither is below it. The existing
+  // matcher is exact-host or dot-suffix, and this is what says so.
+  for (const page of ["https://notexample.test/watch",
+                      "https://example.test.attacker.test/watch"]) {
+    const reply = await pillPermission(events, page);
+    assert.equal(reply.pillAllowed, true, page);
+  }
+});
+
+test("an excluded top-level page refuses its allowed embedded player", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  const reply = await pillPermission(
+    events, null,
+    framedSender("https://example.test/watch", "https://player.other.test/embed"),
+  );
+  assert.equal(reply.pillAllowed, false);
+});
+
+test("an excluded frame is refused inside an allowed page", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["player.other.test"] },
+  });
+  const reply = await pillPermission(
+    events, null,
+    framedSender("https://example.test/watch", "https://player.other.test/embed"),
+  );
+  assert.equal(reply.pillAllowed, false);
+});
+
+test("an allowed page and an allowed frame get the pill", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["blocked.test"] },
+  });
+  const reply = await pillPermission(
+    events, null,
+    framedSender("https://example.test/watch", "https://player.other.test/embed"),
+  );
+  assert.equal(reply.pillAllowed, true);
+});
+
+test("an identity the browser did not supply is refused the pill", async () => {
+  const { events } = loadBackground({ settings: { excludedDomains: [] } });
+  // Every one of these is a sender record the pill cannot be decided from.
+  // isDomainExcluded() answers "not excluded" for an address it cannot parse,
+  // which is right for interception and would be fail-open here.
+  const senders = [
+    undefined,
+    {},
+    { tab: {} },
+    { tab: { id: 1, url: "https://example.test/x" } },       // no frame url
+    { url: "https://example.test/x" },                        // no tab
+    { tab: { id: 1, url: "not a url" }, url: "https://example.test/x" },
+    { tab: { id: 1, url: "https://example.test/x" }, url: "not a url" },
+    { tab: { id: 1, url: "" }, url: "" },
+  ];
+  for (const sender of senders) {
+    const reply = await pillPermission(events, null, sender);
+    assert.equal(reply.pillAllowed, false, `sender ${String(JSON.stringify(sender))}`);
+  }
+});
+
+test("a storage read failure is not permission to show the pill", async () => {
+  // ensureSettings() still resolves - background.js catches the failure and
+  // falls back to defaults - so a caller cannot tell from it that nothing was
+  // read. The pill decision has to notice by itself.
+  const { events } = loadBackground({ rejectSettingsRead: true });
+  const reply = await pillPermission(events, "https://example.test/watch");
+  assert.equal(reply.pillAllowed, false);
+});
+
+test("a first install with nothing stored still allows an unexcluded page", async () => {
+  // The positive control for the case above: a successful read that finds no
+  // stored settings is the shipped defaults, not a failure.
+  const { events } = loadBackground();
+  const reply = await pillPermission(events, "https://example.test/watch");
+  assert.equal(reply.pillAllowed, true);
+  assert.equal(reply.mediaPillEnabled, true);
+});
+
+test("the pill toggle and the page decision stay separate", async () => {
+  const off = loadBackground({ settings: { mediaPillEnabled: false } });
+  const offReply = await pillPermission(off.events, "https://example.test/watch");
+  assert.equal(offReply.mediaPillEnabled, false);
+  // The page is not excluded, and the toggle is not what decides that.
+  assert.equal(offReply.pillAllowed, true);
+
+  // The ordinary-interception switch is not a pill master switch.
+  const disabled = loadBackground({
+    settings: { enabled: false, mediaPillEnabled: true },
+  });
+  const reply = await pillPermission(disabled.events, "https://example.test/watch");
+  assert.equal(reply.pillAllowed, true);
+  assert.equal(reply.mediaPillEnabled, true);
+});
+
+test("concurrent pill requests from different pages do not contaminate each other", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["blocked.test"] },
+  });
+  const replies = [];
+  for (const page of ["https://blocked.test/a", "https://allowed.test/b"]) {
+    events.message.emit(
+      { type: "getSettings", forPill: true },
+      pillSender(page),
+      (response) => { replies.push([page, response]); }
+    );
+  }
+  await settle();
+  await settle();
+  const byPage = Object.fromEntries(replies.map(([p, r]) => [p, r.pillAllowed]));
+  assert.equal(byPage["https://blocked.test/a"], false);
+  assert.equal(byPage["https://allowed.test/b"], true);
+});
+
+test("a pill decision is neither stored nor mixed into the shared settings", async () => {
+  const { events, store } = loadBackground({
+    settings: { excludedDomains: ["blocked.test"] },
+  });
+  const keysBefore = Object.keys(store.data);
+  await pillPermission(events, "https://blocked.test/a");
+
+  // The popup and the options page keep the original answer, untouched.
+  const settings = await sendToBackground(events, { type: "getSettings" });
+  assert.equal("pillAllowed" in settings, false,
+               "a per-page decision must not become configuration");
+  assert.deepEqual(settings.excludedDomains, ["blocked.test"]);
+  assert.deepEqual(Object.keys(store.data), keysBefore,
+                   "deciding whether a pill may show writes nothing");
+});
+
+test("a newly excluded page cannot hand a download over", async () => {
+  const { events, calls, browserDownloads, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+  });
+  const url = "https://cdn.other.test/clip.mp4";
+  const page = "https://example.test/watch";
+
+  // The user excludes the page while the pill is up. A click already in the
+  // queue arrives after the change.
+  setSettings({ excludedDomains: ["example.test"] });
+  const reply = await pillDownload(events, { url, pageUrl: page });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "no native download attempt");
+  assert.equal(calls.cookies.length, 0, "a refused request reads no cookies");
+  assert.equal(calls.notifications.length, 0, "no success feedback");
+  assert.equal(browserDownloads.length, 0, "no browser fallback");
+});
+
+// The check before delegation cannot see a change that lands after it. The
+// cookie read is a suspension point in the middle of the handoff, so an
+// exclusion committed during it has to stop the request before anything leaves
+// the browser - and the jar that was already read must not leave with it.
+test("an exclusion committed while the cookie read is pending stops the handoff",
+     async () => {
+  const url = "https://cdn.other.test/clip.mp4";
+  const page = "https://example.test/watch";
+  let exclude = null;
+  const { events, calls, browserDownloads, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+    cookies: [{ name: "session", value: "s3cr3t-cookie-value" }],
+    cookieHook: async () => { if (exclude) exclude(); },
+  });
+  // One shot: the retry below has to run with the exclusion gone, so the hook
+  // must not re-exclude the page during that second cookie read.
+  exclude = () => {
+    exclude = null;
+    setSettings({ excludedDomains: ["example.test"] });
+  };
+
+  const reply = await pillDownload(events, { url, pageUrl: page });
+
+  assert.equal(calls.cookies.length, 1, "the case only holds if the read ran");
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "no native download attempt after the exclusion landed");
+  assert.equal(JSON.stringify(calls.native).includes("s3cr3t-cookie-value"),
+               false, "the jar that was already read must not be sent");
+  assert.equal(calls.notifications.length, 0, "no success feedback");
+  assert.equal(browserDownloads.length, 0, "no browser fallback");
+
+  // The dedup mark is set before the cookie read, so the refusal has to clear
+  // it. Left behind, an ordinary browser download of the same address inside
+  // the dedup window is silently dropped, which is observable here and is the
+  // only thing that shows the mark is really gone.
+  setSettings({ excludedDomains: [] });
+  calls.native.length = 0;
+  events.downloadCreated.emit({
+    id: 11,
+    url,
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1,
+               "the refused handoff must not leave a dedup mark behind");
+  assert.deepEqual(calls.cancel, [11]);
+
+  const retry = await pillDownload(events, { url, pageUrl: page });
+  assert.equal(retry.ok, true, "a retry once allowed again must go through");
+});
+
+// Revalidating from storage still leaves an ordering question: the answer is a
+// snapshot, and a write can commit after that snapshot is taken. The handoff has
+// to notice that a settings change happened at all, not only that the snapshot
+// it holds says "allowed", or the dispatch decides on settings that no longer
+// exist.
+test("an exclusion that commits after the final permission snapshot stops the handoff",
+     async () => {
+  const url = "https://cdn.other.test/clip.mp4";
+  const page = "https://example.test/watch";
+  let atFinalCheck = null;
+  const loaded = loadBackground({
+    settings: { excludedDomains: [] },
+    cookies: [{ name: "session", value: "s3cr3t-cookie-value" }],
+    // The final revalidation is the only settings read that happens after a
+    // cookie read, which is how this targets that read and not the admission
+    // check before it. The hook commits the exclusion while that read is
+    // pending, so the answer it returns is the already-superseded "allowed".
+    settingsReadHook: async () => { if (atFinalCheck) atFinalCheck(); },
+  });
+  const { events, calls, setSettings } = loaded;
+  atFinalCheck = () => {
+    if (calls.cookies.length === 0) return;
+    atFinalCheck = null;
+    setSettings({ excludedDomains: ["example.test"] });
+  };
+
+  const reply = await pillDownload(events, { url, pageUrl: page });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "a stale allowing snapshot must not authorize the dispatch");
+  assert.equal(JSON.stringify(calls.native).includes("s3cr3t-cookie-value"),
+               false, "no cookies leave the browser on a stale answer");
+});
+
+// The permission answer itself is a snapshot. A change that lands while its
+// storage read is pending makes the answer stale before it is even returned, and
+// the early admission gate acts on that answer: it marks the url and reads the
+// page's cookies. Those are side effects on a page that is, by then, excluded.
+test("a settings change during the permission read reads no cookies", async () => {
+  const url = "https://cdn.other.test/clip.mp4";
+  const page = "https://example.test/watch";
+  let duringRead = null;
+  const loaded = loadBackground({
+    settings: { excludedDomains: [] },
+    cookies: [{ name: "session", value: "s3cr3t-cookie-value" }],
+    settingsReadHook: async () => { if (duringRead) duringRead(); },
+  });
+  const { events, calls, setSettings } = loaded;
+  // Only the admission read is targeted: it is the one that happens before any
+  // cookie has been read, and it is the one whose answer unlocks the side
+  // effects. Armed just before the click so startup reads are not caught.
+  duringRead = () => {
+    if (calls.cookies.length > 0) return;
+    duringRead = null;
+    setSettings({ excludedDomains: ["example.test"] });
+  };
+
+  const reply = await pillDownload(events, { url, pageUrl: page });
+
+  assert.equal(reply.ok, false);
+  assert.equal(reply.reason, "unsupported");
+  assert.equal(calls.cookies.length, 0,
+               "a stale allowing answer must not unlock the cookie read");
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0);
+});
+
+test("a stale allowing answer is not permission to show the pill", async () => {
+  let armed = false;
+  const loaded = loadBackground({
+    settings: { excludedDomains: [] },
+    // Fires on every settings read; only the one the pill's question triggers is
+    // armed, so startup reads answer from the settings they really saw.
+    settingsReadHook: async () => {
+      if (!armed) return;
+      armed = false;
+      loaded.setSettings({ excludedDomains: ["example.test"] });
+    },
+  });
+  await settle();
+
+  armed = true;
+  const permission = await pillPermission(loaded.events,
+                                          "https://example.test/watch");
+  assert.equal(permission.pillAllowed, false,
+               "an answer computed from superseded settings is not permission");
+});
+
+// Refusing a stale answer must not become refusing the page. The content script
+// asks once per change notification, so if the background happens to process the
+// same change during that read, a refusal would leave an allowed page without a
+// pill until the next change or a reload. The answer has to be re-read instead.
+test("an exclusion removed during the permission read still answers allowed",
+     async () => {
+  let armed = false;
+  const loaded = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+    settingsReadHook: async () => {
+      if (!armed) return;
+      armed = false;
+      // The user has just un-excluded the page. The content script's question
+      // and the background's own notification cross.
+      loaded.setSettings({ excludedDomains: [] });
+    },
+  });
+  await settle();
+
+  armed = true;
+  const permission = await pillPermission(loaded.events,
+                                          "https://example.test/watch");
+  assert.equal(permission.pillAllowed, true,
+               "a crossed notification must not hide the pill on an allowed page");
+});
+
+test("permission gives up fail-closed when settings never settle", async () => {
+  const loaded = loadBackground({
+    settings: { excludedDomains: [] },
+    // Never settles: every read is invalidated by another change.
+    settingsReadHook: async () => {
+      loaded.setSettings({ excludedDomains: [], minSizeMB: Math.random() });
+    },
+  });
+  await settle();
+
+  const permission = await pillPermission(loaded.events,
+                                          "https://example.test/watch");
+  assert.equal(permission.pillAllowed, false,
+               "an answer that can never be trusted is not permission");
+  assert.equal(permission.mediaPillEnabled, false);
+});
+
+test("a settings change before the handoff starts does not cancel it",
+     async () => {
+  const url = "https://cdn.other.test/clip.mp4";
+  const page = "https://example.test/watch";
+  let touch = null;
+  const { events, calls, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+  });
+  touch = () => {
+    touch = null;
+    // The user saves the options page with a different setting changed, and the
+    // click comes afterwards. The page is still allowed and nothing changes
+    // during the handoff, so it must proceed: the generation guard may not turn
+    // "settings were saved at some point" into a refusal.
+    setSettings({ excludedDomains: [], minSizeMB: 5 });
+  };
+  touch();
+  const reply = await pillDownload(events, { url, pageUrl: page });
+
+  assert.equal(reply.ok, true);
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1);
+});
+
+// Clearing the mark is right when the refused request is the one that set it.
+// It is wrong when an earlier request for the same address already sent it to
+// Cove: that mark is what stops the browser's own download of the same file
+// from being sent a second time, and it does not belong to the refused request.
+test("a late refusal does not drop a dedup mark another download relies on",
+     async () => {
+  const url = "https://cdn.shared.test/clip.mp4";
+  let duringCookieRead = null;
+  const { events, calls, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+    cookieHook: async () => { if (duringCookieRead) duringCookieRead(); },
+  });
+
+  // One page hands the address over successfully. Its mark is now the thing
+  // protecting that address. Both requests run in the same background, because
+  // the dedup state they share is what the case is about.
+  const first = await pillDownload(events, {
+    url, pageUrl: "https://first.test/watch",
+  });
+  assert.equal(first.ok, true);
+
+  // A second page asks for the same address and is excluded mid-flight.
+  duringCookieRead = () => {
+    duringCookieRead = null;
+    setSettings({ excludedDomains: ["second.test"] });
+  };
+  const refused = await pillDownload(events, {
+    url, pageUrl: "https://second.test/watch",
+  });
+  assert.equal(refused.ok, false, "the second page is refused");
+
+  // The browser starts its own download of the same address inside the dedup
+  // window. The first page's protection must still be in force.
+  calls.native.length = 0;
+  events.downloadCreated.emit({
+    id: 21,
+    url,
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "a refusal must not erase a mark it did not set");
+});
+
+// The mirror image of the case above. Here the refused request DID set the
+// mark, but a later allowed request for the same address replaced it and
+// succeeded. The mark now protects that newer download, so the older refusal
+// must not take it away either: what matters is whether the mark is still the
+// one this request set, not whether this request once set one.
+test("a late refusal does not delete a mark a newer request replaced",
+     async () => {
+  const url = "https://cdn.shared.test/clip.mp4";
+  let holdFirst = null;
+  let releaseFirst = null;
+  const { events, calls, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+    cookieHook: async () => {
+      if (!holdFirst) return;
+      const wait = holdFirst;
+      holdFirst = null;
+      await wait;
+    },
+  });
+  // The first request parks inside its cookie read, holding the mark it set.
+  holdFirst = new Promise((resolve) => { releaseFirst = resolve; });
+  let firstReply;
+  events.message.emit(
+    { type: "downloadMedia", url, pageUrl: "https://first.test/watch" },
+    pillSender("https://first.test/watch"),
+    (reply) => { firstReply = reply; },
+  );
+  await settle();
+
+  // While it is parked, its page is excluded and a second, still allowed page
+  // hands the same address over successfully, refreshing the mark.
+  setSettings({ excludedDomains: ["first.test"] });
+  const second = await pillDownload(events, {
+    url, pageUrl: "https://second.test/watch",
+  });
+  assert.equal(second.ok, true, "the second page is allowed and succeeds");
+
+  releaseFirst();
+  await settle();
+  await settle();
+  assert.equal(firstReply.ok, false, "the parked first request is refused");
+
+  // The browser's own download of the same address must still be deduplicated:
+  // the mark protecting it belongs to the request that succeeded.
+  calls.native.length = 0;
+  calls.cancel.length = 0;
+  events.downloadCreated.emit({
+    id: 31,
+    url,
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "a refusal must not delete a mark that was replaced under it");
+  assert.deepEqual(calls.cancel, []);
+});
+
+// The reason a handoff claims the address before sending anything: the browser
+// may start its own download of that same direct-file URL while the handoff is
+// still in flight, and Cove must not receive it twice. The claim is what covers
+// that span, so the span has to be observed while it is open.
+test("a handoff in flight suppresses interception of the same address",
+     async () => {
+  const url = "https://cdn.shared.test/clip.mp4";
+  let open = null;
+  const gate = new Promise((resolve) => { open = resolve; });
+  const { events, calls } = loadBackground({
+    settings: { excludedDomains: [] },
+    cookieHook: async () => { await gate; },
+  });
+  await settle();
+  calls.native.length = 0;
+
+  let reply;
+  events.message.emit(
+    { type: "downloadMedia", url, pageUrl: "https://first.test/watch" },
+    pillSender("https://first.test/watch"),
+    (r) => { reply = r; },
+  );
+  await settle();
+  assert.equal(calls.cookies.length, 1, "the handoff is parked mid-flight");
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "nothing sent yet");
+
+  // The browser starts the same file while the handoff is still running.
+  events.downloadCreated.emit({
+    id: 51,
+    url,
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "an in-flight handoff must absorb the browser's own download");
+
+  open();
+  await settle();
+  await settle();
+  assert.equal(reply.ok, true, "the handoff itself still completes");
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1,
+               "exactly one download reaches Cove");
+});
+
+// Two handoffs for one address, both refused. Nothing reached Cove, so nothing
+// may be left protecting that address: the browser's own download of it has to
+// be intercepted normally. The order the two withdraw in must not matter.
+test("two refused handoffs for one address leave it unprotected", async () => {
+  const url = "https://cdn.shared.test/clip.mp4";
+  const gates = [];
+  const { events, calls, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+    cookieHook: async () => {
+      // Each request parks here until its own gate opens, so both are in flight
+      // at once and the second one's mark lands while the first still holds one.
+      const gate = gates.shift();
+      if (gate) await gate;
+    },
+  });
+  const opens = [];
+  for (let i = 0; i < 2; i += 1) {
+    gates.push(new Promise((resolve) => { opens.push(resolve); }));
+  }
+
+  const replies = [];
+  for (const page of ["https://first.test/watch", "https://second.test/watch"]) {
+    events.message.emit(
+      { type: "downloadMedia", url, pageUrl: page },
+      pillSender(page),
+      (reply) => { replies.push(reply); },
+    );
+    await settle();
+  }
+
+  // Both pages are excluded while both requests are parked.
+  setSettings({ excludedDomains: ["first.test", "second.test"] });
+  // Withdrawn oldest first, which is the order that resurrected a dead mark.
+  opens[0]();
+  await settle();
+  await settle();
+  opens[1]();
+  await settle();
+  await settle();
+  assert.equal(replies.length, 2, "both requests answered");
+  assert.deepEqual(replies.map((r) => r.ok), [false, false]);
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
+               "neither refused request reached Cove");
+
+  calls.native.length = 0;
+  calls.cancel.length = 0;
+  events.downloadCreated.emit({
+    id: 41,
+    url,
+    filename: "clip.mp4",
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 20_000_000,
+  });
+  await settle();
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1,
+               "nothing reached Cove, so nothing may suppress this download");
+  assert.deepEqual(calls.cancel, [41]);
+});
+
+test("a refused pill download leaves no dedup mark behind", async () => {
+  const { events, calls, setSettings } = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  const url = "https://cdn.other.test/clip.mp4";
+  const page = "https://example.test/watch";
+  await pillDownload(events, { url, pageUrl: page });
+
+  // Un-exclude and retry the same address. A dedup mark left by the refusal
+  // would silently swallow this.
+  setSettings({ excludedDomains: [] });
+  const reply = await pillDownload(events, { url, pageUrl: page });
+  assert.equal(reply.ok, true);
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1);
+});
+
+test("the pill toggle alone refuses a download on an allowed page", async () => {
+  const { events, calls } = loadBackground({
+    settings: { mediaPillEnabled: false },
+  });
+  const reply = await pillDownload(events, {
+    url: "https://cdn.other.test/clip.mp4",
+    pageUrl: "https://example.test/watch",
+  });
+  assert.equal(reply.ok, false);
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 0);
+});
+
+test("ordinary interception being off does not refuse an allowed pill download", async () => {
+  const { events, calls } = loadBackground({
+    settings: { enabled: false, mediaPillEnabled: true },
+  });
+  const reply = await pillDownload(events, {
+    url: "https://cdn.other.test/clip.mp4",
+    pageUrl: "https://example.test/watch",
+  });
+  assert.equal(reply.ok, true);
+  assert.equal(calls.native.filter((m) => m.action === "download").length, 1);
+});
+
+test("the media address is not what the exclusion is matched against", async () => {
+  // The resource lives on an excluded host; the page does not. The page is
+  // what the user excluded, so the handoff goes ahead.
+  const allowed = loadBackground({
+    settings: { excludedDomains: ["cdn.blocked.test"] },
+  });
+  const okReply = await pillDownload(allowed.events, {
+    url: "https://cdn.blocked.test/clip.mp4",
+    pageUrl: "https://example.test/watch",
+  });
+  assert.equal(okReply.ok, true);
+
+  // And the reverse: an excluded page is refused even though its media is on
+  // a host nobody excluded.
+  const refused = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  const noReply = await pillDownload(refused.events, {
+    url: "https://cdn.allowed.test/clip.mp4",
+    pageUrl: "https://example.test/watch",
+  });
+  assert.equal(noReply.ok, false);
+});
+
+test("a pill request answers from current settings, not a stale cache", async () => {
+  const { events, setSettings } = loadBackground({
+    settings: { excludedDomains: [] },
+  });
+  // The content script requeries the instant it sees storage.onChanged, and
+  // there is no guaranteed ordering between that notification and the
+  // background's own. Answering from the cache can therefore answer with the
+  // value the user just replaced.
+  const before = await pillPermission(events, "https://example.test/watch");
+  assert.equal(before.pillAllowed, true);
+
+  setSettings({ excludedDomains: ["example.test"] });
+  const after = await pillPermission(events, "https://example.test/watch");
+  assert.equal(after.pillAllowed, false);
+});
+
+test("the stream and page-url routes are not gated by the pill decision", async () => {
+  const { events } = loadBackground({
+    settings: { excludedDomains: ["example.test"] },
+  });
+  const sender = pillSender("https://example.test/watch");
+  const streams = await sendToBackground(
+    events, { type: "getDetectedStreams" }, sender);
+  assert.ok(Array.isArray(streams), "the popup's stream list still answers");
+  const pageUrl = await sendToBackground(
+    events, { type: "getMediaPageUrl" }, sender);
+  assert.ok(pageUrl && typeof pageUrl.url === "string");
 });

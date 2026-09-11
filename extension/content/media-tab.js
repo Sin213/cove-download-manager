@@ -36,10 +36,14 @@
   // when no adapter is loaded, since nothing is detecting them.
   let adapterStreams = [];
 
-  // Whether the in-page pill is allowed to show. Defaults to true so the
-  // pill behaves as before until settings are read, and stays true if the
-  // read fails (fail open, matching current shipped behavior).
-  let pillEnabled = true;
+  // Whether the in-page pill is allowed to show. Starts suppressed: a page the
+  // user excluded must not flash a pill during the settings round-trip, and an
+  // answer that never arrives is not permission. Only an explicit, current
+  // allowing answer from the background turns it on.
+  let pillEnabled = false;
+  // Invalidates outstanding permission answers. Every settings change bumps
+  // it, so an answer issued before that change cannot be applied after it.
+  let permissionEpoch = 0;
 
   let host = null;
   let pill = null;
@@ -565,8 +569,14 @@
     // created/replaced, before this listener exists to observe a
     // play/playing event for it. Treat "already playing at registration"
     // as equivalent to a play event.
+    // Recording what is playing is an observation, not a decision, so it
+    // happens whether or not the pill may show - exactly as onVideoPlaying
+    // already does it. Registration runs before permission is established, and
+    // gating the record too would lose the video for good: the later scan
+    // would fall through to its readyState >= 2 search and never see a player
+    // still below HAVE_CURRENT_DATA.
+    if (isCurrentlyPlaying(video)) lastKnownPlayingVideo = video;
     if (pillEnabled && isCurrentlyPlaying(video)) {
-      lastKnownPlayingVideo = video;
       if (!isDrmProtected(video)) activateVideo(video, videoUrl(video));
     }
   }
@@ -811,35 +821,50 @@
     scheduleActiveVideoScans();
   }
 
-  // Initial already-playing scan: covers a video that started (and
-  // finished dispatching play/playing) before this script's listeners
-  // attached. Runs immediately at pillEnabled's default (true) so it isn't
-  // blocked on the settings round-trip below.
-  scheduleActiveVideoScans();
+  // Applies an answer only while it is still the current one. An allowing
+  // answer issued before an exclusion landed arrives carrying a stale epoch
+  // and is dropped, so it cannot put back a pill the change just took away.
+  function applyPillPermission(epoch, resp) {
+    if (epoch !== permissionEpoch) return;
+    if (resp && resp.pillAllowed === true && resp.mediaPillEnabled !== false) {
+      // enablePill() runs the bounded already-playing scan, which is what
+      // covers a video that started during the round-trip.
+      enablePill();
+    } else {
+      disablePill();
+    }
+  }
 
-  Promise.resolve(browser.runtime.sendMessage({ type: "getSettings" }))
-    .then((s) => {
-      if (s && s.mediaPillEnabled === false) {
-        disablePill();
-      } else {
-        // Re-scan now that settings are confirmed, in case a video started
-        // playing during the async round-trip.
-        scheduleActiveVideoScans();
-      }
-    })
-    .catch(() => {
-      // Settings unreachable; stay enabled (fail open).
-      scheduleActiveVideoScans();
-    });
+  // Asks the background whether the pill may show for this page and this
+  // frame. Suppresses first: from the moment settings change the previous
+  // decision is void, and the pill stays down until a new answer allows it.
+  // A rejection, a synchronous transport failure or an answer without an
+  // explicit allow all leave it suppressed - and silently, because a page the
+  // user excluded is not a broken Cove and must not be reported as one.
+  function requestPillPermission() {
+    permissionEpoch += 1;
+    const epoch = permissionEpoch;
+    disablePill();
+    try {
+      Promise.resolve(
+        browser.runtime.sendMessage({ type: "getSettings", forPill: true })
+      )
+        .then((resp) => applyPillPermission(epoch, resp))
+        .catch(() => applyPillPermission(epoch, null));
+    } catch {
+      applyPillPermission(epoch, null);
+    }
+  }
+
+  requestPillPermission();
 
   browser.storage.onChanged.addListener((changes, area) => {
     if (area !== "local" || !changes.settings) return;
-    const newValue = changes.settings.newValue || {};
-    if (newValue.mediaPillEnabled === false) {
-      disablePill();
-    } else {
-      enablePill();
-    }
+    // Any settings write can change the exclusion list, and the pill toggle is
+    // no longer the only thing that decides. Re-ask rather than reading the
+    // new value here: what the answer depends on is this frame's own identity,
+    // which only the background can see.
+    requestPillPermission();
   });
 
   // ---- Adapter stream sync with background (every frame) ----

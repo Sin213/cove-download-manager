@@ -94,9 +94,12 @@ function buildCoveMedia(capability) {
       return { ok: false, reason: "unsupported", error: "Unsupported URL" };
     }
 
-    // Same dedup pattern as interception: mark before sending so a direct-file
-    // URL the browser also starts downloading is not intercepted twice.
-    markIntercepted(url);
+    // Claimed, not committed: while this handoff runs, a direct-file URL the
+    // browser also starts downloading must not be intercepted as well. The
+    // commit happens only if the handoff actually reaches Cove, below, so a
+    // refusal or a failure leaves nothing behind - and takes nothing away from
+    // another handoff for the same address.
+    const dedupToken = claimIntercepted(url);
 
     let cookieStr = "";
     try {
@@ -126,14 +129,49 @@ function buildCoveMedia(capability) {
     };
     // Additive and optional: an older host ignores an unknown key.
     if (requestId) nativeMessage.requestId = requestId;
+
+    // The admission check that let this request in ran before the cookie read
+    // above, and that read is a suspension point: an exclusion the user commits
+    // during it would otherwise be decided too late. Asked again here, the last
+    // moment before anything leaves the browser, so the jar already in hand is
+    // not sent either. Read through resolvePillPermission, which reads storage
+    // rather than the cached settings, so the options page's committed change is
+    // what answers. Same refusal the early check gives, for the same reason the
+    // pill already renders it.
+    // Read before the answer is asked for and compared after it arrives. The
+    // answer is a snapshot, so "the snapshot says allowed" is not enough: a
+    // write committed while it was in flight would otherwise be decided too
+    // late again, one step further along. Any settings change inside that
+    // window refuses - conservatively, since which setting changed cannot be
+    // known to be irrelevant here.
+    const generationBefore =
+      typeof settingsGeneration === "number" ? settingsGeneration : null;
+    if (typeof resolvePillPermission === "function" &&
+        (!pillPermitted(await resolvePillPermission(sender)) ||
+         (generationBefore !== null && settingsGeneration !== generationBefore))) {
+      // This handoff is over and never reached Cove, so its claim goes. What
+      // another handoff committed or claimed for the same address is untouched.
+      releaseIntercepted(url, dedupToken);
+      diagRecord("extension.native_bridge", "request_failed", "WARNING",
+                 { reason: "unsupported" }, requestId);
+      return { ok: false, reason: "unsupported",
+               error: "Downloads are turned off for this site" };
+    }
+
     const result = await sendNativeMessage(nativeMessage, requestId);
 
     if (result && result.status === "ok") {
+      // It reached Cove: commit the address for the window, then drop the claim.
+      // The commit is what protects it from here on, and it outlives this
+      // request exactly as the old mark did.
+      markIntercepted(url);
+      releaseIntercepted(url, dedupToken);
       showNotification("Download sent to Cove", filename || url);
       return { ok: true };
     }
-    // Clear the dedup mark so a manual retry is not blocked.
-    recentIntercepted.delete(url);
+    // Nothing was committed, so releasing the claim leaves the address clear and
+    // a manual retry is not blocked.
+    releaseIntercepted(url, dedupToken);
     // "Cove is not available" is the native host's fixed sentence for a request
     // no running Cove accepted. Together with a transport failure that is the
     // one case the user can act on, so it is reported as such instead of being
