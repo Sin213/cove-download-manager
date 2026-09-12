@@ -5,12 +5,14 @@ deletes on every build.
 
 **This is a release candidate, not a submission.** It describes the Chrome
 bundle as it is built from the current source, at the candidate version
-**1.3.10** (`dist/cove-chrome-1.3.10.zip`). That version is provisional: it is
-the next patch above 1.3.9, which was uploaded to the Store from this
-repository, but the public listing cannot show an upload that was rejected,
-withdrawn, or is awaiting review. Confirm on the
-developer dashboard before uploading (see
-[Unresolved external evidence](#5-historical-rejection-context-and-unresolved-external-evidence)).
+**1.3.11** (`dist/cove-chrome-1.3.11.zip`). That version is the next patch
+above 1.3.10, which the public Store listing showed as the **published**
+version on 2026-09-12 (see
+[External evidence](#5-historical-rejection-context-and-unresolved-external-evidence)).
+A published version number cannot be reused, so 1.3.11 is the lowest version
+this bundle may be uploaded under. That still does not rule out a newer upload
+sitting in review, which the public page never shows; confirm on the developer
+dashboard before uploading.
 
 Nothing here means Google has approved anything.
 
@@ -34,6 +36,10 @@ Features:
 • Right-click a video or audio player and choose "Download with Cove" when the player's own address is an ordinary file
 
 • A Cove button appears over a playing video, so a video whose address is an ordinary file can be sent without using the menu
+
+• That button is not shown on a site you have listed under Excluded Domains, and the list takes effect on pages that are already open
+
+• Use the menu beside "Download with Cove" to exclude the current site. Cove opens its own confirmation page, which names the site and asks before the exclusion is saved
 
 • Multi-connection downloads with up to 16 connections per file
 
@@ -68,6 +74,23 @@ What the Chrome bundle can do:
 - Hand over a `video` element the same way from the in-page button. The button
   is video only: the content script looks for `<video>` elements and never
   scans for `<audio>`, so audio has the context menu and nothing else.
+- Withhold the in-page button on a site the user listed under Excluded
+  Domains, and follow a change to that list on an already-open page.
+- Offer "Exclude <host>" in a menu beside the button, which *requests* an
+  exclusion. The page never writes the setting. The request opens a Cove page
+  at the extension's own origin (`confirm-exclude.html`), and only a separate
+  action on that page persists the exclusion.
+
+What the exclusion action does not do:
+
+- It does not stop the extension running on the excluded site. Content scripts
+  still load, the context-menu entries still work, and downloads the browser
+  starts are still filtered by the same list they always were. What the
+  exclusion removes is the in-page button.
+- It does not infer a parent domain. The saved entry is the top-level page's
+  own hostname, resolved by the background script from the tab's address, not
+  from anything the page or an embedded player claims. The existing matcher
+  then covers subdomains of an entry the user already had.
 
 What it cannot do, by construction:
 
@@ -143,6 +166,12 @@ Local data use, in the terms the Store's user-data policy uses:
 - Settings and a 300-entry sanitised diagnostics ring are stored in
   `storage.local`. Addresses, titles, filenames, cookies, referrers, and
   user-agent strings are dropped by field name before an entry is written.
+- A pending exclusion confirmation is held in `storage.session`, which Chrome
+  keeps in memory only and never writes to disk. The record is a random
+  token, the hostname being confirmed, the time it was created, and the id of
+  the tab it came from. It stops counting as valid two minutes after creation,
+  and is removed when it is confirmed, cancelled, or next read or swept after
+  that point. It is not exposed to content scripts.
 - Nothing is sent to the developer. There is no developer-controlled endpoint.
 
 `PRIVACY.md` in this repository is the policy text these summarise.
@@ -168,6 +197,12 @@ Every claim in section 1 that is about behaviour, and where it is enforced.
 | Chrome requests no `webRequest` | `extension/manifest.chrome.json` | `test_chrome_manifest_still_requests_no_webrequest` |
 | 16 connections per file | `cove/config.py:32`, `cove/config.py:135` | - |
 | Cookies, referrer, user-agent are passed on | `extension/background.js` `collectCookies`; `cove/single_instance.py`; `cove/aria2.py:515` | `tests/extension_background.test.js` |
+| The in-page button is withheld on an excluded site, live | `extension/content/media-tab.js` pill admission; `extension/background.js` `resolvePillPermission` | `tests/extension_media_tab.test.js`, `tests/extension_background.test.js` |
+| The page can only request an exclusion, never persist one | `extension/background.js` `requestExcludeConfirmation` creates a token and opens the extension page; `getExcludeConfirmation`, `confirmExcludeSite` and `cancelExcludeConfirmation` all refuse a sender that is not `confirm-exclude.html` via `fromExtensionPage` | `tests/extension_confirm_exclude.test.js`, `tests/extension_background.test.js` |
+| The confirmed host is the top-level page's, not a frame's or a CDN's | `extension/background.js` `excludableHost` reads `sender.tab.url`; `requestExcludeConfirmation` refuses unless the caller's `expectHost` equals it | `tests/extension_confirm_exclude.test.js` |
+| A token is one-time, two-minute, and cannot be replayed | `extension/background.js` `EXCLUDE_CONFIRMATION_TTL_MS`, `consumeExcludeConfirmation` deletes before the write, `chainExcludeConfirmations` serialises | `tests/extension_confirm_exclude.test.js` |
+| Cancel changes no setting | `extension/background.js` `cancelExcludeConfirmation` consumes the token and returns without touching `storage.local` | `tests/extension_confirm_exclude.test.js` |
+| A confirmed write preserves unrelated settings edited elsewhere | `extension/background.js` `excludeConfirmedHost` re-reads inside `chainSettings` and merges | `tests/extension_background.test.js`, `tests/extension_confirm_exclude.test.js` |
 
 Wording that was deliberately avoided, and why:
 
@@ -206,29 +241,56 @@ older 1.3.4 copy and is left untouched.
 Read on 2026-09-07, from the public Store listing for item
 `liakghhamogjcmmgnmcpephlfecmilnf`:
 
-- The published version is **1.3.6**, last updated 10 August 2026, and the item
-  is live in the Tools category.
+- The published version was **1.3.6**, last updated 10 August 2026, and the
+  item is live in the Tools category.
 
-That is the whole of what a public page can establish. The repository source was
-at 1.3.8, so 1.3.7 and 1.3.8 were bumped in this repository (`22f4122`,
-`444fabe`) and never became the published version. Whether either was uploaded
-and rejected, uploaded and withdrawn, or simply never uploaded is not visible
-publicly.
+Read again on **2026-09-12**, from the same public listing:
+
+- The published version is now **1.3.10**, updated **11 September 2026**.
+  The listing's own embedded manifest reports `"version": "1.3.10"` and a
+  package size of 85.75KiB.
+- So 1.3.7 through 1.3.9 did become uploads at some point and 1.3.10 reached
+  publication. Under
+  <https://developer.chrome.com/docs/webstore/update> each new version must
+  have a strictly larger version number than the previous one and a published
+  number cannot be reused, which makes **1.3.11 the lowest version this
+  candidate may use**.
+- The live description still reads "What's new in version 1.3.6". The 1.3.10
+  upload therefore shipped without its listing copy being updated from this
+  repository's draft. Updating the repository document does not update the
+  Store; the description field has to be edited in the dashboard.
+
+That is the whole of what a public page can establish.
 
 Still unread, and not inferable from the source tree or the public page:
 
-- The exact current rejection text and its appeal state.
-- Which Chrome versions have actually been **uploaded**, including any draft,
-  in-review, or rejected upload. A public listing shows the published version
-  only, so it cannot rule out an upload at or above 1.3.10.
-- The live listing copy, screenshots, and promotional images.
+- The exact 1.3.5 rejection text and its appeal state.
+- Whether any version **above** 1.3.10 is already uploaded and sitting in
+  review, draft, or rejected. A public listing shows the published version
+  only, so it cannot rule that out for 1.3.11.
+- The live screenshots and promotional images.
 - The permission justifications currently recorded in the dashboard.
 - The privacy-practices declarations currently recorded in the dashboard.
+  In particular, whether the local-only page reading and the cookie read for
+  the download address are declared. No permission changed in this candidate,
+  which is not the same as the declarations being correct; "no new
+  permissions" is not evidence that the existing disclosures were ever
+  reviewed.
 
-Firefox versioning is a separate question against AMO's own record. Checked the
-same day: the public version of `cove-dm@cove-download-manager.net` was 1.4.7,
-and 1.4.8 has since been uploaded to AMO from this repository, so 1.4.9 is the
-next patch. The same limit applies - an upload awaiting review is not public.
+Firefox versioning is a separate question against AMO's own record. Checked on
+**2026-09-12** through the public AMO API for
+`cove-dm@cove-download-manager.net`: the add-on is `public`, its
+`current_version` is **1.4.9**, and `last_updated` is
+**2026-09-11T05:31:17Z**. The public version list holds 12 versions and 1.4.9
+is the newest. 1.4.9 is therefore published and cannot be reused, which makes
+**1.4.10** the Firefox candidate. The same limit applies in the other
+direction: an upload awaiting review is not public, so an unlisted or pending
+version above 1.4.9 is still not ruled out.
+
+Consequence for issue #16, stated plainly: the A1 half of the issue - the
+in-page button honouring Excluded Domains - is already **published** in both
+stores, as Chrome 1.3.10 and Firefox 1.4.9 on 11 September 2026. What 1.3.11
+and 1.4.10 add is the A2 half, the exclude-site action and its confirmation.
 
 ---
 
@@ -243,10 +305,19 @@ next patch. The same limit applies - an upload awaiting review is not public.
       was subsequently uploaded to the dashboard.
 - [x] Follow-up release: 1.3.10 bumped and rebuilt for the excluded-domains fix
       to the in-page button. 1.3.9 is an immutable submission and is not
-      rebuilt or relabelled.
+      rebuilt or relabelled. 1.3.10 was subsequently published, 11 September
+      2026.
+- [x] This release: 1.3.11 bumped and rebuilt for the exclude-site action and
+      its confirmation page. 1.3.10 is published and is not rebuilt or
+      relabelled. Verified against the public listing on 2026-09-12 that
+      1.3.11 is above the published version.
 - [ ] Read the dashboard: rejection text and appeal state, uploaded-version
       history including drafts and rejections, permission justifications,
-      privacy-practices declarations. Confirm 1.3.10 is unused before uploading.
+      privacy-practices declarations. Confirm 1.3.11 is unused before
+      uploading; the public page only rules out 1.3.10 and below.
+- [ ] Update the live description. It still reads "What's new in version
+      1.3.6" and does not describe the in-page button, the excluded-domains
+      behaviour, or the exclude-site action. Section 1 is the replacement text.
 - [ ] Replace any screenshot that shows a feature this build does not have.
       Screenshots showing stream detection or extraction contradict the copy.
 - [ ] Point the dashboard's privacy policy field at the current `PRIVACY.md`.
@@ -256,18 +327,28 @@ next patch. The same limit applies - an upload awaiting review is not public.
       the download address, and local-only processing still requires disclosure.
 - [ ] Re-check the description against section 4 after any behaviour change.
 
-## 7. Release notes for 1.3.10
+## 7. Release notes for 1.3.11
 
 The Store has no per-version release-notes field; this is the text to use if the
 description's "What's new" area or a changelog entry is updated.
 
 ```text
-The in-page Download with Cove button now respects Excluded Domains. On a site you have excluded, the button is not shown and nothing is handed to the desktop app from it.
+Use the menu beside "Download with Cove" to exclude the current site.
 
-Changes to the excluded-domains list take effect on pages that are already open, without needing a reload.
+Cove opens its own confirmation page before saving the exclusion. The page names the site it is about to exclude, and no setting changes until you choose "Exclude site" there. Choosing "Cancel", or closing the page, leaves your settings exactly as they were.
+
+A confirmed exclusion takes effect on pages that are already open, without a reload: the in-page button disappears from that site. Remove the entry under Excluded Domains in the extension's options to get the button back.
+
+The site that gets excluded is the one in the address bar. A video player embedded from another site, or the server the video itself is served from, cannot put its own name on the exclusion.
+
+Saving the options page preserves an exclusion that was confirmed from another tab while the options page was open, and the unrelated change you made there is still saved.
 
 No permission changes in this version.
 ```
+
+The previous version, 1.3.10, is where the in-page button began respecting
+Excluded Domains. That change is already published and is not re-announced
+here.
 
 ## Official policy references
 
@@ -282,6 +363,34 @@ last two were accessed 2026-09-07 for this release candidate.
 | <https://developer.chrome.com/docs/webstore/program-policies/malicious-and-prohibited/> | Do not facilitate unauthorized access to site content such as circumventing paywalls or login restrictions. Do not encourage, facilitate, or enable unauthorized access, download, or streaming of copyrighted content or media. |
 | <https://developer.chrome.com/docs/webstore/update> | An upgrade is a new zip containing all files, changed and unchanged, plus any changed listing metadata, resubmitted for review. Each new version must have a larger version number than the previous one, and the update is reviewed as a new item would be. |
 | <https://developer.chrome.com/docs/extensions/reference/manifest/version> | One to four dot-separated integers, each 0-65535, no leading zeros on a non-zero integer, not all zero. Comparison is leftmost-first, integer by integer, with a missing integer equal to zero - so versions are not compared as strings. |
+
+## Browser support for the confirmation path
+
+Read 2026-09-12. The confirmation flow adds three platform requirements to
+this bundle, and the manifest's declared floor is not raised for them.
+
+| Requirement | Available from | Source |
+| --- | --- | --- |
+| `storage.session` | Chrome 102 | <https://developer.chrome.com/docs/extensions/reference/api/storage/> - "Chrome 102+", in-memory only, never persisted to disk, 10MB quota, not exposed to content scripts by default |
+| `crypto.randomUUID` | Chrome 92 | Web Crypto, secure contexts only; an extension service worker and an extension page are both secure contexts |
+| `tabs.create` | predates MV3 | - |
+
+`manifest.chrome.json` declares no `minimum_chrome_version`, so the effective
+floor is whatever the browser requires for `manifest_version: 3`. That floor is
+below 102, which means a Chrome old enough to run MV3 but too old for
+`storage.session` is reachable in principle. **The minimum is deliberately not
+raised here**, because the behaviour on such a browser is a clean refusal
+rather than a fault: `confirmationStorage()` in `extension/background.js`
+returns `null` when `browser.storage.session` is absent,
+`readExcludeConfirmations` throws, `requestExcludeConfirmation` returns
+`{ ok: false, reason: "unavailable" }`, and the pill reports "Could not exclude
+this site". No exclusion is written and nothing is left pending. Everything
+else in the bundle is unaffected, because neither the excluded-domains
+suppression nor the download handoff reads `storage.session`.
+
+Raising `minimum_chrome_version` would be a manifest change beyond the version
+line and is out of scope for this release; it is recorded here as a choice, not
+an oversight.
 
 Note for the record: none of these pages bans a video format, and none bans
 HLS as a format. The prohibition is on facilitating unauthorized access to and

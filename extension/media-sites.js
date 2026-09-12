@@ -196,15 +196,19 @@ function downloadStream(msg, sendResponse) {
     sendResponse({ ok: false, error: "Unsupported stream URL" });
     return;
   }
-  sendNativeMessage({
+  // The user-agent is resolved first because Firefox's optional
+  // technicalAndInteraction consent governs it and can change at any time.
+  // Kept inside the promise chain so this function still returns true
+  // synchronously, which is what the adapter contract above requires.
+  userAgentField().then((uaField) => sendNativeMessage({
     action: "download",
     url: msg.url,
     filename: msg.filename || "",
     referrer: "",
     cookies: "",
     fileSize: 0,
-    userAgent: navigator.userAgent,
-  }).then((result) => {
+    ...uaField,
+  })).then((result) => {
     if (result && result.status === "ok") {
       sendResponse({ ok: true });
     } else {

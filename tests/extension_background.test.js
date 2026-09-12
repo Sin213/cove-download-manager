@@ -40,10 +40,23 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          cookieHook = null, settingsReadHook = null,
                          settingsWriteHook = null,
                          worker = false, missingScripts = [],
-                         installedMenus = new Map(), menuApi = "lenient" } = {}) {
+                         installedMenus = new Map(), menuApi = "lenient",
+                         // Firefox's built-in data-collection consent. `undefined`
+                         // is the Chrome/legacy shape - getAll() answers with no
+                         // `data_collection` key at all - and is the default
+                         // because that is what the browser the rest of this
+                         // suite models actually returns. An array models a
+                         // Firefox that has the consent experience, empty for
+                         // "the user has not granted it".
+                         dataConsent,
+                         permissionsApi = "present" } = {}) {
   let confirmationTokenSequence = 0;
   const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
-                  notifications: [], cookies: [], settingsWrites: [], tabsCreated: [] };
+                  notifications: [], cookies: [], settingsWrites: [], tabsCreated: [],
+                  // One entry per permissions.getAll(). Counted so a test can
+                  // prove the consent state is read fresh for each handoff
+                  // rather than cached from startup.
+                  permissionChecks: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
@@ -230,6 +243,31 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     },
     webRequest: { onHeadersReceived: quietEvent() },
   };
+  // Both browsers expose permissions.getAll(). Firefox's built-in consent adds
+  // a `data_collection` array to the answer, and Mozilla documents the
+  // presence or absence of that key as the way to feature-detect the consent
+  // experience at runtime - so the absent key has to be representable here.
+  let consentState = dataConsent;
+  if (permissionsApi !== "missing") {
+    browser.permissions = {
+      async getAll() {
+        calls.permissionChecks.push(
+          consentState === undefined ? "no-data-collection-key" : [...consentState].join(","));
+        if (permissionsApi === "throws") throw new Error("permissions unavailable");
+        const answer = { origins: ["<all_urls>"], permissions: ["downloads"] };
+        if (permissionsApi === "garbage") {
+          // Present but not an array: a shape the gate cannot read as consent.
+          answer.data_collection = "technicalAndInteraction";
+          return answer;
+        }
+        if (consentState !== undefined) answer.data_collection = [...consentState];
+        return answer;
+      },
+    };
+  }
+  // The user can grant or revoke optional consent at any time from
+  // about:addons, so a test has to be able to change it mid-session.
+  events.setDataConsent = (next) => { consentState = next; };
   const context = vm.createContext({
     browser,
     console: { log() {}, error() {} },
@@ -602,7 +640,14 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
 // CoveMediaCapability global - because that is the configuration Chrome will
 // run, not a special explicit one.
 
-function loadMediaCore({ capability, nativeResult = { status: "ok" } } = {}) {
+function loadMediaCore({ capability, nativeResult = { status: "ok" },
+                        // Stands in for background.js's consent gate. The
+                        // default is the granted answer, because that is what
+                        // this route sent before the gate existed and these
+                        // tests are about the core's own mechanics; `false`
+                        // models a browser where the user withheld the
+                        // optional technical-data permission.
+                        technicalConsent = true } = {}) {
   const noop = () => {};
   // media-core.js calls back into background.js globals at call time. Standing
   // in for them here is what lets the pill's handoff be driven against the
@@ -663,6 +708,10 @@ function loadMediaCore({ capability, nativeResult = { status: "ok" } } = {}) {
     async sendNativeMessage(message) {
       core.native.push(message);
       return nativeResult;
+    },
+    // Same shape background.js's helper returns: one key, or no key at all.
+    async userAgentField() {
+      return technicalConsent ? { userAgent: "test-agent" } : {};
     },
     showNotification(title, body) { core.notifications.push({ title, body }); },
     diagRecord(component, event, level, fields, requestId) {
@@ -4691,4 +4740,345 @@ test("the options page cannot write a settings field it does not own", async () 
   assert.equal(reply && reply.ok, true);
   assert.equal(loaded.readSettings().enabled, false);
   assert.equal("nativeHost" in loaded.readSettings(), false);
+});
+
+// ---- Firefox optional technical-data consent (technicalAndInteraction) ----
+//
+// Mozilla requires `technicalAndInteraction` to be OPTIONAL and says it
+// "cannot be required". The browser's user-agent is browser information, which
+// that category covers, so a Firefox handoff may only carry it while the user
+// currently grants the permission. Mozilla documents feature-detecting the
+// consent experience through the presence or absence of the `data_collection`
+// key in permissions.getAll(), which is what these tests model: an absent key
+// is Chrome or a Firefox without the model, an array is a Firefox with it.
+//
+// The payload carries no user-agent by OMITTING the key. That is the existing
+// "none supplied" representation: cove/native_messaging.py reads
+// msg.get("userAgent", "") and the downstream consumers gate on truthiness
+// (cove/extractor.py, cove/hls.py), so an absent key needs no protocol change.
+
+const CONSENT = "technicalAndInteraction";
+const REAL_UA = "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0";
+
+// The two production routes that put navigator.userAgent into a native
+// handoff: the downloads interception path and the context-menu path.
+async function firefoxDownloadHandoff(options) {
+  const loaded = loadBackground(options);
+  await settle();
+  loaded.calls.native.length = 0;
+  loaded.events.downloadCreated.emit(sizedItem(5 * 1024 * 1024));
+  await settle();
+  return loaded;
+}
+
+// A second handoff needs its own address: the interception path dedupes by URL
+// inside DEDUP_WINDOW_MS, so reusing one would be dropped before it ever
+// reached the consent gate and would prove nothing about consent.
+function nextItem(n) {
+  return sizedItem(5 * 1024 * 1024, {
+    id: 900 + n,
+    url: `https://example.test/payload-${n}.zip`,
+    filename: `payload-${n}.zip`,
+  });
+}
+
+async function menuHandoff(loaded) {
+  loaded.calls.native.length = 0;
+  await Promise.all(loaded.events.contextMenuClicked.emit(
+    {
+      menuItemId: "download-with-cove",
+      srcUrl: "https://cdn.example.test/v/clip.mp4",
+      pageUrl: "https://example.test/watch",
+    },
+    { id: 7, url: "https://example.test/watch" },
+  ));
+  await settle();
+  return downloadsOf(loaded.calls);
+}
+
+test("U1 Firefox with technicalAndInteraction granted still sends the user-agent",
+     async () => {
+  const { calls } = await firefoxDownloadHandoff({ dataConsent: [CONSENT] });
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1, "the download is handed off");
+  assert.equal(sent[0].userAgent, REAL_UA,
+               "granted consent means the real user-agent travels");
+});
+
+test("U2 Firefox without the grant hands off the download but no user-agent",
+     async () => {
+  const { calls } = await firefoxDownloadHandoff({ dataConsent: [] });
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1,
+               "the download itself must not be blocked by a technical-data refusal");
+  assert.ok(!("userAgent" in sent[0]),
+            "the key is omitted, which the native host already reads as none");
+  assert.ok(!JSON.stringify(sent[0]).includes("Gecko"),
+            "no part of the real user-agent leaks through another field");
+});
+
+test("U2b an unrelated granted data permission does not unlock the user-agent",
+     async () => {
+  const { calls } = await firefoxDownloadHandoff({ dataConsent: ["websiteContent"] });
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1);
+  assert.ok(!("userAgent" in sent[0]),
+            "only technicalAndInteraction governs technical data");
+});
+
+test("U3 a permission lookup failure fails closed for the user-agent only",
+     async () => {
+  const { calls } = await firefoxDownloadHandoff({
+    dataConsent: [CONSENT], permissionsApi: "throws",
+  });
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1,
+               "a consent lookup failure must not block the download");
+  assert.ok(!("userAgent" in sent[0]),
+            "unknown consent is not consent");
+});
+
+test("U3b a data_collection value that is not a list also fails closed",
+     async () => {
+  const { calls } = await firefoxDownloadHandoff({
+    dataConsent: [CONSENT], permissionsApi: "garbage",
+  });
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1);
+  assert.ok(!("userAgent" in sent[0]),
+            "a shape the gate cannot read is not consent");
+});
+
+test("U3c a browser with no permissions API at all fails closed for the UA",
+     async () => {
+  const { calls } = await firefoxDownloadHandoff({ permissionsApi: "missing" });
+
+  const sent = downloadsOf(calls);
+  assert.equal(sent.length, 1);
+  assert.ok(!("userAgent" in sent[0]));
+});
+
+test("U4 revoking the permission stops the next handoff carrying the user-agent",
+     async () => {
+  const loaded = await firefoxDownloadHandoff({ dataConsent: [CONSENT] });
+  const first = downloadsOf(loaded.calls);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].userAgent, REAL_UA, "granted at first handoff");
+
+  // The user turns it off in about:addons. No restart, no reload.
+  loaded.events.setDataConsent([]);
+
+  loaded.calls.native.length = 0;
+  loaded.events.downloadCreated.emit(nextItem(1));
+  await settle();
+
+  const second = downloadsOf(loaded.calls);
+  assert.equal(second.length, 1, "the download still happens");
+  assert.ok(!("userAgent" in second[0]),
+            "a revoked permission takes effect on the very next handoff");
+});
+
+test("U4b granting the permission mid-session lets the next handoff carry it",
+     async () => {
+  const loaded = await firefoxDownloadHandoff({ dataConsent: [] });
+  assert.ok(!("userAgent" in downloadsOf(loaded.calls)[0]));
+
+  loaded.events.setDataConsent([CONSENT]);
+
+  loaded.calls.native.length = 0;
+  loaded.events.downloadCreated.emit(nextItem(2));
+  await settle();
+
+  assert.equal(downloadsOf(loaded.calls)[0].userAgent, REAL_UA);
+});
+
+test("U4c the consent state is read for every handoff, never cached", async () => {
+  const loaded = await firefoxDownloadHandoff({ dataConsent: [CONSENT] });
+  const afterFirst = loaded.calls.permissionChecks.length;
+  assert.ok(afterFirst >= 1, "the first handoff consults the live permission state");
+
+  loaded.calls.native.length = 0;
+  loaded.events.downloadCreated.emit(nextItem(3));
+  await settle();
+
+  assert.ok(loaded.calls.permissionChecks.length > afterFirst,
+            "the second handoff consults it again rather than reusing an answer");
+});
+
+test("U5 Chrome keeps its user-agent handoff and never consults data consent",
+     async () => {
+  // No dataConsent: getAll() answers without a `data_collection` key, which is
+  // exactly what Chrome returns and what Mozilla says to feature-detect on.
+  const { calls, events } = chromeWorker();
+  await settle();
+  calls.native.length = 0;
+  calls.permissionChecks.length = 0;
+
+  const sent = await menuHandoff({ calls, events });
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].userAgent, REAL_UA,
+               "Chrome behaviour is unchanged by the Firefox consent gate");
+});
+
+test("U6 the context-menu route is gated too, not only the downloads route",
+     async () => {
+  const granted = loadBackground({ dataConsent: [CONSENT] });
+  await settle();
+  const withConsent = await menuHandoff(granted);
+  assert.equal(withConsent.length, 1);
+  assert.equal(withConsent[0].userAgent, REAL_UA);
+
+  const denied = loadBackground({ dataConsent: [] });
+  await settle();
+  const withoutConsent = await menuHandoff(denied);
+  assert.equal(withoutConsent.length, 1,
+               "the menu download still happens without technical consent");
+  assert.ok(!("userAgent" in withoutConsent[0]),
+            "no production route may bypass the gate");
+});
+
+test("U6b no native handoff of any action carries the user-agent without consent",
+     async () => {
+  // A sweep rather than a named-route check: whatever the extension sends,
+  // nothing may contain the real user-agent while consent is absent.
+  const loaded = await firefoxDownloadHandoff({ dataConsent: [] });
+  await menuHandoff(loaded);
+  await settle();
+
+  for (const message of loaded.calls.native) {
+    assert.ok(!JSON.stringify(message).includes("Gecko"),
+              `a ${message.action} message leaked the user-agent`);
+  }
+});
+
+// The real-browser run found these two routes after the first pass gated only
+// background.js. media-core.js (the in-page pill and context-menu media
+// handoff) and media-sites.js (the detected-stream handoff) build their own
+// native payloads, so each needs the same gate. U6 is only true if all three
+// routes obey it.
+
+test("U6c the media/pill route carries the user-agent only with consent",
+     async () => {
+  const granted = loadBackground({ dataConsent: [CONSENT] });
+  await settle();
+  granted.calls.native.length = 0;
+  await requestMedia(granted.events, { requestId: "aa11bb22" });
+  const sentGranted = downloadsOf(granted.calls);
+  assert.equal(sentGranted.length, 1, "the media handoff happens");
+  assert.equal(sentGranted[0].userAgent, REAL_UA);
+
+  const denied = loadBackground({ dataConsent: [] });
+  await settle();
+  denied.calls.native.length = 0;
+  await requestMedia(denied.events, { requestId: "aa11bb22" });
+  const sentDenied = downloadsOf(denied.calls);
+  assert.equal(sentDenied.length, 1,
+               "the media handoff still happens without technical consent");
+  assert.ok(!("userAgent" in sentDenied[0]),
+            "the pill route must not bypass the consent gate");
+  assert.ok("requestId" in sentDenied[0],
+            "the rest of the media payload is untouched");
+});
+
+test("U6d the detected-stream route carries the user-agent only with consent",
+     async () => {
+  const granted = loadBackground({ dataConsent: [CONSENT] });
+  await settle();
+  granted.calls.native.length = 0;
+  sendRuntimeMessage(granted.events, {
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+  const sentGranted = downloadsOf(granted.calls);
+  assert.equal(sentGranted.length, 1, "the stream handoff happens");
+  assert.equal(sentGranted[0].userAgent, REAL_UA);
+
+  const denied = loadBackground({ dataConsent: [] });
+  await settle();
+  denied.calls.native.length = 0;
+  const { returned } = sendRuntimeMessage(denied.events, {
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+  assert.equal(returned, true,
+               "the reply is still asynchronous: the contract is unchanged");
+  await settle();
+  const sentDenied = downloadsOf(denied.calls);
+  assert.equal(sentDenied.length, 1,
+               "the stream handoff still happens without technical consent");
+  assert.ok(!("userAgent" in sentDenied[0]),
+            "the stream route must not bypass the consent gate");
+});
+
+test("U6e a denied-consent sweep across all three routes leaks no user-agent",
+     async () => {
+  const loaded = loadBackground({ dataConsent: [] });
+  await settle();
+  loaded.calls.native.length = 0;
+
+  loaded.events.downloadCreated.emit(nextItem(7));   // interception route
+  await settle();
+  await menuHandoff(loaded);                          // context-menu route
+  await requestMedia(loaded.events, { requestId: "cc33dd44" });  // pill route
+  sendRuntimeMessage(loaded.events, {                 // stream route
+    type: "downloadStream",
+    url: "https://example.test/live.m3u8",
+    filename: "live.mp4",
+  });
+  await settle();
+
+  const sent = downloadsOf(loaded.calls);
+  assert.ok(sent.length >= 3, `expected several handoffs, saw ${sent.length}`);
+  for (const message of loaded.calls.native) {
+    assert.ok(!JSON.stringify(message).includes("Gecko"),
+              `a ${message.action} message leaked the user-agent`);
+  }
+});
+
+test("U7 consent revoked during the pill's settings read is still honoured",
+     async () => {
+  // The media route reads settings between admitting the request and sending
+  // it, and that read is a suspension point. Resolving the user-agent before
+  // it would let a revocation that lands inside the window ship a user-agent
+  // the user had already withdrawn - a time-of-check/time-of-use gap, not a
+  // theoretical one: the same file already re-checks exclusions here for
+  // exactly this reason.
+  let armed = false;
+  let revoked = false;
+  const loaded = loadBackground({
+    dataConsent: [CONSENT],
+    // Arming at the cookie read is what makes this test discriminating. The
+    // handoff reads settings twice: once to admit the request, before the
+    // cookie read, and once more at the last moment before sending. Revoking
+    // on the first would put the revocation ahead of the user-agent in both
+    // the fixed and the broken ordering, and the test would pass either way.
+    // Armed here, only the FINAL read revokes - which is after the broken
+    // ordering has already resolved the user-agent, and before the fixed one
+    // has.
+    cookieHook: async () => { armed = true; },
+    settingsReadHook: async () => {
+      if (!armed || revoked) return;
+      revoked = true;
+      loaded.events.setDataConsent([]);
+    },
+  });
+  await settle();
+  loaded.calls.native.length = 0;
+
+  await requestMedia(loaded.events, { requestId: "ee55ff66" });
+  await settle();
+
+  const sent = downloadsOf(loaded.calls);
+  assert.equal(sent.length, 1, "the download still goes through");
+  assert.ok(revoked, "the revocation really did land during the settings read");
+  assert.ok(!("userAgent" in sent[0]),
+            "a user-agent resolved before the read must not be sent after it");
 });

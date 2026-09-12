@@ -1,6 +1,6 @@
 # Privacy Policy - Cove Download Manager (browser extension)
 
-_Last updated: 2026-09-07_
+_Last updated: 2026-09-12_
 
 Cove Download Manager is a browser extension that hands downloads off to the
 Cove Download Manager desktop application running on the same computer. This
@@ -19,8 +19,10 @@ happens, it is called out.
   download. That is local processing, and it is disclosed here because it is
   still handling of your data.
 - When you start a download, the extension passes the download address, a
-  filename, the referring page address, cookies for that address, and your
-  browser's user-agent string to the local Cove desktop app.
+  filename, the referring page address, and cookies for that address to the
+  local Cove desktop app. On Firefox it also passes your browser's user-agent
+  string when you grant the optional technical-data permission, and omits it
+  when you do not. On Chrome the user-agent is always included.
 - Cove then contacts the site you chose in order to download the file, using
   those cookies and headers. The download itself is a normal network request to
   that site. "Local handoff" describes how Cove is reached, not the download.
@@ -136,7 +138,8 @@ computer. A handoff carries:
   title,
 - the referring page address,
 - cookies for the download address,
-- your browser's user-agent string,
+- your browser's user-agent string - on Firefox only while you grant the
+  optional technical-data permission, and always on Chrome,
 - the file size where the browser knew it,
 - an opaque request id used to match up log entries.
 
@@ -162,6 +165,65 @@ letting the browser download the file, which likewise contacts that site.
 No other network activity originates from this extension. There is no
 developer-controlled endpoint for it to contact.
 
+### How Firefox categorises this
+
+Firefox has a built-in data-collection consent model, and Mozilla treats data
+passed to a native application through Native Messaging as declared data
+transmission. The Firefox build therefore declares three **required**
+categories:
+
+- **Browsing activity**, which in Mozilla's definition is information about
+  the websites you visit, such as specific URLs and domains. That is the
+  address of the file being downloaded and the address of the page you started
+  it from. This is not your browsing history: it is the one address you chose
+  to download and the page you chose it from, at the moment you chose it.
+- **Website content**, which in Mozilla's definition covers what is on a page
+  and what is embedded in it, including cookies, page headers, and request and
+  response information. That is the media address and the cookies read for the
+  download address, both described above.
+- **Website activity**, which covers actions such as saving and downloading.
+  That is the handoff itself.
+
+Those three are required because a download cannot be performed without them.
+
+One further category is declared as **optional**:
+
+- **Technical and interaction data**, which in Mozilla's definition covers
+  device and browser information. For this add-on it means one field and
+  nothing else: the browser user-agent.
+
+Cove may pass the browser user-agent to the locally installed Cove application
+so downloads can use browser-compatible request headers. Firefox users may
+decline or disable this optional technical-data permission, in the install
+prompt or later in about:addons. When it is not granted, Cove does not
+transmit the browser user-agent, and downloads continue to work.
+
+The add-on checks your current choice before each handoff, so turning the
+permission off takes effect on your next download rather than at the next
+restart. It never asks for the permission in the middle of a download.
+
+This optional permission covers the user-agent only. The addresses, cookies,
+referrers and the download action itself are covered by the three required
+categories above and remain necessary for the feature to work; declining the
+technical-data permission does not change them.
+
+The declaration does not describe anything beyond what this policy already
+sets out. In particular it does not mean data is sent to the developer, that
+analytics or tracking exist, that anything is sold or shared for advertising,
+or that cookies are stored on a remote server. The recipient is the Cove
+application on the same computer, and the only remote request is the one Cove
+makes to the site being downloaded from.
+
+Earlier versions of the Firefox add-on declared that no data was collected.
+That was not accurate for an extension whose purpose is handing downloads to a
+local application, and it was corrected in Firefox version 1.4.10. Firefox may
+ask you to confirm the declared categories when the add-on updates.
+
+**Credentials are not a declared category.** Mozilla's authentication
+category covers passwords, usernames, PINs, security questions and
+registration details. This extension reads none of those; the cookie case sits
+inside the website-content category above.
+
 ## What is stored on your device
 
 - **Settings** in local storage: interception on/off, minimum file size,
@@ -176,6 +238,29 @@ developer-controlled endpoint for it to contact.
   held while that tab is open, and dropped when it closes or when it navigates
   to a different address. Reloading the same address does not clear them, so
   addresses seen before a reload can still be listed after it.
+- **A pending site exclusion**, while one is waiting for your confirmation.
+  Choosing "Exclude this site" from the in-page button's menu does not change
+  any setting. It records one pending entry and opens a Cove confirmation page.
+  The entry holds a randomly generated token, the hostname being confirmed,
+  the time it was created, and the id of the tab the request came from. It
+  holds no address, no page title, and no cookies.
+
+  This entry lives in session storage, which the browser keeps in memory and
+  does not write to disk, and which the extension does not expose to the
+  scripts it runs inside web pages. It is discarded when the browser session
+  ends.
+
+  It stops being treated as valid two minutes after it is created. Removal is
+  separate from that: the entry is deleted when you confirm it, when you cancel
+  it, and otherwise the next time the extension reads or sweeps its pending
+  entries after the two minutes have passed. Nothing deletes it on a timer at
+  the two-minute mark, so an unconfirmed entry can still sit in memory,
+  already refused as expired, until the extension next looks or the session
+  ends.
+
+  If you do confirm, the hostname is then added to **excluded domains** in the
+  settings above, which is ordinary persistent local storage and stays until
+  you remove it. Cancelling writes nothing at all.
 
 ### What the diagnostics log contains
 

@@ -125,7 +125,6 @@ function buildCoveMedia(capability) {
       referrer: referrer,
       cookies: cookieStr,
       fileSize: 0,
-      userAgent: navigator.userAgent,
     };
     // Additive and optional: an older host ignores an unknown key.
     if (requestId) nativeMessage.requestId = requestId;
@@ -157,6 +156,15 @@ function buildCoveMedia(capability) {
       return { ok: false, reason: "unsupported",
                error: "Downloads are turned off for this site" };
     }
+
+    // Asked last, for the same reason the exclusion above is asked twice.
+    // Firefox's optional technicalAndInteraction consent governs the
+    // user-agent and the user can revoke it at any moment, so resolving it
+    // any earlier would leave a suspension point - the settings read above -
+    // between the check and the send, and a revocation landing inside that
+    // window would ship a user-agent the user had already withdrawn. Nothing
+    // awaits between here and sendNativeMessage.
+    Object.assign(nativeMessage, await userAgentField());
 
     const result = await sendNativeMessage(nativeMessage, requestId);
 

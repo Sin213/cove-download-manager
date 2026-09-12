@@ -152,6 +152,47 @@ function mediaLoadScripts() {
 
 mediaLoadScripts();
 
+// The browser's user-agent is browser information, which Firefox's built-in
+// data-collection consent puts under `technicalAndInteraction`. Mozilla
+// requires that category to be OPTIONAL - it "cannot be required" - so the
+// user can grant or revoke it at any time from about:addons, and every handoff
+// has to ask again rather than trust a value cached at startup.
+//
+// Returns the user-agent this handoff is allowed to carry, or null for "send
+// none". Never throws: a consent lookup that fails withholds the user-agent
+// but must not take the download down with it.
+async function permittedUserAgent() {
+  const perms = browser.permissions;
+  if (!perms || typeof perms.getAll !== "function") return null;
+
+  let granted;
+  try {
+    granted = await perms.getAll();
+  } catch (e) {
+    return null;
+  }
+  if (!granted || typeof granted !== "object") return null;
+
+  const consent = granted.data_collection;
+  // Mozilla documents the presence or absence of `data_collection` as the way
+  // to feature-detect the built-in consent experience. Absent means this
+  // browser has no such model - Chrome, or a Firefox older than it - where
+  // withholding the user-agent would be a silent regression, not compliance.
+  if (consent === undefined) return navigator.userAgent;
+  // Present but unreadable: treat unknown consent as no consent.
+  if (!Array.isArray(consent)) return null;
+  return consent.includes("technicalAndInteraction") ? navigator.userAgent : null;
+}
+
+// Spreads into a native payload as either one `userAgent` key or nothing at
+// all. Omission is the existing "none supplied" representation on this
+// protocol: the host reads msg.get("userAgent", "") and its consumers gate on
+// a truthy value, so no schema change is needed to say nothing.
+async function userAgentField() {
+  const ua = await permittedUserAgent();
+  return ua === null ? {} : { userAgent: ua };
+}
+
 function sendNativeMessage(msg, requestId) {
   const action = msg && typeof msg.action === "string" ? msg.action : "unknown";
   diagRecord("extension.background", "native_message_sent", "INFO",
@@ -912,7 +953,7 @@ async function interceptDownload(downloadItem) {
     // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
     // not know yet, and the primary's schema refuses a negative size outright.
     fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
-    userAgent: navigator.userAgent,
+    ...(await userAgentField()),
   });
 
   console.log("Cove: native host response", JSON.stringify(result));
@@ -1108,7 +1149,7 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     filename: filename,
     referrer: info.pageUrl || "",
     cookies: cookieStr,
-    userAgent: navigator.userAgent,
+    ...(await userAgentField()),
   });
 
   if (result && result.status === "ok") {

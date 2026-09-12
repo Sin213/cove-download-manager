@@ -164,7 +164,7 @@ def test_chrome_manifest_permissions_and_version_are_untouched(bundles):
     built = json.loads((bundles / "chrome" / "manifest.json").read_text())
     assert built["permissions"] == source["permissions"]
     assert built["host_permissions"] == source["host_permissions"]
-    assert built["version"] == source["version"] == "1.3.10"
+    assert built["version"] == source["version"] == "1.3.11"
     assert built["manifest_version"] == 3
 
 
@@ -178,11 +178,85 @@ def test_firefox_manifest_permissions_and_version_are_untouched(bundles):
     source = json.loads((ROOT / "extension" / "manifest.json").read_text())
     built = json.loads((bundles / "firefox" / "manifest.json").read_text())
     assert built["permissions"] == source["permissions"]
-    assert built["version"] == source["version"] == "1.4.9"
+    assert built["version"] == source["version"] == "1.4.10"
     assert built["manifest_version"] == 2
     assert (built["browser_specific_settings"]["gecko"]["id"]
             == source["browser_specific_settings"]["gecko"]["id"]
             == "cove-dm@cove-download-manager.net")
+
+
+def test_firefox_declares_the_data_it_sends_to_the_native_app(bundles):
+    """`nativeMessaging` obliges a data-collection declaration; "none" is wrong.
+
+    Mozilla's built-in consent model requires that "Data sent to native
+    applications using NativeMessaging must be declared in the data collection
+    consent and categorized in the appropriate consent model"
+    (extensionworkshop.com/documentation/develop/
+    best-practices-for-collecting-user-data-consents/, read 2026-09-12).
+
+    This extension's whole purpose is handing a download to the local Cove
+    application, passing the address, the referring page, cookies for that
+    address, the filename, the user-agent and the size when known. Under the
+    category definitions at extensionworkshop.com/documentation/develop/
+    firefox-builtin-data-consent/ (same date) that is three categories:
+
+    - `browsingActivity`, "Information about the websites users visit, such as
+      specific URLs, domains, or categories of pages users view" - the download
+      address and the referring page are exactly that, and the Chrome listing
+      already discloses them as browsing activity.
+    - `websiteContent`, which covers page content "and anything embedded, such
+      as cookies, audio, page headers, and request and response information".
+    - `websiteActivity`, user actions "such as saving and downloading".
+
+    `authenticationInfo` is deliberately absent: Mozilla scopes it to
+    credentials and account data - passwords, usernames, PINs, security
+    questions, registration information - not to cookies.
+
+    The browser's user-agent also travels, and that is browser information,
+    which Mozilla puts under `technicalAndInteraction`. That category is
+    special: it "cannot be required" and "must be optional", so it is declared
+    in `optional` and `background.js` withholds the user-agent whenever the
+    user has not currently granted it.
+
+    The guard exists so a future release cannot quietly revert to
+    `required: ["none"]` while `nativeMessaging` is still requested, nor
+    promote the technical-data category into `required`, which AMO rejects.
+    """
+    source = json.loads((ROOT / "extension" / "manifest.json").read_text())
+    built = json.loads((bundles / "firefox" / "manifest.json").read_text())
+
+    for name, manifest in (("source", source), ("built bundle", built)):
+        assert "nativeMessaging" in manifest["permissions"], name
+        gecko = manifest["browser_specific_settings"]["gecko"]
+        required = gecko["data_collection_permissions"]["required"]
+
+        # "none" is the standalone "collects nothing" value and cannot be
+        # combined, so its presence here would be a straight contradiction.
+        assert "none" not in required, (
+            f"{name}: manifest still declares no data collection while "
+            "nativeMessaging is requested"
+        )
+        assert set(required) == {
+            "browsingActivity",
+            "websiteContent",
+            "websiteActivity",
+        }, name
+        assert "authenticationInfo" not in required, name
+
+        # Mozilla: technicalAndInteraction "cannot be required" and "must be
+        # optional". Declaring it in `required` is an AMO rejection, and
+        # leaving it out entirely while the user-agent still travels is the
+        # under-declaration this slice exists to fix.
+        optional = gecko["data_collection_permissions"]["optional"]
+        assert optional == ["technicalAndInteraction"], name
+        assert "technicalAndInteraction" not in required, (
+            f"{name}: technicalAndInteraction cannot be a required category"
+        )
+
+    assert (built["browser_specific_settings"]["gecko"]
+            ["data_collection_permissions"]
+            == source["browser_specific_settings"]["gecko"]
+            ["data_collection_permissions"])
 
 
 @pytest.mark.parametrize("browser", ["chrome", "firefox"])
@@ -628,6 +702,31 @@ _LISTINGS = {
     "firefox": (ROOT / "docs" / "firefox-store-listing.md", "manifest.json"),
 }
 
+# Versions that have already gone to a store from this repository and can
+# therefore never be a candidate again. Per browser, because the two are
+# versioned independently against separate stores.
+#
+# 1.3.9 and 1.4.8 were uploaded. Chrome 1.3.10 and Firefox 1.4.9 went further
+# and were confirmed *published* on 2026-09-12: the public Store listing
+# reported version 1.3.10, and the public AMO API reported current_version
+# 1.4.9 with status public. Chrome requires each update to carry a strictly
+# larger version and forbids reusing a published number.
+_SHIPPED = {
+    "chrome": ("1.3.9", "1.3.10"),
+    "firefox": ("1.4.8", "1.4.9"),
+}
+
+# The latest version confirmed published per store, on the evidence above. A
+# candidate must be strictly greater than this. Membership in _SHIPPED alone
+# is not enough: it is an exhaustive blocklist, so a rollback to a number that
+# predates the list - Chrome 1.3.8, Firefox 1.4.7 - would pass it while still
+# being unuploadable.
+_PUBLISHED = {"chrome": "1.3.10", "firefox": "1.4.9"}
+
+
+def _version_tuple(version):
+    return tuple(int(part) for part in version.split("."))
+
 
 @pytest.mark.parametrize("browser", ["chrome", "firefox"])
 def test_store_listing_names_the_current_candidate_version(browser):
@@ -640,15 +739,50 @@ def test_store_listing_names_the_current_candidate_version(browser):
 
 
 @pytest.mark.parametrize("browser", ["chrome", "firefox"])
-def test_store_listing_does_not_offer_an_already_uploaded_version(browser):
-    """1.3.9 and 1.4.8 are immutable submissions; neither may be the candidate."""
-    doc, manifest_name = _LISTINGS[browser]
+def test_candidate_version_is_not_an_already_shipped_version(browser):
+    """The candidate itself must not reuse a shipped version.
+
+    Kept separate from the document check below on purpose. The two are
+    different requirements, and an earlier version of this guard skipped its
+    own document assertions whenever a shipped version equalled the manifest
+    version - which meant the one mistake it existed to catch, reusing a
+    shipped number, made it pass.
+    """
+    _, manifest_name = _LISTINGS[browser]
     version = json.loads((ROOT / "extension" / manifest_name).read_text())["version"]
+
+    assert version not in _SHIPPED[browser], (
+        f"{browser} candidate {version} has already gone to the store; "
+        "a shipped version number can never be reused"
+    )
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_candidate_version_is_above_the_published_one(browser):
+    """Ordering, not just membership in a blocklist.
+
+    Both stores require an update to carry a strictly larger version than the
+    one currently published. A blocklist can only ever name versions somebody
+    remembered to add; an ordering assertion covers every older number,
+    including ones that predate the list entirely.
+    """
+    _, manifest_name = _LISTINGS[browser]
+    version = json.loads((ROOT / "extension" / manifest_name).read_text())["version"]
+    published = _PUBLISHED[browser]
+
+    assert _version_tuple(version) > _version_tuple(published), (
+        f"{browser} candidate {version} is not above the published {published}; "
+        "the store will reject it"
+    )
+
+
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_store_listing_does_not_offer_an_already_shipped_version(browser):
+    """No listing document may still be offering a shipped version."""
+    doc, _ = _LISTINGS[browser]
     text = doc.read_text(encoding="utf-8")
 
-    for uploaded in ("1.3.9", "1.4.8"):
-        if uploaded == version:
-            continue
-        assert f"dist/cove-{browser}-{uploaded}.zip" not in text
-        assert f"What's new in version {uploaded}" not in text
-        assert f"Release notes for {uploaded}" not in text
+    for shipped in _SHIPPED[browser]:
+        assert f"dist/cove-{browser}-{shipped}.zip" not in text
+        assert f"What's new in version {shipped}" not in text
+        assert f"Release notes for {shipped}" not in text
