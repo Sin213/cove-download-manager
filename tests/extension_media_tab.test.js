@@ -19,6 +19,7 @@ class StubNode {
     this.shadowRoot = null;
     this.style = {};
     this.listeners = new Map();
+    this.attributes = new Map();
     this.isConnected = true;
     this.rect = { top: 0, left: 0, width: 0, height: 0, right: 0, bottom: 0 };
     this.classList = {
@@ -35,7 +36,12 @@ class StubNode {
     return child;
   }
 
-  setAttribute() {}
+  // Recorded rather than discarded: the pill's options control is only
+  // operable at all because of its aria state, so a test has to be able to
+  // read back what the script set.
+  setAttribute(name, value) {
+    this.attributes.set(String(name), String(value));
+  }
 
   addEventListener(type, listener) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
@@ -46,6 +52,18 @@ class StubNode {
 
   dispatch(type, event = {}) {
     for (const listener of this.listeners.get(type) || []) listener(event);
+  }
+
+  // HTMLElement.click(). The browser marks what it produces isTrusted: false,
+  // which is the whole reason a page can reach an open shadow root and still
+  // not be the user. Modelled exactly, so a test that calls this is calling
+  // what hostile page script calls.
+  click() {
+    this.dispatch("click", {
+      isTrusted: false,
+      preventDefault() {},
+      stopPropagation() {},
+    });
   }
 
   attachShadow() {
@@ -110,7 +128,8 @@ class StubNode {
   }
 
   getAttribute(name) {
-    return name in this ? this[name] : null;
+    if (name in this) return this[name];
+    return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
 
   contains(node) {
@@ -156,6 +175,8 @@ function stubVideo({ top = 100, width = 640, height = 360, readyState = 4 } = {}
 async function loadMediaTab({ href = "https://example.test/watch", videos = [],
                        sites = true, chromeOnly = false,
                        settingsReply = { mediaPillEnabled: true, pillAllowed: true },
+                       siteHostReply = { ok: true, host: "example.test" },
+                       excludeReply = { ok: true },
                        reply = { mediaPillEnabled: true } } = {}) {
   const timers = [];
   const documentElement = new StubNode("HTML");
@@ -170,7 +191,15 @@ async function loadMediaTab({ href = "https://example.test/watch", videos = [],
     documentElement,
     body,
     listeners: new Map(),
-    createElement: (tag) => new StubNode(tag),
+    activeElement: null,
+    // Real controls take focus, and the menu is only escapable because focus
+    // goes back to the control that opened it. Elements the script creates
+    // therefore record where focus landed.
+    createElement: (tag) => {
+      const node = new StubNode(tag);
+      node.focus = () => { doc.activeElement = node; };
+      return node;
+    },
     querySelector: () => null,
     addEventListener(type, listener) {
       if (!doc.listeners.has(type)) doc.listeners.set(type, []);
@@ -221,6 +250,20 @@ async function loadMediaTab({ href = "https://example.test/watch", videos = [],
           return typeof settingsReply === "function"
             ? Promise.resolve(settingsReply(message))
             : Promise.resolve(settingsReply);
+        }
+        // The two background-owned intents behind the options menu answer from
+        // their own fakes for the same reason: a test about the download
+        // handoff must not have to restate them, and a test about excluding a
+        // site must not have to restate the handoff.
+        if (message && message.type === "getPillSiteHost") {
+          return typeof siteHostReply === "function"
+            ? Promise.resolve(siteHostReply(message))
+            : Promise.resolve(siteHostReply);
+        }
+        if (message && message.type === "requestExcludeConfirmation") {
+          return typeof excludeReply === "function"
+            ? Promise.resolve(excludeReply(message))
+            : Promise.resolve(excludeReply);
         }
         if (typeof reply === "function") return Promise.resolve(reply(message));
         return Promise.resolve(reply);
@@ -318,7 +361,36 @@ async function loadMediaTab({ href = "https://example.test/watch", videos = [],
       sent.filter((m) => m && m.type === "getSettings").length,
     downloadMessages: () =>
       sent.filter((m) => m && m.type === "downloadMedia"),
+    excludeMessages: () =>
+      sent.filter((m) => m && m.type === "requestExcludeConfirmation"),
+    siteHostMessages: () =>
+      sent.filter((m) => m && m.type === "getPillSiteHost"),
   };
+}
+
+// The pill is two controls in one shape: the download action the user has
+// always had, and an options control beside it. Every test that used to reach
+// for "the pill" wants one or the other, so name them in one place.
+function pillParts(host) {
+  const pill = host && host.shadowRoot.children.find((n) => n.className === "cove-pill");
+  const find = (cls) => (pill ? pill.children.find((n) => n.className === cls) : null);
+  const primary = find("cove-primary");
+  return {
+    pill,
+    primary,
+    options: find("cove-options"),
+    label: primary ? primary.children[0] : null,
+    menu: host
+      ? host.shadowRoot.children.find((n) => n.className === "cove-menu")
+      : null,
+  };
+}
+
+// The download gesture: a click on the primary control, not on the container.
+function clickPrimary(host) {
+  const { primary } = pillParts(host);
+  assert.ok(primary, "expected the primary download control inside the shadow root");
+  primary.dispatch("click", {});
 }
 
 // Brings a video up as the active pill target through the hover path.
@@ -580,11 +652,7 @@ function diagMessages(harness) {
 
 async function clickPill(harness, video) {
   const host = hover(harness, video);
-  const pill = host.shadowRoot.children.find(
-    (n) => n.className === "cove-pill"
-  );
-  assert.ok(pill, "expected the pill element inside the shadow root");
-  pill.dispatch("click", {});
+  clickPrimary(host);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   return host;
@@ -671,9 +739,7 @@ test("the pill wording is unchanged by diagnostics", async () => {
     reply: { ok: false, reason: "unavailable" },
   });
   const host = await clickPill(harness, video);
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  const label = pill.children[0];
-  assert.equal(label.textContent, "Cove is not running");
+  assert.equal(pillParts(host).label.textContent, "Cove is not running");
 });
 
 test("a diagnostics send failure never breaks a pill download", async () => {
@@ -737,9 +803,7 @@ test("an unresolvable video reports why instead of failing at the backend", asyn
 
   const host = await clickPill(harness, video);
 
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  const label = pill.children[0];
-  assert.equal(label.textContent, "No video found");
+  assert.equal(pillParts(host).label.textContent, "No video found");
 });
 
 test("an extractor-backed page still downloads from its page address", async () => {
@@ -842,8 +906,7 @@ test("without a site adapter the extractor page address is never contributed", a
     harness.sent.find((m) => m.type === "downloadMedia"), undefined,
     "the page address must not be handed over without the adapter",
   );
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  assert.equal(pill.children[0].textContent, "No video found");
+  assert.equal(pillParts(host).label.textContent, "No video found");
 });
 
 test("without a site adapter an embedded stream attribute is never read", async () => {
@@ -924,8 +987,7 @@ test("a player does not borrow another player's stream", async () => {
     harness.sent.find((m) => m.type === "downloadMedia"), undefined,
     "a player with no stream of its own must not claim one"
   );
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  assert.equal(pill.children[0].textContent, "No video found");
+  assert.equal(pillParts(host).label.textContent, "No video found");
 });
 
 
@@ -1309,9 +1371,7 @@ test("with the adapter loaded and no stream of any kind nothing is handed over",
 // reactivate the video and refresh the cached URL, which is the whole thing
 // under test here.
 async function clickWithoutReactivating(host) {
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  assert.ok(pill, "expected the pill element inside the shadow root");
-  pill.dispatch("click", {});
+  clickPrimary(host);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
 }
@@ -1677,14 +1737,13 @@ test("a click on a pill an exclusion invalidated sends nothing", async () => {
   harness.runTimers();
   const host = harness.pillHost();
   assert.ok(host, "precondition: the pill is up");
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  assert.ok(pill, "precondition: the pill element exists");
+  assert.ok(pillParts(host).primary, "precondition: the pill element exists");
 
   answer = DENIED;
   await harness.changeSettings();
 
   // The pill element is still in the shadow root; the user clicks it.
-  pill.dispatch("click", {});
+  clickPrimary(host);
   await harness.settle();
 
   assert.deepEqual(harness.downloadMessages(), [],
@@ -1702,8 +1761,7 @@ test("a click on an allowed pill still hands over", async () => {
   });
   harness.runTimers();
   const host = harness.pillHost();
-  const pill = host.shadowRoot.children.find((n) => n.className === "cove-pill");
-  pill.dispatch("click", {});
+  clickPrimary(host);
   await harness.settle();
 
   assert.equal(harness.downloadMessages().length, 1);
@@ -1795,4 +1853,516 @@ test("the pill goes down the moment settings change, not when the answer arrives
   await harness.settle();
   harness.runTimers();
   assert.equal(visiblePill(harness), true, "and back once it is allowed again");
+});
+
+// ---------------------------------------------------------------------------
+// "Exclude this site" on the pill (issue #16 A2).
+//
+// One discoverable action beside the download the pill already offers. The
+// pill does not decide anything here: it asks the background which site it is
+// on, then requests a separate extension-origin confirmation. Only that page
+// may ask the background to persist the setting that eventually takes the pill
+// away through the ordinary storage-change path.
+// ---------------------------------------------------------------------------
+
+const DENIED_PERMISSION = { mediaPillEnabled: true, pillAllowed: false };
+
+function menuItem(host) {
+  const { menu } = pillParts(host);
+  return menu ? menu.children[0] : null;
+}
+
+function menuIsOpen(host) {
+  const { menu, options } = pillParts(host);
+  if (!menu) return false;
+  return menu.style.display !== "none" &&
+         options.getAttribute("aria-expanded") === "true";
+}
+
+// A genuine user activation. In a browser the trust flag is set by the browser
+// itself and cannot be forged from script; this harness cannot manufacture one,
+// so it stands in for a browser-generated event. It is the positive control for
+// the logic only - the real trusted-activation proof is the Chrome and Firefox
+// input-automation cases, not this stub.
+function userActivate(node, type = "click", event = {}) {
+  node.dispatch(type, {
+    isTrusted: true,
+    preventDefault() {},
+    stopPropagation() {},
+    ...event,
+  });
+}
+
+// Opens the options menu the way a pointer user does, and lets the background's
+// answer about which site this is settle.
+async function openOptions(harness, host) {
+  const { options } = pillParts(host);
+  assert.ok(options, "expected the pill's options control");
+  options.dispatch("click", {});
+  await harness.settle();
+  return options;
+}
+
+// A pill that is up and anchored, ready for either of its two controls.
+async function pillUp(overrides = {}) {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({ videos: [video], ...overrides });
+  const host = hover(harness, video);
+  assert.ok(host, "precondition: the pill is up");
+  return { harness, host, video };
+}
+
+test("an eligible pill offers an options control beside the download", async () => {
+  const { host } = await pillUp();
+  const { primary, options } = pillParts(host);
+  assert.ok(primary, "the download action is a control of its own");
+  assert.ok(options, "and the options control sits beside it");
+  assert.equal(options.getAttribute("aria-haspopup"), "menu");
+  assert.equal(options.getAttribute("aria-expanded"), "false");
+  assert.equal(options.getAttribute("aria-label"), "Cove pill options");
+});
+
+test("an excluded page offers no options control, because it offers no pill", async () => {
+  const video = stubVideo({ top: 200 });
+  const harness = await loadMediaTab({
+    videos: [video], settingsReply: DENIED_PERMISSION,
+  });
+  hover(harness, video);
+  const host = harness.pillHost();
+  const { options } = pillParts(host);
+  assert.equal(options, null, "nothing to exclude a site from");
+  assert.deepEqual(harness.siteHostMessages(), [],
+                   "and nothing asked the background which site this is");
+});
+
+test("the primary control still hands the video over, unchanged", async () => {
+  const { harness, host } = await pillUp();
+  clickPrimary(host);
+  await harness.settle();
+  assert.equal(harness.downloadMessages().length, 1);
+});
+
+test("opening the options menu hands nothing over", async () => {
+  const { harness, host } = await pillUp();
+  await openOptions(harness, host);
+  assert.deepEqual(harness.downloadMessages(), [],
+                   "the options control is not a second download button");
+  assert.deepEqual(harness.excludeMessages(), [],
+                   "and opening a menu excludes nothing on its own");
+  assert.equal(harness.siteHostMessages().length, 1);
+  assert.equal(menuIsOpen(host), true);
+});
+
+test("the menu names the top-level site the background reported", async () => {
+  const { harness, host } = await pillUp({
+    siteHostReply: { ok: true, host: "news.example.test" },
+  });
+  await openOptions(harness, host);
+  const item = menuItem(host);
+  assert.equal(item.getAttribute("role"), "menuitem");
+  assert.equal(item.textContent, "Exclude news.example.test");
+});
+
+test("opening the menu again does not stack a second one", async () => {
+  const { harness, host } = await pillUp();
+  const options = await openOptions(harness, host);
+  options.dispatch("click", {});
+  await harness.settle();
+  options.dispatch("click", {});
+  await harness.settle();
+  const menus = host.shadowRoot.children.filter((n) => n.className === "cove-menu");
+  assert.equal(menus.length, 1);
+  assert.equal(menuIsOpen(host), true, "the third click left it open");
+  assert.equal(harness.siteHostMessages().length, 2,
+               "one site question per opening, not per click");
+});
+
+// Each opening asks the background which site it is offering. Those answers can
+// arrive in any order, and the menu the user is looking at is the one that asked
+// last: an earlier opening's answer naming a different site must never relabel
+// it, or the action reads as excluding a site it would not exclude.
+async function reopenWithHeldHostAnswers() {
+  const pending = [];
+  const { harness, host } = await pillUp({
+    siteHostReply: () => new Promise((resolve) => { pending.push(resolve); }),
+  });
+  const { options } = pillParts(host);
+  options.dispatch("click", {});          // opening 1 - answer held
+  await harness.settle();
+  options.dispatch("click", {});          // closed again
+  await harness.settle();
+  options.dispatch("click", {});          // opening 2 - the one on screen
+  await harness.settle();
+  assert.equal(pending.length, 2, "one site question per opening");
+  return { harness, host, pending };
+}
+
+test("a stale site answer arriving first cannot label a reopened menu", async () => {
+  const { harness, host, pending } = await reopenWithHeldHostAnswers();
+  pending[0]({ ok: true, host: "first.example.test" });
+  await harness.settle();
+  assert.equal(menuItem(host).textContent, "Exclude this site",
+               "the first opening's answer is not this opening's");
+  pending[1]({ ok: true, host: "second.example.test" });
+  await harness.settle();
+  assert.equal(menuItem(host).textContent, "Exclude second.example.test");
+});
+
+test("a stale site answer arriving last cannot relabel a reopened menu", async () => {
+  const { harness, host, pending } = await reopenWithHeldHostAnswers();
+  pending[1]({ ok: true, host: "second.example.test" });
+  await harness.settle();
+  assert.equal(menuItem(host).textContent, "Exclude second.example.test");
+  pending[0]({ ok: true, host: "first.example.test" });
+  await harness.settle();
+  assert.equal(menuItem(host).textContent, "Exclude second.example.test",
+               "the late answer belongs to an opening that is gone");
+});
+
+test("a second click on the options control closes the menu", async () => {
+  const { harness, host } = await pillUp();
+  const options = await openOptions(harness, host);
+  options.dispatch("click", {});
+  await harness.settle();
+  assert.equal(menuIsOpen(host), false);
+});
+
+test("a click elsewhere on the page closes the menu", async () => {
+  const { harness, host } = await pillUp();
+  await openOptions(harness, host);
+  harness.doc.dispatch("click", { target: harness.body });
+  await harness.settle();
+  assert.equal(menuIsOpen(host), false);
+});
+
+test("Escape closes the menu and gives focus back to the control", async () => {
+  const { harness, host } = await pillUp();
+  const options = await openOptions(harness, host);
+  assert.equal(harness.doc.activeElement, menuItem(host),
+               "opening moved focus into the menu");
+  menuItem(host).dispatch("keydown", { key: "Escape", preventDefault() {} });
+  await harness.settle();
+  assert.equal(menuIsOpen(host), false);
+  assert.equal(harness.doc.activeElement, options, "and focus is not lost");
+});
+
+for (const key of ["Enter", " "]) {
+  test("the options control opens from the keyboard with " + JSON.stringify(key),
+       async () => {
+    const { harness, host } = await pillUp();
+    const { options } = pillParts(host);
+    let prevented = false;
+    options.dispatch("keydown", { key, preventDefault() { prevented = true; } });
+    await harness.settle();
+    assert.equal(menuIsOpen(host), true);
+    assert.equal(prevented, true,
+                 "the key is consumed, so the browser does not also click it");
+    assert.equal(harness.doc.activeElement, menuItem(host));
+  });
+}
+
+test("tabbing out of the menu closes it", async () => {
+  const { harness, host } = await pillUp();
+  await openOptions(harness, host);
+  harness.doc.dispatch("focusin", { target: harness.body });
+  await harness.settle();
+  assert.equal(menuIsOpen(host), false);
+});
+
+test("the pill does not time out from under an open menu", async () => {
+  const { harness, host, video } = await pillUp();
+  video.paused = true;
+  await openOptions(harness, host);
+  harness.runTimers();
+  assert.notEqual(host.style.display, "none",
+                  "a pill whose menu is open is not hover-dismissed");
+});
+
+test("closing the menu lets the pill time out again", async () => {
+  const { harness, host, video } = await pillUp();
+  const options = await openOptions(harness, host);
+  video.paused = true;
+  options.dispatch("click", {});
+  await harness.settle();
+  harness.runTimers();
+  assert.equal(host.style.display, "none");
+});
+
+test("choosing the action asks the background to confirm the host it named", async () => {
+  const { harness, host } = await pillUp({
+    siteHostReply: { ok: true, host: "news.example.test" },
+  });
+  await openOptions(harness, host);
+  userActivate(menuItem(host));
+  await harness.settle();
+  const asked = harness.excludeMessages();
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].expectHost, "news.example.test");
+  assert.deepEqual(harness.downloadMessages(), [],
+                   "and still nothing was handed to Cove");
+  assert.equal(menuIsOpen(host), false);
+});
+
+test("a successful confirmation request leaves storage to take the pill away", async () => {
+  // The content script must not hide the pill itself. If it did, a write that
+  // never committed would still look like it worked, and the pill would come
+  // back on the next navigation with the user believing the site was excluded.
+  let answer = { mediaPillEnabled: true, pillAllowed: true };
+  const { harness, host } = await pillUp({
+    settingsReply: () => answer,
+    siteHostReply: { ok: true, host: "news.example.test" },
+  });
+  await openOptions(harness, host);
+  userActivate(menuItem(host));
+  await harness.settle();
+
+  assert.notEqual(host.style.display, "none",
+                  "opening confirmation must not hide the pill");
+
+  clickPrimary(host);
+  await harness.settle();
+  assert.equal(harness.downloadMessages().length, 1,
+               "nothing local was switched off by the request itself");
+
+  answer = DENIED_PERMISSION;
+  await harness.changeSettings();
+  assert.equal(host.style.display, "none",
+               "the stored setting is what the pill actually obeys");
+});
+
+test("an exclusion the background refused is not reported as done", async () => {
+  const { harness, host } = await pillUp({
+    excludeReply: { ok: false, reason: "unsupported" },
+  });
+  await openOptions(harness, host);
+  userActivate(menuItem(host));
+  await harness.settle();
+  assert.equal(pillParts(host).label.textContent, "Could not exclude this site");
+  assert.notEqual(host.style.display, "none",
+                  "a failed exclusion does not hide the pill as if it worked");
+});
+
+test("a background that never answers the exclusion is not a success either", async () => {
+  const { harness, host } = await pillUp();
+  await openOptions(harness, host);
+  harness.setSendFailure("reject");
+  userActivate(menuItem(host));
+  await harness.settle();
+  assert.equal(pillParts(host).label.textContent, "Could not exclude this site");
+  assert.notEqual(host.style.display, "none");
+});
+
+test("a site the background will not name offers no exclusion to choose", async () => {
+  const { harness, host } = await pillUp({
+    siteHostReply: { ok: false, reason: "unsupported" },
+  });
+  await openOptions(harness, host);
+  assert.equal(menuIsOpen(host), false);
+  assert.deepEqual(harness.excludeMessages(), [],
+                   "no host was named, so no host is excluded");
+  assert.equal(pillParts(host).label.textContent, "Could not exclude this site");
+});
+
+test("a pill an exclusion took away does not leave its menu behind", async () => {
+  let answer = { mediaPillEnabled: true, pillAllowed: true };
+  const { harness, host } = await pillUp({ settingsReply: () => answer });
+  await openOptions(harness, host);
+  answer = DENIED_PERMISSION;
+  await harness.changeSettings();
+  assert.equal(menuIsOpen(host), false);
+});
+
+test("Chrome gets the same options control off the same file", async () => {
+  const { harness, host } = await pillUp({
+    chromeOnly: true,
+    siteHostReply: { ok: true, host: "news.example.test" },
+  });
+  await openOptions(harness, host);
+  assert.equal(menuItem(host).textContent, "Exclude news.example.test");
+  userActivate(menuItem(host));
+  await harness.settle();
+  assert.equal(harness.excludeMessages().length, 1);
+  assert.deepEqual(harness.downloadMessages(), []);
+});
+
+// The pill's visible surface and its clickable surface have to be the same
+// surface. The two controls are real buttons now, so any padding left on the
+// container around them is pill-coloured, pill-shaped space that looks pressable
+// and does nothing - and it is exactly the space the download action used to
+// own. There is no layout engine here, so this reads the rule the pill ships.
+function pillStyleText(host) {
+  const style = host.shadowRoot.children.find((n) => n.tagName === "STYLE");
+  assert.ok(style, "expected the pill's own stylesheet in the shadow root");
+  return style.textContent;
+}
+
+// The rule whose selector IS this one, anchored at the start of its line, so a
+// descendant rule that merely mentions it is not mistaken for it.
+function ruleBody(css, selector) {
+  const start = ("\n" + css).indexOf("\n" + selector + " {");
+  assert.notEqual(start, -1, "expected a " + selector + " rule");
+  return css.slice(start, css.indexOf("}", start));
+}
+
+test("the pill container keeps no padding the controls cannot receive", async () => {
+  const { host } = await pillUp();
+  const css = pillStyleText(host);
+  assert.match(ruleBody(css, ".cove-pill"), /padding:\s*0\b/,
+               "container padding would be dead pill-shaped space");
+});
+
+test("each pill control covers its own visible segment", async () => {
+  const { host } = await pillUp();
+  const css = pillStyleText(host);
+  for (const selector of [".cove-primary", ".cove-options"]) {
+    const body = ruleBody(css, selector);
+    const padding = body.match(/padding:\s*([^;]+);/);
+    assert.ok(padding, selector + " must carry the padding the container gave up");
+    assert.ok(/[1-9]/.test(padding[1]),
+              selector + " padding must be a real hit area, got " + padding[1]);
+  }
+});
+
+test("the hover affordance follows the controls, not the dead container", async () => {
+  // A container that lights up on hover promises a hit target the container no
+  // longer has.
+  const { host } = await pillUp();
+  const css = pillStyleText(host);
+  assert.ok(!css.includes(".cove-pill:hover"),
+            "the container must not advertise itself as pressable");
+  assert.ok(css.includes(".cove-primary:hover") && css.includes(".cove-options:hover"),
+            "each control advertises its own hit area");
+});
+
+test("a media event under an open menu does not take the action away", async () => {
+  // Opening cancels the hide timer, but an autoplay preview that pauses (or a
+  // player that is replaced) schedules a hide of its own afterwards. That must
+  // not close a menu the user is reading.
+  const { harness, host, video } = await pillUp();
+  await openOptions(harness, host);
+  video.paused = true;
+  video.dispatch("pause", { target: video });
+  harness.runTimers();
+  assert.notEqual(host.style.display, "none", "the pill is still up");
+  assert.equal(menuIsOpen(host), true, "and its menu is still open");
+});
+
+// ---- Trusted activation: the page is not the user ----
+
+// The pill host is an open shadow root in the page's own DOM, so page script -
+// including script in an embedded frame that has its own pill - can find these
+// controls and activate them. Opening the menu that way costs nothing: it asks
+// the background which site this is and nothing else. Recording an exclusion is
+// different. It is a persistent settings write, and the only thing that
+// separates the user from the page is whether the browser itself vouched for
+// the event, which is knowable here and nowhere else.
+async function menuOpenFor(overrides = {}) {
+  const { harness, host } = await pillUp(overrides);
+  await openOptions(harness, host);
+  assert.equal(menuItem(host).textContent, "Exclude example.test",
+               "precondition: the menu is open and offering the site");
+  harness.excludeMessages().length = 0;
+  return { harness, host };
+}
+
+function assertNothingExcluded(harness, host, why) {
+  assert.deepEqual(harness.excludeMessages(), [], why);
+  assert.ok(host.isConnected !== false, "and the pill was not taken away");
+}
+
+// T1 - the DOM API a page reaches for.
+test("a page calling click() on the exclude item excludes nothing", async () => {
+  const { harness, host } = await menuOpenFor();
+  menuItem(host).click();
+  await harness.settle();
+  assertNothingExcluded(harness, host,
+                        "element.click() is the page acting, not the user");
+});
+
+// T2 - a hand-built event, which is what a page does when click() is not enough.
+test("a synthetic click event on the exclude item excludes nothing", async () => {
+  const { harness, host } = await menuOpenFor();
+  menuItem(host).dispatch("click", {
+    isTrusted: false, preventDefault() {}, stopPropagation() {},
+  });
+  await harness.settle();
+  assertNothingExcluded(harness, host, "a dispatched MouseEvent is not a user");
+});
+
+// An event with no trust flag at all must not be treated as trusted either:
+// failing open here would make the guard depend on the attacker's thoroughness.
+test("a click event with no trust flag excludes nothing", async () => {
+  const { harness, host } = await menuOpenFor();
+  menuItem(host).dispatch("click", { preventDefault() {}, stopPropagation() {} });
+  await harness.settle();
+  assertNothingExcluded(harness, host, "absent is not trusted");
+});
+
+// T3 - the keyboard route, synthetically. A real Enter on a focused native
+// button makes the browser emit a trusted click; a dispatched keydown emits
+// nothing, and must not be turned into an activation here either.
+for (const key of ["Enter", " "]) {
+  test("a synthetic " + JSON.stringify(key) + " keydown excludes nothing", async () => {
+    const { harness, host } = await menuOpenFor();
+    menuItem(host).dispatch("keydown", {
+      key, isTrusted: false, preventDefault() {}, stopPropagation() {},
+    });
+    await harness.settle();
+    assertNothingExcluded(harness, host, "a dispatched keydown is not a user");
+  });
+}
+
+// T6 - the case that makes this more than a site opting itself out. An embedded
+// player's frame runs its own copy of the content script and gets its own pill,
+// but the exclusion the background records is the TOP-LEVEL host. So a hostile
+// frame activating its own pill from script would disable Cove for the site
+// that embedded it. The guard is what stops that, and it has to hold in a frame
+// exactly as it does at the top. The cross-origin half of this is proven in the
+// browser cases; what is pinned here is that the frame's own script gets no
+// further than the top-level page's would.
+test("a hostile embedded frame cannot exclude the site that embeds it", async () => {
+  const { harness, host } = await menuOpenFor({
+    href: "https://player.example.test/embed",
+    siteHostReply: { ok: true, host: "example.test" },
+  });
+  menuItem(host).click();
+  menuItem(host).dispatch("click", {
+    isTrusted: false, preventDefault() {}, stopPropagation() {},
+  });
+  await harness.settle();
+  assert.deepEqual(harness.excludeMessages(), [],
+                   "script in the frame never reached the settings write");
+
+  // Positive control in the same context: the guard rejects the page, not the
+  // frame. A real user inside that frame can still exclude.
+  userActivate(menuItem(host));
+  await harness.settle();
+  assert.equal(harness.excludeMessages().length, 1,
+               "and a genuine activation in that same frame still works");
+});
+
+// T4 - the positive control, and that one activation is one request.
+test("a trusted activation sends exactly one exclusion request", async () => {
+  const { harness, host } = await menuOpenFor();
+  userActivate(menuItem(host));
+  await harness.settle();
+  const asked = harness.excludeMessages();
+  assert.equal(asked.length, 1, "one user action, one request");
+  assert.equal(asked[0].expectHost, "example.test");
+});
+
+// T5 - the keyboard positive. A focused native button turns a real Enter into a
+// browser-generated click, so this is the event the accessible path delivers.
+// That the browser generates it at all is proven in Chrome and Firefox, not here.
+test("a trusted keyboard activation sends exactly one exclusion request", async () => {
+  const { harness, host } = await menuOpenFor();
+  const item = menuItem(host);
+  assert.equal(harness.doc.activeElement, item, "opening focused the item");
+  item.dispatch("keydown", {
+    key: "Enter", isTrusted: true, preventDefault() {}, stopPropagation() {},
+  });
+  userActivate(item); // the click the browser emits for that keystroke
+  await harness.settle();
+  assert.equal(harness.excludeMessages().length, 1,
+               "the keydown must not activate separately from the click");
 });

@@ -237,10 +237,75 @@ browser.storage.onChanged.addListener((changes, area) => {
   }
 });
 
-async function saveSettings(newSettings) {
-  settings = { ...DEFAULT_SETTINGS, ...newSettings };
-  settingsGeneration += 1;
-  await browser.storage.local.set({ settings });
+// Settings are stored as one whole object, so two writes that overlap each
+// write a snapshot taken before the other saw it and the later one silently
+// undoes the earlier. Every settings write runs through this single chain -
+// the same shape persistInterceptedIds() already uses - so they commit in call
+// order. Work behind a rejected write still runs: a quota failure is not a
+// reason for the user's next save to be dropped too.
+let settingsChain = Promise.resolve();
+
+function chainSettings(work) {
+  const run = settingsChain.then(work, work);
+  settingsChain = run.then(() => {}, () => {});
+  return run;
+}
+
+// The settings there are. A patch is applied field by field from this list
+// rather than spread wholesale, because a message body is caller-shaped data
+// and nothing outside this list is part of the settings.
+const SETTINGS_FIELDS = Object.keys(DEFAULT_SETTINGS);
+
+// The one way settings change. Serializing the writes was never enough on its
+// own: a caller holding a whole-object snapshot - an options page left open,
+// a popup between its read and its write - writes fields it never touched, and
+// a newer value in one of them is gone. So the stored object is read INSIDE the
+// queued operation and only the supplied fields are laid over it. Everything
+// else stays whatever it has since become.
+async function updateSettings(patch) {
+  return chainSettings(async () => {
+    let current;
+    try {
+      const stored = await browser.storage.local.get("settings");
+      current = stored && stored.settings
+        ? { ...DEFAULT_SETTINGS, ...stored.settings }
+        : { ...DEFAULT_SETTINGS };
+    } catch {
+      return { ok: false, reason: "unavailable" };
+    }
+    const next = { ...current };
+    for (const field of SETTINGS_FIELDS) {
+      if (patch && Object.prototype.hasOwnProperty.call(patch, field)) {
+        next[field] = patch[field];
+      }
+    }
+    try {
+      await browser.storage.local.set({ settings: next });
+    } catch {
+      // Reported, never thrown: a quota failure the caller can see is a message
+      // the user gets, and the chain stays usable for the next save.
+      return { ok: false, reason: "unavailable" };
+    }
+    settings = next;
+    settingsGeneration += 1;
+    return { ok: true, settings: next };
+  });
+}
+
+// Settings are profile-wide, so the general settings writer answers only to the
+// extension's own pages. An extension page's sender.url carries the extension
+// origin; a content script's is the address of the page it was injected into
+// and never can.
+function fromExtensionPage(sender, page) {
+  const url = sender && typeof sender.url === "string" ? sender.url : "";
+  if (!url) return false;
+  let base;
+  try {
+    base = browser.runtime.getURL(page);
+  } catch {
+    return false;
+  }
+  return url === base || url.startsWith(base + "?") || url.startsWith(base + "#");
 }
 
 // ---- Download interception ----
@@ -335,6 +400,215 @@ async function resolvePillPermission(sender) {
 // not consulted here: the two have always been independent.
 function pillPermitted(permission) {
   return permission.pillAllowed === true && permission.mediaPillEnabled !== false;
+}
+
+// ---- Secure "Exclude this site" confirmation ----
+
+const EXCLUDE_CONFIRMATIONS_KEY = "_excludeConfirmations";
+const EXCLUDE_CONFIRMATION_TTL_MS = 2 * 60 * 1000;
+
+let newExcludeConfirmationToken = () => crypto.randomUUID();
+
+let excludeConfirmationChain = Promise.resolve();
+
+function chainExcludeConfirmations(work) {
+  const run = excludeConfirmationChain.then(work, work);
+  excludeConfirmationChain = run.then(() => {}, () => {});
+  return run;
+}
+
+function confirmationStorage() {
+  return browser.storage && browser.storage.session
+    ? browser.storage.session
+    : null;
+}
+
+function validConfirmationToken(token) {
+  return typeof token === "string" && token.length > 0 && token.length <= 256;
+}
+
+async function readExcludeConfirmations() {
+  const storage = confirmationStorage();
+  if (!storage) throw new Error("storage.session unavailable");
+  const stored = await storage.get(EXCLUDE_CONFIRMATIONS_KEY);
+  const records = stored && stored[EXCLUDE_CONFIRMATIONS_KEY];
+  return records && typeof records === "object" && !Array.isArray(records)
+    ? records
+    : {};
+}
+
+async function writeExcludeConfirmations(records) {
+  const storage = confirmationStorage();
+  if (!storage) throw new Error("storage.session unavailable");
+  await storage.set({ [EXCLUDE_CONFIRMATIONS_KEY]: records });
+}
+
+function pendingConfirmation(records, token) {
+  if (!validConfirmationToken(token) ||
+      !Object.prototype.hasOwnProperty.call(records, token)) return null;
+  const record = records[token];
+  if (!record || record.token !== token || typeof record.host !== "string" ||
+      !Number.isFinite(record.createdAt) || !Number.isInteger(record.sourceTabId)) {
+    return null;
+  }
+  return record;
+}
+
+function confirmationExpired(record) {
+  return Date.now() - record.createdAt >= EXCLUDE_CONFIRMATION_TTL_MS;
+}
+
+// Only the browser-authenticated top-level HTTP(S) page names the site.
+function excludableHost(sender) {
+  const tabUrl = sender && sender.tab ? sender.tab.url : null;
+  if (typeof tabUrl !== "string" || !tabUrl) return null;
+  let parsed;
+  try {
+    parsed = new URL(tabUrl);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  return parsed.hostname || null;
+}
+
+async function excludeConfirmedHost(host) {
+  return chainSettings(async () => {
+    let current;
+    try {
+      const stored = await browser.storage.local.get("settings");
+      current = stored && stored.settings
+        ? { ...DEFAULT_SETTINGS, ...stored.settings }
+        : { ...DEFAULT_SETTINGS };
+    } catch {
+      return { ok: false, reason: "unavailable" };
+    }
+    const excluded = Array.isArray(current.excludedDomains)
+      ? current.excludedDomains
+      : [];
+    // Reuse the shipped matcher so parent coverage stays identical.
+    if (domainExcludedIn("https://" + host + "/", excluded)) {
+      return { ok: true, alreadyExcluded: true };
+    }
+    // Append without sorting or pruning user-owned narrower entries.
+    const next = { ...current, excludedDomains: [...excluded, host] };
+    try {
+      await browser.storage.local.set({ settings: next });
+    } catch {
+      return { ok: false, reason: "unavailable" };
+    }
+    settings = { ...DEFAULT_SETTINGS, ...next };
+    settingsGeneration += 1;
+    return { ok: true, added: host };
+  });
+}
+
+async function requestExcludeConfirmation(sender, expectHost) {
+  const host = excludableHost(sender);
+  const sourceTabId = sender && sender.tab ? sender.tab.id : null;
+  if (!host || expectHost !== host || !Number.isInteger(sourceTabId)) {
+    return { ok: false, reason: "unsupported" };
+  }
+  // Apply A2's pill admission while the authenticated page identity exists.
+  if (!pillPermitted(await resolvePillPermission(sender))) {
+    return { ok: false, reason: "unsupported" };
+  }
+
+  let token;
+  try {
+    const created = await chainExcludeConfirmations(async () => {
+      const records = await readExcludeConfirmations();
+      for (const candidate of Object.keys(records)) {
+        const valid = pendingConfirmation(records, candidate);
+        if (!valid) {
+          delete records[candidate];
+          continue;
+        }
+        if (confirmationExpired(valid)) {
+          delete records[candidate];
+          continue;
+        }
+        if (valid.sourceTabId === sourceTabId && valid.host === host) {
+          return { duplicate: true };
+        }
+      }
+      const candidate = newExcludeConfirmationToken();
+      if (!validConfirmationToken(candidate) ||
+          Object.prototype.hasOwnProperty.call(records, candidate)) {
+        throw new Error("invalid confirmation token");
+      }
+      records[candidate] = { token: candidate, host, createdAt: Date.now(), sourceTabId };
+      await writeExcludeConfirmations(records);
+      return { token: candidate };
+    });
+    if (created.duplicate) return { ok: false, reason: "pending" };
+    token = created.token;
+    await browser.tabs.create({
+      url: browser.runtime.getURL("confirm-exclude.html") + "#" + token,
+    });
+    return { ok: true };
+  } catch {
+    if (token) {
+      try {
+        await consumeExcludeConfirmation(token);
+      } catch { /* an unavailable session store is already a refusal */ }
+    }
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+async function getExcludeConfirmation(token) {
+  try {
+    return await chainExcludeConfirmations(async () => {
+      const records = await readExcludeConfirmations();
+      const record = pendingConfirmation(records, token);
+      if (!record) return { ok: false, reason: "invalid" };
+      if (confirmationExpired(record)) {
+        delete records[token];
+        await writeExcludeConfirmations(records);
+        return { ok: false, reason: "expired" };
+      }
+      return {
+        ok: true, host: record.host, status: "pending",
+        expiresAt: record.createdAt + EXCLUDE_CONFIRMATION_TTL_MS,
+      };
+    });
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+}
+
+async function consumeExcludeConfirmation(token) {
+  return chainExcludeConfirmations(async () => {
+    const records = await readExcludeConfirmations();
+    const record = pendingConfirmation(records, token);
+    if (!record) return { ok: false, reason: "invalid" };
+    delete records[token];
+    await writeExcludeConfirmations(records);
+    if (confirmationExpired(record)) return { ok: false, reason: "expired" };
+    return { ok: true, record };
+  });
+}
+
+async function confirmExcludeSite(token) {
+  let consumed;
+  try {
+    consumed = await consumeExcludeConfirmation(token);
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
+  if (!consumed.ok) return consumed;
+  // Consumption precedes the write; failure never makes the token reusable.
+  return excludeConfirmedHost(consumed.record.host);
+}
+
+async function cancelExcludeConfirmation(token) {
+  try {
+    const consumed = await consumeExcludeConfirmation(token);
+    return consumed.ok ? { ok: true } : consumed;
+  } catch {
+    return { ok: false, reason: "unavailable" };
+  }
 }
 
 // Dedup guard: URLs intercepted recently (prevents re-intercept after
@@ -864,7 +1138,11 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
 browser.commands.onCommand.addListener(async (command) => {
   if (command === "toggle-intercept") {
     await ensureSettings();  // toggle from the real value, not defaults
-    await saveSettings({ ...settings, enabled: !settings.enabled });
+    // Only the field the shortcut owns. Sending the rest of the in-memory copy
+    // along would make every keystroke a full overwrite of settings this
+    // context may not have been told about.
+    const result = await updateSettings({ enabled: !settings.enabled });
+    if (!result.ok) return;
     updateBadge();
     showNotification(
       "Cove Interception",
@@ -928,11 +1206,69 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     ensureSettings().then(() => sendResponse(settings));
     return true; // async: wait for settings to load before responding
   }
-  if (msg.type === "saveSettings") {
-    saveSettings(msg.settings).then(() => {
+  // The options page sends the fields the user actually edited, so a page that
+  // has been open long enough for its snapshot to go stale cannot carry that
+  // snapshot over anything else.
+  if (msg.type === "updateSettings") {
+    if (!fromExtensionPage(sender, "options/options.html")) {
+      sendResponse({ ok: false, reason: "unsupported" });
+      return;
+    }
+    updateSettings(msg.changes).then((result) => {
       updateBadge();
-      sendResponse({ ok: true });
+      sendResponse(result);
     });
+    return true; // async
+  }
+  if (msg.type === "saveSettings") {
+    // The popup's one settings gesture is the on/off toggle, and it sends the
+    // whole object back to make it. Narrowing it to the field it actually
+    // changes is what keeps the copy it read moments ago from overwriting a
+    // write that landed in between - the popup does not have to know that, and
+    // a context authorised for one field is not a general settings writer.
+    if (!fromExtensionPage(sender, "popup/popup.html")) {
+      sendResponse({ ok: false, reason: "unsupported" });
+      return;
+    }
+    const enabled = msg.settings ? msg.settings.enabled : undefined;
+    updateSettings(enabled === undefined ? {} : { enabled }).then((result) => {
+      updateBadge();
+      sendResponse(result);
+    });
+    return true; // async
+  }
+  // Which site the pill's options menu is offering to exclude. Answered from
+  // the sender record alone, so the label the user reads names the page the
+  // exclusion would actually be recorded for.
+  if (msg.type === "getPillSiteHost") {
+    const host = excludableHost(sender);
+    sendResponse(host ? { ok: true, host } : { ok: false, reason: "unsupported" });
+    return;
+  }
+  if (msg.type === "requestExcludeConfirmation") {
+    requestExcludeConfirmation(sender, msg.expectHost).then(sendResponse);
+    return true; // async
+  }
+  // The old direct content-script authority is deliberately closed. A real
+  // click redressed by a hostile page may open a confirmation tab, but it may
+  // never mutate settings by itself.
+  if (msg.type === "excludeCurrentSite") {
+    sendResponse({ ok: false, reason: "unsupported" });
+    return;
+  }
+  if (msg.type === "getExcludeConfirmation" ||
+      msg.type === "confirmExcludeSite" ||
+      msg.type === "cancelExcludeConfirmation") {
+    if (!fromExtensionPage(sender, "confirm-exclude.html")) {
+      sendResponse({ ok: false, reason: "unsupported" });
+      return;
+    }
+    const action = msg.type === "getExcludeConfirmation"
+      ? getExcludeConfirmation(msg.token)
+      : msg.type === "confirmExcludeSite"
+        ? confirmExcludeSite(msg.token)
+        : cancelExcludeConfirmation(msg.token);
+    action.then(sendResponse);
     return true; // async
   }
   if (msg.type === "getStatus") {
@@ -1044,4 +1380,3 @@ sendNativeMessage({ action: "ping" }).then((r) => {
     status: "transport_error",
   });
 });
-

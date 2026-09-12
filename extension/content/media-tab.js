@@ -48,6 +48,25 @@
   let host = null;
   let pill = null;
   let label = null;
+  // The pill is two controls: the download action it has always been, and an
+  // options control that opens a menu with one entry. Both are real buttons, so
+  // the second is reachable without a pointer and cannot fall through into the
+  // first.
+  let primaryButton = null;
+  let optionsButton = null;
+  let menu = null;
+  let excludeItem = null;
+  let menuOpen = false;
+  // The site the background named for the currently open menu. Only ever what
+  // the background answered, and sent straight back to it so a tab that
+  // navigated in between is caught there rather than excluded by mistake.
+  let menuSiteHost = "";
+  // Identifies the opening a site answer was asked for. `menuOpen` alone cannot:
+  // it is true again after the menu is closed and reopened, so an earlier
+  // opening's late answer would pass that check and label the menu on screen
+  // with a site it was never asked about.
+  let menuGeneration = 0;
+  let excludePending = false;
   let hideTimer = null;
   let resetTimer = null;
   let currentUrl = "";
@@ -146,38 +165,95 @@
     const style = document.createElement("style");
     style.textContent = [
       ":host { all: initial; }",
+      // The container carries no padding of its own. Every pill-coloured pixel
+      // belongs to one of the two buttons, so the surface that looks pressable
+      // is the surface that is pressable - and the download action keeps the
+      // whole hit area it had before it gained a neighbour.
       ".cove-pill {",
-      "  display: flex; align-items: center; gap: 6px;",
-      "  padding: 5px 12px; border-radius: 999px;",
+      "  display: flex; align-items: stretch; gap: 0;",
+      "  padding: 0; border-radius: 999px; overflow: hidden;",
       "  background: #1b1b26; color: #50e6cf;",
       "  border: 1px solid #50e6cf;",
       "  font: 600 12px/1.2 system-ui, sans-serif;",
-      "  cursor: pointer; user-select: none;",
+      "  user-select: none;",
       "  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);",
       "}",
-      ".cove-pill:hover { background: #24243a; }",
       ".cove-pill.cove-sent {",
-      "  color: #9a9ab0; border-color: #9a9ab0; cursor: default;",
+      "  color: #9a9ab0; border-color: #9a9ab0;",
       "}",
+      ".cove-pill.cove-sent .cove-primary { cursor: default; }",
       ".cove-pill.cove-error {",
       "  color: #e66a6a; border-color: #e66a6a;",
       "}",
+      ".cove-primary, .cove-options, .cove-menu-item {",
+      "  all: unset; cursor: pointer; color: inherit;",
+      "  font: inherit; box-sizing: border-box;",
+      "  display: flex; align-items: center;",
+      "}",
+      ".cove-primary { padding: 5px 8px 5px 12px; }",
+      ".cove-primary:hover { background: #24243a; }",
+      ".cove-options {",
+      "  padding: 5px 10px 5px 8px; border-left: 1px solid currentColor;",
+      "  line-height: 1;",
+      "}",
+      ".cove-options:hover { background: #24243a; }",
+      ".cove-menu {",
+      "  margin-top: 4px; padding: 4px; border-radius: 8px;",
+      "  background: #1b1b26; color: #50e6cf;",
+      "  border: 1px solid #50e6cf;",
+      "  font: 600 12px/1.2 system-ui, sans-serif;",
+      "  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);",
+      "}",
+      ".cove-menu-item { display: block; padding: 5px 10px; border-radius: 6px; }",
+      ".cove-menu-item:hover { background: #24243a; }",
     ].join("\n");
     shadow.appendChild(style);
 
     pill = document.createElement("div");
     pill.className = "cove-pill";
-    pill.setAttribute("role", "button");
-    pill.title = "Download with Cove";
 
+    primaryButton = document.createElement("button");
+    primaryButton.className = "cove-primary";
+    primaryButton.type = "button";
+    primaryButton.title = "Download with Cove";
     label = document.createElement("span");
     label.textContent = "Download with Cove";
-    pill.appendChild(label);
+    primaryButton.appendChild(label);
+    pill.appendChild(primaryButton);
+
+    optionsButton = document.createElement("button");
+    optionsButton.className = "cove-options";
+    optionsButton.type = "button";
+    optionsButton.textContent = "▾";
+    optionsButton.setAttribute("aria-haspopup", "menu");
+    optionsButton.setAttribute("aria-expanded", "false");
+    optionsButton.setAttribute("aria-label", "Cove pill options");
+    pill.appendChild(optionsButton);
     shadow.appendChild(pill);
 
-    pill.addEventListener("click", onPillClick);
+    menu = document.createElement("div");
+    menu.className = "cove-menu";
+    menu.setAttribute("role", "menu");
+    menu.style.display = "none";
+    excludeItem = document.createElement("button");
+    excludeItem.className = "cove-menu-item";
+    excludeItem.type = "button";
+    excludeItem.setAttribute("role", "menuitem");
+    menu.appendChild(excludeItem);
+    shadow.appendChild(menu);
+
+    primaryButton.addEventListener("click", onPillClick);
+    optionsButton.addEventListener("click", onOptionsClick);
+    optionsButton.addEventListener("keydown", onOptionsKeydown);
+    excludeItem.addEventListener("click", onExcludeClick);
+    excludeItem.addEventListener("keydown", onMenuKeydown);
     host.addEventListener("mouseenter", cancelHide);
     host.addEventListener("mouseleave", scheduleHide);
+    // Capture phase, on the document, because the menu has to close for a
+    // gesture that lands anywhere else on the page. A click inside the pill
+    // retargets to the host element, which is how this tells the two apart.
+    document.addEventListener("click", onDocumentPointer, true);
+    document.addEventListener("focusin", onDocumentPointer, true);
 
     (document.body || document.documentElement).appendChild(host);
   }
@@ -188,6 +264,7 @@
   const ERROR_LABELS = {
     unavailable: "Cove is not running",
     unsupported: "No video found",
+    exclude: "Could not exclude this site",
   };
 
   function setPillState(state, reason) {
@@ -342,12 +419,21 @@
   }
 
   function hidePill() {
+    // A menu cannot outlive the pill it hangs off, or it would be left open
+    // over the page with no control to close it.
+    closeMenu();
     if (host) host.style.display = "none";
     currentUrl = "";
   }
 
   function scheduleHide() {
     cancelHide();
+    // A menu the user is reading holds the pill up, and not only from the
+    // moment it opened: a preview that pauses, a player that is replaced or a
+    // video that ends all schedule a hide of their own afterwards, and any of
+    // them would take the action away mid-gesture. dismissMenu() is what
+    // resumes the ordinary hide once the menu is gone.
+    if (menuOpen) return;
     hideTimer = setTimeout(() => {
       // A pill anchored to a still-playing video is not hover-dismissed;
       // only a hover-only pill (nothing actively playing) times out. A
@@ -390,6 +476,164 @@
     let out = "";
     while (out.length < 8) out += Math.floor(Math.random() * 16).toString(16);
     return out.slice(0, 8);
+  }
+
+  // ---- Options menu: one action, "Exclude this site" ----
+
+  function focusNode(node) {
+    if (node && typeof node.focus === "function") node.focus();
+  }
+
+  function stopEvent(e) {
+    if (!e) return;
+    if (typeof e.stopPropagation === "function") e.stopPropagation();
+    if (typeof e.preventDefault === "function") e.preventDefault();
+  }
+
+  // Pure: closing never schedules anything, because the pill is also torn down
+  // through here and a hide scheduled from that path would run against a pill
+  // that no longer exists. The gestures that close the menu deliberately ask
+  // for the ordinary hide to resume.
+  function closeMenu(refocus) {
+    if (!menu) return;
+    menuOpen = false;
+    menu.style.display = "none";
+    menuSiteHost = "";
+    if (optionsButton) optionsButton.setAttribute("aria-expanded", "false");
+    if (refocus) focusNode(optionsButton);
+  }
+
+  function dismissMenu(refocus) {
+    if (!menuOpen) return;
+    closeMenu(refocus);
+    scheduleHide();
+  }
+
+  // Which site the exclusion would name. The page cannot answer this: only the
+  // background can see the top-level address the browser recorded, and that is
+  // the only thing the label is allowed to say.
+  async function requestSiteHost() {
+    try {
+      const resp = await Promise.resolve(
+        browser.runtime.sendMessage({ type: "getPillSiteHost" })
+      );
+      return resp && resp.ok === true && typeof resp.host === "string"
+        ? resp.host
+        : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function openMenu() {
+    if (!pillEnabled || !menu || menuOpen) return;
+    menuOpen = true;
+    menuGeneration += 1;
+    const generation = menuGeneration;
+    // A menu the user is reading must not be pulled out from under them by the
+    // hover timer. The ordinary hide resumes when it closes.
+    cancelHide();
+    menu.style.display = "block";
+    optionsButton.setAttribute("aria-expanded", "true");
+    excludeItem.textContent = "Exclude this site";
+
+    const siteHost = await requestSiteHost();
+    // Closed while the answer was in flight, or reopened since: that opening
+    // owns the menu now and this answer is not its.
+    if (!menuOpen || menuGeneration !== generation) return;
+    if (!siteHost) {
+      // Nothing nameable to exclude. Say so on the pill rather than offering an
+      // action that could only ever exclude the wrong thing.
+      dismissMenu(true);
+      setPillState("error", "exclude");
+      return;
+    }
+    menuSiteHost = siteHost;
+    excludeItem.textContent = "Exclude " + siteHost;
+    focusNode(excludeItem);
+  }
+
+  function toggleMenu() {
+    if (menuOpen) dismissMenu(true);
+    else openMenu();
+  }
+
+  function onOptionsClick(e) {
+    // The download action is the pill's primary gesture and this is not it.
+    // Stopping here is what keeps a click on the chevron from reaching it.
+    stopEvent(e);
+    toggleMenu();
+  }
+
+  function onOptionsKeydown(e) {
+    if (!e) return;
+    if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+      // Consumed, or the browser synthesises a click for the same keystroke
+      // and the menu opens and closes again immediately.
+      stopEvent(e);
+      toggleMenu();
+      return;
+    }
+    if (e.key === "Escape") dismissMenu(true);
+  }
+
+  function onMenuKeydown(e) {
+    if (!e) return;
+    if (e.key === "Escape") {
+      stopEvent(e);
+      dismissMenu(true);
+      return;
+    }
+    // Tab is not swallowed: focus leaves the menu the way it normally would,
+    // and the menu closes behind it rather than trapping anyone inside it.
+    if (e.key === "Tab") dismissMenu();
+  }
+
+  function onDocumentPointer(e) {
+    if (!menuOpen || !host) return;
+    const target = e && e.target;
+    if (target === host || (host.contains && target && host.contains(target))) return;
+    dismissMenu();
+  }
+
+  async function onExcludeClick(e) {
+    stopEvent(e);
+    // The pill lives in an open shadow root in the page's own DOM, so the page -
+    // or an embedded player's frame, which gets its own pill and whose exclusion
+    // would name the TOP-LEVEL site - can find this control and activate it.
+    // isTrusted rejects ordinary scripted activation, but a page can redress a
+    // real click. Therefore this gesture only asks the background to open a
+    // packaged confirmation page; it has no settings authority. Absent counts
+    // as untrusted, so the defense-in-depth guard does not depend on how
+    // thorough a synthetic event is.
+    // Opening the menu is deliberately not gated - it only asks which site this
+    // is - and the download action is unchanged: it hands one address to Cove
+    // and persists no setting.
+    if (!e || e.isTrusted !== true) return;
+    if (!menuSiteHost || excludePending) return;
+    excludePending = true;
+    // Captured before the round-trip: closing the menu clears it, and the
+    // background has to be told which offer the user actually accepted.
+    const expectHost = menuSiteHost;
+    excludeItem.textContent = "Opening confirmation…";
+    try {
+      const resp = await Promise.resolve(
+        browser.runtime.sendMessage({ type: "requestExcludeConfirmation", expectHost })
+      );
+      if (!resp || resp.ok !== true) {
+        dismissMenu(true);
+        setPillState("error", "exclude");
+        return;
+      }
+      // Nothing else. This request wrote no setting. A later confirmation-page
+      // mutation is what may take the pill away through storage.onChanged.
+      dismissMenu();
+    } catch {
+      dismissMenu(true);
+      setPillState("error", "exclude");
+    } finally {
+      excludePending = false;
+    }
   }
 
   async function onPillClick() {
@@ -802,6 +1046,7 @@
 
   function disablePill() {
     pillEnabled = false;
+    closeMenu();
     cancelHide();
     clearActiveVideoScans();
     for (const timer of streamRefreshTimers) clearTimeout(timer);

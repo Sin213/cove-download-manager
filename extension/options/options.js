@@ -35,6 +35,71 @@ function mediaPillAvailable() {
   }
 }
 
+// The settings the user has changed since this page loaded. This page is the
+// one settings writer that can sit open for hours, so what it sends on Save is
+// these fields and nothing else: the rest are whatever they have become since,
+// and sending the load-time snapshot back would erase anything that changed in
+// the meantime - an exclusion the pill added, the keyboard toggle, another tab.
+const dirty = new Set();
+
+// Which control carries which setting, how to read it, and how to show it.
+// Loading writes these controls directly and fires no events, so it never marks
+// anything dirty; only a user gesture does.
+const FIELD_SPECS = {
+  enabled: {
+    controls: [enabledCheckbox],
+    read: () => enabledCheckbox.checked,
+    show: (s) => { enabledCheckbox.checked = s.enabled !== false; },
+  },
+  mediaPillEnabled: {
+    controls: [mediaPillEnabledCheckbox],
+    read: () => mediaPillEnabledCheckbox.checked,
+    show: (s) => { mediaPillEnabledCheckbox.checked = s.mediaPillEnabled !== false; },
+  },
+  minSizeBytes: {
+    controls: [minSizeInput, minSizeUnit],
+    // A cleared input parses to NaN, which would silently disable the size
+    // filter (NaN comparisons are always false); treat it as 0.
+    read: () => (parseInt(minSizeInput.value, 10) || 0) * parseInt(minSizeUnit.value, 10),
+    show: (s) => {
+      const bytes = s.minSizeBytes || 0;
+      const unit = bytes >= 1073741824 && bytes % 1073741824 === 0 ? 1073741824
+        : bytes >= 1048576 && bytes % 1048576 === 0 ? 1048576 : 1024;
+      minSizeInput.value = unit === 1024 ? Math.round(bytes / 1024) : bytes / unit;
+      minSizeUnit.value = String(unit);
+    },
+  },
+  interceptExtensions: {
+    controls: [extensionsTextarea],
+    read: () => extensionsTextarea.value
+      .split(",").map((s) => s.trim().toLowerCase()).filter((s) => s.startsWith(".")),
+    show: (s) => { extensionsTextarea.value = (s.interceptExtensions || []).join(", "); },
+  },
+  excludedDomains: {
+    controls: [excludedDomainsTextarea],
+    read: () => excludedDomainsTextarea.value
+      .split("\n").map((s) => s.trim().toLowerCase()).filter(Boolean),
+    show: (s) => { excludedDomainsTextarea.value = (s.excludedDomains || []).join("\n"); },
+  },
+};
+const FIELDS = Object.keys(FIELD_SPECS);
+
+for (const field of FIELDS) {
+  for (const element of FIELD_SPECS[field].controls) {
+    // Both, because which one a control emits depends on the control: a
+    // textarea reports "input", a select reports "change", and a checkbox can
+    // report either.
+    for (const type of ["input", "change"]) {
+      element.addEventListener(type, () => { dirty.add(field); });
+    }
+  }
+}
+
+function flashStatus(text) {
+  saveStatus.textContent = text;
+  setTimeout(() => { saveStatus.textContent = ""; }, 2000);
+}
+
 async function loadSettings() {
   const s = await browser.runtime.sendMessage({ type: "getSettings" });
 
@@ -43,48 +108,56 @@ async function loadSettings() {
     if (section) section.hidden = true;
   }
 
-  enabledCheckbox.checked = s.enabled;
-  mediaPillEnabledCheckbox.checked = s.mediaPillEnabled !== false;
-  extensionsTextarea.value = (s.interceptExtensions || []).join(", ");
-  excludedDomainsTextarea.value = (s.excludedDomains || []).join("\n");
-
-  const bytes = s.minSizeBytes || 0;
-  if (bytes >= 1073741824 && bytes % 1073741824 === 0) {
-    minSizeInput.value = bytes / 1073741824;
-    minSizeUnit.value = "1073741824";
-  } else if (bytes >= 1048576 && bytes % 1048576 === 0) {
-    minSizeInput.value = bytes / 1048576;
-    minSizeUnit.value = "1048576";
-  } else {
-    minSizeInput.value = Math.round(bytes / 1024);
-    minSizeUnit.value = "1024";
-  }
+  for (const field of FIELDS) FIELD_SPECS[field].show(s || {});
 }
 
-saveBtn.addEventListener("click", async () => {
-  const newSettings = {
-    enabled: enabledCheckbox.checked,
-    mediaPillEnabled: mediaPillEnabledCheckbox.checked,
-    // A cleared input parses to NaN, which would silently disable the size
-    // filter (NaN comparisons are always false); treat it as 0.
-    minSizeBytes: (parseInt(minSizeInput.value, 10) || 0) * parseInt(minSizeUnit.value, 10),
-    interceptExtensions: extensionsTextarea.value
-      .split(",")
-      .map((s) => s.trim().toLowerCase())
-      .filter((s) => s.startsWith(".")),
-    excludedDomains: excludedDomainsTextarea.value
-      .split("\n")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean),
-  };
+// Settings this page is not editing follow the stored value while it sits open,
+// so an exclusion the pill just added is visible here rather than only after a
+// reload. A field the user has unsaved edits in is theirs until they save or
+// reload it: their typing is never replaced by someone else's write.
+browser.storage.onChanged.addListener((changes, area) => {
+  if (area !== "local" || !changes.settings) return;
+  const s = changes.settings.newValue || {};
+  for (const field of FIELDS) {
+    if (!dirty.has(field)) FIELD_SPECS[field].show(s);
+  }
+});
 
-  await browser.runtime.sendMessage({ type: "saveSettings", settings: newSettings });
-  saveStatus.textContent = "Saved";
-  setTimeout(() => { saveStatus.textContent = ""; }, 2000);
+saveBtn.addEventListener("click", async () => {
+  if (dirty.size === 0) {
+    flashStatus("Saved");
+    return;
+  }
+  const changes = {};
+  for (const field of dirty) changes[field] = FIELD_SPECS[field].read();
+
+  let result;
+  try {
+    result = await browser.runtime.sendMessage({ type: "updateSettings", changes });
+  } catch {
+    result = null;
+  }
+  if (!result || result.ok !== true) {
+    // Bounded and the same either way: the page cannot tell a quota failure
+    // from a background that went away, and neither is the user's to debug.
+    flashStatus("Could not save settings");
+    return;
+  }
+
+  // Cleared per field, and only where the control still holds what was sent.
+  // An edit made while this was in flight is newer than what landed, so that
+  // field stays pending and the next Save carries it.
+  for (const field of Object.keys(changes)) {
+    if (JSON.stringify(FIELD_SPECS[field].read()) === JSON.stringify(changes[field])) {
+      dirty.delete(field);
+    }
+  }
+  flashStatus("Saved");
 });
 
 resetExtensionsBtn.addEventListener("click", () => {
   extensionsTextarea.value = DEFAULT_EXTENSIONS.join(", ");
+  dirty.add("interceptExtensions");
 });
 
 testConnectionBtn.addEventListener("click", async () => {

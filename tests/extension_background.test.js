@@ -3,6 +3,8 @@ const fs = require("node:fs");
 const test = require("node:test");
 const vm = require("node:vm");
 
+const EXTENSION_ORIGIN = "chrome-extension://covetestextensionid/";
+
 function event() {
   const listeners = [];
   return {
@@ -36,20 +38,26 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          storedIntercepted = null, eraseThrows = false,
                          slowInterceptedIds = false,
                          cookieHook = null, settingsReadHook = null,
+                         settingsWriteHook = null,
                          worker = false, missingScripts = [],
                          installedMenus = new Map(), menuApi = "lenient" } = {}) {
+  let confirmationTokenSequence = 0;
   const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
-                  notifications: [], cookies: [] };
+                  notifications: [], cookies: [], settingsWrites: [], tabsCreated: [] };
   const events = {
     downloadCreated: event(),
     downloadChanged: event(),
     contextMenuClicked: event(),
     downloadErased: event(),
     message: event(),
+    // The keyboard shortcut is a settings writer, so a test has to be able to
+    // fire it rather than infer it.
+    command: event(),
     // A real recorded event, not a silent stub: the pill's whole lifecycle
     // hangs off this notification, so a test has to be able to fire it.
     storageChanged: event(),
   };
+  events.calls = calls;
   const browserDownloads = [];
   const quietEvent = () => event();
   // A real key/value store, so the diagnostics ring can be inspected the way
@@ -86,6 +94,21 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     },
     async set(obj) {
       if (breakStorage) throw new Error("QuotaExceededError");
+      // A settings write has to be visible to the next get("settings") and has
+      // to notify, which is what real storage does. Without that, code that
+      // merges onto a freshly read snapshot would re-read the original fixture
+      // forever and every lost-update case would pass for the wrong reason.
+      if ("settings" in obj) {
+        if (settingsWriteHook) await settingsWriteHook(obj.settings);
+        const oldValue = storedSettings;
+        storedSettings = obj.settings;
+        calls.settingsWrites.push(obj.settings);
+        Object.assign(store.data, obj);
+        events.storageChanged.emit(
+          { settings: { newValue: obj.settings, oldValue } }, "local",
+        );
+        return;
+      }
       Object.assign(store.data, obj);
     },
     async remove(key) { delete store.data[key]; },
@@ -96,7 +119,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       async setBadgeText({ text }) { badge.text.push(text); },
       async setBadgeBackgroundColor({ color }) { badge.colors.push(color); },
     },
-    commands: { onCommand: quietEvent() },
+    commands: { onCommand: events.command },
     contextMenus: {
       // Chrome keeps created items across service worker restarts and across
       // an extension update, and answers a second create() for the same id
@@ -181,6 +204,10 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     runtime: {
       lastError: null,
       getManifest: () => ({ version: "1.4.4" }),
+      // Extension pages are identified by their own origin, so the harness has
+      // to have one. A content script's sender.url is the page's address and
+      // never starts with this.
+      getURL: (path) => EXTENSION_ORIGIN + path,
       onInstalled: quietEvent(),
       onMessage: events.message,
       async sendNativeMessage(_host, message) {
@@ -194,6 +221,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onChanged: events.storageChanged,
     },
     tabs: {
+      async create(details) { calls.tabsCreated.push(details); return { id: 99, ...details }; },
       async query() { return tabs; },
       async sendMessage() {},
       onRemoved: quietEvent(),
@@ -209,6 +237,10 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
     },
     URL,
+    crypto: {
+      randomUUID: () => "123e4567-e89b-42d3-a456-" +
+        String(confirmationTokenSequence++).padStart(12, "0"),
+    },
     setTimeout,
     clearTimeout,
   });
@@ -267,8 +299,16 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       { settings: { newValue: next, oldValue } }, "local",
     );
   }
+  // A settings write this context is never told about. Real storage does not
+  // guarantee a change notification reaches the context that has to act next -
+  // it is why the pill's permission reads storage rather than the cached copy -
+  // so a cache that happens to be fresh must never be what a merge relies on.
+  function writeSettingsSilently(next) {
+    storedSettings = next;
+    store.data.settings = next;
+  }
   return { calls, events, browserDownloads, store, context, badge, installedMenus,
-           setSettings, readSettings: () => storedSettings };
+           setSettings, writeSettingsSilently, readSettings: () => storedSettings };
 }
 
 async function settle() {
@@ -3951,4 +3991,704 @@ test("the stream and page-url routes are not gated by the pill decision", async 
   const pageUrl = await sendToBackground(
     events, { type: "getMediaPageUrl" }, sender);
   assert.ok(pageUrl && typeof pageUrl.url === "string");
+});
+
+// ---------------------------------------------------------------------------
+// "Exclude this site" from the in-page pill (issue #16 A2).
+//
+// The pill offers one action that adds the site the user is actually on to the
+// excluded domains the options page already owns. Which site that is, is not
+// the pill's to decide: the page can embed any player and can put any address
+// in a message, so the only identity worth anything here is the top-level page
+// the browser itself recorded on sender.tab.url. These drive the real onMessage
+// listener for that reason - a helper tested on its own would prove nothing
+// about which url the listener actually hands it.
+// ---------------------------------------------------------------------------
+
+// One "which site am I on" request through the real listener.
+async function pillSiteHost(events, sender) {
+  let reply;
+  events.message.emit({ type: "getPillSiteHost" }, sender,
+                      (response) => { reply = response; });
+  await settle();
+  await settle();
+  return reply;
+}
+
+async function requestExclude(events, sender, expectHost, extra = {}) {
+  let reply;
+  events.message.emit(
+    { type: "requestExcludeConfirmation", expectHost, ...extra }, sender,
+    (response) => { reply = response; },
+  );
+  for (let i = 0; i < 6; i += 1) await settle();
+  if (!reply || reply.ok !== true) return { reply };
+  const opened = events.calls.tabsCreated.at(-1).url;
+  return { reply, token: opened.slice(opened.indexOf("#") + 1) };
+}
+
+async function confirmExclude(events, token) {
+  let reply;
+  events.message.emit(
+    { type: "confirmExcludeSite", token },
+    { id: "cove", url: EXTENSION_ORIGIN + "confirm-exclude.html" },
+    (response) => { reply = response; },
+  );
+  for (let i = 0; i < 6; i += 1) await settle();
+  return reply;
+}
+
+// One complete request + packaged-page confirmation through the real listener.
+function sendExclude(events, sender, expectHost, extra = {}) {
+  let reply;
+  (async () => {
+    const requested = await requestExclude(events, sender, expectHost, extra);
+    reply = requested.token
+      ? await confirmExclude(events, requested.token)
+      : requested.reply;
+  })();
+  return () => reply;
+}
+
+async function excludeSite(events, sender, expectHost, extra = {}) {
+  const read = sendExclude(events, sender, expectHost, extra);
+  for (let i = 0; i < 16; i += 1) await settle();
+  return read();
+}
+
+// Excluding from a page whose host is what the menu offered, which is the
+// ordinary case and the shape the rest of these vary from.
+async function excludeFrom(pageUrl, options = {}) {
+  const loaded = loadBackground({ settings: { excludedDomains: [], ...options.settings } });
+  await settle();
+  const sender = options.sender || pillSender(pageUrl);
+  const host = options.expectHost !== undefined
+    ? options.expectHost
+    : new URL(pageUrl).hostname;
+  const reply = await excludeSite(loaded.events, sender, host, options.extra);
+  return { ...loaded, reply, sender };
+}
+
+// Copied into this realm: a list the background wrote was built inside the vm,
+// and a strict deep comparison against a plain array otherwise fails on the
+// prototype rather than on the contents anyone cares about.
+function excludedNow(loaded) {
+  const stored = loaded.readSettings();
+  return [...((stored && stored.excludedDomains) || [])];
+}
+
+test("the pill's exclude action records the page the user is on", async () => {
+  const loaded = await excludeFrom("https://news.example.test/watch");
+  assert.equal(loaded.reply.ok, true);
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"]);
+});
+
+test("an embedded player excludes the page, not the frame that asked", async () => {
+  const sender = framedSender("https://news.example.test/watch",
+                              "https://player.vendor.test/embed");
+  const loaded = await excludeFrom("https://news.example.test/watch", { sender });
+  assert.equal(loaded.reply.ok, true);
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"],
+                   "the player's own host is not what the user excluded");
+});
+
+test("the media address never becomes the excluded domain", async () => {
+  // The message body is page-reachable. Carrying a media address in it must
+  // not move the exclusion onto the CDN.
+  const loaded = await excludeFrom("https://news.example.test/watch", {
+    extra: { url: "https://cdn.vendor.test/video.mp4",
+             pageUrl: "https://cdn.vendor.test/video.mp4" },
+  });
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"]);
+});
+
+test("a hostname supplied in the message body cannot choose the excluded site", async () => {
+  // expectHost is a confirmation token, never the authority. A body naming a
+  // site the sender is not on is a mismatch and is refused outright.
+  const loaded = await excludeFrom("https://news.example.test/watch", {
+    expectHost: "bank.example.test",
+  });
+  assert.equal(loaded.reply.ok, false);
+  assert.deepEqual(excludedNow(loaded), [],
+                   "a forged host excluded nothing at all");
+});
+
+test("a subdomain is excluded as itself, not reduced to its parent", async () => {
+  const loaded = await excludeFrom("https://deep.news.example.test/watch");
+  assert.deepEqual(excludedNow(loaded), ["deep.news.example.test"]);
+});
+
+for (const [name, pageUrl, host] of [
+  ["localhost", "http://localhost:8080/watch", "localhost"],
+  ["an IPv4 literal", "http://127.0.0.1:9000/watch", "127.0.0.1"],
+  ["an IPv6 literal", "http://[::1]:9000/watch", "[::1]"],
+  ["a punycode host", "https://xn--bcher-kva.example.test/watch",
+   "xn--bcher-kva.example.test"],
+]) {
+  test(name + " is a site the pill can exclude", async () => {
+    const loaded = await excludeFrom(pageUrl);
+    assert.equal(loaded.reply.ok, true);
+    assert.deepEqual(excludedNow(loaded), [host]);
+  });
+}
+
+test("a trailing-dot host is stored in the shape that suppresses that page", async () => {
+  // The parser keeps the trailing dot, and so does the matcher the pill's
+  // permission runs. Storing a prettier spelling would save a setting that
+  // never takes the pill away from the page it was saved on.
+  const pageUrl = "https://example.test./watch";
+  const loaded = await excludeFrom(pageUrl);
+  assert.equal(loaded.reply.ok, true);
+  const permission = await pillPermission(loaded.events, pageUrl);
+  assert.equal(permission.pillAllowed, false,
+               "the stored host is the one that matches the visited page");
+});
+
+for (const pageUrl of [
+  "about:blank",
+  "file:///home/user/clip.mp4",
+  "data:text/html,<video>",
+  "blob:https://example.test/9d1",
+  "moz-extension://abc/options.html",
+  "not a url at all",
+]) {
+  test(pageUrl.slice(0, 16) + " is not a site an exclusion can name", async () => {
+    const sender = pillSender(pageUrl);
+    const loaded = loadBackground({ settings: { excludedDomains: [] } });
+    await settle();
+    const host = await pillSiteHost(loaded.events, sender);
+    assert.equal(host.ok, false);
+    assert.equal(host.reason, "unsupported");
+    const reply = await excludeSite(loaded.events, sender, "example.test");
+    assert.equal(reply.ok, false);
+    assert.equal(reply.reason, "unsupported");
+    assert.deepEqual(excludedNow(loaded), []);
+  });
+}
+
+test("a sender the browser gave no tab for excludes nothing", async () => {
+  const loaded = loadBackground({ settings: { excludedDomains: [] } });
+  await settle();
+  const reply = await excludeSite(loaded.events, { url: "https://example.test/watch" },
+                                  "example.test");
+  assert.equal(reply.ok, false);
+  assert.deepEqual(excludedNow(loaded), []);
+});
+
+test("the menu is told the top-level host, not the frame's", async () => {
+  const loaded = loadBackground();
+  await settle();
+  const reply = await pillSiteHost(loaded.events,
+    framedSender("https://news.example.test/watch", "https://player.vendor.test/embed"));
+  assert.equal(reply.ok, true);
+  assert.equal(reply.host, "news.example.test");
+});
+
+test("a tab that navigated away is not excluded in the old page's place", async () => {
+  // The menu was opened on A. By the time the user picked the action the tab
+  // is on B, so the sender the browser hands this message names B. The offer
+  // the user accepted was about A, and B is not it.
+  const loaded = loadBackground({ settings: { excludedDomains: [] } });
+  await settle();
+  const reply = await excludeSite(loaded.events,
+                                  pillSender("https://other.example.test/watch"),
+                                  "news.example.test");
+  assert.equal(reply.ok, false);
+  assert.deepEqual(excludedNow(loaded), [],
+                   "neither the page the menu named nor the one it landed on");
+});
+
+test("a context that may not show a pill here may not write settings here", async () => {
+  // The frame is excluded, so A1 refuses it the pill. A refused frame must not
+  // still be able to add domains to the user's settings.
+  const loaded = loadBackground({
+    settings: { excludedDomains: ["player.vendor.test"] },
+  });
+  await settle();
+  const reply = await excludeSite(loaded.events,
+    framedSender("https://news.example.test/watch", "https://player.vendor.test/embed"),
+    "news.example.test");
+  assert.equal(reply.ok, false);
+  assert.deepEqual(excludedNow(loaded), ["player.vendor.test"]);
+});
+
+test("the pill toggle being off also refuses an exclusion", async () => {
+  const loaded = loadBackground({
+    settings: { excludedDomains: [], mediaPillEnabled: false },
+  });
+  await settle();
+  const reply = await excludeSite(loaded.events, pillSender("https://news.example.test/w"),
+                                  "news.example.test");
+  assert.equal(reply.ok, false);
+  assert.deepEqual(excludedNow(loaded), []);
+});
+
+// ---- Duplicates and coverage: the shipped matcher decides, not new logic ----
+
+test("excluding a site that is already excluded writes nothing", async () => {
+  const loaded = loadBackground({ settings: { excludedDomains: [] } });
+  await settle();
+  const pending = await requestExclude(loaded.events,
+    pillSender("https://news.example.test/watch"), "news.example.test");
+  loaded.writeSettingsSilently({ excludedDomains: ["news.example.test"] });
+  const reply = await confirmExclude(loaded.events, pending.token);
+  assert.equal(reply.ok, true);
+  assert.equal(reply.alreadyExcluded, true);
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"]);
+  assert.deepEqual(loaded.calls.settingsWrites, [],
+                   "an already-excluded site costs no storage write");
+});
+
+test("a parent already on the list covers the subdomain being excluded", async () => {
+  const loaded = loadBackground({ settings: { excludedDomains: [] } });
+  await settle();
+  const pending = await requestExclude(loaded.events,
+    pillSender("https://news.example.test/watch"), "news.example.test");
+  loaded.writeSettingsSilently({ excludedDomains: ["example.test"] });
+  const reply = await confirmExclude(loaded.events, pending.token);
+  assert.equal(reply.alreadyExcluded, true);
+  assert.deepEqual(excludedNow(loaded), ["example.test"],
+                   "no redundant child beside the parent that already covers it");
+});
+
+test("excluding the parent keeps the narrower entry the user already had", async () => {
+  const loaded = await excludeFrom("https://example.test/watch", {
+    settings: { excludedDomains: ["news.example.test"] },
+  });
+  assert.equal(loaded.reply.ok, true);
+  assert.deepEqual(excludedNow(loaded), ["news.example.test", "example.test"],
+                   "appended, and the child it now covers is not pruned");
+});
+
+test("an exclusion appends without reordering what was already there", async () => {
+  const loaded = await excludeFrom("https://new.example.test/watch", {
+    settings: { excludedDomains: ["zeta.test", "alpha.test", "m.test"] },
+  });
+  assert.deepEqual(excludedNow(loaded),
+                   ["zeta.test", "alpha.test", "m.test", "new.example.test"]);
+});
+
+test("an exclusion leaves every unrelated setting exactly as it was", async () => {
+  const loaded = await excludeFrom("https://news.example.test/watch", {
+    settings: {
+      enabled: false,
+      mediaPillEnabled: true,
+      minSizeBytes: 4242,
+      interceptExtensions: [".iso"],
+      excludedDomains: [],
+    },
+  });
+  const stored = loaded.readSettings();
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"],
+                   "precondition: the exclusion is what rewrote this object");
+  assert.equal(stored.enabled, false);
+  assert.equal(stored.minSizeBytes, 4242);
+  assert.deepEqual(stored.interceptExtensions, [".iso"]);
+  assert.equal(stored.mediaPillEnabled, true);
+});
+
+// ---- Overlapping writes ----
+
+test("two exclusions of the same site in flight together add it once", async () => {
+  const loaded = loadBackground({ settings: { excludedDomains: [] } });
+  await settle();
+  const sender = pillSender("https://news.example.test/watch");
+  sendExclude(loaded.events, sender, "news.example.test");
+  sendExclude(loaded.events, sender, "news.example.test");
+  for (let i = 0; i < 12; i += 1) await settle();
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"]);
+  assert.equal(loaded.calls.settingsWrites.length, 1,
+               "the second request found the first one's entry already there");
+});
+
+test("an ordinary settings save overlapping an exclusion loses neither", async () => {
+  // The options page writes the whole settings object. Held open across the
+  // exclusion, an unserialized write would save a snapshot taken before the
+  // exclusion existed and quietly drop it.
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let holdNext = true;
+  const loaded = loadBackground({
+    settings: { excludedDomains: [], minSizeBytes: 1 },
+    settingsWriteHook: async () => {
+      if (!holdNext) return;
+      holdNext = false;
+      await held;
+    },
+  });
+  await settle();
+
+  let saved;
+  // From the options page, which is the only context the general settings
+  // writer answers to, and carrying the one field the user changed there.
+  loaded.events.message.emit(
+    { type: "updateSettings", changes: { minSizeBytes: 999 } },
+    { id: "cove", url: EXTENSION_ORIGIN + "options/options.html" },
+    (r) => { saved = r; });
+  await settle();
+  sendExclude(loaded.events, pillSender("https://news.example.test/watch"),
+              "news.example.test");
+  for (let i = 0; i < 4; i += 1) await settle();
+
+  release();
+  for (let i = 0; i < 14; i += 1) await settle();
+
+  assert.equal(saved.ok, true);
+  const stored = loaded.readSettings();
+  assert.equal(stored.minSizeBytes, 999, "the save the user made survived");
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"],
+                   "and so did the exclusion that followed it");
+});
+
+test("an exclusion merges onto what storage holds, not what this context saw", async () => {
+  // The options page saved while this background was not listening, or the
+  // service worker was asleep and woke on defaults. Merging onto the cached
+  // copy would write back the settings the user had already replaced.
+  const loaded = loadBackground({
+    settings: { excludedDomains: [], minSizeBytes: 1 },
+  });
+  await settle();
+  loaded.writeSettingsSilently({ excludedDomains: ["other.test"], minSizeBytes: 777 });
+
+  const reply = await excludeSite(loaded.events, pillSender("https://news.example.test/w"),
+                                  "news.example.test");
+  assert.equal(reply.ok, true);
+  assert.deepEqual(excludedNow(loaded), ["other.test", "news.example.test"],
+                   "the entry the cache never saw is still there");
+  assert.equal(loaded.readSettings().minSizeBytes, 777,
+               "and so is the unrelated setting it never saw either");
+});
+
+test("a storage write that fails excludes nothing and says so", async () => {
+  const loaded = loadBackground({
+    settings: { excludedDomains: [] }, breakStorage: true,
+  });
+  await settle();
+  const reply = await excludeSite(loaded.events, pillSender("https://news.example.test/w"),
+                                  "news.example.test");
+  assert.equal(reply.ok, false);
+  assert.deepEqual(excludedNow(loaded), []);
+});
+
+test("a failed settings write does not stop the next one", async () => {
+  let failing = true;
+  const loaded = loadBackground({
+    settings: { excludedDomains: [] },
+    settingsWriteHook: async () => {
+      if (failing) throw new Error("QuotaExceededError");
+    },
+  });
+  await settle();
+  const sender = pillSender("https://news.example.test/watch");
+  const first = await excludeSite(loaded.events, sender, "news.example.test");
+  assert.equal(first.ok, false);
+
+  failing = false;
+  const second = await excludeSite(loaded.events, sender, "news.example.test");
+  assert.equal(second.ok, true, "the chain still runs work behind a rejection");
+  assert.deepEqual(excludedNow(loaded), ["news.example.test"]);
+});
+
+test("a successful exclusion is what takes the pill away", async () => {
+  // Not a second local rule: the setting it wrote is the same one A1 already
+  // reads, so the very next permission question answers no.
+  const pageUrl = "https://news.example.test/watch";
+  const loaded = await excludeFrom(pageUrl);
+  const before = loaded.reply;
+  assert.equal(before.ok, true);
+  const permission = await pillPermission(loaded.events, pageUrl);
+  assert.equal(permission.pillAllowed, false);
+});
+
+// ---- The options page against the real background ----
+
+// Settings are one stored object, and the options page is the one writer that
+// holds a snapshot of it open for as long as the user leaves the tab there.
+// These load options.js from source against a document built from options.html
+// and send its messages to the real background listener: nothing in between is
+// modelled, so a save that loses a setting loses it here the way it would in
+// the browser.
+function optionsElement(id) {
+  return {
+    id, value: "", checked: false, textContent: "", hidden: false,
+    listeners: {},
+    addEventListener(type, fn) {
+      (this.listeners[type] = this.listeners[type] || []).push(fn);
+    },
+    async fire(type) {
+      for (const fn of this.listeners[type] || []) await fn({ target: this });
+    },
+  };
+}
+
+// Built from the shipped markup rather than hand-written, so an options page
+// that stops shipping a control fails here instead of finding a stub the
+// harness kindly created for it.
+const OPTIONS_IDS = ["enabled", "media-pill-enabled", "min-size", "min-size-unit",
+                     "extensions", "excluded-domains", "reset-extensions",
+                     "test-connection", "test-result", "save", "save-status",
+                     "media-pill-section"];
+
+function optionsDocument() {
+  const html = fs.readFileSync("extension/options/options.html", "utf8");
+  const nodes = new Map();
+  for (const id of OPTIONS_IDS) {
+    assert.ok(html.includes(`id="${id}"`), `options.html no longer ships #${id}`);
+    nodes.set(id, optionsElement(id));
+  }
+  return { getElementById: (id) => nodes.get(id) || null };
+}
+
+function loadOptions(loaded) {
+  const document = optionsDocument();
+  const sent = [];
+  const timeouts = [];
+  const sender = { id: "cove", url: EXTENSION_ORIGIN + "options/options.html" };
+  const context = vm.createContext({
+    document,
+    console: { log() {}, error() {} },
+    setTimeout(fn, ms) { timeouts.push({ fn, ms }); return timeouts.length; },
+    clearTimeout() {},
+    globalThis: undefined,
+  });
+  context.globalThis = context;
+  const browser = {
+    runtime: {
+      getManifest: () => ({ content_scripts: [{}] }),
+      sendMessage(message) {
+        sent.push(message);
+        return new Promise((resolve, reject) => {
+          const replies = loaded.events.message.emit(message, sender, resolve);
+          if (!replies.some((value) => value === true)) resolve(undefined);
+        });
+      },
+    },
+    storage: {
+      onChanged: {
+        addListener: (fn) => loaded.events.storageChanged.addListener(fn),
+      },
+    },
+  };
+  context.browser = browser;
+  context.chrome = browser;
+  vm.runInContext(fs.readFileSync("extension/options/options.js", "utf8"),
+                  context, { filename: "extension/options/options.js" });
+  return { sent, timeouts, sender, el: (id) => document.getElementById(id) };
+}
+
+const MB = 1048576;
+const BASE_SETTINGS = {
+  enabled: true,
+  mediaPillEnabled: true,
+  minSizeBytes: MB,
+  interceptExtensions: [".zip"],
+  excludedDomains: [],
+};
+
+async function openOptionsPage(settings = {}) {
+  const loaded = loadBackground({ settings: { ...BASE_SETTINGS, ...settings } });
+  await settle();
+  const page = loadOptions(loaded);
+  await settle();
+  return { loaded, page };
+}
+
+// A save is a message round trip plus a queued write plus a storage
+// notification, so nothing about it is decided in one turn.
+async function saveOptions(page) {
+  await page.el("save").fire("click");
+  for (let i = 0; i < 6; i += 1) await settle();
+}
+
+// S1 - the finding. The page's snapshot of excludedDomains is older than what
+// is stored, and the user changes something else entirely.
+test("a stale options page saving one field does not erase a newer exclusion",
+     async () => {
+  const { loaded, page } = await openOptionsPage();
+  // Silently: a merge that relies on having been notified is not a merge, and
+  // real storage makes no such promise to a context that is about to write.
+  loaded.writeSettingsSilently({ ...BASE_SETTINGS, excludedDomains: ["example.test"] });
+
+  page.el("min-size").value = "5";
+  await page.el("min-size").fire("input");
+  await saveOptions(page);
+
+  assert.deepEqual(excludedNow(loaded), ["example.test"],
+                   "a save that did not touch excluded domains erased one");
+  assert.equal(loaded.readSettings().minSizeBytes, 5 * MB,
+               "and the field the user did change was still written");
+});
+
+test("a stale options page saves nothing at all when the user changed nothing",
+     async () => {
+  const { loaded, page } = await openOptionsPage();
+  loaded.writeSettingsSilently({ ...BASE_SETTINGS, excludedDomains: ["example.test"] });
+  await saveOptions(page);
+  assert.deepEqual(excludedNow(loaded), ["example.test"]);
+});
+
+// S2 - the keyboard shortcut is the other whole-object writer.
+test("the keyboard toggle does not erase an exclusion it never saw", async () => {
+  const loaded = loadBackground({ settings: { ...BASE_SETTINGS } });
+  await settle();
+  loaded.writeSettingsSilently({ ...BASE_SETTINGS, excludedDomains: ["example.test"] });
+
+  loaded.events.command.emit("toggle-intercept");
+  for (let i = 0; i < 8; i += 1) await settle();
+
+  assert.deepEqual(excludedNow(loaded), ["example.test"]);
+  assert.equal(loaded.readSettings().enabled, false, "and the toggle still toggled");
+});
+
+// S3 - two options pages opened from the same snapshot, editing different things.
+test("two options pages editing different fields both persist", async () => {
+  const { loaded, page: first } = await openOptionsPage();
+  const second = loadOptions(loaded);
+  await settle();
+
+  first.el("enabled").checked = false;
+  await first.el("enabled").fire("change");
+  second.el("min-size").value = "7";
+  await second.el("min-size").fire("input");
+
+  await saveOptions(first);
+  await saveOptions(second);
+
+  assert.equal(loaded.readSettings().enabled, false);
+  assert.equal(loaded.readSettings().minSizeBytes, 7 * MB);
+});
+
+// S4 - both pages deliberately changed the SAME field. No merge can satisfy
+// both, and the bounded rule is that the last save committed for that field
+// wins. What is being pinned here is that it is only that field.
+test("two options pages editing the same field end on the last one saved",
+     async () => {
+  const { loaded, page: first } = await openOptionsPage({ enabled: true });
+  const second = loadOptions(loaded);
+  await settle();
+  loaded.writeSettingsSilently({ ...BASE_SETTINGS, excludedDomains: ["example.test"] });
+
+  first.el("enabled").checked = false;
+  await first.el("enabled").fire("change");
+  second.el("enabled").checked = true;
+  await second.el("enabled").fire("change");
+
+  await saveOptions(first);
+  await saveOptions(second);
+
+  assert.equal(loaded.readSettings().enabled, true, "the later save for that field won");
+  assert.deepEqual(excludedNow(loaded), ["example.test"],
+                   "and neither of them touched anything else");
+});
+
+// S5 - an open page that is not being edited follows the stored value.
+test("an external settings change updates an options control nobody is editing",
+     async () => {
+  const { loaded, page } = await openOptionsPage();
+  loaded.setSettings({ ...BASE_SETTINGS, excludedDomains: ["example.test"] });
+  await settle();
+  assert.equal(page.el("excluded-domains").value, "example.test");
+});
+
+// S6 - and stops at the edge of what the user has typed.
+test("an external settings change does not overwrite an unsaved local edit",
+     async () => {
+  const { loaded, page } = await openOptionsPage();
+  page.el("excluded-domains").value = "typed.test";
+  await page.el("excluded-domains").fire("input");
+
+  loaded.setSettings({ ...BASE_SETTINGS, excludedDomains: ["example.test"] });
+  await settle();
+
+  assert.equal(page.el("excluded-domains").value, "typed.test");
+  assert.equal(page.el("enabled").checked, true, "the untouched control still followed");
+});
+
+test("an edit made while a save is in flight is not lost", async () => {
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const loaded = loadBackground({
+    settings: { ...BASE_SETTINGS },
+    settingsWriteHook: () => held,
+  });
+  await settle();
+  const page = loadOptions(loaded);
+  await settle();
+
+  page.el("min-size").value = "5";
+  await page.el("min-size").fire("input");
+  const saving = saveOptions(page);
+  await settle();
+  page.el("min-size").value = "9";
+  await page.el("min-size").fire("input");
+  release();
+  await saving;
+
+  assert.equal(loaded.readSettings().minSizeBytes, 5 * MB, "the submitted value landed");
+  await saveOptions(page);
+  assert.equal(loaded.readSettings().minSizeBytes, 9 * MB,
+               "and the newer edit was still pending, not discarded as saved");
+});
+
+test("a failed settings write is reported and the next save still works",
+     async () => {
+  let failNext = true;
+  const loaded = loadBackground({
+    settings: { ...BASE_SETTINGS },
+    settingsWriteHook: () => {
+      if (!failNext) return;
+      failNext = false;
+      throw new Error("QuotaExceededError");
+    },
+  });
+  await settle();
+  const page = loadOptions(loaded);
+  await settle();
+
+  page.el("min-size").value = "5";
+  await page.el("min-size").fire("input");
+  await saveOptions(page);
+
+  assert.notEqual(page.el("save-status").textContent, "Saved",
+                  "a write that failed must not report success");
+  assert.equal(loaded.readSettings().minSizeBytes, MB, "and nothing was committed");
+
+  await saveOptions(page);
+  assert.equal(loaded.readSettings().minSizeBytes, 5 * MB,
+               "the rejected write did not poison the settings chain");
+});
+
+test("a content script cannot update settings through the options message",
+     async () => {
+  const loaded = loadBackground({ settings: { ...BASE_SETTINGS } });
+  await settle();
+  let reply;
+  loaded.events.message.emit(
+    { type: "updateSettings", changes: { excludedDomains: ["evil.test"], enabled: false } },
+    pillSender("https://evil.test/watch"),
+    (response) => { reply = response; },
+  );
+  for (let i = 0; i < 6; i += 1) await settle();
+
+  assert.notEqual(reply && reply.ok, true);
+  assert.deepEqual(excludedNow(loaded), []);
+  assert.equal(loaded.readSettings().enabled, true);
+});
+
+test("the options page cannot write a settings field it does not own", async () => {
+  const loaded = loadBackground({ settings: { ...BASE_SETTINGS } });
+  await settle();
+  const page = loadOptions(loaded);
+  await settle();
+  let reply;
+  loaded.events.message.emit(
+    { type: "updateSettings", changes: { enabled: false, nativeHost: "attacker" } },
+    page.sender,
+    (response) => { reply = response; },
+  );
+  for (let i = 0; i < 6; i += 1) await settle();
+
+  assert.equal(reply && reply.ok, true);
+  assert.equal(loaded.readSettings().enabled, false);
+  assert.equal("nativeHost" in loaded.readSettings(), false);
 });
