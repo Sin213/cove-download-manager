@@ -754,42 +754,6 @@ the official `yt-dlp.exe` automatically when it is not already under
 
 ---
 
-## Project layout
-
-```
-cove-download-manager/
-├── cove/                        # Python package
-│   ├── app.py                   #   bootstrap: app + daemon + window wiring
-│   ├── aria2.py                 #   aria2c lifecycle + JSON-RPC client
-│   ├── clipboard.py             #   URL extractor for "Add from clipboard"
-│   ├── config.py                #   JSON-backed Settings + ScheduleWindow
-│   ├── db.py                    #   SQLite schema + connection helper
-│   ├── debrid.py                #   Real-Debrid / AllDebrid link resolution
-│   ├── dialogs.py               #   Add / Schedule / Settings / batch picker
-│   ├── entry.py                 #   CLI entry point
-│   ├── hls.py                   #   ffmpeg-backed HLS (M3U8) downloader
-│   ├── main_window.py           #   QMainWindow + table + side panel
-│   ├── native_host_install.py   #   auto-register native messaging hosts
-│   ├── native_messaging.py      #   native messaging host for browser extension
-│   ├── portable.py              #   portable-mode data directory detection
-│   ├── queue.py                 #   QueueManager + DownloadTask
-│   ├── scheduler.py             #   time-window allowed/not-allowed gate
-│   ├── system_open.py           #   AppImage env scrubbing for xdg-open children
-│   ├── theme.py                 #   cove design tokens + QSS, light/dark themes
-│   ├── updater.py               #   GitHub releases + SHA-256 verifier
-│   └── widgets.py               #   Titlebar, BrandBadge, StatsStrip, ...
-├── extension/                   # Firefox WebExtension (native messaging)
-├── packaging/                   # PyInstaller launcher + Inno Setup script
-├── scripts/                     # build-deb.sh, build-windows-wine.sh
-├── docs/screenshot.png
-├── cove_icon.png                # shared cove skull badge
-├── build.sh                     # AppImage build (python-appimage)
-├── pyproject.toml
-└── requirements.txt
-```
-
----
-
 ## License
 
 MIT.
