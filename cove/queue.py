@@ -19,7 +19,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
-from PySide6.QtCore import QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal, Slot
 
 from . import db, debrid, dedup, diagnostics, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, Aria2RpcError, bittorrent_enabled
@@ -29,9 +29,11 @@ from .output_paths import (
     MissingEngineOutputError,
     OutputPathError,
     WorkDirectory,
+    adopt_work_directory,
     cleanup_work_directory,
     create_work_directory,
     publish_output,
+    validate_engine_output,
     validate_public_filename,
 )
 from .torrent import TorrentError
@@ -621,6 +623,8 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         created_at=row["created_at"],
         segments=row["segments"],
         backend=_row_get(row, "backend", "aria2"),
+        work_dir=_row_get(row, "work_dir", "") or "",
+        output_path=_row_get(row, "output_path", "") or "",
         cookies=_clean_header(_row_get(row, "cookies", "")),
         referrer=_clean_header(_row_get(row, "referrer", "")),
         user_agent=_clean_header(_row_get(row, "user_agent", "")),
@@ -662,6 +666,11 @@ class DownloadTask:
     num_pieces: int = 0
     last_status_at: float = 0.0
     backend: str = "aria2"
+    work_dir: str = ""
+    output_path: str = ""
+    output_identity: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    # Admission filename, before a probe/backend fills display metadata.
+    aria2_filename: Optional[str] = field(default=None, init=False, repr=False)
     # Browser-supplied headers, used by the ffmpeg/yt-dlp backends for
     # authenticated or anti-hotlink media. Empty for plain aria2 tasks
     # (the direct extension -> aria2 path passes headers via RPC instead).
@@ -845,6 +854,10 @@ class QueueManager(QObject):
         # and dropped from the DB; we keep it in self.tasks so the on_done
         # callback can still find the gid and dispatch a clean shutdown.
         self._pending_launch: dict[int, dict] = {}
+        # Publication owns the staging inode until its callback settles. Removal
+        # is deferred here rather than racing a filesystem worker.
+        self._publishing: dict[int, dict] = {}
+        self._publication_shutdown = False
         # Tasks whose cancellation aria2 has not confirmed yet. Maps tid ->
         # the removal intent captured when the user asked:
         #   {"gid": str, "path": str|None, "clean": bool, "private_run": bool}
@@ -946,6 +959,9 @@ class QueueManager(QObject):
         self._purge_legacy_drop_dir()
         db.init()
         self._load_persisted()
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._drain_publications)
 
     # ---- persistence --------------------------------------------------
 
@@ -1174,7 +1190,8 @@ class QueueManager(QObject):
                 UPDATE downloads
                 SET filename=?, status=?, gid=?, total_bytes=?, completed_bytes=?,
                     error=?, finished_at=?, segments=?, out_dir=?,
-                    debrid_route=?, debrid_item_id=?, debrid_file_id=?
+                    debrid_route=?, debrid_item_id=?, debrid_file_id=?,
+                    work_dir=?, output_path=?
                 WHERE id=?
                 """,
                 (
@@ -1190,6 +1207,8 @@ class QueueManager(QObject):
                     t.debrid_route,
                     t.debrid_item_id,
                     t.debrid_file_id,
+                    t.work_dir,
+                    t.output_path,
                     t.id,
                 ),
             )
@@ -1733,7 +1752,7 @@ class QueueManager(QObject):
         """
         if reported:
             try:
-                return publish_output(work, reported, requested)
+                return publish_output(work, reported, requested, return_identity=True)
             except MissingEngineOutputError as missing:
                 rejection = missing
         else:
@@ -1743,7 +1762,7 @@ class QueueManager(QObject):
             raise rejection
         published_suffix = os.path.splitext(candidates[0])[1]
         fallback = os.path.splitext(requested)[0] + published_suffix
-        return publish_output(work, candidates[0], validate_public_filename(fallback))
+        return publish_output(work, candidates[0], validate_public_filename(fallback), return_identity=True)
 
     def _debrid_credential_facts(self) -> dict:
         """Configured-or-not, as booleans. Never the credential itself."""
@@ -3472,22 +3491,29 @@ class QueueManager(QObject):
             self._remove_torrent(t, delete_file)
             return
 
+        publishing = self._publishing.get(tid)
+        if publishing is not None:
+            # Keep the row and ownership until the worker can no longer write.
+            publishing["remove"] = (delete_file, keep_incomplete)
+            return
+
         # Special case: add_uri RPC is in flight. We can't ask aria2 to
         # remove a gid we don't have yet, so keep the task alive in
         # self.tasks but hide it from the UI/DB. on_done will dispatch the
         # actual remove once it learns the gid. Only aria2 tasks qualify:
         # active ffmpeg/yt-dlp tasks never get a gid and must instead go
         # through the normal path that terminates their process.
-        if t.status == "active" and not t.gid and t.backend == "aria2":
+        if tid in self._pending_launch and not t.gid and t.backend == "aria2":
             # Resolve the cleanup decision now, while the task is still here to
-            # ask; on_done only sees the tombstone. A task in this state has no
-            # private engine run by definition.
+            # ask; on_done only sees the tombstone. Staging was persisted before
+            # the add RPC, so capture its validated identity now.
             self._pending_launch.setdefault(tid, {}).update(
                 {
                     "remove": True,
                     "delete_file": self._cleans_incomplete_data(
                         t, delete_file, keep_incomplete, private_run=False
                     ),
+                    "work": self._adopt_task_work(t),
                 }
             )
             with db.connect() as conn:
@@ -3511,19 +3537,19 @@ class QueueManager(QObject):
             private_run = True
             self._retire_extractor_run(tid)
         gid = t.gid
-        path = None if private_run else self._task_path(t)
+        cleanup = None if private_run else self._owned_cleanup(t)
         clean = self._cleans_incomplete_data(t, delete_file, keep_incomplete, private_run)
 
         if not gid:
             # Nothing to cancel: there is no backend transfer to outlive us.
-            self._finish_removal(tid, path if clean else None)
+            self._finish_removal(tid, cleanup if clean else None)
             return
 
         # A gid means aria2 may still be writing. Until it answers, the task
         # is still real: it stays visible, keeps its gid mapping and keeps
         # occupying a concurrency slot. Deleting files here would race aria2
         # into recreating them.
-        self._removing[tid] = {"gid": gid, "path": path, "clean": clean}
+        self._removing[tid] = {"gid": gid, "clean": clean}
         # The row does have to record that it is on its way out, though. Before
         # this was two-phase the delete was synchronous, so a crash could never
         # resurrect a removed download; leaving the row untouched until aria2
@@ -3537,7 +3563,7 @@ class QueueManager(QObject):
         def _confirmed(*_args):
             # Ordering below is load-bearing: aria2 has forgotten the gid, so
             # the payload and control file can no longer be recreated.
-            self._finish_removal(tid, path if clean else None)
+            self._finish_removal(tid, cleanup if clean else None)
 
         def _refused(*args):
             self.error.emit(*args)
@@ -3557,7 +3583,7 @@ class QueueManager(QObject):
             return True
         return bool(self._pending_launch.get(tid, {}).get("remove"))
 
-    def _finish_removal(self, tid: int, unlink_path: str | None) -> None:
+    def _finish_removal(self, tid: int, cleanup) -> None:
         """Let go of a task aria2 has confirmed it no longer owns."""
         self._removing.pop(tid, None)
         self.tasks.pop(tid, None)
@@ -3568,8 +3594,8 @@ class QueueManager(QObject):
         self._cmd_queued.pop(tid, None)
         with db.connect() as conn:
             conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
-        if unlink_path:
-            self._make_unlinker(unlink_path)()
+        if cleanup:
+            cleanup()
         self.task_removed.emit(tid)
         self._maybe_start_next()
 
@@ -4279,7 +4305,7 @@ class QueueManager(QObject):
                 return
             if exit_code == 0:
                 try:
-                    published = publish_output(work, output_path, requested)
+                    published, identity = publish_output(work, output_path, requested, return_identity=True)
                 except (OSError, OutputPathError) as exc:
                     self._cleanup_engine_work(work)
                     t.status = "error"
@@ -4287,6 +4313,8 @@ class QueueManager(QObject):
                     t.finished_at = time.time()
                 else:
                     t.filename = published.name
+                    t.output_path = str(published)
+                    t.output_identity = identity
                     t.status = "completed"
                     t.finished_at = time.time()
                     t.error = None
@@ -4443,7 +4471,7 @@ class QueueManager(QObject):
                            task_id=t.id, engine="yt-dlp",
                            reported=bool(reported))
                 try:
-                    published = self._publish_extractor_output(work, reported, requested)
+                    published, identity = self._publish_extractor_output(work, reported, requested)
                 except (OSError, OutputPathError) as exc:
                     self._diag_engine_work_shape(t, work, reported)
                     self._diag_engine_output_rejected(t, reported, work, exc)
@@ -4454,6 +4482,8 @@ class QueueManager(QObject):
                     self._diag_task_failed(t, "extractor_publish_failed")
                 else:
                     t.filename = published.name
+                    t.output_path = str(published)
+                    t.output_identity = identity
                     t.status = "completed"
                     t.finished_at = time.time()
                     t.total_bytes = max(t.total_bytes, 1000)
@@ -4506,6 +4536,8 @@ class QueueManager(QObject):
         proc.start(cmd[0], cmd[1:])
 
     def _launch(self, t: DownloadTask) -> None:
+        if t.id in self._publishing:
+            return
         t.status = "active"
         t.error = None
         # Every fresh attempt - a retry, a force-start, a resume that has to
@@ -4574,6 +4606,16 @@ class QueueManager(QObject):
             self.task_changed.emit(t.id)
             self._maybe_start_next()
             return
+        try:
+            work = self._prepare_aria2_work(t)
+        except (OutputPathError, OSError) as exc:
+            t.status = "error"
+            t.error = str(exc)
+            self._persist(t)
+            self.task_changed.emit(t.id)
+            self._maybe_start_next()
+            return
+        t.aria2_filename = t.filename
         self._pending_launch[t.id] = {}
 
         def on_done(gid: str, tid: int = t.id) -> None:
@@ -4586,17 +4628,17 @@ class QueueManager(QObject):
             # Deferred remove wins over deferred pause: the user said
             # "drop this", so do that and don't bother pausing first.
             if pending.get("remove"):
-                # Best-effort file cleanup: the filename may not be known yet
-                # (set by the first status poll, which we skipped), in which
-                # case the unlinker is a no-op. Unlink only after aria2 drops
-                # the gid so it can't recreate the partial/.aria2 files.
-                path = self._task_path(tt) if tt else None
-                unlink = self._make_unlinker(path) if pending.get("delete_file") else None
+                # Only the captured private directory can be cleaned, and only
+                # after confirmed cancellation. Failure grants no authority.
+                owned_work = pending.get("work")
+                cleanup = (
+                    lambda: self._cleanup_engine_work(owned_work)
+                ) if owned_work and pending.get("delete_file") else None
                 self._spawn(
                     self.rpc.remove,
                     gid,
-                    on_done=(lambda *_: unlink()) if unlink else None,
-                    on_fail=(lambda *_: unlink()) if unlink else None,
+                    on_done=(lambda *_: cleanup()) if cleanup else None,
+                    on_fail=lambda *_: None,
                 )
                 # Pop the still-tracked task so the polling loop forgets it.
                 self.tasks.pop(tid, None)
@@ -4675,7 +4717,7 @@ class QueueManager(QObject):
             self._spawn(
                 self.rpc.add_uri,
                 [t.url],
-                t.out_dir,
+                str(work.path),
                 t.connections,
                 t.speed_limit_kbps,
                 t.filename,
@@ -4818,7 +4860,12 @@ class QueueManager(QObject):
         return result.download
 
     def _probe_and_add(self, t: DownloadTask) -> str:
+        # Launch prepared/persisted staging on the main thread. The probe may
+        # only revalidate that reference, never create directories or write DB.
+        work = adopt_work_directory(t.out_dir, t.work_dir)
         target = self._resolve_debrid(t)
+        requested = t.filename  # Resolution can supply the admission filename.
+        t.aria2_filename = requested
         probed = False
         supports_range = False
         content_length = 0
@@ -4846,8 +4893,8 @@ class QueueManager(QObject):
         if content_length > 0 and t.total_bytes <= 0:
             t.total_bytes = content_length
         gid = self.rpc.add_uri(
-            [target], t.out_dir, segments,
-            t.speed_limit_kbps, t.filename,
+            [target], str(work.path), segments,
+            t.speed_limit_kbps, requested,
         )
         # Runs on the probe worker thread; DiagLogger.emit is thread safe.
         # Host class and segment count only - never the URL handed to aria2.
@@ -4931,7 +4978,7 @@ class QueueManager(QObject):
             # so the older snapshot can land last and walk the task's byte
             # count backwards. Ordering two concurrent answers after the fact
             # is guesswork; not making the second call is not.
-            if t.id in self._removing or t.id in self._polling:
+            if t.id in self._removing or t.id in self._polling or t.id in self._publishing:
                 continue
             self._polling.add(t.id)
             self._spawn(
@@ -4965,7 +5012,7 @@ class QueueManager(QObject):
         t = self.tasks.get(tid)
         if not t:
             return
-        if tid in self._removing:
+        if tid in self._removing or tid in self._publishing:
             # Cancellation is already in flight. Completing, failing or
             # cleaning up here would act on a task that is on its way out.
             return
@@ -4998,10 +5045,21 @@ class QueueManager(QObject):
             path = files[0].get("path") or ""
             if path:
                 from pathlib import Path
-                t.filename = Path(path).name
+                work = self._adopt_task_work(t)
+                if work:
+                    try:
+                        t.filename = validate_public_filename(validate_engine_output(work, path).name)
+                    except (OutputPathError, OSError):
+                        pass
+                elif not t.work_dir:
+                    # External rows remain display-only, with no ownership.
+                    t.filename = Path(path).name
         a2_status = status.get("status")
         if a2_status == "complete":
             if t.status == "completed":
+                return
+            if not is_torrent and t.work_dir:
+                self._publish_aria2_output(t, files[0].get("path", "") if files else "")
                 return
             t.status = "completed"
             t.finished_at = time.time()
@@ -5036,7 +5094,136 @@ class QueueManager(QObject):
             self.task_changed.emit(tid)
 
     def _task_path(self, t: DownloadTask):
+        # Display/duplicate routing only. NEVER removal authority.
         if not t.filename:
             return None
         from pathlib import Path
         return Path(t.out_dir) / t.filename
+
+    def _adopt_task_work(self, t: DownloadTask) -> WorkDirectory | None:
+        if not t.work_dir:
+            return None
+        try:
+            return adopt_work_directory(t.out_dir, t.work_dir)
+        except (OutputPathError, OSError):
+            return None
+
+    def _prepare_aria2_work(self, t: DownloadTask) -> WorkDirectory:
+        work = self._adopt_task_work(t)
+        if work is None:
+            os.makedirs(t.out_dir, exist_ok=True)
+            work = create_work_directory(t.out_dir)
+            t.work_dir = str(work.path)
+        self._persist(t)  # Durable BEFORE add_uri, including probe admission.
+        return work
+
+    def _owned_cleanup(self, t: DownloadTask):
+        work = self._adopt_task_work(t)
+        if work:
+            return lambda: self._cleanup_engine_work(work)
+        # A requested name and an engine path are never publication evidence.
+        if not t.output_path or t.output_identity is None:
+            return None
+        from pathlib import Path
+        path = Path(t.output_path)
+        destination, identity = t.out_dir, t.output_identity
+
+        def cleanup():
+            try:
+                root = Path(destination).resolve(strict=True)
+                if path.parent != root:
+                    return  # Publications are direct children of the resolved destination.
+                if (os.unlink in os.supports_dir_fd and os.stat in os.supports_dir_fd
+                        and os.stat in os.supports_follow_symlinks
+                        and hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")):
+                    expected = root.stat()
+                    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        pinned = os.fstat(fd)
+                        if (pinned.st_dev, pinned.st_ino) != (expected.st_dev, expected.st_ino):
+                            return
+                        current = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+                        if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+                            # Pinning prevents ancestor redirection; a leaf swap
+                            # between this stat and unlink remains a POSIX race.
+                            os.unlink(path.name, dir_fd=fd)
+                    finally:
+                        os.close(fd)
+                elif _within(destination, str(path)):
+                    # Platforms without dir_fd retain pathname/ancestor races.
+                    current = path.lstat()
+                    if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+                        path.unlink()
+            except OSError:
+                pass
+        return cleanup
+
+    def _publish_aria2_output(self, t: DownloadTask, reported: str) -> None:
+        tid, gid = t.id, t.gid
+        flight = {"done": threading.Event()}
+        self._publishing[tid] = flight
+        destination, work_path = t.out_dir, t.work_dir
+        requested = t.aria2_filename
+
+        def publish():
+            # Filesystem work only. No task state or Qt objects on this worker.
+            try:
+                work = adopt_work_directory(destination, work_path)
+                source = validate_engine_output(work, reported)
+                flight["result"] = publish_output(work, source, requested or source.name,
+                                                 allow_copy=True, return_identity=True)
+                return flight["result"]
+            except Exception as exc:
+                flight["error"] = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                flight["done"].set()
+
+        def settle(published=None, error=None):
+            if self._publishing.get(tid) is not flight:
+                return
+            self._publishing.pop(tid, None)
+            if self.tasks.get(tid) is not t or tid in self._removing:
+                return
+            if error is None:
+                published, t.output_identity = published
+                t.output_path = str(published)
+                t.work_dir = ""
+                t.filename = published.name
+                t.status = "completed"
+                t.error = None
+                self._diag("aria2", "final_success", "INFO", task_id=tid, gid=gid)
+                self._diag("queue", "task_completed", "INFO", task_id=tid, backend=t.backend)
+            else:
+                t.status = "error"
+                t.error = error
+                self._diag_task_failed(t, "aria2_error")
+            t.finished_at = time.time()
+            t.clear_debrid()
+            self._persist(t)
+            self.task_changed.emit(tid)
+            if "remove" in flight:
+                delete, keep = flight["remove"]
+                if self._publication_shutdown:
+                    # Recover cancellation next launch; quit grants no deletion.
+                    self._removing[tid] = {"gid": t.gid, "clean": False}
+                    self._persist(t)
+                else:
+                    self.remove(tid, delete_file=delete, keep_incomplete=keep)
+            if not self._publication_shutdown:
+                self._maybe_start_next()
+
+        flight["settle"] = settle
+        self._spawn(publish, on_done=lambda path: settle(published=path),
+                    on_fail=lambda msg: settle(error=msg))
+
+    @Slot()
+    def _drain_publications(self) -> None:
+        # Main-thread quit drain: two minutes TOTAL, without event processing.
+        # A timed-out worker remains live; a later commit can still miss durable
+        # settlement. Staging survives only until that worker actually commits.
+        self._publication_shutdown = True
+        deadline = time.monotonic() + 120
+        for flight in list(self._publishing.values()):
+            if flight["done"].wait(max(0, deadline - time.monotonic())):
+                flight["settle"](published=flight.get("result"), error=flight.get("error"))

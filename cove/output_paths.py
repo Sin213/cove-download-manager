@@ -509,7 +509,7 @@ class _WindowsPublicationApi:
         ):
             self._raise_last_error("rename", candidate)
 
-    def publish_no_replace(self, work: "WorkDirectory", source_path: Path, candidate: str) -> None:
+    def publish_no_replace(self, work: "WorkDirectory", source_path: Path, candidate: str) -> tuple[int, int]:
         if work.native_work_identity is None or work.native_destination_identity is None:
             raise _WindowsApiError(
                 "directory identity validation",
@@ -547,7 +547,11 @@ class _WindowsPublicationApi:
             destination_directory = self._win32_path(
                 self._final_path(destination_handle, work.destination)
             )
+            # Metadata comes from the same pinned handle used for publication,
+            # never an independent lookup of its old or new pathname.
+            identity = self._identity(self._file_information(source_handle, source_path))
             self._rename_no_replace(source_handle, destination_directory, candidate)
+            return identity
         finally:
             self._close(source_handle)
             self._close(destination_handle)
@@ -666,6 +670,46 @@ def create_work_directory(destination: str | os.PathLike[str]) -> WorkDirectory:
         if isinstance(exc, _WindowsApiError):
             raise _windows_output_error(exc) from exc
         raise
+
+
+def adopt_work_directory(
+    destination: str | os.PathLike[str], work_path: str | os.PathLike[str]
+) -> WorkDirectory:
+    """Revalidate a persisted private name, capturing its current identity.
+
+    This proves location, shape and owner, not that the inode is the original
+    one: the persisted schema contains a path, not an inode identity.
+    """
+    try:
+        root = _destination_path(destination)
+        path = Path(os.path.abspath(work_path))
+        info = path.lstat()
+        root_info = root.stat()
+        if (
+            path.parent.resolve(strict=True) != root
+            or not path.name.startswith(".cove-work-")
+            or not stat.S_ISDIR(info.st_mode)
+            or info.st_dev != root_info.st_dev
+            or (os.name == "posix" and info.st_uid != os.geteuid())
+        ):
+            raise OutputPathError("Invalid persisted private output directory")
+        # Canonicalise only the parent; lstat above must reject a symlink leaf.
+        path = root / path.name
+        native_work = native_root = None
+        if _is_windows_runtime():
+            api = _windows_publication_api_factory()
+            native_root = api.capture_directory_identity(root)
+            native_work = api.capture_directory_identity(path)
+        work = WorkDirectory(
+            path, root, info.st_dev, info.st_ino, root_info.st_dev,
+            root_info.st_ino, native_work, native_root,
+        )
+        _assert_owned(work)
+        return work
+    except _WindowsApiError as exc:
+        raise _windows_output_error(exc) from exc
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise OutputPathError("Could not adopt private output directory") from exc
 
 
 def _assert_owned(work: WorkDirectory) -> None:
@@ -904,9 +948,9 @@ def _relative_link_supported() -> bool:
     )
 
 
-def _windows_link_candidate(work: WorkDirectory, source_path: Path, candidate: str) -> None:
+def _windows_link_candidate(work: WorkDirectory, source_path: Path, candidate: str) -> tuple[int, int] | None:
     try:
-        _windows_publication_api_factory().publish_no_replace(work, source_path, candidate)
+        return _windows_publication_api_factory().publish_no_replace(work, source_path, candidate)
     except _WindowsApiError as exc:
         if exc.operation == "rename" and exc.winerror_code in {
             _WINDOWS_ERROR_FILE_EXISTS,
@@ -955,7 +999,11 @@ def _link_pinned_fd(source_fd: int, destination_fd: int, candidate: str) -> None
         pinned_info = os.fstat(source_fd)
         reference_info = os.stat(source_reference)
     except OSError as exc:
-        raise OutputPathError("Pinned descriptor reference is unavailable") from exc
+        failure = OutputPathError("Pinned descriptor reference is unavailable")
+        # Preserve the baseline exception for media. Only a missing optional
+        # /proc reference, not access denial, permits an opted-in safe copy.
+        failure._hardlink_unsupported = exc.errno in {errno.ENOENT, errno.ENOTDIR}
+        raise failure from exc
     if (reference_info.st_dev, reference_info.st_ino) != (
         pinned_info.st_dev,
         pinned_info.st_ino,
@@ -965,7 +1013,9 @@ def _link_pinned_fd(source_fd: int, destination_fd: int, candidate: str) -> None
     try:
         linkat = ctypes.CDLL(None, use_errno=True).linkat
     except (AttributeError, OSError) as exc:
-        raise OutputPathError("Pinned-inode publication is unsupported") from exc
+        failure = OutputPathError("Pinned-inode publication is unsupported")
+        failure._hardlink_unsupported = True
+        raise failure from exc
     linkat.argtypes = [
         ctypes.c_int,
         ctypes.c_char_p,
@@ -994,10 +1044,10 @@ def _link_candidate(
     candidate: str,
     *,
     source_fd: int | None = None,
-) -> None:
+    allow_copy: bool = False,
+) -> tuple[int, int] | None:
     if _is_windows_runtime():
-        _windows_link_candidate(work, source_path, candidate)
-        return
+        return _windows_link_candidate(work, source_path, candidate)
 
     if source_fd is None:
         raise OutputPathError("Pinned-inode publication is unsupported")
@@ -1007,9 +1057,69 @@ def _link_candidate(
         work.destination_inode,
     )
     try:
-        _link_pinned_fd(source_fd, destination_fd, candidate)
+        try:
+            _link_pinned_fd(source_fd, destination_fd, candidate)
+        except (OSError, OutputPathError) as exc:
+            # EPERM: filesystem rejects links; ENOTSUP/EOPNOTSUPP: unsupported
+            # operation; ENOSYS: linkat or /proc unavailable; EMLINK: link limit.
+            # Permission/access, space, I/O and cross-device failures stay errors.
+            unsupported = getattr(exc, "_hardlink_unsupported", False) or (
+                isinstance(exc, OSError) and exc.errno in {
+                    errno.EPERM, errno.EOPNOTSUPP, errno.ENOTSUP, errno.ENOSYS, errno.EMLINK,
+                }
+            )
+            if not allow_copy or not unsupported:
+                raise
+            return _copy_pinned_fd(source_fd, destination_fd, candidate)
     finally:
         _close_fd(destination_fd)
+
+
+def _copy_pinned_fd(source_fd: int, destination_fd: int, candidate: str) -> tuple[int, int]:
+    """Exclusive, bounded copy. The public partial is visible; this is NOT atomic."""
+    created_fd = None
+    identity = None
+    try:
+        # Preserve ordinary source permissions subject to umask, never special bits.
+        mode = stat.S_IMODE(os.fstat(source_fd).st_mode) & 0o777
+        created_fd = os.open(
+            candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode, dir_fd=destination_fd,
+        )
+        info = os.fstat(created_fd)
+        identity = (info.st_dev, info.st_ino)
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while chunk := os.read(source_fd, 1024 * 1024):
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(created_fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "Output copy made no progress")
+                remaining = remaining[written:]
+        os.fsync(created_fd)
+        current = os.lstat(candidate, dir_fd=destination_fd)
+        if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != identity:
+            raise OutputPathError("Public copy candidate identity changed before commit")
+        os.close(created_fd)
+        created_fd = None
+        return identity
+    except FileExistsError:
+        if created_fd is None:
+            raise  # Collision at exclusive creation, never touch the existing file.
+        raise OutputPathError("Output copy failed") from None
+    except (OSError, NotImplementedError, TypeError) as exc:
+        if identity is not None:
+            try:
+                current = os.lstat(candidate, dir_fd=destination_fd)
+                if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+                    # POSIX cannot close the tiny lstat-to-unlinkat race. Prefer
+                    # leaving an orphan whenever identity cannot be established.
+                    os.unlink(candidate, dir_fd=destination_fd)
+            except (OSError, NotImplementedError, TypeError):
+                pass
+        raise OutputPathError(f"Could not copy private output: {exc}") from exc
+    finally:
+        _close_fd(created_fd)
 
 
 def cleanup_work_directory(work: WorkDirectory) -> None:
@@ -1055,16 +1165,27 @@ def publish_output(
     work: WorkDirectory,
     source: str | os.PathLike[str],
     requested_filename: str | os.PathLike[str],
-) -> Path:
-    """Publish a completed private file with atomic no-clobber semantics."""
+    *,
+    allow_copy: bool = False,
+    return_identity: bool = False,
+) -> Path | tuple[Path, tuple[int, int] | None]:
+    """Publish without clobbering; opt-in copying is non-atomic and may be slow.
+
+    The default preserves media publication's baseline hardlink-only behavior.
+    Callers allowing copy must arrange to run publication off the UI thread.
+    """
 
     source_path = validate_engine_output(work, source)
     requested = validate_public_filename(requested_filename)
     source_fd = None if _is_windows_runtime() else _open_pinned_source(work, source_path)
     try:
+        info = os.fstat(source_fd) if source_fd is not None else None
+        identity = (info.st_dev, info.st_ino) if info is not None else None
         for candidate in collision_candidates(requested):
             try:
-                _link_candidate(work, source_path, candidate, source_fd=source_fd)
+                copied_identity = _link_candidate(work, source_path, candidate, source_fd=source_fd,
+                                                  allow_copy=allow_copy)
+                identity = copied_identity or identity
             except FileExistsError:
                 continue
             except OSError as exc:
@@ -1080,4 +1201,5 @@ def publish_output(
         cleanup_work_directory(work)
     except (OSError, OutputPathError):
         pass
-    return work.destination / candidate
+    published = work.destination / candidate
+    return (published, identity) if return_identity else published

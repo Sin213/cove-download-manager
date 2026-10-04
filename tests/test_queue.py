@@ -215,7 +215,7 @@ class _FakeRpc:
             "connections": connections,
             "filename": filename,
         })
-        return "gid-1"
+        return getattr(self, "add_result", "gid-1")
 
     # ---- BitTorrent (Slice B) -----------------------------------------
 
@@ -249,7 +249,7 @@ class _FakeRpc:
 
     def get_files(self, gid):
         self.files_calls.append(gid)
-        return getattr(self, "files_result", [])
+        return getattr(self, "files_by_gid", {}).get(gid, getattr(self, "files_result", []))
 
     def remove(self, gid, force=True):
         # `remove_errors` models the wrapper's own outward contract: a gid
@@ -287,7 +287,7 @@ class _FakeRpc:
 
     def tell_status(self, gid):
         self.status_calls.append(gid)
-        return dict(getattr(self, "status_result", {}))
+        return dict(getattr(self, "status_by_gid", {}).get(gid, getattr(self, "status_result", {})))
 
 
 @pytest.fixture
@@ -322,6 +322,12 @@ def _debrid_settings(**extra):
     base = dict(all_debrid_enabled=True, all_debrid_api_key="ad-key-value")
     base.update(extra)
     return base
+
+
+def _probe_prepared(queue, task):
+    # Production launch does this on the main thread before starting a probe.
+    queue._prepare_aria2_work(task)
+    return queue._probe_and_add(task)
 
 
 def _persisted_row(db_path, tid):
@@ -416,7 +422,7 @@ def test_debrid_url_goes_to_aria2_while_the_task_keeps_the_original(queue_env, m
     tid = queue.add_url(ORIGINAL_URL)
     task = queue.tasks[tid]
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
 
     assert rpc.added[0]["uris"] == [NODE_URL]
     assert task.url == ORIGINAL_URL
@@ -433,7 +439,7 @@ def test_debrid_generated_url_is_never_persisted(queue_env, monkeypatch):
     tid = queue.add_url(ORIGINAL_URL)
     task = queue.tasks[tid]
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     task.status = "active"
     queue._persist(task)
 
@@ -453,7 +459,7 @@ def test_provider_filename_fills_an_empty_filename(queue_env, monkeypatch):
     task = queue.tasks[tid]
     assert task.filename is None
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert task.filename == "movie.mkv"
 
 
@@ -466,7 +472,7 @@ def test_provider_filename_never_overwrites_a_user_supplied_name(queue_env, monk
     tid = queue.add_url(ORIGINAL_URL, filename="my choice.mkv")
     task = queue.tasks[tid]
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert task.filename == "my choice.mkv"
     assert rpc.added[0]["filename"] == "my choice.mkv"
 
@@ -480,7 +486,7 @@ def test_provider_filesize_seeds_progress(queue_env, monkeypatch):
     tid = queue.add_url(ORIGINAL_URL)
     task = queue.tasks[tid]
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert task.total_bytes == 4096
 
 
@@ -498,7 +504,7 @@ def test_provider_filesize_skips_the_head_probe(queue_env, monkeypatch):
         lambda self, url, **kw: calls.append(url) or (_ for _ in ()).throw(AssertionError("HEAD")),
     )
     tid = queue.add_url(ORIGINAL_URL)
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
     assert calls == []
 
 
@@ -548,7 +554,7 @@ def test_ordinary_head_content_length_seeds_size(queue_env, monkeypatch):
             ok=True, headers={"Accept-Ranges": "bytes", "Content-Length": "20971520"}
         ),
     )
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert task.total_bytes == 20971520
 
 
@@ -564,7 +570,7 @@ def test_ordinary_head_does_not_overwrite_an_existing_size(queue_env, monkeypatc
             ok=True, headers={"Accept-Ranges": "bytes", "Content-Length": "20971520"}
         ),
     )
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert task.total_bytes == 111
 
 
@@ -614,7 +620,7 @@ def test_resolver_failure_propagates_to_the_task_error_path(queue_env, monkeypat
     tid = queue.add_url(ORIGINAL_URL)
 
     with pytest.raises(DebridError):
-        queue._probe_and_add(queue.tasks[tid])
+        _probe_prepared(queue, queue.tasks[tid])
     assert rpc.added == [], "a failed resolution must not fall through to aria2"
 
 
@@ -647,7 +653,7 @@ def test_unsupported_host_falls_through_to_the_direct_download(queue_env, monkey
     tid = queue.add_url("https://example.com/plain.zip")
     task = queue.tasks[tid]
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert rpc.added[0]["uris"] == ["https://example.com/plain.zip"]
     assert task.debrid_provider == ""
     assert task.resolved_url == ""
@@ -826,7 +832,7 @@ def _sync_spawn(queue):
         calls.append(fn)
         try:
             result = fn(*args, **kwargs)
-        except (Aria2Error, DebridError, TorrentError) as exc:
+        except (Aria2Error, DebridError, TorrentError, OutputPathError, OSError) as exc:
             if on_fail is not None:
                 on_fail(str(exc))
         else:
@@ -1293,7 +1299,7 @@ def test_provider_domain_exclusion_bypass_is_limited_to_internal_rows(queue_env,
             TORRENT_NODE_URL, "ep1.mkv", 10, provider
         ),
     )
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
     assert rpc.added[0]["uris"] == [TORRENT_NODE_URL]
 
     # An ordinary task on a provider-owned domain is left alone by resolve.
@@ -1330,7 +1336,7 @@ def test_ordinary_http_task_is_untouched_by_the_torrent_route(queue_env, monkeyp
     task = queue.tasks[tid]
     assert task.source_type == ""
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
 
     assert rpc.added[0]["uris"] == [NODE_URL]
     assert _persisted_url(db_path, tid) == ORIGINAL_URL
@@ -2744,7 +2750,7 @@ def test_first_torbox_success_persists_item_id_and_keeps_original_url(
     tid = queue.add_url(ORIGINAL_URL)
     task = queue.tasks[tid]
 
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
 
     assert rpc.added[0]["uris"] == [TORBOX_NODE_URL]
     assert task.url == ORIGINAL_URL
@@ -2771,7 +2777,7 @@ def test_torbox_cdn_url_is_not_persisted(queue_env, monkeypatch, torbox_availabl
         ),
     )
     tid = queue.add_url(ORIGINAL_URL)
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
     queue._persist(queue.tasks[tid])
     assert TORBOX_NODE_URL not in _persisted_row_text(db_path, tid)
 
@@ -2790,7 +2796,7 @@ def test_retry_reuses_the_existing_torbox_item(queue_env, monkeypatch, torbox_av
         return Unrestricted(TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id=item_id)
 
     monkeypatch.setattr(debrid, "torbox_refresh_web_download", fake_refresh)
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
 
     assert calls == [("42", ORIGINAL_URL)]
     assert task.debrid_item_id == "42"
@@ -2833,7 +2839,7 @@ def test_missing_remote_item_soft_recreates_and_persists_replacement_id(
             TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id="99"
         ),
     )
-    queue._probe_and_add(task)
+    _probe_prepared(queue, task)
     assert task.debrid_item_id == "99"
 
     task.status = "active"
@@ -2863,7 +2869,7 @@ def test_no_concurrent_duplicate_create_when_already_pinned(
             TORBOX_NODE_URL, "movie.mkv", 4096, debrid.TORBOX, item_id=item_id
         ),
     )
-    queue._probe_and_add(task)  # must not raise
+    _probe_prepared(queue, task)  # must not raise
 
 
 def test_torbox_preferred_first_when_gate_is_on(queue_env, monkeypatch, torbox_available):
@@ -2881,7 +2887,7 @@ def test_torbox_preferred_first_when_gate_is_on(queue_env, monkeypatch, torbox_a
 
     monkeypatch.setattr(debrid, "resolve", fake_resolve)
     tid = queue.add_url(ORIGINAL_URL)
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
     assert order[0][0] == debrid.TORBOX
 
 
@@ -2917,7 +2923,7 @@ def test_provider_auth_error_does_not_silently_fall_back(queue_env, monkeypatch,
     monkeypatch.setattr(debrid, "resolve", _boom)
     tid = queue.add_url(ORIGINAL_URL)
     with pytest.raises(DebridError):
-        queue._probe_and_add(queue.tasks[tid])
+        _probe_prepared(queue, queue.tasks[tid])
     assert rpc.added == []
 
 
@@ -2935,7 +2941,7 @@ def test_torbox_disabled_by_default_gate_gives_current_behavior(queue_env, monke
         lambda self, url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
     )
     tid = queue.add_url("https://example.com/plain.zip")
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
     assert rpc.added[0]["uris"] == ["https://example.com/plain.zip"]
     assert debrid._enabled_providers(queue.settings) == []
 
@@ -2955,7 +2961,7 @@ def test_pinned_torbox_task_falls_through_when_gate_is_off(queue_env, monkeypatc
         raise AssertionError("torbox_refresh_web_download must not run while the gate is off")
 
     monkeypatch.setattr(debrid, "torbox_refresh_web_download", _refresh_must_not_be_called)
-    queue._probe_and_add(task)  # must not raise
+    _probe_prepared(queue, task)  # must not raise
     assert rpc.added[0]["uris"] == [ORIGINAL_URL]
 
 
@@ -6066,7 +6072,7 @@ def test_aria2_add_records_the_gid_and_no_url(queue_env, monkeypatch, diag):
         lambda self, url, **kw: SimpleNamespace(ok=True, headers={"Content-Length": "5"}),
     )
     tid = queue.add_url("https://example.com/video.mp4")
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
 
     add = _one(diag, "aria2", "add")
     assert add["task"] == tid
@@ -6132,7 +6138,7 @@ def test_diagnostics_failures_never_fail_a_download(queue_env, monkeypatch, diag
     tid = queue.add_url("https://example.com/video.mp4")
     assert tid is not None
     queue._launch(queue.tasks[tid])
-    queue._probe_and_add(queue.tasks[tid])
+    _probe_prepared(queue, queue.tasks[tid])
     assert rpc.added, "the download must still reach aria2"
 
 
@@ -6156,8 +6162,9 @@ def _aria2_task(queue_env, tmp_path, filename="Show.S01E01.mkv"):
         filename=filename,
     )
     queue._launch(queue.tasks[tid])
-    payload = tmp_path / filename
-    control = tmp_path / (filename + ".aria2")
+    work = Path(queue.tasks[tid].work_dir)
+    payload = work / filename
+    control = work / (filename + ".aria2")
     payload.write_bytes(b"partial payload")
     control.write_bytes(b"aria2 resume state")
     return queue, rpc, db_path, tid, payload, control
@@ -6269,8 +6276,11 @@ def test_removing_a_completed_aria2_download_keeps_the_finished_file(
 ):
     queue, _rpc, db_path, tid, payload, control = _aria2_task(queue_env, tmp_path)
     queue._apply_status(tid, {"status": "complete", "totalLength": "10",
-                              "completedLength": "10"})
+                              "completedLength": "10", "files": [{"path": str(payload)}]})
     assert queue.tasks[tid].status == "completed"
+    payload = Path(queue.tasks[tid].output_path)
+    control = payload.with_name(payload.name + ".aria2")
+    control.write_bytes(b"foreign sidecar")
 
     queue.remove(tid)
 
@@ -6285,12 +6295,15 @@ def test_removing_a_completed_aria2_download_with_delete_still_deletes(
 ):
     queue, _rpc, _db, tid, payload, control = _aria2_task(queue_env, tmp_path)
     queue._apply_status(tid, {"status": "complete", "totalLength": "10",
-                              "completedLength": "10"})
+                              "completedLength": "10", "files": [{"path": str(payload)}]})
+    payload = Path(queue.tasks[tid].output_path)
+    control = payload.with_name(payload.name + ".aria2")
+    control.write_bytes(b"foreign sidecar")
 
     queue.remove(tid, delete_file=True)
 
     assert not payload.exists()
-    assert not control.exists()
+    assert control.read_bytes() == b"foreign sidecar"
 
 
 def test_removing_an_aria2_download_mid_add_cleans_up_once_the_gid_lands(
@@ -6318,8 +6331,9 @@ def test_removing_an_aria2_download_mid_add_cleans_up_once_the_gid_lands(
     queue.tasks[tid].status = "active"
     assert pending
 
-    payload = tmp_path / "late.bin"
-    control = tmp_path / "late.bin.aria2"
+    work = Path(queue.tasks[tid].work_dir)
+    payload = work / "late.bin"
+    control = work / "late.bin.aria2"
     payload.write_bytes(b"partial")
     control.write_bytes(b"ctrl")
 
@@ -6390,11 +6404,10 @@ def test_clear_completed_never_deletes_incomplete_data(queue_env, tmp_path):
     assert tid in queue.tasks
 
 
-def test_an_adopted_external_aria2_download_is_cleaned_on_removal(
+def test_an_adopted_external_aria2_download_has_no_deletion_authority(
     queue_env, tmp_path
 ):
-    # A row Cove deliberately adopted from aria2 is a Cove-managed row: it
-    # carries the authoritative path aria2 itself reported.
+    # Backend-reported paths cannot prove Cove created the file.
     queue, rpc, db_path = queue_env()
     _sync_spawn(queue)
     payload = tmp_path / "stranger.bin"
@@ -6419,8 +6432,8 @@ def test_an_adopted_external_aria2_download_is_cleaned_on_removal(
     queue.remove(tid)
 
     assert rpc.removed == ["gid-external"]
-    assert not payload.exists()
-    assert not control.exists()
+    assert payload.read_bytes() == b"partial payload"
+    assert control.read_bytes() == b"aria2 resume state"
 
 
 def test_removing_an_extractor_task_keeps_its_existing_behaviour(
@@ -8161,7 +8174,7 @@ def test_task_path_resolves_the_task_local_destination(queue_env):
 
 
 def test_commit_prepared_persists_custom_dir_and_filename_and_restores(
-    queue_env, monkeypatch
+    queue_env, monkeypatch, tmp_path
 ):
     """RED 29: a task-local out_dir + filename survive persist/reload and the
     aria2 launch receives dir/out exactly (dir always, out only when set)."""
@@ -8169,21 +8182,20 @@ def test_commit_prepared_persists_custom_dir_and_filename_and_restores(
 
     queue, rpc, db_path = queue_env(intelligent_segments=False)
     prepared = queue.prepare_url(DIRECT_URL, intake="manual")
-    prepared = _replace(
-        prepared, out_dir="/srv/custom-dir", filename="custom-name.zip"
-    )
+    custom = str(tmp_path / "custom-dir")
+    prepared = _replace(prepared, out_dir=custom, filename="custom-name.zip")
     tid = queue.commit_prepared(prepared)
     task = queue.tasks[tid]
 
-    assert task.out_dir == "/srv/custom-dir"
+    assert task.out_dir == custom
     assert task.filename == "custom-name.zip"
     row = _persisted_row(db_path, tid)
-    assert row["out_dir"] == "/srv/custom-dir"
+    assert row["out_dir"] == custom
     assert row["filename"] == "custom-name.zip"
 
     # Restore path rebuilds the same task-local destination.
     restored = _task_from_persisted_row(row)
-    assert restored.out_dir == "/srv/custom-dir"
+    assert restored.out_dir == custom
     assert restored.filename == "custom-name.zip"
 
     # The launch path hands aria2 dir always and out only for a set filename.
@@ -8194,7 +8206,8 @@ def test_commit_prepared_persists_custom_dir_and_filename_and_restores(
 
     monkeypatch.setattr(queue, "_spawn", _sync_spawn)
     queue._launch(task)
-    assert rpc.added and rpc.added[0]["out_dir"] == "/srv/custom-dir"
+    assert rpc.added and Path(rpc.added[0]["out_dir"]).parent == Path(custom)
+    assert rpc.added[0]["out_dir"] == task.work_dir
     assert rpc.added[0]["filename"] == "custom-name.zip"
 
 
@@ -8215,7 +8228,8 @@ def test_commit_prepared_blank_filename_sends_no_out(queue_env, monkeypatch):
     queue._launch(queue.tasks[tid])
 
     assert rpc.added and rpc.added[0]["filename"] is None
-    assert rpc.added[0]["out_dir"] == queue.settings.download_dir
+    assert Path(rpc.added[0]["out_dir"]).parent == Path(queue.settings.download_dir)
+    assert rpc.added[0]["out_dir"] == queue.tasks[tid].work_dir
 
 
 def test_two_prepared_requests_are_isolated(queue_env):

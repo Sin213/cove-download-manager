@@ -89,6 +89,12 @@ _MIGRATIONS = [
         "ALTER TABLE downloads ADD COLUMN debrid_item_id TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE downloads ADD COLUMN debrid_file_id TEXT NOT NULL DEFAULT ''",
     ],
+    # v7 -> v8: task-private staging and committed public output. Additive;
+    # legacy rows have no deletion authority and are never inferred from disk.
+    [
+        "ALTER TABLE downloads ADD COLUMN work_dir TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE downloads ADD COLUMN output_path TEXT NOT NULL DEFAULT ''",
+    ],
 ]
 
 

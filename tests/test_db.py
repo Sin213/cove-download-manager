@@ -6,6 +6,47 @@ import time
 from cove import db
 
 
+def test_v7_upgrade_adds_exactly_two_empty_ownership_columns(tmp_path):
+    path = tmp_path / "v7.db"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(db.SCHEMA)
+        for migration in db._MIGRATIONS[:7]:
+            for sql in migration:
+                try:
+                    conn.execute(sql)
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc):
+                        raise
+        conn.execute("PRAGMA user_version=7")
+        conn.execute("INSERT INTO downloads (url,out_dir,filename,created_at) VALUES (?,?,?,?)",
+                     ("https://example.com/legacy", str(tmp_path), "legacy.zip", 1.0))
+        before = {r[1] for r in conn.execute("PRAGMA table_info(downloads)")}
+    db.init(path)
+    with db.connect(path) as conn:
+        after = {r["name"] for r in conn.execute("PRAGMA table_info(downloads)")}
+        assert after - before == {"work_dir", "output_path"}
+        row = conn.execute("SELECT * FROM downloads").fetchone()
+        assert row["filename"] == "legacy.zip"
+        assert row["work_dir"] == row["output_path"] == ""
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
+def test_fresh_db_ownership_columns_round_trip(tmp_path):
+    path = tmp_path / "fresh.db"
+    db.init(path)
+    with db.connect(path) as conn:
+        columns = {r["name"]: r for r in conn.execute("PRAGMA table_info(downloads)")}
+        for name in ("work_dir", "output_path"):
+            assert columns[name]["type"] == "TEXT"
+            assert columns[name]["notnull"] == 1
+        conn.execute("INSERT INTO downloads (url,out_dir,created_at,work_dir,output_path) "
+                     "VALUES (?,?,?,?,?)", ("https://example.com/f", "/scratch", 1, "/scratch/.cove-work-a", "/scratch/f"))
+    with db.connect(path) as conn:
+        row = conn.execute("SELECT work_dir,output_path FROM downloads").fetchone()
+        assert tuple(row) == ("/scratch/.cove-work-a", "/scratch/f")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+
+
 def _v0_db(path):
     """Create a pre-migration (v0) database with one legacy row."""
     conn = sqlite3.connect(path)
