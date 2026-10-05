@@ -208,7 +208,7 @@ class _FakeRpc:
         self.paused.append(gid)
         return gid
 
-    def add_uri(self, uris, out_dir, connections, speed_limit_kbps, filename):
+    def add_uri(self, uris, out_dir, connections, speed_limit_kbps, filename, gid=None):
         self.added.append({
             "uris": list(uris),
             "out_dir": out_dir,
@@ -236,12 +236,12 @@ class _FakeRpc:
         self.version_calls.append(True)
         return self.version
 
-    def add_magnet(self, uri, out_dir, speed_limit_kbps=0):
+    def add_magnet(self, uri, out_dir, speed_limit_kbps=0, gid=None):
         self.magnets.append({"uri": uri, "out_dir": out_dir,
                              "speed_limit_kbps": speed_limit_kbps})
         return "gid-meta"
 
-    def add_torrent(self, data, out_dir, speed_limit_kbps=0, select_file=None):
+    def add_torrent(self, data, out_dir, speed_limit_kbps=0, select_file=None, gid=None):
         self.torrents.append({"data": data, "out_dir": out_dir,
                               "speed_limit_kbps": speed_limit_kbps,
                               "select_file": select_file})

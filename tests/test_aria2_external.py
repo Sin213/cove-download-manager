@@ -16,6 +16,48 @@ from cove.aria2 import (
 from cove.config import MAX_CONNECTIONS_PER_SERVER, Settings
 
 
+@pytest.mark.parametrize("method,args", [
+    ("add_uri", (["https://example.com/file"], "/scratch", 4)),
+    ("add_magnet", ("magnet:?xt=urn:btih:abc", "/scratch")),
+    ("add_torrent", (b"torrent bytes", "/scratch")),
+])
+@pytest.mark.parametrize("gid", [None, "123456789abcdef0"])
+def test_caller_owned_gid_option_is_forwarded_only_when_supplied(monkeypatch, method, args, gid):
+    rpc = Aria2RPC(Settings())
+    calls = []
+    monkeypatch.setattr(rpc, "_call", lambda method, params: calls.append((method, params)) or "123456789abcdef0")
+    kwargs = {} if gid is None else {"gid": gid}
+    assert getattr(rpc, method)(*args, **kwargs) == "123456789abcdef0"
+    opts = calls[0][1][-1]
+    assert opts.get("gid") == gid
+    assert ("gid" in opts) == (gid is not None)
+
+
+@pytest.mark.parametrize("method,args", [
+    ("add_uri", (["https://example.com/file"], "/scratch", 4)),
+    ("add_magnet", ("magnet:?xt=urn:btih:abc", "/scratch")),
+    ("add_torrent", (b"torrent bytes", "/scratch")),
+])
+@pytest.mark.parametrize("gid", ["", "0" * 16, "a" * 15, "a" * 17, "A" * 16, "g" * 16, 123])
+def test_invalid_caller_gid_is_rejected_before_rpc(monkeypatch, method, args, gid):
+    rpc = Aria2RPC(Settings())
+    calls = []
+    monkeypatch.setattr(rpc, "_call", lambda *args: calls.append(args))
+    with pytest.raises(Aria2Error):
+        getattr(rpc, method)(*args, gid=gid)
+    assert not calls
+
+
+def test_generated_gid_is_lowercase_nonzero_and_skips_reserved_identity(monkeypatch):
+    import cove.aria2 as module
+    generator = getattr(module, "generate_gid", None)
+    assert callable(generator), "caller-owned GID generator missing"
+    values = iter(["0" * 16, "123456789abcdef0", "abcdef0123456789"])
+    monkeypatch.setattr(module.secrets, "token_hex", lambda size: next(values) if size == 8 else pytest.fail("wrong GID width"))
+    assert generator() == "123456789abcdef0"
+    assert generator() == "abcdef0123456789"
+
+
 @pytest.fixture(autouse=True)
 def _no_stale_daemon():
     """Daemon startup tests must not depend on what holds 6800 locally.

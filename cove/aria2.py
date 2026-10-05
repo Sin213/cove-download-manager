@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import base64
 import os
+import re
+import secrets
 import shutil
 import signal
 import socket
@@ -34,6 +36,20 @@ from .netiface import interface_exists
 
 class Aria2Error(RuntimeError):
     pass
+
+
+def validate_gid(gid: str) -> None:
+    """Reject invalid caller identities before any RPC can admit a download."""
+    if not isinstance(gid, str) or re.fullmatch(r"[0-9a-f]{16}", gid) is None or gid == "0" * 16:
+        raise Aria2Error("Invalid download GID: expected 16 lowercase hexadecimal characters, not all zero.")
+
+
+def generate_gid() -> str:
+    """Generate a fresh aria2 identity, excluding its reserved all-zero GID."""
+    while True:
+        gid = secrets.token_hex(8)
+        if gid != "0" * 16:
+            return gid
 
 
 class Aria2RpcError(Aria2Error):
@@ -516,6 +532,7 @@ class Aria2RPC:
         speed_limit_kbps: int = 0,
         filename: str | None = None,
         headers: list[str] | None = None,
+        gid: str | None = None,
     ) -> str:
         connections = min(max(int(connections), 1), MAX_CONNECTIONS_PER_SERVER)
         opts: dict[str, str] = {
@@ -530,9 +547,15 @@ class Aria2RPC:
             opts["out"] = filename
         if headers:
             opts["header"] = headers
+        if gid is not None:
+            validate_gid(gid)
+            opts["gid"] = gid
         return self._call("aria2.addUri", [uris, opts])
 
-    def add_magnet(self, uri: str, out_dir: str, speed_limit_kbps: int = 0) -> str:
+    def add_magnet(
+        self, uri: str, out_dir: str, speed_limit_kbps: int = 0,
+        gid: str | None = None,
+    ) -> str:
         """Start a magnet locally. Returns aria2's *metadata* gid.
 
         aria2 fetches the torrent metadata as its own download and then
@@ -542,6 +565,9 @@ class Aria2RPC:
         opts: dict[str, str] = {"dir": out_dir, "seed-time": "0"}
         if speed_limit_kbps > 0:
             opts["max-download-limit"] = f"{speed_limit_kbps}K"
+        if gid is not None:
+            validate_gid(gid)
+            opts["gid"] = gid
         return self._call("aria2.addUri", [[uri], opts])
 
     def add_magnet_metadata(self, uri: str, out_dir: str) -> str:
@@ -584,6 +610,7 @@ class Aria2RPC:
         out_dir: str,
         speed_limit_kbps: int = 0,
         select_file: str | None = None,
+        gid: str | None = None,
     ) -> str:
         """Start a validated `.torrent` locally via aria2.addTorrent.
 
@@ -601,6 +628,9 @@ class Aria2RPC:
             # Forward-compatible plumbing only; Slice B always downloads
             # every file, so nothing passes this today.
             opts["select-file"] = select_file
+        if gid is not None:
+            validate_gid(gid)
+            opts["gid"] = gid
         return self._call("aria2.addTorrent", [encoded, [], opts])
 
     def get_files(self, gid: str) -> list[dict]:

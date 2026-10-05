@@ -57,6 +57,80 @@ def complete(queue, t, path):
     queue._apply_status(t.id, {"status": "complete", "files": [{"path": str(path)}]})
 
 
+@pytest.mark.parametrize("delete", [False, True])
+def test_F2_remove_during_publication_is_durable_and_recovers_without_relaunch(queue_env, delete):
+    from tests.test_queue import _persisted_row
+    queue, rpc, db_path = queue_env(intelligent_segments=False)
+    inline(queue)
+    t = task(queue)
+    queue._launch(t)
+    identity = t.gid
+    payload = Path(t.work_dir) / "file.zip"
+    payload.write_bytes(b"owned")
+    calls = hold(queue)
+    complete(queue, t, payload)
+    queue.remove(t.id, delete_file=delete)
+    row = _persisted_row(db_path, t.id)
+    assert row["status"] == "removing", "F2: publication removal intent was not durable"
+    assert row["gid"] == identity and not row["output_path"] and t.status != "completed"
+    fresh, fresh_rpc, _ = queue_env(intelligent_segments=False)
+    assert t.id not in fresh.tasks and fresh._recovered_removals[0][1] == identity
+    inline(fresh)
+    fresh._scheduler_allows = True
+    fresh._maybe_start_next()
+    assert fresh_rpc.added == []
+    release(calls.pop(0))
+    assert t.status == "completed"
+    assert _persisted_row(db_path, t.id)["status"] == "removing"
+    drain_calls = list(calls)
+    calls.clear()
+    for call in drain_calls:
+        release(call)
+    assert t.id not in queue.tasks and _persisted_row(db_path, t.id) is None
+    assert (Path(t.out_dir) / "file.zip").exists() is not delete
+
+
+@pytest.mark.parametrize("outcome", ["success", "error"])
+@pytest.mark.parametrize("delete", [False, True])
+def test_R3_publication_settlement_never_commits_a_gap_in_removal_intent(queue_env, monkeypatch, outcome, delete):
+    import cove.queue as module
+    from tests.test_queue import _persisted_row
+    queue, rpc, path = queue_env(intelligent_segments=False)
+    inline(queue)
+    t = task(queue)
+    queue._launch(t)
+    identity = t.gid
+    payload = Path(t.work_dir) / "file.zip"
+    payload.write_bytes(b"owned")
+    if outcome == "error":
+        def fail_publish(*args, **kwargs):
+            raise module.OutputPathError("publication failed")
+        monkeypatch.setattr(module, "publish_output", fail_publish)
+    calls = hold(queue)
+    complete(queue, t, payload)
+    queue.remove(t.id, delete_file=delete)
+    original_persist = queue._persist
+    observed = []
+    def capture_after_settle_persist(candidate):
+        original_persist(candidate)
+        if not observed and candidate is t and t.id not in queue._publishing:
+            row = _persisted_row(path, t.id)
+            fresh, fresh_rpc, _ = queue_env(intelligent_segments=False)
+            observed.append((row["status"], row["gid"], fresh, fresh_rpc))
+    monkeypatch.setattr(queue, "_persist", capture_after_settle_persist)
+    release(calls.pop(0))
+    status, gid, fresh, fresh_rpc = observed[0]
+    assert status == "removing" and gid == identity, "R3: settlement committed completed/error before removal ownership"
+    assert t.id not in fresh.tasks and fresh._recovered_removals[0][1] == identity
+    assert fresh_rpc.added == []
+    assert t.status == ("completed" if outcome == "success" else "error")
+    for call in list(calls):
+        release(call)
+    assert t.id not in queue.tasks and _persisted_row(path, t.id) is None
+    public = Path(t.out_dir) / "file.zip"
+    assert public.exists() is (outcome == "success" and not delete)
+
+
 @pytest.mark.parametrize("engine", ["ffmpeg", "yt-dlp", "extractor-fallback"])
 def test_g2_media_replacement_after_commit_is_never_recorded_as_owned(
     queue_env, fake_process, tmp_path, monkeypatch, engine

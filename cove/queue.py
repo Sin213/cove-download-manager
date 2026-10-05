@@ -22,7 +22,7 @@ from typing import Optional
 from PySide6.QtCore import QCoreApplication, QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal, Slot
 
 from . import db, debrid, dedup, diagnostics, netiface, torrent
-from .aria2 import Aria2Error, Aria2RPC, Aria2RpcError, bittorrent_enabled
+from .aria2 import Aria2Error, Aria2RPC, Aria2RpcError, bittorrent_enabled, generate_gid
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
 from .output_paths import (
@@ -671,6 +671,8 @@ class DownloadTask:
     output_identity: tuple[int, int] | None = field(default=None, init=False, repr=False)
     # Admission filename, before a probe/backend fills display metadata.
     aria2_filename: Optional[str] = field(default=None, init=False, repr=False)
+    # Identity reserved before an add is dispatched; gid remains confirmed-only.
+    launch_gid: str = field(default="", init=False, repr=False)
     # Browser-supplied headers, used by the ffmpeg/yt-dlp backends for
     # authenticated or anti-hotlink media. Empty for plain aria2 tasks
     # (the direct extension -> aria2 path passes headers via RPC instead).
@@ -826,6 +828,8 @@ class _RpcCall(QRunnable):
 
 
 class QueueManager(QObject):
+    _ABSENCE_SETTLE_S = 0.25
+    _UNRECONCILED_TORRENT_ERROR = "Remove this download first; Cove could not confirm the previous attempt stopped."
     task_added = Signal(int)            # task id
     task_changed = Signal(int)          # task id
     task_removed = Signal(int)          # task id
@@ -846,17 +850,16 @@ class QueueManager(QObject):
         self._pool = QThreadPool.globalInstance()
         self._inflight: set[_RpcCall] = set()
         self._auto_paused: set[int] = set()
-        # Tasks whose add_uri RPC is in flight. Maps tid -> deferred actions
-        # the user requested before the gid landed:
-        #   {"pause": True}                — call rpc.pause(gid) on arrival
-        #   {"remove": True, "delete_file": bool}
-        # If "remove" is set, the task has already been hidden from the UI
-        # and dropped from the DB; we keep it in self.tasks so the on_done
-        # callback can still find the gid and dispatch a clean shutdown.
+        # Real dispatched adds, with any pause intent merged into that add.
+        # Removal lives in _removing and SQLite before its callback lands.
         self._pending_launch: dict[int, dict] = {}
+        # Pre-add torrent continuations belong to one attempt, never an add.
+        self._torrent_attempt: dict[int, object] = {}
         # Publication owns the staging inode until its callback settles. Removal
         # is deferred here rather than racing a filesystem worker.
         self._publishing: dict[int, dict] = {}
+        # Survives publication settlement until cancellation owns the row.
+        self._deferred_removal: set[int] = set()
         self._publication_shutdown = False
         # Tasks whose cancellation aria2 has not confirmed yet. Maps tid ->
         # the removal intent captured when the user asked:
@@ -865,6 +868,9 @@ class QueueManager(QObject):
         # this window, because until aria2 answers, the download is still
         # running and Cove is the only thing that knows about it.
         self._removing: dict[int, dict] = {}
+        # A refused reconciliation still owns a possibly admitted identity.
+        # Its slot survives the error state until resolution or same-GID retry.
+        self._unreconciled: set[int] = set()
         # Removals a previous run left unfinished, held until the daemon is
         # confirmed up; filled by _load_persisted, drained by resume_persisted.
         self._recovered_removals: list[tuple[int, str, bool]] = []
@@ -1023,6 +1029,9 @@ class QueueManager(QObject):
         # launch alike. `resume_persisted` is the first moment aria2 is known
         # to be reachable, and it is where these are drained.
         self._recovered_removals = pending_removals
+        # These identities belong to cancellation, even before daemon startup
+        # lets resume_persisted run. An external snapshot cannot adopt them.
+        self._seen_gids.update(row[1] for row in pending_removals)
         for tid in unreadable:
             with db.connect() as conn:
                 conn.execute(
@@ -1183,7 +1192,10 @@ class QueueManager(QObject):
         # aria2 answers, or a crash in between restores a download the user
         # already removed. Everything else about the row still persists, and
         # _restore_removal clears _removing before it rewrites the true status.
-        status = "removing" if t.id in self._removing else t.status
+        status = "removing" if (
+            t.id in self._removing or t.id in self._unreconciled
+            or t.id in self._deferred_removal
+        ) else t.status
         with db.connect() as conn:
             conn.execute(
                 """
@@ -1197,7 +1209,7 @@ class QueueManager(QObject):
                 (
                     t.filename,
                     status,
-                    t.gid,
+                    t.gid or self._removing.get(t.id, {}).get("gid") or t.launch_gid or None,
                     t.total_bytes,
                     t.completed_bytes,
                     t.error,
@@ -2449,12 +2461,30 @@ class QueueManager(QObject):
         return meta, torrent.store_managed_torrent(meta)
 
     def _launch_torrent(self, t: DownloadTask) -> None:
+        attempt = object()
+        self._torrent_attempt[t.id] = attempt
         self._spawn(
             self._probe_torrent,
             t,
-            on_done=lambda probed, tid=t.id: self._on_torrent_probed(tid, probed),
-            on_fail=lambda msg, tid=t.id: self._fail_task(tid, msg),
+            on_done=lambda probed, tid=t.id: self._on_torrent_probed(tid, probed, attempt),
+            on_fail=lambda msg, tid=t.id: self._fail_torrent_attempt(tid, attempt, msg),
         )
+
+    def _current_torrent_attempt(self, tid: int, attempt: object) -> bool:
+        t = self.tasks.get(tid)
+        return (
+            attempt is not None and self._torrent_attempt.get(tid) is attempt
+            and t is not None and t.source_type == SOURCE_TORRENT and not t.gid
+            and tid not in self._removing and tid not in self._unreconciled
+        )
+
+    def _void_torrent_attempt(self, tid: int) -> None:
+        self._torrent_attempt.pop(tid, None)
+        self._awaiting_consent.discard(tid)
+
+    def _fail_torrent_attempt(self, tid: int, attempt: object, msg: str) -> None:
+        if self._current_torrent_attempt(tid, attempt):
+            self._fail_task(tid, msg)
 
     def _probe_torrent(self, t: DownloadTask):
         """Ask the providers whether they already hold this torrent.
@@ -2495,7 +2525,9 @@ class QueueManager(QObject):
         )
         return cached, meta
 
-    def _on_torrent_probed(self, tid: int, probed) -> None:
+    def _on_torrent_probed(self, tid: int, probed, attempt: object) -> None:
+        if not self._current_torrent_attempt(tid, attempt):
+            return
         t = self.tasks.get(tid)
         if t is None or t.source_type != SOURCE_TORRENT:
             return
@@ -2503,7 +2535,7 @@ class QueueManager(QObject):
         if cached is None:
             # No enabled provider holds it. Cove downloads it itself rather
             # than handing the user off to another torrent client.
-            self._start_local_torrent(tid)
+            self._start_local_torrent(tid, attempt)
             return
         files = cached.files
         if t.selected_files is not None:
@@ -2520,7 +2552,7 @@ class QueueManager(QObject):
                     selected=len(t.selected_files),
                     provider_files=len(cached.files),
                 )
-                self._start_local_torrent(tid)
+                self._start_local_torrent(tid, attempt)
                 return
         try:
             self._materialize_cached_torrent(t, cached, files)
@@ -2554,6 +2586,11 @@ class QueueManager(QObject):
         Either way the short-lived delivery URL is generated per launch
         and never reaches the database.
         """
+        if t.launch_gid or t.id in self._unreconciled:
+            self._fail_task(t.id, self._UNRECONCILED_TORRENT_ERROR)
+            self.error.emit(self._UNRECONCILED_TORRENT_ERROR)
+            return
+        self._void_torrent_attempt(t.id)
         from .config import categorize
 
         def link_for(f) -> str:
@@ -2700,7 +2737,9 @@ class QueueManager(QObject):
         mode = getattr(self.settings, "torrent_fallback_mode", TORRENT_FALLBACK_AUTOMATIC)
         return mode == TORRENT_FALLBACK_AUTOMATIC
 
-    def _start_local_torrent(self, tid: int) -> None:
+    def _start_local_torrent(self, tid: int, attempt: object) -> None:
+        if not self._current_torrent_attempt(tid, attempt):
+            return
         t = self.tasks.get(tid)
         if t is None or t.source_type != SOURCE_TORRENT:
             return
@@ -2727,7 +2766,7 @@ class QueueManager(QObject):
             self._awaiting_consent.add(tid)
             self.torrent_consent_needed.emit(tid)
             return
-        self._verify_bittorrent_then_add(tid)
+        self._verify_bittorrent_then_add(tid, attempt)
 
     def torrent_consent(self, tid: int, accepted: bool, remember: bool = False) -> None:
         """The user's answer to the uncached-torrent notice.
@@ -2739,6 +2778,9 @@ class QueueManager(QObject):
         """
         if tid not in self._awaiting_consent:
             return
+        attempt = self._torrent_attempt.get(tid)
+        if not self._current_torrent_attempt(tid, attempt):
+            return
         self._awaiting_consent.discard(tid)
         if not accepted:
             self._fail_task(tid, TORRENT_CONSENT_DECLINED)
@@ -2747,7 +2789,7 @@ class QueueManager(QObject):
         if remember:
             self.settings.torrent_ip_disclosure_shown = True
             self.settings.save()
-        self._verify_bittorrent_then_add(tid)
+        self._verify_bittorrent_then_add(tid, attempt)
 
     def torrent_consent_reevaluate(self, tid: int) -> None:
         """Re-run the local-torrent checks after the user visited Settings.
@@ -2758,38 +2800,99 @@ class QueueManager(QObject):
         """
         if tid not in self._awaiting_consent:
             return
+        attempt = self._torrent_attempt.get(tid)
+        if not self._current_torrent_attempt(tid, attempt):
+            return
         self._awaiting_consent.discard(tid)
-        self._start_local_torrent(tid)
+        self._start_local_torrent(tid, attempt)
 
-    def _verify_bittorrent_then_add(self, tid: int) -> None:
+    def _verify_bittorrent_then_add(self, tid: int, attempt: object) -> None:
+        if not self._current_torrent_attempt(tid, attempt):
+            return
         if self._bt_capable is True:
-            self._add_local_torrent(tid)
+            self._add_local_torrent(tid, attempt)
             return
         if self._bt_capable is False:
             self._fail_task(tid, TORRENT_NO_BITTORRENT)
             return
         self._spawn(
             self._bittorrent_capable,
-            on_done=lambda ok, tid=tid: self._on_bittorrent_capability(tid, ok),
+            on_done=lambda ok, tid=tid: self._on_bittorrent_capability(tid, ok, attempt),
             # A capability check that cannot complete is not permission to
             # start a torrent anyway.
-            on_fail=lambda _msg, tid=tid: self._fail_task(tid, TORRENT_NO_BITTORRENT),
+            on_fail=lambda _msg, tid=tid: self._fail_torrent_attempt(tid, attempt, TORRENT_NO_BITTORRENT),
         )
 
     def _bittorrent_capable(self) -> bool:
         """Runs on a QThreadPool worker; never call it from the GUI thread."""
         return bittorrent_enabled(self.rpc.get_version())
 
-    def _on_bittorrent_capability(self, tid: int, ok: bool) -> None:
+    def _on_bittorrent_capability(self, tid: int, ok: bool, attempt: object) -> None:
+        if not self._current_torrent_attempt(tid, attempt):
+            return
         self._bt_capable = bool(ok)
         if ok:
-            self._add_local_torrent(tid)
+            self._add_local_torrent(tid, attempt)
         else:
             self._fail_task(tid, TORRENT_NO_BITTORRENT)
 
-    def _add_local_torrent(self, tid: int) -> None:
+    def _begin_aria2_launch(self, t: DownloadTask) -> dict:
+        """Reserve ownership on the GUI thread before an add can be admitted."""
+        gid = t.launch_gid
+        if not gid:
+            gid = generate_gid()
+            while gid in self._seen_gids:
+                gid = generate_gid()
+        t.launch_gid = gid
+        self._seen_gids.add(gid)
+        pending = {"gid": gid, "unreconciled": t.id in self._unreconciled}
+        self._unreconciled.discard(t.id)
+        self._pending_launch[t.id] = pending
+        self._persist(t)
+        return pending
+
+    def _add_in_flight(self, tid: int) -> bool:
+        return bool(self._pending_launch.get(tid, {}).get("gid"))
+
+    def _take_aria2_launch(self, tid: int, launch: dict) -> dict | None:
+        """Consume one terminal callback, rejecting duplicates/old generations."""
+        pending = self._pending_launch.get(tid)
+        if pending is not launch:
+            return None
+        return self._pending_launch.pop(tid)
+
+    def _on_aria2_add_failed(self, tid: int, launch: dict, msg: str) -> None:
+        pending = self._take_aria2_launch(tid, launch)
         t = self.tasks.get(tid)
-        if t is None or t.source_type != SOURCE_TORRENT:
+        if pending is None or t is None:
+            return
+        was_paused = t.status == "paused"
+        t.status = "error"
+        t.error = msg
+        t.finished_at = time.time()
+        entry = self._removing.get(tid)
+        if entry is not None:
+            entry["add_error"] = msg
+            entry["pause"] = bool(pending.get("pause") or was_paused)
+            self._persist(t)
+            self.task_changed.emit(tid)
+            self._start_removal(tid)
+            return
+        # Keep launch_gid: a lost reply can leave the identity live in aria2.
+        if pending.get("unreconciled"):
+            self._unreconciled.add(tid)
+        self._persist(t)
+        self.task_changed.emit(tid)
+        self._maybe_start_next()
+
+    def _add_local_torrent(self, tid: int, attempt: object) -> None:
+        if not self._current_torrent_attempt(tid, attempt):
+            return
+        t = self.tasks.get(tid)
+        if (
+            t is None or t.source_type != SOURCE_TORRENT or tid in self._removing
+            or self._add_in_flight(tid)
+        ):
             return
         # The disclosure and the capability check both take time, and the
         # user may have stopped the queue (or the scheduler window may have
@@ -2799,12 +2902,9 @@ class QueueManager(QObject):
         # start_queue / the scheduler / resume relaunch it.
         queue_held = not self._running or not self._scheduler_allows
         if queue_held or t.status == "paused":
-            # No add RPC is being issued, so nothing may be left claiming
-            # one is in flight: pause() records that intent for any active
-            # gid-less aria2 task, including one parked on the disclosure,
-            # and a stale entry here would make resume() wait forever for a
-            # gid callback that never comes.
-            self._pending_launch.pop(tid, None)
+            # No add is dispatched. Retire this pre-add attempt so resume
+            # can start a new one after the queue or task is released.
+            self._void_torrent_attempt(tid)
             t.status = "paused"
             if queue_held:
                 # Queue-driven, not user-driven, so start_queue and the
@@ -2819,14 +2919,15 @@ class QueueManager(QObject):
             # One row stands for the whole torrent, so the row is named
             # after the torrent rather than after a file inside it.
             t.filename = t.torrent_name
+        self._void_torrent_attempt(tid)
+        launch = self._begin_aria2_launch(t)
         if t.torrent_path:
             t.phase = ""
-            self._pending_launch.setdefault(tid, {})
             self._spawn(
                 self._add_managed_torrent,
                 t,
-                on_done=lambda gid, tid=tid: self._on_local_torrent_gid(tid, gid),
-                on_fail=lambda msg, tid=tid: self._fail_task(tid, msg),
+                on_done=lambda gid, tid=tid: self._on_local_torrent_gid(tid, gid, launch),
+                on_fail=lambda msg, tid=tid: self._on_aria2_add_failed(tid, launch, msg),
             )
             return
         # A magnet has no metadata yet: aria2 fetches it as its own download
@@ -2834,12 +2935,11 @@ class QueueManager(QObject):
         t.phase = PHASE_METADATA
         self._persist(t)
         self.task_changed.emit(tid)
-        self._pending_launch.setdefault(tid, {})
         self._spawn(
             self._add_local_magnet,
             t,
-            on_done=lambda gid, tid=tid: self._on_local_torrent_gid(tid, gid),
-            on_fail=lambda msg, tid=tid: self._fail_task(tid, msg),
+            on_done=lambda gid, tid=tid: self._on_local_torrent_gid(tid, gid, launch),
+            on_fail=lambda msg, tid=tid: self._on_aria2_add_failed(tid, launch, msg),
         )
 
     def _add_local_magnet(self, t: DownloadTask) -> str:
@@ -2856,7 +2956,9 @@ class QueueManager(QObject):
             # refuses this combination; this is the launch-side backstop.
             raise TorrentError(TORRENT_SELECTION_UNSUPPORTED)
         try:
-            return self.rpc.add_magnet(t.url, t.out_dir, t.speed_limit_kbps)
+            return self.rpc.add_magnet(
+                t.url, t.out_dir, t.speed_limit_kbps, gid=t.launch_gid or None
+            )
         except Aria2Error:
             raise TorrentError(TORRENT_ARIA2_FAILED) from None
 
@@ -2877,27 +2979,34 @@ class QueueManager(QObject):
         select_file = torrent.aria2_select_file(t.selected_files)
         try:
             return self.rpc.add_torrent(
-                data, t.out_dir, t.speed_limit_kbps, select_file=select_file
+                data, t.out_dir, t.speed_limit_kbps, select_file=select_file,
+                gid=t.launch_gid or None,
             )
         except Aria2Error:
             raise TorrentError(TORRENT_ARIA2_FAILED) from None
 
-    def _on_local_torrent_gid(self, tid: int, gid: str) -> None:
+    def _on_local_torrent_gid(self, tid: int, gid: str, launch: dict) -> None:
         # Record the gid before anything else so the external-download poll
         # can never adopt Cove's own torrent as a stranger's.
-        self._seen_gids.add(gid)
-        pending = self._pending_launch.pop(tid, {})
-        t = self.tasks.get(tid)
-        if t is None:
-            # Removed while the add was in flight; don't leak the download,
-            # and honour a remove-and-delete the user already chose.
-            self._finish_inflight_torrent_removal(
-                gid,
-                pending.get("out_dir", ""),
-                bool(pending.get("delete_file")),
-            )
+        if not isinstance(gid, str) or not gid:
+            self._on_aria2_add_failed(tid, launch, "aria2 returned no download identity")
             return
+        pending = self._take_aria2_launch(tid, launch)
+        t = self.tasks.get(tid)
+        if pending is None or t is None:
+            return
+        self._seen_gids.add(gid)
+        self._unreconciled.discard(tid)
         t.gid = gid
+        t.launch_gid = ""  # Confirmed ownership has moved to the returned gid.
+        entry = self._removing.get(tid)
+        if entry is not None:
+            entry["gid"] = gid
+            entry["pause"] = bool(pending.get("pause") or t.status == "paused")
+            self._persist(t)
+            self.task_changed.emit(tid)
+            self._start_removal(tid)
+            return
         if (
             pending.get("pause")
             or t.status == "paused"
@@ -2986,9 +3095,10 @@ class QueueManager(QObject):
         t = self.tasks.get(tid)
         if not t:
             return
-        # Nothing is in flight for a failed task; a leftover entry would
-        # make _maybe_start_next skip it forever on retry.
-        self._pending_launch.pop(tid, None)
+        # Retire pre-add work, but never lose a dispatched add's ownership.
+        self._void_torrent_attempt(tid)
+        if not self._add_in_flight(tid):
+            self._pending_launch.pop(tid, None)
         t.status = "error"
         t.error = msg
         t.finished_at = time.time()
@@ -3129,10 +3239,10 @@ class QueueManager(QObject):
             self._mark_paused(tid)
             return
         if t.status == "active" and not t.gid and t.backend == "aria2":
-            # add_uri is mid-flight; remember the intent so on_done can
-            # send rpc.pause() once it knows the gid. Reflect it locally
-            # right away so the UI doesn't lie about state.
-            self._pending_launch.setdefault(tid, {})["pause"] = True
+            # A dispatched add owns deferred pause intent. Pre-add work only
+            # needs the local paused state until it reaches the add gate.
+            if self._add_in_flight(tid):
+                self._pending_launch[tid]["pause"] = True
             self._mark_paused(tid)
             return
         if t.gid and t.status == "active":
@@ -3185,6 +3295,8 @@ class QueueManager(QObject):
         but Cove still has to agree with it.
         """
         self._desired_paused[tid] = (gid, paused)
+        if tid in self._removing:
+            return
         if self._in_flight(tid, gid):
             self._cmd_queued[tid] = (gid, paused, send, settle)
             return
@@ -3403,9 +3515,22 @@ class QueueManager(QObject):
         self._desired_paused[tid] = (gid, False)
         self._converge(tid, gid)
 
+    def _refuse_unreconciled_torrent_retry(self, t: DownloadTask) -> bool:
+        if t.source_type != SOURCE_TORRENT or t.id not in self._unreconciled:
+            return False
+        t.status = "error"
+        self._persist(t)
+        self.task_changed.emit(t.id)
+        self.error.emit(self._UNRECONCILED_TORRENT_ERROR)
+        return True
+
     def resume(self, tid: int) -> None:
         t = self.tasks.get(tid)
         if not t or t.status not in {"paused", "error"}:
+            return
+        if tid in self._removing and t.status == "error":
+            return
+        if self._refuse_unreconciled_torrent_retry(t):
             return
         if t.gid and t.status == "paused":
             # Optimistic flip to active — unpause is just telling aria2 to
@@ -3422,12 +3547,11 @@ class QueueManager(QObject):
                 )
 
             self._issue_state(tid, t.gid, False, _send)
-        elif not t.gid and tid in self._pending_launch:
-            # The add RPC is still in flight, so there is nothing to unpause
-            # and nothing to relaunch — a relaunch would add it to aria2
-            # twice. Cancel the deferred pause instead and let the gid
-            # callback finish the transition back to active.
-            self._pending_launch[tid].pop("pause", None)
+        elif not t.gid and (self._add_in_flight(tid) or tid in self._torrent_attempt):
+            # The add or its pre-add attempt still owns the continuation.
+            # Resume it locally rather than dispatching a second attempt.
+            if self._add_in_flight(tid):
+                self._pending_launch[tid].pop("pause", None)
             t.status = "active"
             t.error = None
             self._persist(t)
@@ -3482,6 +3606,8 @@ class QueueManager(QObject):
         t = self.tasks.get(tid)
         if not t:
             return
+        if tid in self._removing:
+            return
 
         # Torrents first: a torrent has its own removal path, and it also
         # covers the two states the generic in-flight handling below cannot
@@ -3495,35 +3621,9 @@ class QueueManager(QObject):
         if publishing is not None:
             # Keep the row and ownership until the worker can no longer write.
             publishing["remove"] = (delete_file, keep_incomplete)
-            return
-
-        # Special case: add_uri RPC is in flight. We can't ask aria2 to
-        # remove a gid we don't have yet, so keep the task alive in
-        # self.tasks but hide it from the UI/DB. on_done will dispatch the
-        # actual remove once it learns the gid. Only aria2 tasks qualify:
-        # active ffmpeg/yt-dlp tasks never get a gid and must instead go
-        # through the normal path that terminates their process.
-        if tid in self._pending_launch and not t.gid and t.backend == "aria2":
-            # Resolve the cleanup decision now, while the task is still here to
-            # ask; on_done only sees the tombstone. Staging was persisted before
-            # the add RPC, so capture its validated identity now.
-            self._pending_launch.setdefault(tid, {}).update(
-                {
-                    "remove": True,
-                    "delete_file": self._cleans_incomplete_data(
-                        t, delete_file, keep_incomplete, private_run=False
-                    ),
-                    "work": self._adopt_task_work(t),
-                }
-            )
-            with db.connect() as conn:
-                conn.execute("DELETE FROM downloads WHERE id=?", (tid,))
-            self.task_removed.emit(tid)
-            return
-
-        # A second click while aria2 is still deciding must not start a
-        # second teardown for the same task.
-        if tid in self._removing:
+            self._deferred_removal.add(tid)
+            self._persist(t)
+            self.task_changed.emit(tid)
             return
 
         # Normal path: stop any private engine run, then ask aria2 to forget
@@ -3536,7 +3636,7 @@ class QueueManager(QObject):
         if tid in self._extractor_procs or tid in self._extractor_work:
             private_run = True
             self._retire_extractor_run(tid)
-        gid = t.gid
+        gid = t.gid or (t.launch_gid if t.backend == "aria2" else None)
         cleanup = None if private_run else self._owned_cleanup(t)
         clean = self._cleans_incomplete_data(t, delete_file, keep_incomplete, private_run)
 
@@ -3549,7 +3649,13 @@ class QueueManager(QObject):
         # is still real: it stays visible, keeps its gid mapping and keeps
         # occupying a concurrency slot. Deleting files here would race aria2
         # into recreating them.
-        self._removing[tid] = {"gid": gid, "clean": clean}
+        self._removing[tid] = {
+            "gid": gid, "clean": clean,
+            "cleanup": cleanup if clean else None,
+            "launch": not bool(t.gid), "add_error": t.error,
+            "pause": t.status == "paused",
+        }
+        self._deferred_removal.discard(tid)
         # The row does have to record that it is on its way out, though. Before
         # this was two-phase the delete was synchronous, so a crash could never
         # resurrect a removed download; leaving the row untouched until aria2
@@ -3560,16 +3666,10 @@ class QueueManager(QObject):
         self._persist(t)
         self.task_changed.emit(tid)
 
-        def _confirmed(*_args):
-            # Ordering below is load-bearing: aria2 has forgotten the gid, so
-            # the payload and control file can no longer be recreated.
-            self._finish_removal(tid, cleanup if clean else None)
-
-        def _refused(*args):
-            self.error.emit(*args)
-            self._restore_removal(tid)
-
-        self._spawn(self.rpc.remove, gid, on_done=_confirmed, on_fail=_refused)
+        # An unresolved add can still land after a not-found removal answer.
+        # Its terminal callback starts teardown; no absence probe runs earlier.
+        if not self._add_in_flight(tid):
+            self._start_removal(tid)
 
     def is_pending_removal(self, tid: int) -> bool:
         """Whether `tid` is still tracked only so its cancellation can finish.
@@ -3579,13 +3679,110 @@ class QueueManager(QObject):
         that hide removed tasks need this to tell "on its way out" from "the
         backend refused, so it is live again".
         """
-        if tid in self._removing:
-            return True
-        return bool(self._pending_launch.get(tid, {}).get("remove"))
+        return tid in self._removing or tid in self._deferred_removal
+
+    @staticmethod
+    def _confirm_removal(result) -> str:
+        """Only an explicit backend acknowledgement can authorize retirement."""
+        if not isinstance(result, str) or not result:
+            raise Aria2Error("aria2 did not confirm removal")
+        return result
+
+    def _start_removal(self, tid: int) -> None:
+        """Run the shared cancellation transaction once the add has resolved."""
+        entry = self._removing.get(tid)
+        t = self.tasks.get(tid)
+        if entry is None or t is None or entry.get("started") or self._add_in_flight(tid):
+            return
+        entry["started"] = True
+        entry["ambiguous"] = not bool(t.gid)
+        entry["admitted"] = bool(t.gid)
+        is_torrent = t.source_type == SOURCE_TORRENT
+
+        def confirmed(paths=()):
+            if self._removing.get(tid) is not entry:
+                return
+            if not is_torrent and not entry["ambiguous"]:
+                try:
+                    self._confirm_removal(paths)
+                except Aria2Error as exc:
+                    refused(str(exc))
+                    return
+            if is_torrent:
+                self._finish_torrent_removal(tid, paths)
+            else:
+                self._finish_removal(tid, entry.get("cleanup"))
+
+        def refused(*args):
+            if self._removing.get(tid) is not entry:
+                return
+            if is_torrent:
+                self._refuse_torrent_removal(tid, *args)
+            else:
+                self.error.emit(*args)
+                self._restore_removal(tid)
+
+        if entry["ambiguous"]:
+            self._spawn(
+                self._cancel_ambiguous_transfer, entry,
+                is_torrent, t.phase == PHASE_METADATA,
+                on_done=confirmed, on_fail=refused,
+            )
+        elif is_torrent:
+            self._spawn(
+                self._cancel_torrent_transfer, entry,
+                t.phase == PHASE_METADATA, bool(entry.get("delete_file")),
+                on_done=confirmed, on_fail=refused,
+            )
+        else:
+            self._spawn(self.rpc.remove, entry["gid"], on_done=confirmed, on_fail=refused)
+
+    def _cancel_ambiguous_transfer(
+        self, entry: dict, is_torrent: bool, follow_children: bool
+    ) -> tuple[str, ...]:
+        """Reconcile the exact add identity after its terminal failure callback.
+
+        Only two consecutive aria2 not-found answers, separated by a finite
+        settle interval, establish absence. A found identity is cancelled via
+        the ordinary transaction; every other answer/error refuses removal.
+        """
+        gid = entry["gid"]
+        for attempt in range(2):
+            try:
+                status = self.rpc.tell_status(gid)
+            except Aria2RpcError as answered:
+                if not answered.gid_not_found():
+                    raise
+            else:
+                if not isinstance(status, dict) or status.get("gid") != gid or status.get("status") not in {
+                    "active", "waiting", "paused", "complete", "error", "removed"
+                }:
+                    raise Aria2Error("Could not establish download ownership from aria2 status.")
+                entry["admitted"] = True
+                break
+            if attempt == 0:
+                if self._ABSENCE_SETTLE_S:
+                    time.sleep(self._ABSENCE_SETTLE_S)
+            else:
+                entry["absent"] = True
+        if is_torrent:
+            # Even a missing metadata parent may have an admitted payload.
+            return self._cancel_torrent_transfer(
+                entry, follow_children, bool(entry.get("delete_file"))
+            )
+        if not entry.get("absent"):
+            self._confirm_removal(self.rpc.remove(gid))
+        return ()
 
     def _finish_removal(self, tid: int, cleanup) -> None:
         """Let go of a task aria2 has confirmed it no longer owns."""
+        if tid not in self.tasks:
+            return
+        self._unreconciled.discard(tid)
+        self._deferred_removal.discard(tid)
+        self._void_torrent_attempt(tid)
         self._removing.pop(tid, None)
+        self._pending_launch.pop(tid, None)
         self.tasks.pop(tid, None)
         self._cmd_gen.pop(tid, None)
         self._desired_paused.pop(tid, None)
@@ -3625,10 +3822,28 @@ class QueueManager(QObject):
         clear the durable removal marker, or the next launch would drop a task
         aria2 is still running.
         """
-        self._removing.pop(tid, None)
+        entry = self._removing.pop(tid, {})
+        self._deferred_removal.discard(tid)
         t = self.tasks.get(tid)
         if t is None:
             return
+        if entry.get("launch"):
+            if entry.get("admitted"):
+                t.gid = entry["gid"]
+                t.launch_gid = ""
+                self._seen_gids.add(t.gid)
+            if t.gid:
+                self._unreconciled.discard(tid)
+                queue_held = not self._running or not self._scheduler_allows
+                t.status = "paused" if entry.get("pause") or queue_held else "active"
+                t.error = None
+                t.finished_at = None
+                if queue_held:
+                    self._auto_paused.add(tid)
+            else:
+                t.status = "error"
+                t.error = entry.get("add_error") or t.error
+                self._unreconciled.add(tid)
         self._persist(t)
         self.task_changed.emit(tid)
         self._reassert_intent(t)
@@ -3682,7 +3897,7 @@ class QueueManager(QObject):
         that those deletions left empty.
         """
         tid = t.id
-        gid = t.gid
+        gid = t.gid or t.launch_gid
         base = t.out_dir
 
         # A second click while aria2 is still deciding must not start a
@@ -3690,11 +3905,13 @@ class QueueManager(QObject):
         if tid in self._removing:
             return
 
+        self._void_torrent_attempt(tid)
         if not gid:
-            # Nothing has been handed to aria2 yet, so there is no transfer
-            # that could outlive the row. Letting go here is safe, and an add
-            # still in flight is covered by the tombstone below.
+            # No add was dispatched (queued, consent, or paused before launch).
+            self._unreconciled.discard(tid)
+            self._deferred_removal.discard(tid)
             self.tasks.pop(tid, None)
+            self._pending_launch.pop(tid, None)
             self._awaiting_consent.discard(tid)
             self._consent_granted.discard(tid)
             with db.connect() as conn:
@@ -3704,16 +3921,6 @@ class QueueManager(QObject):
             # another live task for the same info hash still needs it.
             if t.torrent_path and not self._info_hash_in_use(t.info_hash):
                 torrent.discard_managed_torrent(t.torrent_path)
-            if tid in self._pending_launch:
-                # The add RPC is still on its way back. Leave a tombstone so
-                # the gid callback can finish the job - including the delete
-                # the user asked for, which would otherwise be dropped along
-                # with any partial data aria2 wrote in the meantime.
-                self._pending_launch[tid] = {
-                    "remove": True,
-                    "delete_file": bool(delete_file),
-                    "out_dir": base,
-                }
             self._maybe_start_next()
             return
 
@@ -3727,20 +3934,17 @@ class QueueManager(QObject):
             "gid": gid,
             "delete_file": bool(delete_file),
             "out_dir": base,
+            "launch": not bool(t.gid), "add_error": t.error,
+            "pause": t.status == "paused",
         }
+        self._deferred_removal.discard(tid)
         # The row still has to record that it is on its way out: being in
         # `_removing` is what makes _persist write the durable marker, so a
         # crash inside the round trip cannot restore a removed download.
         self._persist(t)
         self.task_changed.emit(tid)
-        self._spawn(
-            self._cancel_torrent_transfer,
-            self._removing[tid],
-            t.phase == PHASE_METADATA,
-            bool(delete_file),
-            on_done=lambda paths, tid=tid: self._finish_torrent_removal(tid, paths),
-            on_fail=lambda *args, tid=tid: self._refuse_torrent_removal(tid, *args),
-        )
+        if not self._add_in_flight(tid):
+            self._start_removal(tid)
 
     def _cancel_torrent_transfer(
         self, entry: dict, follow_children: bool, delete_file: bool
@@ -3756,7 +3960,8 @@ class QueueManager(QObject):
         transfer rather than one that is already gone.
         """
         parent = entry["gid"]
-        children = self._torrent_children(parent) if follow_children else []
+        parent_absent = bool(entry.get("absent"))
+        children = self._torrent_children(parent, parent_absent) if follow_children else []
         paths: tuple[str, ...] = ()
         if delete_file:
             for owned in [parent, *children]:
@@ -3769,7 +3974,8 @@ class QueueManager(QObject):
         # already owns, its children are untouched, and the parent still names
         # them for the retry. Stopping the children first left the opposite -
         # a task restored in the metadata phase whose payload was already gone.
-        self.rpc.remove(parent)
+        if not parent_absent:
+            self._confirm_removal(self.rpc.remove(parent))
         if not follow_children:
             return paths
         # aria2 can finish the metadata and create the payload child in the
@@ -3783,19 +3989,21 @@ class QueueManager(QObject):
             # this point hands the task back naming a live transfer instead of
             # a gid aria2 has already forgotten.
             entry["gid"] = children[0]
+            entry["admitted"] = True
         owned = list(children)
-        for child in self._torrent_children(parent):
+        for child in self._torrent_children(parent, parent_absent):
             if child not in owned:
                 owned.append(child)
         for child in owned:
             entry["gid"] = child
+            entry["admitted"] = True
             if delete_file and child not in children:
                 # The children known before the removal were inventoried above.
                 paths += self._owned_file_paths(child)
-            self.rpc.remove(child)
+            self._confirm_removal(self.rpc.remove(child))
         return paths
 
-    def _torrent_children(self, parent: str) -> list[str]:
+    def _torrent_children(self, parent: str, known_absent: bool = False) -> list[str]:
         """Transfers aria2 itself attributes to `parent`.
 
         Two sources, both aria2's own statement about this one gid: the
@@ -3803,8 +4011,10 @@ class QueueManager(QObject):
         `following` it. Never a match on info hash, output directory or
         filename - those would cancel jobs this task does not own.
         """
+        status = None
         try:
-            status = self.rpc.tell_status(parent)
+            if not known_absent:
+                status = self.rpc.tell_status(parent)
         except Aria2RpcError as answered:
             # Only "GID is not found" is aria2 stating there is no such
             # download; not knowing the parent is not knowing there is no
@@ -3851,7 +4061,11 @@ class QueueManager(QObject):
         entry = self._removing.pop(tid, None)
         if entry is None:
             return
+        self._unreconciled.discard(tid)
+        self._deferred_removal.discard(tid)
+        self._void_torrent_attempt(tid)
         t = self.tasks.pop(tid, None)
+        self._pending_launch.pop(tid, None)
         self._awaiting_consent.discard(tid)
         self._consent_granted.discard(tid)
         self._cmd_gen.pop(tid, None)
@@ -3882,15 +4096,18 @@ class QueueManager(QObject):
         loop against a daemon that is not answering is worse than a removal
         the user can see failed and ask for again.
         """
-        anchor = self._removing.get(tid, {}).get("gid")
+        entry = self._removing.get(tid, {})
+        anchor = entry.get("gid")
         t = self.tasks.get(tid)
-        if t is not None and anchor and t.gid != anchor:
+        if t is not None and anchor and (t.gid or entry.get("admitted")) and t.gid != anchor:
             # Ownership moved during the teardown: the metadata parent was
             # stopped and its payload child was not. The task takes the gid
             # that still names a running transfer, or the only thing pointing
             # at it would be a gid aria2 has already forgotten.
+            previous = t.gid or t.launch_gid
             t.gid = anchor
-            if t.phase == PHASE_METADATA:
+            self._seen_gids.add(anchor)
+            if t.phase == PHASE_METADATA and anchor != previous:
                 # This is the same parent-to-child handoff the poll performs,
                 # so it has to leave the same state behind. A payload gid still
                 # wearing the metadata phase is read as a metadata fetch, and
@@ -3908,33 +4125,6 @@ class QueueManager(QObject):
                 t.last_status_at = 0.0
         self.error.emit(*args)
         self._restore_removal(tid)
-
-    def _finish_inflight_torrent_removal(
-        self, gid: str, base: str, delete_file: bool
-    ) -> None:
-        """Drop a gid that landed after its task was removed.
-
-        Reuses the same bounded deletion path as an ordinary removal, so
-        anything aria2 wrote during the race is cleaned up under exactly the
-        same containment checks.
-        """
-        def _drop(paths=()):
-            def _after(*_args):
-                if paths and base:
-                    self._delete_torrent_files(paths, base)
-                self._maybe_start_next()
-
-            self._spawn(self.rpc.remove, gid, on_done=_after, on_fail=_after)
-
-        if not (delete_file and base):
-            _drop()
-            return
-        self._spawn(
-            self.rpc.get_files,
-            gid,
-            on_done=lambda files: _drop(self._torrent_file_paths(files)),
-            on_fail=lambda *_: _drop(),
-        )
 
     def _info_hash_in_use(self, info_hash: str) -> bool:
         """Whether anything still needs the managed copy for this torrent.
@@ -4196,14 +4386,14 @@ class QueueManager(QObject):
         self._pool.start(call)
 
     def _active_count(self) -> int:
-        return sum(1 for t in self.tasks.values() if t.status == "active")
+        return sum(1 for t in self.tasks.values() if (
+            t.status == "active" or t.id in self._removing or t.id in self._unreconciled
+        ))
 
     def _maybe_start_next(self) -> None:
         if not self._running or not self._scheduler_allows:
             return
         slots = max(0, self.settings.max_concurrent - self._active_count())
-        if slots <= 0:
-            return
         ready = sorted(
             # `not t.gid` guards against relaunching a task that already has
             # an aria2 gid (e.g. an adopted external download) — doing so
@@ -4216,12 +4406,19 @@ class QueueManager(QObject):
                 if t.status == "queued"
                 and not t.gid
                 and t.id not in self._pending_launch
+                and t.id not in self._removing
                 and t.id not in self._extractor_pause_pending
             ),
             key=lambda t: t.created_at,
         )
-        for t in ready[:slots]:
-            self._launch(t)
+        for t in ready:
+            if t.id in self._unreconciled:
+                # Retry reuses this task's already occupied backend slot.
+                if not self._refuse_unreconciled_torrent_retry(t):
+                    self._launch(t)
+            elif slots > 0:
+                self._launch(t)
+                slots -= 1
 
     def _launch_hls(self, t: DownloadTask) -> None:
         from .hls import ffmpeg_command, parse_ffmpeg_progress
@@ -4536,7 +4733,12 @@ class QueueManager(QObject):
         proc.start(cmd[0], cmd[1:])
 
     def _launch(self, t: DownloadTask) -> None:
-        if t.id in self._publishing:
+        if self._refuse_unreconciled_torrent_retry(t):
+            return
+        if (
+            t.id in self._publishing or t.id in self._removing
+            or self._add_in_flight(t.id)
+        ):
             return
         t.status = "active"
         t.error = None
@@ -4616,42 +4818,32 @@ class QueueManager(QObject):
             self._maybe_start_next()
             return
         t.aria2_filename = t.filename
-        self._pending_launch[t.id] = {}
+        launch = self._begin_aria2_launch(t)
+        identity = launch["gid"]
 
         def on_done(gid: str, tid: int = t.id) -> None:
-            pending = self._pending_launch.pop(tid, {})
+            if not isinstance(gid, str) or not gid:
+                self._on_aria2_add_failed(tid, launch, "aria2 returned no download identity")
+                return
+            pending = self._take_aria2_launch(tid, launch)
             tt = self.tasks.get(tid)
+            if pending is None or tt is None:
+                return
             # Record our own gid immediately (before any remove/pause branch)
             # so the external-download poll never re-adopts it.
             self._seen_gids.add(gid)
-
-            # Deferred remove wins over deferred pause: the user said
-            # "drop this", so do that and don't bother pausing first.
-            if pending.get("remove"):
-                # Only the captured private directory can be cleaned, and only
-                # after confirmed cancellation. Failure grants no authority.
-                owned_work = pending.get("work")
-                cleanup = (
-                    lambda: self._cleanup_engine_work(owned_work)
-                ) if owned_work and pending.get("delete_file") else None
-                self._spawn(
-                    self.rpc.remove,
-                    gid,
-                    on_done=(lambda *_: cleanup()) if cleanup else None,
-                    on_fail=lambda *_: None,
-                )
-                # Pop the still-tracked task so the polling loop forgets it.
-                self.tasks.pop(tid, None)
-                self._maybe_start_next()
-                return
-
-            if tt is None:
-                # Task vanished some other way; clean up the gid in aria2
-                # so we don't leak it and bail.
-                self._spawn(self.rpc.remove, gid)
-                return
+            self._unreconciled.discard(tid)
 
             tt.gid = gid
+            tt.launch_gid = ""  # The returned gid now owns this operation.
+            entry = self._removing.get(tid)
+            if entry is not None:
+                entry["gid"] = gid
+                entry["pause"] = bool(pending.get("pause") or tt.status == "paused")
+                self._persist(tt)
+                self.task_changed.emit(tid)
+                self._start_removal(tid)
+                return
 
             if pending.get("pause") or tt.status == "paused":
                 # User paused before gid landed (or stop_queue's pause_all
@@ -4677,23 +4869,7 @@ class QueueManager(QObject):
             self.task_changed.emit(tid)
 
         def on_fail(msg: str, tid: int = t.id) -> None:
-            pending = self._pending_launch.pop(tid, {})
-            tt = self.tasks.get(tid)
-
-            # If the user already removed the task, the failure is moot —
-            # the local row and DB entry are already gone.
-            if pending.get("remove"):
-                self.tasks.pop(tid, None)
-                self._maybe_start_next()
-                return
-
-            if not tt:
-                return
-            tt.status = "error"
-            tt.error = msg
-            self._persist(tt)
-            self.task_changed.emit(tid)
-            self._maybe_start_next()
+            self._on_aria2_add_failed(tid, launch, msg)
 
         is_http = t.url.startswith("http://") or t.url.startswith("https://")
         # _probe_and_add is the only off-GUI-thread path that can do network
@@ -4721,6 +4897,7 @@ class QueueManager(QObject):
                 t.connections,
                 t.speed_limit_kbps,
                 t.filename,
+                gid=identity,
                 on_done=on_done,
                 on_fail=on_fail,
             )
@@ -4895,6 +5072,7 @@ class QueueManager(QObject):
         gid = self.rpc.add_uri(
             [target], str(work.path), segments,
             t.speed_limit_kbps, requested,
+            gid=t.launch_gid or None,
         )
         # Runs on the probe worker thread; DiagLogger.emit is thread safe.
         # Host class and segment count only - never the URL handed to aria2.
@@ -5207,6 +5385,7 @@ class QueueManager(QObject):
                 if self._publication_shutdown:
                     # Recover cancellation next launch; quit grants no deletion.
                     self._removing[tid] = {"gid": t.gid, "clean": False}
+                    self._deferred_removal.discard(tid)
                     self._persist(t)
                 else:
                     self.remove(tid, delete_file=delete, keep_incomplete=keep)
