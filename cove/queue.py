@@ -2894,7 +2894,7 @@ class QueueManager(QObject):
         if remember:
             self.settings.torrent_ip_disclosure_shown = True
             self.settings.save()
-        self._verify_bittorrent_then_add(tid, attempt)
+        self._start_local_torrent(tid, attempt)
 
     def torrent_consent_reevaluate(self, tid: int) -> None:
         """Re-run the local-torrent checks after the user visited Settings.
@@ -2937,7 +2937,7 @@ class QueueManager(QObject):
             return
         self._bt_capable = bool(ok)
         if ok:
-            self._add_local_torrent(tid, attempt)
+            self._start_local_torrent(tid, attempt)
         else:
             self._fail_task(tid, TORRENT_NO_BITTORRENT)
 
@@ -3047,6 +3047,18 @@ class QueueManager(QObject):
             on_fail=lambda msg, tid=tid: self._on_aria2_add_failed(tid, launch, msg),
         )
 
+    def _require_local_payload_policy(self, t: DownloadTask) -> None:
+        """Recheck on the worker immediately before the peer-capable RPC."""
+        policy = self.local_p2p_policy(
+            consent_granted=t.id in self._consent_granted, require_enabled=False,
+        )
+        if policy != P2P_ALLOW:
+            raise TorrentError({
+                P2P_BLOCK_FALLBACK_POLICY: TORRENT_CANCELLED_UNCACHED,
+                P2P_BLOCK_PROXY_POLICY: TORRENT_PROXY_BLOCKED,
+                P2P_NEEDS_CONSENT: TORRENT_CONSENT_DECLINED,
+            }[policy])
+
     def _add_local_magnet(self, t: DownloadTask) -> str:
         """Hand the magnet to aria2, keeping its failures unquotable.
 
@@ -3061,6 +3073,7 @@ class QueueManager(QObject):
             # refuses this combination; this is the launch-side backstop.
             raise TorrentError(TORRENT_SELECTION_UNSUPPORTED)
         try:
+            self._require_local_payload_policy(t)
             return self.rpc.add_magnet(
                 t.url, t.out_dir, t.speed_limit_kbps, gid=t.launch_gid or None
             )
@@ -3083,6 +3096,7 @@ class QueueManager(QObject):
         # byte for byte the call it was before selection existed.
         select_file = torrent.aria2_select_file(t.selected_files)
         try:
+            self._require_local_payload_policy(t)
             return self.rpc.add_torrent(
                 data, t.out_dir, t.speed_limit_kbps, select_file=select_file,
                 gid=t.launch_gid or None,

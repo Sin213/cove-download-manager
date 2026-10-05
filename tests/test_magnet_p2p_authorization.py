@@ -10,12 +10,17 @@ import pytest
 
 import cove.main_window as mw
 import cove.queue as qm
-from tests.test_queue import queue_env, _rows  # noqa: F401
+from tests.test_queue import (  # noqa: F401
+    MAGNET, _local_settings, _local_torrent_file, _persisted_row,
+    queue_env, _rows,
+)
 from tests.test_magnet_metadata import _fixture_bytes, _magnet, _other_bytes
 from tests.test_manual_magnet_contents import (
     _REJECT, _env, _errors, _fixture_cached, _inline, _plan, _running,
 )
 from tests.test_search_magnet_contents import _result
+from tests.test_queue_output_ownership import release
+from tests.test_queue_removal_ownership import absent, drain
 
 
 FALLBACK_BLOCKED = (
@@ -983,3 +988,442 @@ def test_r3_failed_cached_conversion_retains_request_consent(
         _running(queue)
         queue.resume(tid)
         assert prompts == [] and len(rpc.torrents) == 1
+
+
+# ---------------------------------------------------------------------------
+# S02A: current policy at local BitTorrent PAYLOAD admission (A1-A16)
+# ---------------------------------------------------------------------------
+
+_PAYLOAD_BLOCKS = [
+    pytest.param({"torrent_fallback_mode": "never"},
+                 qm.TORRENT_CANCELLED_UNCACHED, id="fallback"),
+    pytest.param({"proxy_type": "http", "proxy_host": "127.0.0.1",
+                  "torrent_allow_with_proxy": False},
+                 qm.TORRENT_PROXY_BLOCKED, id="proxy"),
+]
+_PAYLOAD_REVOCATIONS = _PAYLOAD_BLOCKS + [
+    pytest.param({"torrent_ip_disclosure_shown": False},
+                 qm.TORRENT_CONSENT_DECLINED, id="disclosure"),
+]
+
+
+class _PayloadAdmission:
+    """Hold actual spawned workers, then run their real function/callback."""
+
+    def __init__(self, queue, rpc, db_path, tid, payload):
+        self.queue, self.rpc, self.db_path, self.tid = queue, rpc, db_path, tid
+        self.payload = payload
+        self.held = {"_bittorrent_capable"}
+        self.pending = deque()
+        self.capability_calls = 0
+        self.payload_calls = 0
+        self.prompts = []
+        queue.torrent_consent_needed.connect(self.prompts.append)
+        queue._spawn = self.spawn
+
+    @property
+    def task(self):
+        return self.queue.tasks[self.tid]
+
+    def spawn(self, fn, *args, on_done=None, on_fail=None, **kwargs):
+        name = getattr(fn, "__name__", "")
+        if name == "_bittorrent_capable":
+            self.capability_calls += 1
+        elif name in {"_add_local_magnet", "_add_managed_torrent"}:
+            self.payload_calls += 1
+        call = (fn, args, kwargs, on_done, on_fail)
+        if name in self.held:
+            self.pending.append(call)
+        else:
+            release(call)
+
+    def start(self):
+        self.queue._launch(self.task)
+
+    def finish(self):
+        assert len(self.pending) == 1
+        release(self.pending.popleft())
+
+    def change(self, settings):
+        for key, value in settings.items():
+            setattr(self.queue.settings, key, value)
+
+    def assert_adds(self, count):
+        expected, other = ((self.rpc.magnets, self.rpc.torrents)
+                           if self.payload == "magnet"
+                           else (self.rpc.torrents, self.rpc.magnets))
+        assert len(expected) == count and other == []
+
+    def assert_failed(self, message):
+        self.assert_adds(0)
+        assert self.task.status == "error" and self.task.error == message
+        assert not self.task.gid and self.tid not in self.queue._pending_launch
+        assert self.tid not in self.queue._torrent_attempt
+        row = _persisted_row(self.db_path, self.tid)
+        assert row["status"] == "error" and row["error"] == message
+
+    def assert_admitted(self):
+        self.assert_adds(1)
+        assert self.task.status == "active" and self.task.error is None
+        assert self.task.gid and not self.task.launch_gid
+        assert self.tid not in self.queue._pending_launch
+        assert self.tid not in self.queue._torrent_attempt
+        assert not self.pending
+
+
+@pytest.fixture(params=["magnet", "torrent"])
+def payload_admission(queue_env, monkeypatch, tmp_path, request):
+    if request.param == "torrent":
+        queue, rpc, path, tid, _raw, _calls = _local_torrent_file(
+            queue_env, monkeypatch, tmp_path, all_debrid_enabled=False,
+        )
+    else:
+        queue, rpc, path = queue_env(**_local_settings(all_debrid_enabled=False))
+        tid = queue.add_url(MAGNET)
+        _running(queue)
+    return _PayloadAdmission(queue, rpc, path, tid, request.param)
+
+
+@pytest.mark.parametrize("settings,message", _PAYLOAD_BLOCKS)
+@pytest.mark.parametrize("grant", ["persistent", "request"])
+def test_s02a_a1_a2_a5_policy_tightens_during_capability(
+    payload_admission, settings, message, grant,
+):
+    h = payload_admission
+    if grant == "request":
+        h.change({"torrent_ip_disclosure_shown": False})
+        h.queue._consent_granted.add(h.tid)
+    h.start()
+    assert h.capability_calls == 1 and len(h.pending) == 1
+    h.change(settings)
+    h.finish()
+    h.assert_failed(message)
+    assert h.prompts == [] and h.payload_calls == 0
+
+
+def test_s02a_a3_a14_revocation_returns_to_one_consent_prompt(payload_admission):
+    h = payload_admission
+    h.start()
+    h.change({"torrent_ip_disclosure_shown": False})
+    h.finish()
+    h.assert_adds(0)
+    assert h.tid in h.queue._awaiting_consent
+    assert h.prompts == [h.tid]
+    assert h.task.status == "active" and h.task.error is None
+    assert h.tid in h.queue._torrent_attempt
+    h.queue.torrent_consent(h.tid, True)
+    h.assert_admitted()
+    assert h.prompts == [h.tid] and h.capability_calls == 1
+    assert h.tid in h.queue._consent_granted
+    assert not h.queue.settings.torrent_ip_disclosure_shown
+
+
+def test_s02a_a4_request_grant_survives_capability_reentry(payload_admission):
+    h = payload_admission
+    h.change({"torrent_ip_disclosure_shown": False})
+    h.queue._consent_granted.add(h.tid)
+    h.start()
+    h.finish()
+    h.assert_admitted()
+    assert h.prompts == [] and h.capability_calls == 1
+    assert h.tid in h.queue._consent_granted
+
+
+@pytest.mark.parametrize("settings,message", _PAYLOAD_REVOCATIONS + [
+    pytest.param({}, None, id="allow"),
+])
+def test_s02a_a6_cached_capability_still_uses_current_policy(
+    payload_admission, settings, message,
+):
+    h = payload_admission
+    h.queue._bt_capable = True
+    h.change(settings)
+    h.start()
+    assert h.capability_calls == 0 and h.rpc.version_calls == []
+    if message == qm.TORRENT_CONSENT_DECLINED:
+        h.assert_adds(0)
+        assert h.prompts == [h.tid] and h.tid in h.queue._awaiting_consent
+    elif message is not None:
+        h.assert_failed(message)
+        assert h.prompts == []
+    else:
+        h.assert_admitted()
+        assert h.prompts == []
+
+
+@pytest.mark.parametrize("outcome", ["false", "failure"])
+def test_s02a_a7_a8_capability_refusal_is_terminal(
+    payload_admission, monkeypatch, outcome,
+):
+    h = payload_admission
+    h.start()
+    h.change({"torrent_ip_disclosure_shown": False})
+    if outcome == "false":
+        monkeypatch.setattr(h.rpc, "version", {"enabledFeatures": []})
+    else:
+        def fail_version():
+            raise qm.Aria2Error("capability unavailable")
+        monkeypatch.setattr(h.rpc, "get_version", fail_version)
+    h.finish()
+    h.assert_failed(qm.TORRENT_NO_BITTORRENT)
+    assert h.prompts == [] and h.capability_calls == 1 and not h.pending
+
+
+def test_s02a_a9_remove_during_capability_never_resurrects(payload_admission):
+    h = payload_admission
+    h.start()
+    h.queue.remove(h.tid)
+    h.finish()
+    h.assert_adds(0)
+    assert h.tid not in h.queue.tasks and _persisted_row(h.db_path, h.tid) is None
+    assert h.tid not in h.queue._pending_launch
+    assert h.tid not in h.queue._torrent_attempt
+    assert h.prompts == [] and not h.pending
+
+
+@pytest.mark.parametrize("gate", ["stop", "scheduler", "pause"])
+def test_s02a_a10_a11_lifecycle_blocks_then_legitimate_resume(
+    payload_admission, gate,
+):
+    h = payload_admission
+    h.start()
+    if gate == "stop":
+        h.queue.stop_queue()
+    elif gate == "scheduler":
+        h.queue.set_scheduler_allowed(False)
+    else:
+        h.queue.pause(h.tid)
+    h.finish()
+    h.assert_adds(0)
+    assert h.task.status == "paused" and not h.task.gid
+    assert h.tid not in h.queue._torrent_attempt
+    assert h.tid not in h.queue._pending_launch
+    assert (h.tid in h.queue._auto_paused) == (gate != "pause")
+    if gate == "stop":
+        h.queue.start_queue()
+    elif gate == "scheduler":
+        h.queue.set_scheduler_allowed(True)
+    else:
+        h.queue.resume(h.tid)
+    h.assert_admitted()
+    assert h.capability_calls == 1 and h.prompts == []
+
+
+def test_s02a_a12_a13_current_allow_has_one_worker_and_one_add(payload_admission):
+    h = payload_admission
+    h.start()
+    h.change({"torrent_fallback_mode": "never"})
+    h.change({"torrent_fallback_mode": "automatic"})
+    h.finish()
+    h.assert_admitted()
+    assert h.capability_calls == 1 and len(h.rpc.version_calls) == 1
+    assert h.queue._bt_capable is True and h.prompts == []
+
+
+@pytest.mark.parametrize("settings,message", _PAYLOAD_BLOCKS)
+@pytest.mark.parametrize("remember", [False, True])
+def test_s02a_a15_consent_answer_rechecks_hard_policy(
+    payload_admission, monkeypatch, settings, message, remember,
+):
+    h = payload_admission
+    h.change({"torrent_ip_disclosure_shown": False})
+    h.queue._bt_capable = True
+    saves = []
+    monkeypatch.setattr(h.queue.settings, "save", lambda: saves.append(True))
+    h.start()
+    assert h.prompts == [h.tid] and h.tid in h.queue._awaiting_consent
+    h.change(settings)
+    h.queue.torrent_consent(h.tid, True, remember=remember)
+    h.assert_failed(message)
+    assert h.prompts == [h.tid] and h.capability_calls == 0 and h.payload_calls == 0
+    assert h.tid in h.queue._consent_granted
+    assert saves == ([True] if remember else [])
+    assert h.queue.settings.torrent_ip_disclosure_shown is remember
+
+
+@pytest.mark.parametrize("settings,message", _PAYLOAD_REVOCATIONS + [
+    pytest.param({}, None, id="allow"),
+])
+def test_s02a_a16_pool_hop_rechecks_policy_and_settles_launch(
+    payload_admission, settings, message,
+):
+    h = payload_admission
+    h.queue._bt_capable = True
+    h.held = {"_add_local_magnet", "_add_managed_torrent"}
+    h.start()
+    assert h.tid in h.queue._pending_launch and h.task.launch_gid
+    reserved = h.task.launch_gid
+    h.change(settings)
+    h.finish()
+    if message is None:
+        h.assert_admitted()
+    else:
+        h.assert_failed(message)
+        # S01B conservatively retains the reserved identity on add failure.
+        assert h.task.launch_gid == reserved and reserved in h.queue._seen_gids
+        assert _persisted_row(h.db_path, h.tid)["gid"] == reserved
+        assert h.tid not in h.queue._unreconciled
+        assert h.queue._active_count() == 0
+    assert h.prompts == [] and h.capability_calls == 0
+
+
+# S02A repair 1: policy changes inside reads, concurrent callbacks, and removal.
+@pytest.mark.parametrize("payload_admission", ["torrent"], indirect=True)
+@pytest.mark.parametrize("settings,message", _PAYLOAD_REVOCATIONS + [
+    pytest.param({}, None, id="allow"),
+])
+def test_s02a_t1_managed_read_cannot_authorize_a_later_payload(
+    payload_admission, monkeypatch, settings, message,
+):
+    h = payload_admission
+    h.queue._bt_capable = True
+    h.held = {"_add_managed_torrent"}
+    original_read = qm.torrent.read_managed_torrent
+    reads = []
+
+    def read_and_change_policy(path, info_hash):
+        data = original_read(path, info_hash)
+        reads.append((path, info_hash))
+        h.change(settings)
+        return data
+
+    monkeypatch.setattr(qm.torrent, "read_managed_torrent", read_and_change_policy)
+    h.start()
+    reserved = h.task.launch_gid
+    assert reserved and h.tid in h.queue._pending_launch and reads == []
+    h.finish()
+    assert reads == [(h.task.torrent_path, h.task.info_hash)]
+    if message is None:
+        h.assert_admitted()
+    else:
+        h.assert_failed(message)
+        assert h.task.launch_gid == reserved and reserved in h.queue._seen_gids
+        assert _persisted_row(h.db_path, h.tid)["gid"] == reserved
+        assert h.tid not in h.queue._unreconciled
+        assert h.queue._active_count() == 0
+    assert h.prompts == [] and h.capability_calls == 0
+
+
+@pytest.mark.parametrize("order", [(0, 1), (1, 0)], ids=["fifo", "reverse"])
+@pytest.mark.parametrize("tighten", [False, True], ids=["allow", "block"])
+def test_s02a_t2_concurrent_capabilities_keep_each_payload_owned(
+    payload_admission, monkeypatch, tmp_path, order, tighten,
+):
+    h = payload_admission
+    queue = h.queue
+    # Intake stays queued while the second task's managed copy is prepared.
+    queue._scheduler_allows = False
+    raw = _other_bytes()
+    if h.payload == "torrent":
+        source = tmp_path / "second.torrent"
+        source.write_bytes(raw)
+        queue.add_torrent_file(str(source), str(tmp_path))
+        second = next(t for tid, t in queue.tasks.items() if tid != h.tid)
+    else:
+        uri = _magnet(qm.torrent.parse_torrent(raw).info_hash)
+        second = queue.tasks[queue.add_url(uri)]
+    queue._scheduler_allows = True
+    tasks = [h.task, second]
+    assert tasks[0].info_hash != tasks[1].info_hash
+    h.held |= {"_add_local_magnet", "_add_managed_torrent"}
+    rpc_method = "add_magnet" if h.payload == "magnet" else "add_torrent"
+    original_add = getattr(h.rpc, rpc_method)
+    admitted = []
+
+    def add_with_reserved_identity(*args, **kwargs):
+        original_add(*args, **kwargs)  # Keep the existing payload RPC spy.
+        admitted.append(kwargs["gid"])
+        return kwargs["gid"]
+
+    monkeypatch.setattr(h.rpc, rpc_method, add_with_reserved_identity)
+    assert queue._bt_capable is None
+    h.start()
+    queue._launch(second)
+    # Two concurrent cache misses each spawn a worker: existing behavior.
+    assert h.capability_calls == 2 and len(h.pending) == 2
+    assert queue._bt_capable is None
+    capabilities = list(h.pending)
+    h.pending.clear()
+    release(capabilities[order[0]])
+    first = tasks[order[0]]
+    reserved = first.launch_gid
+    assert reserved and first.status == "active"
+    assert first.id in queue._pending_launch and len(h.pending) == 1
+    h.assert_adds(0)
+    if tighten:
+        h.change({"torrent_fallback_mode": "never"})
+    release(capabilities[order[1]])
+    if tighten:
+        assert first.status == "active" and first.launch_gid == reserved
+        assert first.id in queue._pending_launch
+        assert tasks[order[1]].error == qm.TORRENT_CANCELLED_UNCACHED
+        assert len(h.pending) == 1  # Only the first callback dispatched an add.
+    else:
+        assert len(h.pending) == 2
+    h.assert_adds(0)
+    while h.pending:
+        release(h.pending.popleft())
+    h.assert_adds(0 if tighten else 2)
+    assert h.capability_calls == 2 and len(h.rpc.version_calls) == 2
+    assert h.payload_calls == (1 if tighten else 2) and h.prompts == []
+    assert admitted == ([] if tighten else [t.gid for t in (first, tasks[order[1]])])
+    if not tighten:
+        assert len(set(admitted)) == 2
+    for t in tasks:
+        assert t.id not in queue._torrent_attempt and t.id not in queue._pending_launch
+        row = _persisted_row(h.db_path, t.id)
+        if tighten:
+            assert t.status == row["status"] == "error" and not t.gid
+            assert t.error == row["error"] == qm.TORRENT_CANCELLED_UNCACHED
+        else:
+            assert t.status == row["status"] == "active" and t.error is None
+            assert t.gid == row["gid"] and not t.launch_gid
+
+
+@pytest.mark.parametrize("settings,message", _PAYLOAD_REVOCATIONS)
+def test_s02a_t3_worker_refusal_completes_pending_removal(
+    payload_admission, monkeypatch, settings, message,
+):
+    h = payload_admission
+    queue = h.queue
+    queue._bt_capable = True
+    h.held = {"_add_local_magnet", "_add_managed_torrent", "_cancel_ambiguous_transfer"}
+    monkeypatch.setattr(queue, "_ABSENCE_SETTLE_S", 0)
+    probes, removed = [], []
+
+    def not_found(gid):
+        probes.append(gid)
+        raise absent(gid)
+
+    monkeypatch.setattr(h.rpc, "tell_status", not_found)
+    queue.task_removed.connect(removed.append)
+    h.start()
+    reserved = h.task.launch_gid
+    assert reserved and h.tid in queue._pending_launch
+    queue.remove(h.tid)
+    row = _persisted_row(h.db_path, h.tid)
+    assert queue.is_pending_removal(h.tid) and not removed
+    assert row["status"] == "removing" and row["gid"] == reserved
+    assert not queue._removing[h.tid].get("started")
+    h.change(settings)
+    h.finish()  # Existing add-failure callback starts owned cancellation.
+    h.assert_adds(0)
+    assert h.task.status == "error" and h.task.error == message
+    assert h.tid not in queue._pending_launch and h.task.launch_gid == reserved
+    entry = queue._removing[h.tid]
+    assert entry["started"] and entry["add_error"] == message and entry["gid"] == reserved
+    row = _persisted_row(h.db_path, h.tid)
+    assert row["status"] == "removing" and row["error"] == message
+    assert row["gid"] == reserved and not removed and probes == []
+    assert queue._active_count() == 1 and len(h.pending) == 1
+    calls = list(h.pending)
+    h.pending.clear()
+    drain(calls)
+    assert not calls and not h.pending and probes == [reserved, reserved]
+    assert removed == [h.tid] and h.rpc.removed == []
+    assert h.tid not in queue.tasks and _persisted_row(h.db_path, h.tid) is None
+    for ownership in (queue._pending_launch, queue._torrent_attempt, queue._removing,
+                      queue._unreconciled, queue._deferred_removal):
+        assert h.tid not in ownership
+    assert queue._active_count() == 0 and h.prompts == []
+    h.assert_adds(0)
