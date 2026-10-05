@@ -38,7 +38,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          storedIntercepted = null, eraseThrows = false,
                          slowInterceptedIds = false,
                          cookieHook = null, settingsReadHook = null,
-                         settingsWriteHook = null,
+                         settingsWriteHook = null, permissionsHook = null,
                          worker = false, missingScripts = [],
                          installedMenus = new Map(), menuApi = "lenient",
                          // Firefox's built-in data-collection consent. `undefined`
@@ -251,6 +251,9 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   if (permissionsApi !== "missing") {
     browser.permissions = {
       async getAll() {
+        // Park the real userAgentField await before computing fresh consent.
+        // This hook is test-only and does not change the permission answer.
+        if (permissionsHook) await permissionsHook();
         calls.permissionChecks.push(
           consentState === undefined ? "no-data-collection-key" : [...consentState].join(","));
         if (permissionsApi === "throws") throw new Error("permissions unavailable");
@@ -5081,4 +5084,252 @@ test("U7 consent revoked during the pill's settings read is still honoured",
   assert.ok(revoked, "the revocation really did land during the settings read");
   assert.ok(!("userAgent" in sent[0]),
             "a user-agent resolved before the read must not be sent after it");
+});
+
+// S03: exercise the real background + core after the final permission read,
+// parked specifically inside userAgentField's permissions.getAll await.
+const S03_POLICY_SETTINGS = {
+  enabled: true,
+  mediaPillEnabled: true,
+  excludedDomains: [],
+  minSizeBytes: 0,
+  interceptExtensions: [".mp4"],
+};
+const S03_POLICY_URL = "https://cdn.policy.test/clip.mp4";
+const S03_POLICY_PAGE = "https://page.policy.test/watch";
+const S03_COOKIE_SECRET = "s03-collected-cookie";
+
+async function parkS03FinalPermission({ competingPermissionsHook = null } = {}) {
+  let armed = false;
+  let parked = false;
+  let open;
+  const gate = new Promise((resolve) => { open = resolve; });
+  const loaded = loadBackground({
+    settings: { ...S03_POLICY_SETTINGS },
+    cookies: [{ name: "session", value: S03_COOKIE_SECRET }],
+    dataConsent: [CONSENT],
+    permissionsHook: async () => {
+      if (!armed) {
+        if (competingPermissionsHook) await competingPermissionsHook();
+        return;
+      }
+      armed = false; // one-shot; subsequent attempts and interception can run
+      parked = true;
+      await gate;
+    },
+  });
+  await settle();
+  loaded.calls.native.length = 0; // ignore startup status traffic
+  loaded.calls.notifications.length = 0;
+  armed = true;
+  const response = new Promise((resolve) => {
+    loaded.events.message.emit(
+      { type: "downloadMedia", url: S03_POLICY_URL, pageUrl: S03_POLICY_PAGE },
+      pillSender(S03_POLICY_PAGE), resolve,
+    );
+  });
+  await settle();
+  assert.ok(parked, "fixture must reach the final UA permission await");
+  assert.equal(loaded.calls.cookies.length, 1, "cookies were collected before the final await");
+  assert.equal(downloadsOf(loaded.calls).length, 0, "native dispatch has not started while parked");
+  assert.equal(evalIn(loaded.context, `interceptClaims.get(${JSON.stringify(S03_POLICY_URL)}).size`), 1,
+               "this request owns one in-flight claim");
+  const generation = evalIn(loaded.context, "settingsGeneration");
+  return {
+    ...loaded, generation,
+    async release() {
+      open();
+      const reply = await response;
+      await settle();
+      return reply;
+    },
+  };
+}
+
+function assertS03FinalRefusal(loaded, reply) {
+  assert.equal(downloadsOf(loaded.calls).length, 0,
+               "policy changed during final UA await: no native download may be sent");
+  assert.deepEqual(JSON.parse(JSON.stringify(reply)), {
+    ok: false, reason: "unsupported", error: "Downloads are turned off for this site",
+  });
+  assert.equal(JSON.stringify(loaded.calls.native).includes(S03_COOKIE_SECRET), false,
+               "collected cookies must never leave on a rejected handoff");
+  assert.equal(loaded.calls.notifications.length, 0, "a rejected request has no success notification");
+  assert.equal(evalIn(loaded.context, `interceptClaims.has(${JSON.stringify(S03_POLICY_URL)})`), false,
+               "the rejected request's claim must be released");
+  assert.equal(evalIn(loaded.context, `recentIntercepted.has(${JSON.stringify(S03_POLICY_URL)})`), false,
+               "a rejected request must not commit an interception mark");
+}
+
+function emitS03BrowserDownload(loaded, id) {
+  loaded.events.downloadCreated.emit({
+    id, url: S03_POLICY_URL, filename: "clip.mp4", state: "in_progress",
+    startTime: new Date().toISOString(), totalBytes: 20_000_000,
+  });
+}
+
+for (const [id, changeName, change] of [
+  ["P1", "site exclusion", (loaded) => {
+    loaded.setSettings({ ...S03_POLICY_SETTINGS, excludedDomains: ["page.policy.test"] });
+  }],
+  ["P2", "pill disabled", (loaded) => {
+    loaded.setSettings({ ...S03_POLICY_SETTINGS, mediaPillEnabled: false });
+  }],
+  ["P3", "consent revoked with a settings change", (loaded) => {
+    loaded.events.setDataConsent([]);
+    loaded.setSettings({ ...S03_POLICY_SETTINGS, minSizeBytes: 1 });
+  }],
+  ["P5", "equivalent settings write", (loaded) => {
+    loaded.setSettings({ ...S03_POLICY_SETTINGS, excludedDomains: [] });
+  }],
+]) {
+  test(`S03 ${id}: ${changeName} during final UA await refuses without native effects`, async () => {
+    const loaded = await parkS03FinalPermission();
+    change(loaded);
+    assert.ok(evalIn(loaded.context, "settingsGeneration") > loaded.generation,
+              "storage.onChanged must advance the authorizing generation");
+    const reply = await loaded.release();
+    assertS03FinalRefusal(loaded, reply);
+
+    // Restoring policy and starting the browser's own download of this exact
+    // URL proves both the claim and any stale mark are absent after refusal.
+    loaded.setSettings({ ...S03_POLICY_SETTINGS });
+    emitS03BrowserDownload(loaded, 803);
+    await settle();
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 1,
+                 "the rejected handoff must not suppress a later browser download");
+    assert.deepEqual(loaded.calls.cancel, [803]);
+  });
+}
+
+test("S03 P3b: consent revoked alone during final UA await sends once without userAgent", async () => {
+  const loaded = await parkS03FinalPermission();
+  loaded.events.setDataConsent([]);
+  assert.equal(evalIn(loaded.context, "settingsGeneration"), loaded.generation,
+               "consent-only revocation does not synthesize a settings change");
+  const reply = await loaded.release();
+  assert.equal(reply.ok, true);
+  const sent = downloadsOf(loaded.calls);
+  assert.equal(sent.length, 1, "today's consent-only behavior still permits the handoff");
+  assert.equal("userAgent" in sent[0], false, "revoked consent omits the userAgent key");
+  assert.equal(sent[0].cookies, `session=${S03_COOKIE_SECRET}`);
+  assert.equal(loaded.calls.notifications.length, 1);
+  assert.equal(evalIn(loaded.context, `interceptClaims.has(${JSON.stringify(S03_POLICY_URL)})`), false);
+});
+
+test("S03 P4: unchanged policy dispatches once, commits one mark and releases its claim", async () => {
+  const loaded = await parkS03FinalPermission();
+  const reply = await loaded.release();
+  assert.equal(reply.ok, true);
+  const sent = downloadsOf(loaded.calls);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].url, S03_POLICY_URL);
+  assert.equal(sent[0].cookies, `session=${S03_COOKIE_SECRET}`);
+  assert.equal(sent[0].userAgent, REAL_UA);
+  assert.equal(loaded.calls.notifications.length, 1, "one success notification");
+  assert.equal(loaded.calls.notifications[0].title, "Download sent to Cove");
+  assert.equal(evalIn(loaded.context, "recentIntercepted.size"), 1, "one committed address");
+  assert.equal(evalIn(loaded.context, `recentIntercepted.has(${JSON.stringify(S03_POLICY_URL)})`), true);
+  assert.equal(evalIn(loaded.context, "interceptClaims.size"), 0, "the successful request released its claim");
+  emitS03BrowserDownload(loaded, 804);
+  await settle();
+  assert.equal(downloadsOf(loaded.calls).length, 1, "the committed mark suppresses duplicate browser interception");
+  assert.equal(loaded.calls.notifications.length, 1);
+});
+
+test("S03 P6: final-await rejection releases its claim and a later genuine attempt succeeds", async () => {
+  const loaded = await parkS03FinalPermission();
+  loaded.setSettings({ ...S03_POLICY_SETTINGS, mediaPillEnabled: false });
+  const rejected = await loaded.release();
+  const rejectedNativeCount = downloadsOf(loaded.calls).length;
+  const rejectedClaimRemains = evalIn(loaded.context, `interceptClaims.has(${JSON.stringify(S03_POLICY_URL)})`);
+  const rejectedMarkRemains = evalIn(loaded.context, `recentIntercepted.has(${JSON.stringify(S03_POLICY_URL)})`);
+  loaded.setSettings({ ...S03_POLICY_SETTINGS });
+  // Background receives the legitimate retry's message; gesture origin is
+  // covered by G4/G5 in the content tests, not forged in this background VM.
+  const retry = await pillDownload(loaded.events, { url: S03_POLICY_URL, pageUrl: S03_POLICY_PAGE });
+  assert.equal(rejectedNativeCount, 0, "the rejected attempt must not have dispatched native authority");
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.reason, "unsupported");
+  assert.equal(rejectedClaimRemains, false, "the rejected attempt's own claim is gone before retry");
+  assert.equal(rejectedMarkRemains, false, "the rejected attempt committed no mark");
+  assert.equal(retry.ok, true, "the next genuine attempt for the same URL must succeed");
+  assert.equal(downloadsOf(loaded.calls).length, 1, "only the genuine retry reaches native");
+  assert.equal(loaded.calls.notifications.length, 1);
+  assert.equal(evalIn(loaded.context, "interceptClaims.size"), 0);
+});
+
+test("S03 P6b: final refusal preserves a competing request's claim and committed mark", async () => {
+  // Two schedules within one ownership test: B either still holds its claim
+  // or has completed and committed its mark when A withdraws. Deleting the
+  // whole claims entry loses B in the first; clearing the mark loses B in the
+  // second. Neither protection belongs to A's refusing request.
+  for (const protection of ["claim", "mark"]) {
+    let parkB = false;
+    let bParked = false;
+    let releaseB;
+    const bGate = new Promise((resolve) => { releaseB = resolve; });
+    const loaded = await parkS03FinalPermission({
+      competingPermissionsHook: async () => {
+        if (!parkB) return;
+        parkB = false;
+        bParked = true;
+        await bGate;
+      },
+    });
+    const claimTokens = () => JSON.parse(evalIn(loaded.context,
+      `JSON.stringify(Array.from(interceptClaims.get(${JSON.stringify(S03_POLICY_URL)})?.keys() || []))`));
+    const aToken = claimTokens()[0];
+    loaded.setSettings({ ...S03_POLICY_SETTINGS, excludedDomains: ["page.policy.test"] });
+    const otherPage = "https://other.policy.test/watch";
+    parkB = protection === "claim";
+    const bResponse = new Promise((resolve) => {
+      loaded.events.message.emit(
+        { type: "downloadMedia", url: S03_POLICY_URL, pageUrl: otherPage },
+        pillSender(otherPage), resolve,
+      );
+    });
+    await settle();
+    let expectedClaims = [];
+    if (protection === "claim") {
+      assert.ok(bParked, "B must be parked holding its own claim");
+      const tokens = claimTokens();
+      assert.equal(tokens.length, 2, "A and B each hold a separate claim");
+      expectedClaims = tokens.filter((token) => token !== aToken);
+      assert.equal(expectedClaims.length, 1);
+    } else {
+      assert.equal((await bResponse).ok, true, "B completes on its still-allowed page");
+      assert.deepEqual(claimTokens(), [aToken], "only A's claim remains after B succeeds");
+    }
+    const expectedMark = evalIn(loaded.context,
+      `recentIntercepted.get(${JSON.stringify(S03_POLICY_URL)})`);
+    if (protection === "mark") assert.equal(typeof expectedMark, "number", "B committed a dedup mark");
+    const sentBeforeA = downloadsOf(loaded.calls).length;
+    const notificationsBeforeA = loaded.calls.notifications.length;
+
+    const aReply = await loaded.release();
+    assert.deepEqual(JSON.parse(JSON.stringify(aReply)), {
+      ok: false, reason: "unsupported", error: "Downloads are turned off for this site",
+    });
+    assert.equal(downloadsOf(loaded.calls).length, sentBeforeA, "A adds no native dispatch");
+    assert.equal(loaded.calls.notifications.length, notificationsBeforeA, "A adds no success notification");
+    assert.deepEqual(claimTokens(), expectedClaims, "A releases only its token, preserving B's claim");
+    assert.equal(evalIn(loaded.context, `recentIntercepted.get(${JSON.stringify(S03_POLICY_URL)})`),
+                 expectedMark, "A must not erase B's committed mark");
+
+    emitS03BrowserDownload(loaded, 806);
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, sentBeforeA,
+                 `B's ${protection} must still suppress duplicate browser interception`);
+    assert.deepEqual(loaded.calls.cancel, [], "suppressed duplicate is not intercepted");
+    if (protection === "claim") {
+      releaseB();
+      assert.equal((await bResponse).ok, true, "B still finishes after A is refused");
+      await settle();
+    }
+    assert.equal(downloadsOf(loaded.calls).length, 1, "only B reaches native authority");
+    assert.equal(loaded.calls.notifications.length, 1);
+    assert.deepEqual(claimTokens(), []);
+  }
 });

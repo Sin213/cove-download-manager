@@ -157,14 +157,24 @@ function buildCoveMedia(capability) {
                error: "Downloads are turned off for this site" };
     }
 
-    // Asked last, for the same reason the exclusion above is asked twice.
-    // Firefox's optional technicalAndInteraction consent governs the
-    // user-agent and the user can revoke it at any moment, so resolving it
-    // any earlier would leave a suspension point - the settings read above -
-    // between the check and the send, and a revocation landing inside that
-    // window would ship a user-agent the user had already withdrawn. Nothing
-    // awaits between here and sendNativeMessage.
-    Object.assign(nativeMessage, await userAgentField());
+    // Firefox's optional technicalAndInteraction consent can be revoked at any
+    // moment. Resolving the user-agent earlier would leave a suspension point
+    // between consent lookup and dispatch, allowing a later revocation to ship
+    // a user-agent the user had withdrawn. Resolve that consent last.
+    // The user-agent lookup is another suspension point, so compare the
+    // authorizing generation after it resolves. This is the last authorization
+    // step before dispatch; nothing else awaits before sendNativeMessage.
+    // Consent revocation alone is read fresh here and only omits the user-agent,
+    // preserving the existing handoff behavior when settings have not changed.
+    const userAgent = await userAgentField();
+    if (generationBefore !== null && settingsGeneration !== generationBefore) {
+      releaseIntercepted(url, dedupToken);
+      diagRecord("extension.native_bridge", "request_failed", "WARNING",
+                 { reason: "unsupported" }, requestId);
+      return { ok: false, reason: "unsupported",
+               error: "Downloads are turned off for this site" };
+    }
+    Object.assign(nativeMessage, userAgent);
 
     const result = await sendNativeMessage(nativeMessage, requestId);
 

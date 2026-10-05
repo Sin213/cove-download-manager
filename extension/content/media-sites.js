@@ -17,7 +17,13 @@
   "use strict";
 
   function isHttpUrl(u) {
-    return typeof u === "string" && /^https?:\/\//i.test(u);
+    if (typeof u !== "string" || !/^https?:\/\//i.test(u)) return false;
+    try {
+      new URL(u);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   function extractorPageUrl() {
@@ -32,7 +38,21 @@
     return "";
   }
 
+  function isRedditPage() {
+    try {
+      const url = new URL(location.href);
+      const host = url.hostname.toLowerCase();
+      return url.protocol === "https:" &&
+        (host === "reddit.com" || host.endsWith(".reddit.com"));
+    } catch {}
+    return false;
+  }
+
   function embeddedStreamUrl(video) {
+    // data-hls-url is page-owned input. Accept it only on the HTTPS Reddit
+    // identity this adapter was built for, before inspecting the player.
+    if (!isRedditPage()) return "";
+
     // Reddit's embed exposes both DASH and HLS URLs in the player container,
     // but normally requests only DASH. Prefer HLS because Cove can download
     // and merge that stream directly.

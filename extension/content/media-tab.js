@@ -636,7 +636,13 @@
     }
   }
 
-  async function onPillClick() {
+  async function onPillClick(e) {
+    // The open shadow root lets page script call .click() or dispatchEvent.
+    // As with onExcludeClick, scripted or absent trust creates no authority.
+    // A real Enter/Space on the focused native button produces a trusted click
+    // from the browser, so keyboard access needs no separate handler. Authority
+    // starts at this gesture; background policy checks are defense in depth.
+    if (!e || e.isTrusted !== true) return;
     if (!pillEnabled || downloadPending) return;
 
     // A page the site adapter designates is downloaded from its page URL. Do

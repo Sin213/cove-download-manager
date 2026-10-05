@@ -386,11 +386,26 @@ function pillParts(host) {
   };
 }
 
-// The download gesture: a click on the primary control, not on the container.
+// Trusted user activation on the primary control. userActivate models browser
+// authority in this test harness only; actual isTrusted cannot be manufactured
+// by page script. Chrome/Firefox input automation supplies the real proof.
 function clickPrimary(host) {
   const { primary } = pillParts(host);
   assert.ok(primary, "expected the primary download control inside the shadow root");
-  primary.dispatch("click", {});
+  userActivate(primary);
+}
+
+// Page-script fixtures deliberately supply no browser-owned authority.
+function scriptedPrimaryClick(host) {
+  pillParts(host).primary.click();
+}
+
+function untrustedPrimaryDispatch(host) {
+  pillParts(host).primary.dispatch("click", { isTrusted: false });
+}
+
+function absentTrustPrimaryDispatch(host) {
+  pillParts(host).primary.dispatch("click", {});
 }
 
 // Brings a video up as the active pill target through the hover path.
@@ -916,7 +931,7 @@ test("without a site adapter an embedded stream attribute is never read", async 
 
   const harness = await loadMediaTab({
     sites: false,
-    href: "https://example.test/feed",
+    href: "https://www.reddit.com/feed",
     videos: [video],
     reply: { ok: true },
   });
@@ -968,7 +983,7 @@ test("a player does not borrow another player's stream", async () => {
   const bareVideo = blobVideo({ top: 200 });
 
   const harness = await loadMediaTab({
-    href: "https://example.test/feed",
+    href: "https://www.reddit.com/feed",
     videos: [ownerVideo, bareVideo],
   });
   harness.body.appendChild(owner);
@@ -2366,3 +2381,192 @@ test("a trusted keyboard activation sends exactly one exclusion request", async 
   assert.equal(harness.excludeMessages().length, 1,
                "the keydown must not activate separately from the click");
 });
+
+// S03: VM trust is test authority only. Real browser-owned mouse/keyboard
+// isTrusted semantics require separate Chrome and Firefox automation.
+const S03_BROWSER_CONFIGS = [
+  ["Firefox", { sites: true }],
+  ["Chrome", { sites: false, chromeOnly: true }],
+];
+const S03_SCRIPTED_CLICKS = [
+  ["G1", "scripted primary.click()", scriptedPrimaryClick],
+  ["G2", "explicitly untrusted click", untrustedPrimaryDispatch],
+  ["G2", "absent-trust click", absentTrustPrimaryDispatch],
+];
+
+for (const [browserName, config] of S03_BROWSER_CONFIGS) {
+  for (const [id, activationName, activate] of S03_SCRIPTED_CLICKS) {
+    test(`S03 ${id} ${browserName}: ${activationName} creates no download intent`, async () => {
+      const video = stubVideo({ top: 200 });
+      const harness = await loadMediaTab({ ...config, videos: [video], reply: { ok: true } });
+      const host = hover(harness, video);
+      activate(host);
+      await settle();
+      assert.equal(downloads(harness).length, 0, "page script must not send downloadMedia");
+      assert.equal(diagMessages(harness).filter((m) => m.event === "video_download_requested").length,
+                   0, "page script must not create request diagnostics");
+    });
+
+    test(`S03 G7 ${browserName}: ${activationName} leaves a later genuine click intact`, async () => {
+      const video = stubVideo({ top: 200 });
+      const harness = await loadMediaTab({ ...config, videos: [video], reply: { ok: true } });
+      const host = hover(harness, video);
+      const initialLabel = pillParts(host).label.textContent;
+      activate(host);
+      await settle();
+      assert.equal(downloads(harness).length, 0, "synthetic activation must leave no handoff");
+      assert.equal(diagMessages(harness).filter((m) => m.event === "video_download_requested").length,
+                   0, "synthetic activation must leave no request diagnostic");
+      assert.equal(pillParts(host).label.textContent, initialLabel,
+                   "synthetic activation must leave the pill label unchanged");
+      clickPrimary(host);
+      await settle();
+      assert.equal(downloads(harness).length, 1, "the subsequent trusted click sends exactly once");
+      assert.equal(pillParts(host).label.textContent, "Sent to Cove");
+    });
+  }
+
+  test(`S03 G3 ${browserName}: synthetic primary and container keys create no download intent`, async () => {
+    const video = stubVideo({ top: 200 });
+    const harness = await loadMediaTab({ ...config, videos: [video], reply: { ok: true } });
+    const host = hover(harness, video);
+    const { primary, pill, label } = pillParts(host);
+    const initialLabel = label.textContent;
+    for (const node of [primary, pill]) {
+      for (const type of ["keydown", "keypress", "keyup"]) {
+        for (const key of ["Enter", " "]) {
+          node.dispatch(type, { key, isTrusted: false, preventDefault() {}, stopPropagation() {} });
+          await settle();
+          assert.equal(downloads(harness).length, 0, `${type} ${JSON.stringify(key)} must not send downloadMedia`);
+        }
+      }
+    }
+    assert.equal(diagMessages(harness).filter((m) => m.event === "video_download_requested").length, 0);
+    assert.equal(label.textContent, initialLabel);
+  });
+
+  test(`S03 G4 ${browserName}: trusted primary mouse click sends exactly once`, async () => {
+    const video = stubVideo({ top: 200 });
+    const harness = await loadMediaTab({ ...config, videos: [video], reply: { ok: true } });
+    const host = await clickPill(harness, video);
+    assert.equal(downloads(harness).length, 1);
+    assert.equal(pillParts(host).label.textContent, "Sent to Cove");
+  });
+
+  for (const key of ["Enter", " "]) {
+    test(`S03 G5 ${browserName}: trusted keyboard ${JSON.stringify(key)} uses the browser click`, async () => {
+      const video = stubVideo({ top: 200 });
+      const harness = await loadMediaTab({ ...config, videos: [video], reply: { ok: true } });
+      const host = hover(harness, video);
+      const { primary } = pillParts(host);
+      primary.focus();
+      assert.equal(harness.doc.activeElement, primary);
+      userActivate(primary, "keydown", { key });
+      await settle();
+      assert.equal(downloads(harness).length, 0, "keydown alone must not create a custom download path");
+      // A native button gets a trusted click from real keyboard activation.
+      // This models that click; real-browser keyboard proof is separate.
+      clickPrimary(host);
+      await settle();
+      assert.equal(downloads(harness).length, 1);
+      assert.equal(pillParts(host).label.textContent, "Sent to Cove");
+    });
+  }
+
+  test(`S03 G6 ${browserName}: hostile eligible subframe cannot activate its open-shadow pill`, async () => {
+    // This harness is the frame's own document; the background permission
+    // answer explicitly allows it. Parent/top-frame policy is not the guard.
+    const video = stubVideo({ top: 200 });
+    const harness = await loadMediaTab({ ...config, href: "https://player.example.test/embed",
+      videos: [video], reply: { ok: true } });
+    hover(harness, video);
+    const pageFoundHost = harness.body.children.find((node) => node.className === "cove-media-tab-host");
+    assert.ok(pageFoundHost.shadowRoot, "the page can find the open shadow root");
+    scriptedPrimaryClick(pageFoundHost);
+    await settle();
+    assert.equal(downloads(harness).length, 0, "subframe page script must not send downloadMedia");
+    assert.equal(diagMessages(harness).filter((m) => m.event === "video_download_requested").length, 0);
+    clickPrimary(pageFoundHost);
+    await settle();
+    assert.equal(downloads(harness).length, 1, "a genuine click in the same eligible frame still works");
+  });
+
+  test(`S03 G6 ${browserName}: trusted click in the eligible subframe still works`, async () => {
+    const video = stubVideo({ top: 200 });
+    const harness = await loadMediaTab({ ...config, href: "https://player.example.test/embed",
+      videos: [video], reply: { ok: true } });
+    await clickPill(harness, video);
+    assert.equal(downloads(harness).length, 1);
+    assert.equal(downloads(harness)[0].pageUrl, "https://player.example.test/embed");
+  });
+}
+
+for (const [destination, url] of [
+  ["private", "http://127.0.0.1:8099/private-export"],
+  ["non-private", "https://stream.example.test/x/master.m3u8"],
+]) {
+  test(`S03 F1 Firefox: unrelated page cannot supply a ${destination} embedded target`, async () => {
+    const video = blobVideo({ top: 200 });
+    const harness = await loadMediaTab({ href: "https://news.example.test/article",
+      videos: [video], reply: streamReply([]) });
+    withEmbeddedOwner(harness, video, url);
+    const host = await clickPill(harness, video);
+    assert.equal(downloads(harness).length, 0, "unrelated page metadata must not select a privileged target");
+    assert.equal(pillParts(host).label.textContent, "No video found");
+  });
+}
+
+// Supported identity: HTTPS reddit.com and its subdomains, as established by
+// the adapter's Reddit comment, the Reddit design spec, and existing tests.
+for (const href of ["https://www.reddit.com/feed", "https://old.reddit.com/r/x/comments/y/z/", "https://reddit.com/"]) {
+  test(`S03 F2 Firefox: supported identity ${href} preserves embedded handoff`, async () => {
+    const video = blobVideo({ top: 200 });
+    const harness = await loadMediaTab({ href, videos: [video], reply: streamReply([]) });
+    withEmbeddedOwner(harness, video);
+    await clickPill(harness, video);
+    assert.deepEqual(downloads(harness).map((m) => m.url), [EMBEDDED_STREAM]);
+  });
+}
+
+for (const href of ["https://reddit.com.evil.example/", "https://evilreddit.com/", "https://notreddit.com/",
+                    "http://www.reddit.com/", "about:blank"]) {
+  test(`S03 F2 Firefox: unsupported identity ${href} refuses embedded metadata`, async () => {
+    const video = blobVideo({ top: 200 });
+    const harness = await loadMediaTab({ href, videos: [video], reply: streamReply([]) });
+    withEmbeddedOwner(harness, video);
+    const host = await clickPill(harness, video);
+    assert.equal(downloads(harness).length, 0, "unsupported page identity must not authorize embedded metadata");
+    assert.equal(pillParts(host).label.textContent, "No video found");
+  });
+}
+
+for (const value of ["javascript:alert(1)", "blob:https://www.reddit.com/player", "", "relative/master.m3u8",
+                    "https://", "https://[", "http://", "https://example.com:99999"]) {
+  test(`S03 F3 Firefox: invalid embedded value ${JSON.stringify(value)} safely refuses`, async () => {
+    const video = blobVideo({ top: 200 });
+    const harness = await loadMediaTab({ href: "https://www.reddit.com/feed",
+      videos: [video], reply: streamReply([]) });
+    withEmbeddedOwner(harness, video, value);
+    const host = await clickPill(harness, video);
+    assert.equal(downloads(harness).length, 0);
+    assert.equal(pillParts(host).label.textContent, "No video found");
+  });
+}
+
+for (const chromeOnly of [false, true]) {
+  test(`S03 F4 Chrome: no adapter reads or stream traffic (chromeOnly=${chromeOnly})`, async () => {
+    const video = blobVideo({ top: 200 });
+    const harness = await loadMediaTab({ sites: false, chromeOnly, href: "https://www.reddit.com/feed",
+      videos: [video], reply: { ok: true } });
+    const owner = withEmbeddedOwner(harness, video);
+    let attributeReads = 0;
+    Object.defineProperty(owner, "data-hls-url", {
+      get() { attributeReads += 1; return EMBEDDED_STREAM; },
+    });
+    const host = await clickPill(harness, video);
+    assert.equal(attributeReads, 0, "Firefox metadata must never be read without its adapter");
+    assert.equal(downloads(harness).length, 0);
+    assert.equal(pillParts(host).label.textContent, "No video found");
+    assert.equal(harness.sent.filter((m) => m.type === "getDetectedStreams").length, 0);
+  });
+}
