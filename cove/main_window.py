@@ -77,6 +77,10 @@ from .dialogs import (
     torrent_file_problem,
 )
 from .queue import (
+    MAGNET_BLOCKED,
+    MAGNET_P2P_CONSENT_DECLINED,
+    P2P_ALLOW,
+    P2P_NEEDS_CONSENT,
     PHASE_METADATA,
     TORRENT_PREFLIGHT_FAILED,
     DownloadTask,
@@ -168,9 +172,23 @@ P2P_DISCLOSURE_TEXT = (
     "Cove cannot verify that your VPN is active."
 )
 
+P2P_METADATA_DISCLOSURE_TITLE = "Get torrent file list"
+P2P_METADATA_DISCLOSURE_TEXT = (
+    "Cove needs BitTorrent metadata to show this torrent's file list. "
+    "Retrieving it may contact trackers, DHT and peers. Your IP address can "
+    "be exposed before any file download begins.\n\n"
+    "You can change local BitTorrent preferences in Settings → BitTorrent. "
+    "Cove cannot verify that your VPN is active."
+)
+P2P_REMEMBER_FAILED = (
+    "Cove could not save your choice. Permission applies only to this "
+    "torrent request; the notice will appear again next time."
+)
 
-def build_p2p_consent_box(parent):
-    """The uncached-torrent notice, its three buttons and its checkbox.
+
+def build_p2p_consent_box(parent, *, metadata=False):
+    """Build the post-commit uncached-torrent notice by default.
+    With metadata=True, build the metadata (file-list) notice instead.
 
     Cancel is the default: a user who dismisses this dialog has not agreed
     to join a swarm. The checkbox is only ever honoured alongside the
@@ -180,13 +198,16 @@ def build_p2p_consent_box(parent):
     """
     box = QMessageBox(parent)
     box.setIcon(QMessageBox.Warning)
-    box.setWindowTitle(P2P_DISCLOSURE_TITLE)
-    box.setText(P2P_DISCLOSURE_TEXT)
-    remember = QCheckBox("Don't show this notice again", box)
+    box.setWindowTitle(P2P_METADATA_DISCLOSURE_TITLE if metadata else P2P_DISCLOSURE_TITLE)
+    box.setText(P2P_METADATA_DISCLOSURE_TEXT if metadata else P2P_DISCLOSURE_TEXT)
+    remember = QCheckBox(
+        "Don't ask again before Cove uses local BitTorrent"
+        if metadata else "Don't show this notice again", box,
+    )
     box.setCheckBox(remember)
     settings_button = box.addButton("Open Settings", QMessageBox.ActionRole)
-    cancel_button = box.addButton("Cancel download", QMessageBox.RejectRole)
-    download_button = box.addButton("Download locally", QMessageBox.AcceptRole)
+    cancel_button = box.addButton("Cancel" if metadata else "Cancel download", QMessageBox.RejectRole)
+    download_button = box.addButton("Get file list" if metadata else "Download locally", QMessageBox.AcceptRole)
     box.setDefaultButton(cancel_button)
     box.setEscapeButton(cancel_button)
     return box, download_button, settings_button, remember
@@ -439,17 +460,20 @@ class _MagnetRequest:
         self.preflight = request
         self._finish()
 
-    def fail(self, _resolution) -> None:
+    def fail(self, resolution) -> None:
         """Cancelled, refused, timed out or failed: nothing was produced.
 
-        Deliberately silent. The queue emits the one sentence a failure
-        deserves and says nothing for a cancellation, and there is no second
-        error surface here - and no fallback to adding the raw magnet, which
-        would download exactly the files the user was about to deselect.
+        The queue emits the failure sentence and says nothing for a cancel.
+        Policy refusals also need a visible explanation: the queue's error
+        pill does not display its text. Never fall back to the raw magnet.
         """
         if self.settled:
             return
         self._finish()
+        if resolution.state == MAGNET_BLOCKED and not self._owner._preflights_closed:
+            QMessageBox.information(
+                self._owner, "Torrent file list unavailable", resolution.failure_message,
+            )
 
     def cancel(self) -> None:
         """Ask the resolution to stop. The result still closes the dialog."""
@@ -1653,6 +1677,9 @@ class MainWindow(QMainWindow):
     ) -> "int | None":
         """Fetch one magnet's metadata, then hand it to Torrent Contents.
 
+        Authorization (policy check and consent) happens first, before any
+        loading modal, request, workspace or RPC.
+
         Returns the task the user confirmed, or None for every way this can
         end without one.
 
@@ -1664,11 +1691,57 @@ class MainWindow(QMainWindow):
         that was handed over, and a late success cannot reopen a request the
         user already stopped.
         """
-        record = _MagnetRequest(self)
+        record = None
         try:
+            granted = False
+            while True:
+                if self._preflights_closed:
+                    return None
+                _magnet, state, message = self.queue.magnet_preflight_check(url)
+                if state:
+                    # Skip authorization for existing network-free refusals.
+                    # The resolver owns their state, sentence and callback.
+                    break
+                policy = self.queue.local_p2p_policy()
+                if policy == P2P_ALLOW:
+                    break
+                if policy != P2P_NEEDS_CONSENT:
+                    message = self.queue.magnet_p2p_policy_message(policy)
+                    self.queue.error.emit(message)
+                    QMessageBox.information(self, "Torrent file list unavailable", message)
+                    return None
+                box, accept, settings, remember = build_p2p_consent_box(self, metadata=True)
+                box.exec()
+                if self._preflights_closed:
+                    return None
+                clicked = box.clickedButton()
+                if clicked is settings:
+                    self._open_settings()
+                    if self._preflights_closed:
+                        return None
+                    continue  # a fresh policy decision and a fresh checkbox
+                if clicked is not accept:
+                    self.queue.error.emit(MAGNET_P2P_CONSENT_DECLINED)
+                    return None
+                granted = True
+                if remember.isChecked():
+                    previous = self.settings.torrent_ip_disclosure_shown
+                    self.settings.torrent_ip_disclosure_shown = True
+                    try:
+                        self.settings.save()
+                    except Exception:
+                        self.settings.torrent_ip_disclosure_shown = previous
+                        QMessageBox.warning(self, "Choice could not be saved", P2P_REMEMBER_FAILED)
+                        if self._preflights_closed:
+                            return None
+                break
+            if self._preflights_closed:
+                return None
+            record = _MagnetRequest(self)
             record.resolution = self.queue.resolve_magnet_preflight(
                 url, out_dir=out_dir, intake=intake,
                 on_resolved=record.resolve, on_failed=record.fail,
+                p2p_consent_granted=granted,
             )
             if not record.settled:
                 # Refused outright (unparsable magnet, torrent already spoken
@@ -1696,7 +1769,8 @@ class MainWindow(QMainWindow):
             # without a record the only symptom is "ERROR, nothing
             # downloads" with nothing in the diagnostics to explain it.
             logging.getLogger("cove").exception("magnet_preflight_failed")
-            record.abandon()
+            if record is not None:
+                record.abandon()
             self.queue.error.emit(TORRENT_PREFLIGHT_FAILED)
             return None
         if record.preflight is not None:

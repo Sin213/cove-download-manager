@@ -176,6 +176,28 @@ class PreparedDownload:
     selected_files: Optional[tuple[int, ...]] = None
 
 
+class _P2PConsentGrant:
+    """An in-memory decision owned by one resolution/preflight, used once."""
+
+    def __init__(self, granted: bool = False):
+        self._granted = granted is True
+        self._lock = threading.Lock()
+
+    @property
+    def allowed(self) -> bool:
+        with self._lock:
+            return self._granted
+
+    def consume(self) -> bool:
+        with self._lock:
+            granted = self._granted
+            self._granted = False
+            return granted
+
+    def revoke(self) -> None:
+        self.consume()
+
+
 @dataclass(frozen=True)
 class TorrentPreflight:
     """One parsed local `.torrent`, awaiting an interactive file choice.
@@ -192,16 +214,44 @@ class TorrentPreflight:
 
     metadata: "torrent.TorrentMetadata"
     prepared: PreparedDownload
+    p2p_consent_grant: Optional[_P2PConsentGrant] = field(
+        default=None, repr=False, compare=False,
+    )
 
 
-# The five ways one magnet metadata request can end. Exactly one of them is
+# The six ways one magnet metadata request can end. Exactly one of them is
 # delivered per request, exactly once. SUCCESS is the only one that produces
-# a TorrentPreflight; the other four leave nothing behind at all.
+# a TorrentPreflight; the other five leave nothing behind at all.
 MAGNET_SUCCESS = "success"
 MAGNET_ERROR = "error"
 MAGNET_TIMEOUT = "timeout"
 MAGNET_CANCELLED = "cancelled"
 MAGNET_DUPLICATE = "duplicate"
+MAGNET_BLOCKED = "blocked"
+
+P2P_ALLOW = "allow"
+P2P_BLOCK_TORRENT_DISABLED = "block_torrent_disabled"
+P2P_BLOCK_FALLBACK_POLICY = "block_fallback_policy"
+P2P_BLOCK_PROXY_POLICY = "block_proxy_policy"
+P2P_NEEDS_CONSENT = "needs_consent"
+
+MAGNET_P2P_FALLBACK_BLOCKED = (
+    "Cove cannot fetch this torrent's file list because Settings → BitTorrent → "
+    "“When a torrent is not cached” is set to “Cancel the download”, which "
+    "also blocks local BitTorrent for the file list."
+)
+MAGNET_P2P_PROXY_BLOCKED = (
+    "Cove cannot fetch this torrent's file list because a proxy is enabled. "
+    "To allow local BitTorrent anyway, tick “Allow local BitTorrent while "
+    "proxy settings are enabled” in Settings → BitTorrent."
+)
+MAGNET_P2P_CONSENT_REQUIRED = (
+    "Cove cannot fetch this torrent's file list without permission to use "
+    "local BitTorrent."
+)
+MAGNET_P2P_CONSENT_DECLINED = (
+    "Fetching this torrent's file list through local BitTorrent was declined."
+)
 
 
 class MagnetResolution:
@@ -217,8 +267,10 @@ class MagnetResolution:
     whoever sets it first decides how this request ended.
     """
 
-    def __init__(self, info_hash: str, magnet_uri: str):
+    def __init__(self, info_hash: str, magnet_uri: str, *, p2p_consent_granted=False):
         self.info_hash = info_hash
+        self.p2p_consent_grant = _P2PConsentGrant(p2p_consent_granted)
+        self.failure_message = ""
         # The magnet exactly as it was accepted, trackers and all. It is the
         # future task's URL, so nothing here may reduce it to an info hash.
         self.magnet_uri = magnet_uri
@@ -255,6 +307,8 @@ class MagnetResolution:
             if self._state:
                 return False
             self._state = state
+            if state != MAGNET_SUCCESS:
+                self.p2p_consent_grant.revoke()
             return True
 
     def begin_success(self) -> bool:
@@ -285,6 +339,7 @@ class MagnetResolution:
             if self._state or self._pending_success:
                 return False
             self._state = MAGNET_CANCELLED
+            self.p2p_consent_grant.revoke()
             return True
 
     def abandon(self) -> None:
@@ -302,6 +357,7 @@ class MagnetResolution:
             if not self._state:
                 self._state = MAGNET_CANCELLED
             self._delivered = True
+            self.p2p_consent_grant.revoke()
 
     def claim_delivery(self) -> bool:
         """True for the first attempt to deliver this request's result."""
@@ -1593,7 +1649,9 @@ class QueueManager(QObject):
             selected_files=selection,
         )
 
-    def commit_prepared(self, prepared: PreparedDownload) -> Optional[int]:
+    def commit_prepared(
+        self, prepared: PreparedDownload, *, p2p_consent_granted=False,
+    ) -> Optional[int]:
         """Create exactly one task from a prepared request.
 
         This is the single authoritative task-creation path: the legacy
@@ -1602,6 +1660,8 @@ class QueueManager(QObject):
         in-memory DownloadTask, the diagnostic event, the task_added signal
         and the auto-start scheduling are exactly what the pre-feature
         `add_url` did after its classification step.
+        Only literal True for `p2p_consent_granted` seeds per-task consent
+        before the task can start.
         """
         t = DownloadTask(
             id=-1,
@@ -1654,6 +1714,8 @@ class QueueManager(QObject):
                 ),
             )
             t.id = cur.lastrowid
+        if p2p_consent_granted is True and t.source_type == SOURCE_TORRENT:
+            self._consent_granted.add(t.id)
         self.tasks[t.id] = t
         self._diag_url_added(t, prepared.intake)
         self.task_added.emit(t.id)
@@ -1965,6 +2027,26 @@ class QueueManager(QObject):
     # hash, commit and discard as a local `.torrent`. There is no second
     # preflight model, and nothing here chooses files.
 
+    def magnet_preflight_check(self, url: str):
+        """Read-only eligibility, shared by the UI and resolver intake.
+
+        Keep the existing refusal order: support, parsing, resolving, held,
+        then live. This takes no hold and grants no network permission.
+        """
+        if not self._torrent_enabled():
+            return None, MAGNET_ERROR, TORRENT_SUPPORT_DISABLED
+        try:
+            magnet = torrent.parse_magnet(url)
+        except TorrentError as exc:
+            return None, MAGNET_ERROR, str(exc)
+        if magnet.info_hash in self._magnet_resolutions:
+            return magnet, MAGNET_DUPLICATE, MAGNET_ALREADY_RESOLVING
+        if magnet.info_hash in self._preflight_hashes:
+            return magnet, MAGNET_DUPLICATE, TORRENT_PREFLIGHT_PENDING
+        if self._live_torrent(magnet.info_hash):
+            return magnet, MAGNET_DUPLICATE, "That torrent is already in Cove's queue."
+        return magnet, "", ""
+
     def resolve_magnet_preflight(
         self,
         url: str,
@@ -1975,15 +2057,15 @@ class QueueManager(QObject):
         on_failed=None,
         timeout_s: float | None = None,
         poll_s: float | None = None,
+        p2p_consent_granted: bool = False,
     ) -> MagnetResolution:
         """Fetch a magnet's metainfo and turn it into a torrent preflight.
 
         Asynchronous: the swarm round trip, the parse and the info-hash
         verification all happen on a worker, and the returned handle is how
-        the caller cancels. No UI calls this yet - manual magnets, Search and
-        the API bridge keep the route they had - but the shape is one a GUI
-        can use, because a caller that had to block the event loop for up to
-        a minute could not be written against it. The handle comes back
+        the interactive caller cancels. Current local-P2P policy and either
+        persistent consent or this request's explicit grant must authorize
+        the metadata fetch, and are rechecked at RPC admission. It comes back
         already settled when the request is refused outright: a magnet that
         will not parse, or one whose torrent is already spoken for, never
         reaches aria2 at all.
@@ -2004,37 +2086,19 @@ class QueueManager(QObject):
             return self._refuse_magnet_resolution(
                 resolution, MAGNET_ERROR, TORRENT_PREFLIGHT_FAILED, on_failed
             )
-        if not self._torrent_enabled():
-            return self._refuse_magnet_resolution(
-                resolution, MAGNET_ERROR, TORRENT_SUPPORT_DISABLED, on_failed
+        magnet, state, message = self.magnet_preflight_check(url)
+        if magnet is not None:
+            resolution = MagnetResolution(
+                magnet.info_hash, magnet.original_uri,
+                p2p_consent_granted=p2p_consent_granted,
             )
-        try:
-            magnet = torrent.parse_magnet(url)
-        except TorrentError as exc:
-            # Malformed, v2-only, contradictory or simply not a magnet. No
-            # workspace, no aria2 job, nothing to clean up.
+        if state:
+            return self._refuse_magnet_resolution(resolution, state, message, on_failed)
+        policy = self.local_p2p_policy(consent_granted=p2p_consent_granted)
+        if policy != P2P_ALLOW:
             return self._refuse_magnet_resolution(
-                resolution, MAGNET_ERROR, str(exc), on_failed
-            )
-        resolution = MagnetResolution(magnet.info_hash, magnet.original_uri)
-
-        # Ownership, before anything is written anywhere. All three are the
-        # same refusal and differ only in what they can honestly say about
-        # it. `_live_torrent` covers the last case and, being the queue's one
-        # duplicate guard, the middle one too - so the narrower checks come
-        # first to keep their own accurate sentence rather than borrow its.
-        if magnet.info_hash in self._magnet_resolutions:
-            return self._refuse_magnet_resolution(
-                resolution, MAGNET_DUPLICATE, MAGNET_ALREADY_RESOLVING, on_failed
-            )
-        if magnet.info_hash in self._preflight_hashes:
-            return self._refuse_magnet_resolution(
-                resolution, MAGNET_DUPLICATE, TORRENT_PREFLIGHT_PENDING, on_failed
-            )
-        if self._live_torrent(magnet.info_hash):
-            return self._refuse_magnet_resolution(
-                resolution, MAGNET_DUPLICATE,
-                "That torrent is already in Cove's queue.", on_failed,
+                resolution, MAGNET_BLOCKED, self.magnet_p2p_policy_message(policy),
+                on_failed,
             )
 
         # The claim itself: one entry in the queue's one held-hash registry,
@@ -2064,6 +2128,7 @@ class QueueManager(QObject):
         self, resolution: MagnetResolution, state: str, message: str, on_failed
     ) -> MagnetResolution:
         """End a request that never started, delivering its one result."""
+        resolution.failure_message = message
         resolution.settle(state)
         if resolution.claim_delivery():
             self.error.emit(message)
@@ -2071,9 +2136,8 @@ class QueueManager(QObject):
                 on_failed(resolution)
         return resolution
 
-    @staticmethod
     def _resolve_magnet_metadata(
-        rpc, resolution: MagnetResolution, timeout_s: float, poll_s: float
+        self, rpc, resolution: MagnetResolution, timeout_s: float, poll_s: float
     ):
         """Fetch, contain, parse and verify one magnet's metainfo.
 
@@ -2095,7 +2159,7 @@ class QueueManager(QObject):
             except OSError:
                 raise TorrentError(MAGNET_METADATA_UNAVAILABLE) from None
             resolution.note_workspace(workspace)
-            meta = QueueManager._fetch_magnet_metadata(
+            meta = self._fetch_magnet_metadata(
                 rpc, resolution, workspace, timeout_s, poll_s
             )
             # Cleanup is part of the result, not an afterthought. A metainfo
@@ -2127,14 +2191,21 @@ class QueueManager(QObject):
                 QueueManager._clean_magnet_resolution(rpc, resolution)
             raise
 
-    @staticmethod
     def _fetch_magnet_metadata(
-        rpc, resolution: MagnetResolution, workspace: str,
+        self, rpc, resolution: MagnetResolution, workspace: str,
         timeout_s: float, poll_s: float,
     ):
         """The metadata-only aria2 job, bounded in both time and trust."""
         if resolution.cancelled:
             raise TorrentError(MAGNET_METADATA_UNAVAILABLE)
+        policy = self.local_p2p_policy(
+            consent_granted=resolution.p2p_consent_grant.allowed,
+        )
+        if policy != P2P_ALLOW:
+            message = self.magnet_p2p_policy_message(policy)
+            resolution.failure_message = message
+            resolution.settle(MAGNET_BLOCKED)
+            raise TorrentError(message)
         try:
             gid = rpc.add_magnet_metadata(resolution.magnet_uri, workspace)
         except Aria2Error:
@@ -2323,7 +2394,10 @@ class QueueManager(QObject):
                 on_failed(resolution)
             return
         resolution.settle(MAGNET_SUCCESS)
-        request = TorrentPreflight(metadata=meta, prepared=prepared)
+        request = TorrentPreflight(
+            metadata=meta, prepared=prepared,
+            p2p_consent_grant=resolution.p2p_consent_grant,
+        )
         # The hold does not change hands so much as change owner in place:
         # the hash has been in `_preflight_hashes` since before the metadata
         # was fetched, and this is the request that inherits it. There is no
@@ -2345,6 +2419,8 @@ class QueueManager(QObject):
     ) -> None:
         if not resolution.claim_delivery():
             return  # A shutdown already answered for this request.
+        resolution.failure_message = message
+        resolution.p2p_consent_grant.revoke()
         self._release_magnet_hold(resolution)
         if resolution.state != MAGNET_CANCELLED:
             # A cancellation is the caller's own doing and needs no sentence.
@@ -2414,9 +2490,14 @@ class QueueManager(QObject):
             self.discard_torrent_preflight(request)
             return None
         try:
-            return self.commit_prepared(
-                replace(request.prepared, selected_files=selection)
+            prepared = replace(request.prepared, selected_files=selection)
+            granted = (
+                request.p2p_consent_grant.consume()
+                if request.p2p_consent_grant is not None else False
             )
+            if granted:
+                return self.commit_prepared(prepared, p2p_consent_granted=True)
+            return self.commit_prepared(prepared)
         finally:
             # Released only once the task exists, so the managed copy is
             # never momentarily ownerless between the two.
@@ -2439,6 +2520,8 @@ class QueueManager(QObject):
         )
 
     def _release_torrent_preflight(self, request: TorrentPreflight) -> None:
+        if request.p2p_consent_grant is not None:
+            request.p2p_consent_grant.revoke()
         self._preflight_hashes.discard(request.metadata.info_hash)
 
     def _discard_managed_copy(self, info_hash: str, path: str) -> None:
@@ -2671,6 +2754,7 @@ class QueueManager(QObject):
                     )
                     new_rows.append((cur.lastrowid, dest_dir, name, f))
 
+        self._consent_granted.discard(t.id)
         if existing is not None:
             self.tasks.pop(t.id, None)
             self.task_removed.emit(t.id)
@@ -2737,30 +2821,51 @@ class QueueManager(QObject):
         mode = getattr(self.settings, "torrent_fallback_mode", TORRENT_FALLBACK_AUTOMATIC)
         return mode == TORRENT_FALLBACK_AUTOMATIC
 
+    def local_p2p_policy(self, *, consent_granted=False, require_enabled=True):
+        """The current policy for any local swarm contact, in precedence order."""
+        if require_enabled and not self._torrent_enabled():
+            return P2P_BLOCK_TORRENT_DISABLED
+        if not self._local_fallback_allowed():
+            return P2P_BLOCK_FALLBACK_POLICY
+        if self._proxy_configured() and not getattr(
+            self.settings, "torrent_allow_with_proxy", False,
+        ):
+            return P2P_BLOCK_PROXY_POLICY
+        if getattr(self.settings, "torrent_ip_disclosure_shown", False) or consent_granted is True:
+            return P2P_ALLOW
+        return P2P_NEEDS_CONSENT
+
+    @staticmethod
+    def magnet_p2p_policy_message(policy):
+        return {
+            P2P_BLOCK_TORRENT_DISABLED: TORRENT_SUPPORT_DISABLED,
+            P2P_BLOCK_FALLBACK_POLICY: MAGNET_P2P_FALLBACK_BLOCKED,
+            P2P_BLOCK_PROXY_POLICY: MAGNET_P2P_PROXY_BLOCKED,
+            P2P_NEEDS_CONSENT: MAGNET_P2P_CONSENT_REQUIRED,
+        }[policy]
+
     def _start_local_torrent(self, tid: int, attempt: object) -> None:
         if not self._current_torrent_attempt(tid, attempt):
             return
         t = self.tasks.get(tid)
         if t is None or t.source_type != SOURCE_TORRENT:
             return
-        if not self._local_fallback_allowed():
+        policy = self.local_p2p_policy(
+            consent_granted=tid in self._consent_granted, require_enabled=False,
+        )
+        if policy == P2P_BLOCK_FALLBACK_POLICY:
             # "Cancel the download" in Settings. The task stays visible as a
             # failure with a reason rather than vanishing, and the notice
             # below is skipped entirely: the user already answered it.
             self._fail_task(tid, TORRENT_CANCELLED_UNCACHED)
             return
-        if self._proxy_configured() and not getattr(
-            self.settings, "torrent_allow_with_proxy", False
-        ):
+        if policy == P2P_BLOCK_PROXY_POLICY:
             # aria2's --all-proxy covers HTTP(S) trackers and web seeds; it
             # says nothing about peer connections, DHT or UDP announces. A
             # user who set a proxy did not agree to leak around it.
             self._fail_task(tid, TORRENT_PROXY_BLOCKED)
             return
-        if (
-            not getattr(self.settings, "torrent_ip_disclosure_shown", False)
-            and tid not in self._consent_granted
-        ):
+        if policy == P2P_NEEDS_CONSENT:
             # Park the task and ask the window. Nothing has been sent to
             # aria2 yet, so declining costs the swarm nothing.
             self._awaiting_consent.add(tid)
