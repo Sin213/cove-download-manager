@@ -86,26 +86,31 @@ class NetworkInterfaceUnavailable(RuntimeError):
 def bound_requests_session(name: str):
     """A requests.Session whose outgoing sockets originate from `name`.
 
-    Covers the direct HTTP calls Cove makes outside of aria2 (debrid API
-    resolution, queue probes) so binding an interface in Settings protects
-    all of Cove's network traffic, not only aria2-managed downloads.
+    Covers HTTP calls Cove makes outside of aria2 (debrid API resolution,
+    queue probes), including connections through Requests' environment
+    proxies. Direct pools and proxy managers use the same source address.
     """
     import requests
     from requests.adapters import HTTPAdapter
 
-    session = requests.Session()
     if not name:
-        return session
+        return requests.Session()
     address = interface_address(name)
     if not address:
         raise NetworkInterfaceUnavailable(
             f"Network interface '{name}' has no address right now."
         )
 
+    session = requests.Session()
+
     class _BoundAdapter(HTTPAdapter):
         def init_poolmanager(self, *args, **kwargs):
             kwargs["source_address"] = (address, 0)
             return super().init_poolmanager(*args, **kwargs)
+
+        def proxy_manager_for(self, proxy, **proxy_kwargs):
+            proxy_kwargs["source_address"] = (address, 0)
+            return super().proxy_manager_for(proxy, **proxy_kwargs)
 
     adapter = _BoundAdapter()
     session.mount("http://", adapter)

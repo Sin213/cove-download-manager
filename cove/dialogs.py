@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import debrid, torrent
+from . import debrid, netiface, torrent
 from .clipboard import extract_urls
 from .config import (
     CATEGORY_NAMES,
@@ -105,6 +105,11 @@ class _AccountTest(QRunnable):
             account = self._fn()
         except DebridError as e:
             self.signals.failed.emit(self.provider, str(e))
+        except netiface.NetworkInterfaceUnavailable as error:
+            self.signals.failed.emit(
+                self.provider,
+                f"{debrid.provider_label(self.provider)}: {error}",
+            )
         except Exception:
             # Never surface the raw exception: it may quote the request,
             # and the request carries the API credential.
@@ -1687,9 +1692,17 @@ class SettingsDialog(QDialog):
         button.setProperty("testing", True)
         button.setEnabled(False)
 
-        # Resolve the callable through the module at call time so the test
-        # runs against whatever cove.debrid currently exposes.
-        call = _AccountTest(provider, lambda: fn(credential))
+        # Capture the dialog's draft on the GUI thread before scheduling.
+        interface = str(self.torrent_interface.currentData() or "")
+
+        def test_account():
+            session = netiface.bound_requests_session(interface)
+            try:
+                return fn(credential, session=session)
+            finally:
+                session.close()
+
+        call = _AccountTest(provider, test_account)
         _INFLIGHT_ACCOUNT_TESTS.add(call)
         call.signals.done.connect(self._on_account_test_done)
         call.signals.failed.connect(self._on_account_test_failed)

@@ -6,6 +6,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 # ---------------------------------------------------------------------------
 # Download File Info preflight setting
@@ -578,6 +580,301 @@ def test_torbox_account_test_reports_sanitized_results(tmp_path):
 
     for key in ("tb_success_text", "tb_failure_text", "tb_crash_text"):
         assert "SECRETVALUE" not in m[key], key
+
+
+# ---------------------------------------------------------------------------
+# Account Test interface policy (A1-A9, all three providers)
+# ---------------------------------------------------------------------------
+
+
+ACCOUNT_INTERFACE_SCRIPT = r'''
+import gc, json, sys, time, weakref
+from pathlib import Path
+from unittest import mock
+from PySide6.QtCore import QThread, QThreadPool
+from PySide6.QtWidgets import QApplication
+
+import cove.config as config
+tmp = Path(sys.argv[1])
+config.CONFIG_DIR = tmp
+config.DATA_DIR = tmp
+config.CONFIG_FILE = tmp / "settings.json"
+
+from cove import debrid, dialogs, netiface
+from cove.config import Settings
+
+app = QApplication([])
+pool = QThreadPool.globalInstance()
+KEY = "test-api-key"
+provider = sys.argv[2]
+label = debrid.provider_label(provider)
+attr, button_attr, edit_attr, result_attr, enabled_setting, key_setting = {
+    "alldebrid": ("all_debrid_account", "ad_test", "ad_key", "ad_result",
+                  "all_debrid_enabled", "all_debrid_api_key"),
+    "real_debrid": ("real_debrid_account", "rd_test", "rd_token", "rd_result",
+                    "real_debrid_enabled", "real_debrid_api_token"),
+    "torbox": ("torbox_account", "torbox_test", "torbox_token", "torbox_result",
+               "torbox_enabled", "torbox_api_token"),
+}[provider]
+
+
+def drain():
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if pool.waitForDone(50):
+            for _ in range(3):
+                app.processEvents()
+            return
+    raise AssertionError("account worker did not finish within 10 seconds")
+
+
+def run_case(saved, draft, outcome="success", presses=1, change_after_click=False):
+    attempts, sessions, session_refs, calls, signals = [], [], [], [], []
+
+    class SpySession:
+        def __init__(self, name):
+            self.number = len(sessions) + 1
+            self.record = {"number": self.number, "interface": name, "closes": 0}
+            sessions.append(self.record)
+            session_refs.append(weakref.ref(self))
+
+        def close(self):
+            self.record["closes"] += 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+            return False
+
+    def bound(name):
+        attempts.append({"interface": name, "off_gui_thread": QThread.currentThread() != app.thread()})
+        if name == "gone-vpn":
+            raise netiface.NetworkInterfaceUnavailable(
+                "Network interface 'gone-vpn' has no address right now."
+            )
+        return SpySession(name)
+
+    def account(credential, **kwargs):
+        session = kwargs.get("session")
+        calls.append({
+            "credential": credential,
+            "kwargs": sorted(kwargs),
+            "session_number": getattr(session, "number", None),
+            "same_session": bool(session_refs) and session is session_refs[-1](),
+            "off_gui_thread": QThread.currentThread() != app.thread(),
+        })
+        if outcome == "debrid_error":
+            raise debrid.DebridError(provider, "auth", "the API key was rejected. Check the key in Settings.")
+        if outcome == "unexpected":
+            raise RuntimeError("RuntimeError carrying " + credential)
+        return {"username": "coveuser", "is_premium": True, "is_trial": False,
+                "type": "premium", "email": "test-user@example.test", "is_subscribed": True}
+
+    original_init = dialogs._AccountTest.__init__
+
+    def observe_signals(worker, *args, **kwargs):
+        original_init(worker, *args, **kwargs)
+        worker.signals.done.connect(lambda p, account: signals.append(["done", p]))
+        worker.signals.failed.connect(lambda p, message: signals.append(["failed", p, message]))
+        worker.signals.finished.connect(lambda: signals.append(["finished"]))
+
+    settings = Settings(torrent_network_interface=saved, torrent_support_enabled=True,
+                        **{enabled_setting: True, key_setting: KEY})
+    with mock.patch.object(netiface, "bound_requests_session", bound), \
+         mock.patch.object(dialogs, "list_interfaces", return_value=["old-vpn", "new-vpn", "synthetic-vpn"]), \
+         mock.patch.object(dialogs.SettingsDialog, "_refresh_magnet_status"), \
+         mock.patch.object(debrid, "TORBOX_FEATURE_AVAILABLE", True), \
+         mock.patch.object(debrid, attr, account), \
+         mock.patch.object(dialogs._AccountTest, "__init__", observe_signals), \
+         mock.patch("requests.sessions.Session.request", side_effect=AssertionError("live request forbidden")):
+        dialog = dialogs.SettingsDialog(settings)
+        button = getattr(dialog, button_attr)
+        result = getattr(dialog, result_attr)
+        getattr(dialog, edit_attr).setText(KEY)
+        if draft == "gone-vpn":
+            dialog.torrent_interface.addItem("gone-vpn (not available)", "gone-vpn")
+        index = dialog.torrent_interface.findData(draft)
+        assert index >= 0, "synthetic draft interface missing from combo"
+        dialog.torrent_interface.setCurrentIndex(index)
+        disabled_during_test = []
+        try:
+            for _ in range(presses):
+                if change_after_click:
+                    # Hold only scheduling: click on the GUI thread, change the
+                    # combo, THEN let the real Qt pool run. No timing race can
+                    # make a worker that reads the draft too late pass A2.
+                    queued = []
+                    original_start = pool.start
+                    with mock.patch.object(pool, "start", side_effect=queued.append):
+                        button.click()
+                        disabled_during_test.append(not button.isEnabled())
+                        dialog.torrent_interface.setCurrentIndex(dialog.torrent_interface.findData("old-vpn"))
+                    assert len(queued) == 1, "Test did not schedule exactly one worker"
+                    original_start(queued.pop())
+                else:
+                    button.click()
+                    disabled_during_test.append(not button.isEnabled())
+                drain()
+            # Test records keep only weak references to the actual sessions.
+            gc.collect()
+            for _ in range(3):
+                app.processEvents()
+            gc.collect()
+            return {
+                "attempts": attempts, "sessions": sessions, "calls": calls, "signals": signals,
+                "text": result.text(), "button_enabled": button.isEnabled(),
+                "testing": button.property("testing"), "disabled_during_test": disabled_during_test,
+                "sessions_retained": [ref() is not None for ref in session_refs],
+                "inflight": len(dialogs._INFLIGHT_ACCOUNT_TESTS),
+                "saved_interface": settings.torrent_network_interface,
+                "draft_after": dialog.torrent_interface.currentData(),
+            }
+        finally:
+            drain()
+            dialog.close()
+            dialog.deleteLater()
+            app.sendPostedEvents(None, 0)
+            app.processEvents()
+
+
+out = {
+    "draft": run_case("", "synthetic-vpn"),
+    "capture": run_case("old-vpn", "new-vpn", change_after_click=True),
+    "unavailable": run_case("", "gone-vpn"),
+    "any": run_case("old-vpn", ""),
+    "success": run_case("", "synthetic-vpn"),
+    "debrid_error": run_case("", "synthetic-vpn", outcome="debrid_error"),
+    "unexpected": run_case("", "synthetic-vpn", outcome="unexpected"),
+    "repeated": run_case("", "synthetic-vpn", presses=3),
+}
+print(json.dumps(out))
+'''
+
+
+@pytest.fixture(scope="module", params=["alldebrid", "real_debrid", "torbox"])
+def account_interface_results(request, tmp_path_factory):
+    """One isolated Qt script per provider; every A1-A8 case is asserted separately.
+
+    Parameterizing all cases over all three providers supplies A9 coverage.
+    """
+    tmp_path = tmp_path_factory.mktemp("account-interface-" + request.param)
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    result = subprocess.run(
+        [sys.executable, "-c", ACCOUNT_INTERFACE_SCRIPT, str(tmp_path), request.param],
+        cwd=Path(__file__).resolve().parents[1], env=env,
+        text=True, capture_output=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    return request.param, json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _assert_account_session_passed(case, interface, presses=1):
+    assert [attempt["interface"] for attempt in case["attempts"]] == [interface] * presses, (
+        "Account Test must construct a bound session for the draft interface on each press"
+    )
+    assert all(attempt["off_gui_thread"] for attempt in case["attempts"])
+    assert len(case["calls"]) == presses
+    assert all(call["credential"] == "test-api-key" for call in case["calls"])
+    assert all(call["kwargs"] == ["session"] for call in case["calls"])
+    assert all(call["same_session"] for call in case["calls"]), "provider did not receive the constructed session"
+    assert all(call["off_gui_thread"] for call in case["calls"])
+
+
+def _assert_account_button_restored(case, presses=1):
+    assert case["disabled_during_test"] == [True] * presses
+    assert case["button_enabled"] is True
+    assert case["testing"] is False
+
+
+def test_a1_account_test_passes_draft_bound_session(account_interface_results):
+    _, results = account_interface_results
+    case = results["draft"]
+    _assert_account_session_passed(case, "synthetic-vpn")
+    assert case["saved_interface"] == ""
+    _assert_account_button_restored(case)
+
+
+def test_a2_account_test_captures_draft_at_click(account_interface_results):
+    _, results = account_interface_results
+    case = results["capture"]
+    _assert_account_session_passed(case, "new-vpn")
+    assert case["saved_interface"] == "old-vpn"
+    assert case["draft_after"] == "old-vpn"
+    _assert_account_button_restored(case)
+
+
+def test_a3_unavailable_draft_never_transmits_credential(account_interface_results):
+    provider, results = account_interface_results
+    case = results["unavailable"]
+    assert case["calls"] == [], "unavailable draft interface still transmitted a provider credential"
+    assert [attempt["interface"] for attempt in case["attempts"]] == ["gone-vpn"]
+    assert case["sessions"] == []
+    label = {"alldebrid": "AllDebrid", "real_debrid": "Real-Debrid", "torbox": "TorBox"}[provider]
+    expected = f"{label}: Network interface 'gone-vpn' has no address right now."
+    assert case["text"] == expected
+    assert [signal for signal in case["signals"] if signal[0] == "failed"] == [["failed", provider, expected]]
+    assert not any(signal[0] == "done" for signal in case["signals"])
+    assert "test-api-key" not in case["text"]
+    _assert_account_button_restored(case)
+
+
+def test_a4_any_interface_uses_ordinary_session_and_restores_button(account_interface_results):
+    _, results = account_interface_results
+    case = results["any"]
+    _assert_account_session_passed(case, "")
+    assert "connected" in case["text"]
+    _assert_account_button_restored(case)
+
+
+def test_a5_account_session_closed_once_on_success(account_interface_results):
+    provider, results = account_interface_results
+    case = results["success"]
+    assert "connected" in case["text"]
+    assert [session["closes"] for session in case["sessions"]] == [1], "successful Test did not close its session exactly once"
+    assert [signal for signal in case["signals"] if signal[0] == "done"] == [["done", provider]]
+    assert case["signals"].count(["finished"]) == 1
+    assert "test-api-key" not in case["text"]
+    _assert_account_button_restored(case)
+
+
+def test_a6_account_session_closed_once_on_debrid_error(account_interface_results):
+    provider, results = account_interface_results
+    case = results["debrid_error"]
+    label = {"alldebrid": "AllDebrid", "real_debrid": "Real-Debrid", "torbox": "TorBox"}[provider]
+    assert case["text"] == f"{label}: the API key was rejected. Check the key in Settings."
+    assert "test-api-key" not in case["text"]
+    assert [session["closes"] for session in case["sessions"]] == [1], "DebridError path did not close its session exactly once"
+    assert [signal for signal in case["signals"] if signal[0] == "failed"] == [["failed", provider, case["text"]]]
+    assert case["signals"].count(["finished"]) == 1
+    _assert_account_button_restored(case)
+
+
+def test_a7_account_session_closed_once_on_sanitized_unexpected_error(account_interface_results):
+    provider, results = account_interface_results
+    case = results["unexpected"]
+    label = {"alldebrid": "AllDebrid", "real_debrid": "Real-Debrid", "torbox": "TorBox"}[provider]
+    assert case["text"] == f"{label}: the account test could not be completed."
+    assert "test-api-key" not in case["text"]
+    assert "RuntimeError" not in case["text"]
+    assert [session["closes"] for session in case["sessions"]] == [1], "unexpected error path did not close its session exactly once"
+    assert [signal for signal in case["signals"] if signal[0] == "failed"] == [["failed", provider, case["text"]]]
+    assert case["signals"].count(["finished"]) == 1
+    _assert_account_button_restored(case)
+
+
+def test_a8_repeated_account_tests_use_fresh_closed_unretained_sessions(account_interface_results):
+    _, results = account_interface_results
+    case = results["repeated"]
+    assert len(case["sessions"]) == 3, "three Test presses must create three fresh sessions"
+    _assert_account_session_passed(case, "synthetic-vpn", presses=3)
+    assert [call["session_number"] for call in case["calls"]] == [1, 2, 3]
+    assert [session["closes"] for session in case["sessions"]] == [1, 1, 1]
+    assert case["sessions_retained"] == [False, False, False]
+    assert case["inflight"] == 0
+    _assert_account_button_restored(case, presses=3)
 
 
 # ---------------------------------------------------------------------------

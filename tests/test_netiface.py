@@ -121,3 +121,55 @@ def test_bound_urlopen_raises_when_address_unresolvable():
     with patch("cove.netiface.interface_address", return_value=None):
         with pytest.raises(NetworkInterfaceUnavailable):
             bound_urlopen("https://example.com", name="wg0-mullvad")
+
+
+def test_bound_requests_session_lifecycle_leaves_no_unreturned_open_session(monkeypatch):
+    import requests
+
+    constructed, closed = [], []
+
+    class RecordingSession(requests.Session):
+        def __init__(self):
+            super().__init__()
+            constructed.append(self)
+
+        def close(self):
+            closed.append(self)
+            super().close()
+
+    monkeypatch.setattr(requests, "Session", RecordingSession)
+    try:
+        with patch("cove.netiface.interface_address", return_value=None):
+            with pytest.raises(NetworkInterfaceUnavailable) as failure:
+                bound_requests_session("gone-vpn")
+        assert str(failure.value) == "Network interface 'gone-vpn' has no address right now."
+        assert len(constructed) - len(closed) == 0, (
+            f"unavailable interface left {len(constructed)} sessions constructed "
+            f"and {len(closed)} closed"
+        )
+
+        before = len(constructed)
+        with patch("cove.netiface.interface_address", return_value="127.0.0.2"):
+            selected = bound_requests_session("synthetic-vpn")
+        assert constructed[before:] == [selected]
+        assert selected not in closed
+        prepared = selected.prepare_request(requests.Request("GET", "http://127.0.0.1/"))
+        assert prepared.method == "GET"
+        assert selected.get_adapter(prepared.url).poolmanager.connection_pool_kw["source_address"] == ("127.0.0.2", 0)
+        selected.close()
+
+        before = len(constructed)
+        with patch("cove.netiface.interface_address", side_effect=AssertionError("unexpected address lookup")) as lookup:
+            ordinary = bound_requests_session("")
+            lookup.assert_not_called()
+        assert constructed[before:] == [ordinary]
+        assert ordinary not in closed
+        prepared = ordinary.prepare_request(requests.Request("GET", "http://127.0.0.1/"))
+        assert prepared.method == "GET"
+        assert ordinary.get_adapter(prepared.url).poolmanager.connection_pool_kw.get("source_address") is None
+        assert len(constructed) - len(closed) == 1
+    finally:
+        # Also clean up the leaked session when demonstrating the pre-fix RED.
+        for session in constructed:
+            if session not in closed:
+                session.close()
