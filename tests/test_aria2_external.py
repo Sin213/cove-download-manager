@@ -1,9 +1,13 @@
 """Tests for the concurrency cap and external-download discovery."""
 import base64
+import os
 import threading
+from urllib.parse import quote
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from cove import aria2, config
 
 from cove.aria2 import (
     Aria2Daemon,
@@ -59,12 +63,17 @@ def test_generated_gid_is_lowercase_nonzero_and_skips_reserved_identity(monkeypa
 
 
 @pytest.fixture(autouse=True)
-def _no_stale_daemon():
+def _no_stale_daemon(tmp_path, monkeypatch):
     """Daemon startup tests must not depend on what holds 6800 locally.
 
     Tests that exercise the reclaim path re-patch this inside the test, and
     the inner patch wins.
     """
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(aria2, "DATA_DIR", data_dir)
+    monkeypatch.setattr(aria2, "ARIA2_SESSION", data_dir / "aria2.session")
+    monkeypatch.setattr(aria2, "ARIA2_LOG", data_dir / "aria2.log")
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
     with patch.object(Aria2Daemon, "_port_in_use", return_value=False):
         yield
 
@@ -80,12 +89,188 @@ def _live_proc():
     return proc
 
 
+@pytest.fixture
+def s04_daemon(monkeypatch, tmp_path):
+    """Real scratch paths and start(), with only the child/RPC mocked."""
+    settings = Settings(
+        download_dir=str(tmp_path / "downloads"), rpc_secret="S04_RPC_SECRET_unit",
+        proxy_type="http", proxy_host="127.0.0.1", proxy_port=18080,
+        proxy_username="s04user", proxy_password="S04_ARGV_SECRET_9f3c",
+    )
+    popen = MagicMock(return_value=_live_proc())
+    monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "aria2c")
+    monkeypatch.setattr(aria2.subprocess, "Popen", popen)
+    monkeypatch.setattr(Aria2RPC, "get_version", lambda self: {"version": "1.37.0"})
+    daemon = Aria2Daemon(settings)
+    try:
+        yield daemon, popen, aria2.DATA_DIR / "aria2.rpc.conf"
+    finally:
+        daemon.stop()
+
+
+@pytest.mark.parametrize("password", ["S04_ARGV_SECRET_9f3c", "S04_ARGV_SECRET_9f3c:@% #"])
+def test_s04_proxy_credentials_absent_from_argv(s04_daemon, password):
+    """P1/M6: raw and encoded credentials must never be process arguments."""
+    daemon, popen, conf = s04_daemon
+    daemon.settings.proxy_password = password
+    daemon.start()
+    args = popen.call_args.args[0]
+    joined = "\0".join(args)
+    for value in (password, quote(password, safe=""), "s04user", daemon._build_proxy_url()):
+        assert value not in joined
+    assert not any(arg.startswith("--all-proxy") for arg in args)
+    assert f"--conf-path={conf}" in args
+    assert conf.read_text().splitlines() == [
+        "rpc-secret=S04_RPC_SECRET_unit", f"all-proxy={daemon._build_proxy_url()}",
+    ]
+
+
+def test_s04_rpc_secret_remains_absent_from_argv(s04_daemon):
+    """P2/M12: the already-fixed RPC argv boundary stays fixed."""
+    daemon, popen, conf = s04_daemon
+    daemon.start()
+    assert daemon.settings.rpc_secret not in "\0".join(popen.call_args.args[0])
+    assert f"--conf-path={conf}" in popen.call_args.args[0]
+    assert "rpc-secret=S04_RPC_SECRET_unit" in conf.read_text().splitlines()
+
+
+@pytest.mark.parametrize("active", ["http", "none", "empty-host"])
+@pytest.mark.parametrize("value", ["http://127.0.0.1:1", ""], ids=["conflict", "empty"])
+def test_s04_proxy_environment_preserves_argv_precedence(s04_daemon, monkeypatch, active, value):
+    """C2: strip only the env option that newly overrides the conf transport."""
+    for name in ("all_proxy", "ALL_PROXY", "http_proxy", "HTTP_PROXY", "https_proxy",
+                 "HTTPS_PROXY", "ftp_proxy", "FTP_PROXY"):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("no_proxy", "example.invalid")
+    monkeypatch.setenv("S04_ENV_SENTINEL", "preserved")
+    before = dict(os.environ)
+    daemon, popen, _ = s04_daemon
+    if active == "none":
+        daemon.settings.proxy_type = "none"
+    elif active == "empty-host":
+        daemon.settings.proxy_host = ""
+    daemon.start()
+    child_env = popen.call_args.kwargs.get("env")
+    if active == "http":
+        expected = dict(before)
+        expected.pop("all_proxy", None)
+        if os.name == "nt":
+            expected.pop("ALL_PROXY", None)  # Windows environment names are case insensitive.
+        assert isinstance(child_env, dict), "an active conf proxy needs an explicit child environment"
+        assert child_env == expected
+        assert child_env is not os.environ
+        assert daemon.settings.proxy_password not in "\0".join(child_env.values())
+        assert daemon.settings.rpc_secret not in "\0".join(child_env.values())
+    else:
+        assert child_env is None or child_env == before
+    assert dict(os.environ) == before, "never mutate the parent process environment"
+
+
+_S04_PROXY_SEMANTICS = [
+    pytest.param("http", "proxy.invalid", 8080, "s04user", "S04_ARGV_SECRET_9f3c",
+                 "http://s04user:S04_ARGV_SECRET_9f3c@proxy.invalid:8080", id="http"),
+    pytest.param("https", "proxy.invalid", 8080, "s04user", "S04_ARGV_SECRET_9f3c",
+                 "https://s04user:S04_ARGV_SECRET_9f3c@proxy.invalid:8080", id="https"),
+    pytest.param("socks5", "proxy.invalid", 8080, "s04user", "S04_ARGV_SECRET_9f3c",
+                 "socks5://s04user:S04_ARGV_SECRET_9f3c@proxy.invalid:8080", id="socks5"),
+    pytest.param("http", "proxy.invalid", 0, "s04user", "", "http://s04user@proxy.invalid", id="user-only"),
+    pytest.param("http", "proxy.invalid", 0, "", "S04_ARGV_SECRET_9f3c",
+                 "http://proxy.invalid", id="password-without-user"),
+    pytest.param("http", "proxy.invalid", 0, "", "", "http://proxy.invalid", id="no-auth-no-port"),
+    pytest.param("http", "proxy.invalid", 8080, "", "", "http://proxy.invalid:8080", id="no-auth-port"),
+    pytest.param("none", "proxy.invalid", 8080, "s04user", "S04_ARGV_SECRET_9f3c", None, id="none"),
+    pytest.param("http", "", 8080, "s04user", "S04_ARGV_SECRET_9f3c", None, id="empty-host"),
+]
+
+
+@pytest.mark.parametrize("kind,host,port,user,password,expected", _S04_PROXY_SEMANTICS)
+def test_s04_proxy_url_semantics_preserved(kind, host, port, user, password, expected):
+    """Existing URL semantics, independent of the new conf transport."""
+    daemon = Aria2Daemon(Settings(
+        proxy_type=kind, proxy_host=host, proxy_port=port,
+        proxy_username=user, proxy_password=password,
+    ))
+    active = kind != "none" and bool(host)
+    assert (daemon._build_proxy_url() if active else None) == expected
+
+
+@pytest.mark.parametrize("kind,host,port,user,password,expected", _S04_PROXY_SEMANTICS)
+def test_s04_proxy_semantics_in_conf(s04_daemon, kind, host, port, user, password, expected):
+    daemon, popen, conf = s04_daemon
+    settings = daemon.settings
+    settings.proxy_type, settings.proxy_host, settings.proxy_port = kind, host, port
+    settings.proxy_username, settings.proxy_password = user, password
+    daemon.start()
+    expected_lines = ["rpc-secret=S04_RPC_SECRET_unit"]
+    if expected is not None:
+        expected_lines.append(f"all-proxy={expected}")
+    assert conf.read_text().splitlines() == expected_lines
+    assert not any(arg.startswith("--all-proxy") for arg in popen.call_args.args[0])
+
+
+def test_s04_disabling_proxy_rewrites_conf_without_old_secret(s04_daemon):
+    """P5/M8: check both the credential-bearing start and the disabled start."""
+    daemon, popen, conf = s04_daemon
+    daemon.settings.proxy_password = "S04_OLD_PROXY_SECRET"
+    daemon.start()
+    first = conf.read_text()
+    daemon.stop()
+    daemon.settings.proxy_type = "none"
+    daemon.start()
+    current = conf.read_text()
+    assert "S04_OLD_PROXY_SECRET" not in current
+    assert current.splitlines() == ["rpc-secret=S04_RPC_SECRET_unit"]
+    assert "S04_OLD_PROXY_SECRET" in first, "the enabled start must use the protected conf"
+    assert all("S04_OLD_PROXY_SECRET" not in "\0".join(call.args[0]) for call in popen.call_args_list)
+
+
+def test_s04_password_rotation_replaces_conf_and_argv_stays_secret_free(s04_daemon):
+    """P6/M8: the current conf contains B only; neither spawn exposes A/B."""
+    daemon, popen, conf = s04_daemon
+    daemon.settings.proxy_password = "S04_OLD_PROXY_SECRET"
+    daemon.start()
+    first = conf.read_text()
+    daemon.stop()
+    daemon.settings.proxy_password = "S04_ARGV_SECRET_9f3c_rotated"
+    daemon.start()
+    current = conf.read_text()
+    assert "S04_OLD_PROXY_SECRET" not in current
+    assert current.splitlines() == [
+        "rpc-secret=S04_RPC_SECRET_unit", f"all-proxy={daemon._build_proxy_url()}",
+    ]
+    assert "S04_OLD_PROXY_SECRET" in first
+    assert all(
+        secret not in "\0".join(call.args[0])
+        for call in popen.call_args_list
+        for secret in ("S04_OLD_PROXY_SECRET", "S04_ARGV_SECRET_9f3c_rotated")
+    )
+
+
+@pytest.mark.parametrize("field", ["proxy_host", "rpc_secret", "proxy_type", "proxy_port"])
+@pytest.mark.parametrize("control", ["\r", "\n", "\x00", "\x01", "\x1f", "\x7f"],
+                         ids=["cr", "lf", "nul", "soh", "us", "del"])
+def test_s04_raw_conf_controls_fail_closed(s04_daemon, field, control):
+    """P8/M10: validate raw conf values before writing or spawning."""
+    daemon, popen, conf = s04_daemon
+    value = f"S04_RPC_SECRET_injection{control}max-concurrent-downloads=999"
+    setattr(daemon.settings, field, value)
+    error = None
+    try:
+        daemon.start()
+    except Aria2Error as exc:
+        error = exc
+    text = conf.read_text() if conf.exists() else ""
+    assert "max-concurrent-downloads=999" not in text
+    assert not popen.called, "invalid raw fields must never reach the child"
+    assert error is not None, "expected Aria2Error for a control character"
+    assert value not in str(error)
+    assert "S04_RPC_SECRET_injection" not in str(error)
+
+
 def test_daemon_lifts_max_concurrent_downloads():
     """aria2 defaults to 5; the daemon must pass an explicit higher cap."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
@@ -99,8 +284,6 @@ def test_daemon_caps_per_server_connections_for_stock_aria2():
     settings = Settings(connections_per_server=32)
     daemon = Aria2Daemon(settings)
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
@@ -114,8 +297,6 @@ def test_daemon_stops_seeding_when_the_download_completes():
     """Local BitTorrent must not keep uploading after Cove says "done"."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
@@ -128,8 +309,6 @@ def test_daemon_binds_to_the_selected_network_interface():
     settings = Settings(torrent_network_interface="wg0-mullvad")
     daemon = Aria2Daemon(settings)
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.interface_exists", return_value=True), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
@@ -141,8 +320,6 @@ def test_daemon_binds_to_the_selected_network_interface():
 def test_daemon_passes_no_interface_flag_for_any_interface():
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()
@@ -155,8 +332,6 @@ def test_daemon_refuses_to_launch_when_the_interface_is_gone():
     settings = Settings(torrent_network_interface="wg0-mullvad")
     daemon = Aria2Daemon(settings)
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.interface_exists", return_value=False), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
@@ -183,15 +358,15 @@ def test_daemon_reclaims_the_port_from_a_leftover_aria2():
     # In use before the shutdown call, free afterwards.
     in_use = iter([True, False, False])
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2Daemon, "_port_in_use", side_effect=lambda: next(in_use)), \
+         patch.object(Aria2Daemon, "_wait_for_port_release") as wait, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}), \
          patch.object(Aria2RPC, "shutdown") as shutdown:
         daemon.start()
 
     assert shutdown.call_count == 1
+    assert wait.call_count == 1
     # Exactly one spawn: the leftover is cleared before we launch, so no
     # child is ever burned on a doomed bind.
     assert popen.call_count == 1
@@ -201,10 +376,9 @@ def test_daemon_reports_a_port_it_cannot_reclaim():
     """If the leftover will not go away, say so instead of pretending."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2Daemon, "_port_in_use", return_value=True), \
+         patch.object(Aria2Daemon, "_wait_for_port_release") as wait, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}), \
          patch.object(Aria2RPC, "shutdown"):
         with pytest.raises(Aria2Error) as excinfo:
@@ -212,6 +386,7 @@ def test_daemon_reports_a_port_it_cannot_reclaim():
 
     message = str(excinfo.value)
     assert "6800" in message and "aria2c" in message
+    assert wait.call_count == 1
     assert popen.call_count == 0
 
 
@@ -219,8 +394,6 @@ def test_daemon_refuses_a_foreign_aria2_on_our_port():
     """A stranger's aria2 rejects our secret and must not be shut down."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()), \
          patch.object(Aria2Daemon, "_port_in_use", return_value=True), \
          patch.object(Aria2RPC, "get_version", side_effect=Aria2Error("Unauthorized")), \
@@ -236,8 +409,6 @@ def test_daemon_keeps_a_healthy_child_without_shutting_anything_down():
     """The normal path must not gain a stray shutdown call."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2Daemon, "_port_in_use", return_value=False), \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}), \
@@ -252,8 +423,6 @@ def test_daemon_adds_no_speculative_bittorrent_flags():
     """Only --seed-time=0 is new; DHT/PEX/ports stay on aria2 defaults."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.DATA_DIR", MagicMock()), \
-         patch("cove.aria2.ARIA2_SESSION", MagicMock()), \
          patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
          patch.object(Aria2RPC, "get_version", return_value={"version": "1.37"}):
         daemon.start()

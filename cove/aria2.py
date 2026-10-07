@@ -14,6 +14,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -30,6 +31,7 @@ from .config import (
     DATA_DIR,
     MAX_CONNECTIONS_PER_SERVER,
     Settings,
+    prepare_private_directory,
 )
 from .netiface import interface_exists
 
@@ -200,21 +202,12 @@ class Aria2Daemon:
             else:
                 hint = "Install it: sudo apt install aria2  (or your distro's equivalent)"
             raise Aria2Error(f"aria2c not found. {hint}")
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        conf_path = self._write_rpc_conf()
         ARIA2_SESSION.touch(exist_ok=True)
         connections = min(
             max(int(self.settings.connections_per_server), 1),
             MAX_CONNECTIONS_PER_SERVER,
         )
-        # Pass the RPC secret via a 0600 conf file, not argv: command lines
-        # are world-readable on many systems (/proc, process listers).
-        conf_path = DATA_DIR / "aria2.rpc.conf"
-        conf_path.touch(exist_ok=True)
-        try:
-            os.chmod(conf_path, 0o600)
-        except OSError:
-            pass
-        conf_path.write_text(f"rpc-secret={self.settings.rpc_secret}\n")
         args = [
             aria2c,
             f"--conf-path={conf_path}",
@@ -260,9 +253,6 @@ class Aria2Daemon:
             args.append(
                 f"--max-overall-download-limit={self.settings.overall_speed_limit_kbps}K"
             )
-        if self.settings.proxy_type != "none" and self.settings.proxy_host:
-            proxy_url = self._build_proxy_url()
-            args.append(f"--all-proxy={proxy_url}")
         # Reclaim the port *before* spawning. Checking afterwards races the
         # doomed child: it needs a moment to fail its bind and exit, so
         # poll() can still read "alive" while the RPC reply is really coming
@@ -303,7 +293,51 @@ class Aria2Daemon:
                 "for a leftover aria2c) or change the RPC port in Cove's "
                 "settings, then restart Cove."
             )
-        raise Aria2Error(f"aria2 RPC did not come up: {last_err}")
+        raise Aria2Error("aria2 RPC did not come up.")
+
+    def _write_rpc_conf(self) -> Path:
+        """Publish a complete private conf; no credential belongs in argv."""
+        s = self.settings
+        for value in (s.proxy_host, s.proxy_type, s.proxy_port, s.rpc_secret):
+            if any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in str(value)):
+                raise Aria2Error("Invalid control character in aria2 configuration.")
+        text = f"rpc-secret={s.rpc_secret}\n"
+        if s.proxy_type != "none" and s.proxy_host:
+            text += f"all-proxy={self._build_proxy_url()}\n"
+        conf_path = DATA_DIR / "aria2.rpc.conf"
+        temporary = None
+        fd = None
+        try:
+            prepare_private_directory(DATA_DIR)
+            candidate = DATA_DIR / f".aria2.rpc.conf.{secrets.token_hex(12)}.tmp"
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            temporary = candidate  # Never unlink a candidate we did not create.
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as conf:
+                fd = None  # The file object now owns the descriptor.
+                conf.write(text)
+                conf.flush()
+                os.fsync(conf.fileno())
+            os.replace(temporary, conf_path)
+            temporary = None
+            if os.name != "nt":
+                if not stat.S_ISREG(conf_path.lstat().st_mode):
+                    raise OSError("aria2 configuration must be a regular file")
+                os.chmod(conf_path, 0o600, follow_symlinks=False)
+                info = conf_path.lstat()
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise OSError("aria2 configuration is not private")
+            return conf_path
+        except (OSError, ValueError):
+            raise Aria2Error("Unable to prepare private aria2 configuration.") from None
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if temporary is not None:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
 
     def is_running(self) -> bool:
         """Whether our aria2c child is alive. Cheap enough for a GUI timer.
@@ -328,15 +362,26 @@ class Aria2Daemon:
         return self._proc is not None and self._proc.poll() is None
 
     def _spawn(self, args: list[str]) -> None:
+        child_env = None
+        if self.settings.proxy_type != "none" and self.settings.proxy_host:
+            # aria2 1.37.0 reads all_proxy after conf but before argv. Only this
+            # option lost precedence when moved to conf; protocol proxy options
+            # and no_proxy retain their pre-S04 behaviour. Uppercase names are
+            # ignored on POSIX, but Windows environment names ignore case.
+            child_env = os.environ.copy()
+            child_env.pop("all_proxy", None)
+            if os.name == "nt":
+                child_env.pop("ALL_PROXY", None)
         try:
             self._proc = subprocess.Popen(
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=child_env,
                 **_hidden_console_kwargs(),
             )
-        except OSError as e:
-            raise Aria2Error(f"Failed to launch aria2c: {e}")
+        except OSError:
+            raise Aria2Error("Failed to launch aria2c.") from None
 
     def _await_rpc(self, timeout: float = 5.0) -> Exception | None:
         """Poll the RPC endpoint. None once it answers, else the last error."""

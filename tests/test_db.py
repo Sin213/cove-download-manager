@@ -1,9 +1,316 @@
 """Tests for additive cove.db migrations."""
 
+import os
 import sqlite3
+import stat
+import subprocess
+import sys
 import time
+from contextlib import closing
+from pathlib import Path
 
-from cove import db
+import pytest
+
+from cove import config, db
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fcntl lock regression")
+@pytest.mark.parametrize("mode", [0o600, 0o644], ids=["private", "migration"])
+def test_s04_second_connection_preserves_process_write_lock(tmp_path, monkeypatch, mode):
+    """C1: only an independent process can detect the silently dropped lock."""
+    _, path = _s04_db_paths(tmp_path, monkeypatch)
+    db.init(path)
+    probe = r'''
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0.3, isolation_level=None)
+try:
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as error:
+        assert "database is locked" in str(error)
+        print("LOCKED")
+    else:
+        print("ACQUIRED")
+finally:
+    connection.close()
+'''
+
+    def lock_status():
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(path)], capture_output=True,
+            text=True, check=True, timeout=3,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
+        )
+        return result.stdout.strip()
+
+    with closing(sqlite3.connect(path, isolation_level=None)) as holder:
+        holder.execute("BEGIN IMMEDIATE")
+        path.chmod(mode)
+        assert lock_status() == "LOCKED", "establish the cross-process oracle first"
+        with db.connect(path):
+            pass
+        assert lock_status() == "LOCKED", "preparing another connection must not release SQLite's locks"
+        holder.rollback()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor/lock regression")
+@pytest.mark.parametrize("operation", ["init", "connect"])
+def test_s04_private_db_preparation_does_not_open_database(tmp_path, monkeypatch, operation):
+    """C1: even a failed O_EXCL probe is unnecessary on an existing private DB."""
+    _, path = _s04_db_paths(tmp_path, monkeypatch)
+    db.init(path)
+    opened = []
+    original_open = os.open
+
+    def observe_open(name, *args, **kwargs):
+        if Path(name) == path:
+            opened.append(name)
+        return original_open(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", observe_open)
+    if operation == "init":
+        db.init(path)
+    else:
+        with db.connect(path) as conn:
+            assert conn.execute("SELECT 1").fetchone()[0] == 1
+    assert not opened, "auxiliary database descriptors can release another connection's fcntl locks"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes and symlinks")
+@pytest.mark.parametrize("operation", ["init", "connect"])
+@pytest.mark.parametrize("spelling", ["relative", "dotdot"])
+@pytest.mark.parametrize("leaf", ["permissive", "symlink"])
+def test_s04_db_alias_preserves_owned_leaf_boundary(tmp_path, monkeypatch, operation, spelling, leaf):
+    """C3: normalise spelling, while preserving the final symlink for refusal."""
+    data_dir = tmp_path / "data" / "cove"
+    data_dir.parent.mkdir()
+    monkeypatch.setattr(db, "DATA_DIR", data_dir)
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    monkeypatch.chdir(tmp_path)
+    if spelling == "relative":
+        path = Path("data/cove/cove.db")
+    else:
+        (tmp_path / "alias").mkdir()
+        path = tmp_path / "alias" / ".." / "data" / "cove" / "cove.db"
+    target = tmp_path / "unrelated"
+    if leaf == "symlink":
+        target.mkdir()
+        target.chmod(0o755)
+        (target / "sentinel").write_bytes(b"S04_SYNTHETIC_COOKIE")
+        data_dir.symlink_to(target, target_is_directory=True)
+        before = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in target.iterdir()}
+    else:
+        data_dir.mkdir()
+        data_dir.chmod(0o755)
+    observed = []
+    original_connect = sqlite3.connect
+
+    def observe_connect(database, *args, **kwargs):
+        observed.append(stat.S_IMODE(data_dir.stat().st_mode))
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", observe_connect)
+    error = None
+    previous = os.umask(0o022)
+    try:
+        try:
+            if operation == "init":
+                db.init(path)
+            else:
+                with db.connect(path) as conn:
+                    assert conn.execute("SELECT 1").fetchone()[0] == 1
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            error = exc
+    finally:
+        os.umask(previous)
+    if leaf == "symlink":
+        after = {p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode)) for p in target.iterdir()}
+        assert after == before
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+        assert not observed, "refuse the aliased symlink before SQLite is called"
+        assert error is not None and str(error)
+        assert "S04_SYNTHETIC_COOKIE" not in str(error)
+    else:
+        assert error is None
+        assert observed == [0o700]
+        assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX private-file creation flags/modes")
+@pytest.mark.parametrize("owned", [True, False], ids=["cove-leaf", "custom-parent"])
+@pytest.mark.parametrize("operation", ["init", "connect"])
+@pytest.mark.parametrize("mask", [0o022, 0o000], ids=["umask022", "umask000"])
+def test_s04_db_creation_mode_oracle(tmp_path, monkeypatch, owned, operation, mask):
+    """C5: later chmod cannot conceal a permissive initial creation request."""
+    if owned:
+        parent, path = _s04_db_paths(tmp_path, monkeypatch)
+    else:
+        parent = tmp_path / "custom-parent"
+        path = parent / "custom.db"
+    parent.mkdir(parents=True)
+    parent.chmod(0o755)
+    events = []
+    original_open, original_chmod, original_fchmod = os.open, os.chmod, os.fchmod
+
+    def observe_open(name, flags, mode=0o777, **kwargs):
+        fd = original_open(name, flags, mode, **kwargs)
+        if Path(name) == path and flags & os.O_CREAT:
+            events.append(("create", mode, flags, stat.S_IMODE(os.fstat(fd).st_mode)))
+        return fd
+
+    def observe_chmod(name, mode, **kwargs):
+        if Path(name) == path:
+            events.append(("chmod", mode))
+        return original_chmod(name, mode, **kwargs)
+
+    def observe_fchmod(fd, mode):
+        if path.exists():
+            info, target = os.fstat(fd), path.stat()
+            if (info.st_dev, info.st_ino) == (target.st_dev, target.st_ino):
+                events.append(("fchmod", mode))
+        return original_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "open", observe_open)
+    monkeypatch.setattr(os, "chmod", observe_chmod)
+    monkeypatch.setattr(os, "fchmod", observe_fchmod)
+    previous = os.umask(mask)
+    try:
+        if operation == "init":
+            db.init(path)
+        else:
+            with db.connect(path) as conn:
+                assert conn.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        os.umask(previous)
+    creations = [event for event in events if event[0] == "create"]
+    assert len(creations) == 1, events
+    _, mode, flags, initial = creations[0]
+    assert mode == 0o600, events
+    required = os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    assert flags & required == required, events
+    assert initial == 0o600, events
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(parent.stat().st_mode) == (0o700 if owned else 0o755)
+
+
+def _s04_db_paths(tmp_path, monkeypatch):
+    data_dir = tmp_path / "xdg-data" / "cove"
+    path = data_dir / "cove.db"
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(config, "DB_FILE", path)
+    monkeypatch.setattr(db, "DB_FILE", path)
+    # db currently imports only DB_FILE. Also isolate a future DATA_DIR alias.
+    monkeypatch.setattr(db, "DATA_DIR", data_dir, raising=False)
+    return data_dir, path
+
+
+def _s04_snapshot(conn):
+    return {
+        "version": conn.execute("PRAGMA user_version").fetchone()[0],
+        "schema": conn.execute(
+            "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
+        ).fetchall(),
+        "columns": conn.execute("PRAGMA table_info(downloads)").fetchall(),
+        "indexes": conn.execute("PRAGMA index_list(downloads)").fetchall(),
+        "journal": conn.execute("PRAGMA journal_mode").fetchone()[0],
+        "synchronous": conn.execute("PRAGMA synchronous").fetchone()[0],
+        "locking": conn.execute("PRAGMA locking_mode").fetchone()[0],
+        "rows": conn.execute("SELECT * FROM downloads ORDER BY id").fetchall(),
+    }
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes do not describe Windows ACLs")
+@pytest.mark.parametrize("operation", ["init", "connect"])
+@pytest.mark.parametrize("mask", [0o022, 0o000], ids=["umask022", "umask000"])
+def test_s04_fresh_db_private_before_sqlite(tmp_path, monkeypatch, mask, operation):
+    """D1/D2: even connect() must securely pre-create a missing database."""
+    data_dir, path = _s04_db_paths(tmp_path, monkeypatch)
+    if operation == "connect":
+        # connect() historically expects a parent; do not require a new API.
+        data_dir.mkdir(parents=True)
+        data_dir.chmod(0o755)
+    observed = []
+    original_connect = sqlite3.connect
+
+    def observe_connect(database, *args, **kwargs):
+        observed.append((
+            stat.S_IMODE(data_dir.stat().st_mode),
+            stat.S_IMODE(path.stat().st_mode) if path.exists() else None,
+        ))
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", observe_connect)
+    previous = os.umask(mask)
+    try:
+        if operation == "init":
+            db.init(path)
+        else:
+            with db.connect(path) as conn:
+                assert conn.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        os.umask(previous)
+    with closing(original_connect(path)) as conn:
+        if operation == "init":
+            assert conn.execute("SELECT name FROM sqlite_master WHERE name='downloads'").fetchone()
+            assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+    assert observed == [(0o700, 0o600)], "permissions must precede SQLite's first open"
+    assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes do not describe Windows ACLs")
+@pytest.mark.parametrize("operation", ["init", "connect"])
+def test_s04_migration_precedes_sqlite_and_preserves_history(tmp_path, monkeypatch, operation):
+    """D3/M3: record modes at the actual sqlite3.connect boundary."""
+    data_dir, path = _s04_db_paths(tmp_path, monkeypatch)
+    db.init(path)
+    with db.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO downloads (url,out_dir,created_at,cookies,referrer,user_agent) "
+            "VALUES (?,?,?,?,?,?)",
+            ("http://example.invalid/s04.bin?sig=S04_SYNTHETIC_COOKIE", str(tmp_path), 1,
+             "Cookie: sid=S04_SYNTHETIC_COOKIE", "http://example.invalid/ref", "S04-UA"),
+        )
+    original_connect = sqlite3.connect
+    with closing(original_connect(path)) as conn:
+        before = _s04_snapshot(conn)
+    data_dir.chmod(0o755)
+    path.chmod(0o644)
+    observed = []
+
+    def observe_connect(database, *args, **kwargs):
+        observed.append((stat.S_IMODE(data_dir.stat().st_mode), stat.S_IMODE(path.stat().st_mode)))
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", observe_connect)
+    previous = os.umask(0o022)
+    try:
+        if operation == "init":
+            db.init(path)
+        else:
+            with db.connect(path) as conn:
+                assert conn.execute("SELECT cookies FROM downloads").fetchone()[0] == "Cookie: sid=S04_SYNTHETIC_COOKIE"
+    finally:
+        os.umask(previous)
+    with closing(original_connect(path)) as conn:
+        assert _s04_snapshot(conn) == before
+    assert observed == [(0o700, 0o600)], "late chmod leaves the initial SQLite open unsafe"
+
+
+def test_s04_permission_migration_keeps_schema_and_pragmas(tmp_path, monkeypatch):
+    """D11: permissions do not authorize schema or SQLite policy changes."""
+    data_dir, path = _s04_db_paths(tmp_path, monkeypatch)
+    db.init(path)
+    with closing(sqlite3.connect(path)) as conn:
+        before = _s04_snapshot(conn)
+    if os.name != "nt":
+        data_dir.chmod(0o755)
+        path.chmod(0o644)
+    db.init(path)
+    with db.connect(path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
+    with closing(sqlite3.connect(path)) as conn:
+        assert _s04_snapshot(conn) == before
 
 
 def test_v7_upgrade_adds_exactly_two_empty_ownership_columns(tmp_path):

@@ -1,8 +1,11 @@
+import errno
+import os
 import sqlite3
+import stat
 from contextlib import contextmanager
 from pathlib import Path
 
-from .config import DB_FILE, MAX_CONNECTIONS_PER_SERVER
+from .config import DATA_DIR, DB_FILE, MAX_CONNECTIONS_PER_SERVER, prepare_private_directory
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS downloads (
@@ -112,8 +115,57 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _prepare_database(path: Path) -> None:
+    """Create or tighten the regular DB file before SQLite can touch it."""
+    if os.path.abspath(path.parent) == os.path.abspath(DATA_DIR):
+        prepare_private_directory(DATA_DIR)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        try:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except FileExistsError:
+            info = path.lstat()  # Another creator won; use the no-descriptor path below.
+        else:
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise OSError(errno.EINVAL, "Cove database must be a regular file")
+                if os.name != "nt":
+                    fchmod = getattr(os, "fchmod", None)
+                    if fchmod is not None:
+                        fchmod(fd, 0o600)
+                    else:
+                        os.chmod(path, 0o600, follow_symlinks=False)
+                    if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                        raise OSError(errno.EACCES, "Cove database is not private")
+            finally:
+                os.close(fd)
+            return
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(errno.EINVAL, "Cove database must be a regular file")
+    # Closing ANY auxiliary fd on an existing DB drops this process's SQLite
+    # fcntl locks. Inspect and tighten existing files without opening them.
+    if os.name == "nt" or stat.S_IMODE(info.st_mode) == 0o600:
+        return
+    try:
+        os.chmod(path, 0o600, follow_symlinks=False)
+    except NotImplementedError:
+        raise OSError(errno.ENOTSUP, "No-follow database permission repair is unavailable") from None
+    tightened = path.lstat()
+    if not stat.S_ISREG(tightened.st_mode) or (tightened.st_dev, tightened.st_ino) != (
+        info.st_dev, info.st_ino,
+    ):
+        raise OSError(errno.EINVAL, "Cove database changed during permission repair")
+    if stat.S_IMODE(tightened.st_mode) != 0o600:
+        raise OSError(errno.EACCES, "Cove database is not private")
+
+
 def init(path: Path = DB_FILE) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_database(path)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
         _migrate(conn)
@@ -121,6 +173,7 @@ def init(path: Path = DB_FILE) -> None:
 
 @contextmanager
 def connect(path: Path = DB_FILE):
+    _prepare_database(path)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:

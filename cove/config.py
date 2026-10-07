@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -10,11 +11,45 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List
 
-from .portable import is_portable, portable_data_dir
+from .portable import _exe_dir, is_portable
 from .search.indexers import CustomTorznabIndexer, parse_custom_indexers
 
+
+def prepare_private_directory(path: Path) -> None:
+    """Prepare a Cove-owned final leaf without changing its ancestors."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise OSError(errno.EINVAL, "Cove storage path must be a real directory")
+    if os.name == "nt":
+        return  # POSIX modes are not Windows ACL isolation.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                 | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            info.st_dev, info.st_ino,
+        ):
+            raise OSError(errno.EINVAL, "Cove storage directory changed while opening")
+        fchmod = getattr(os, "fchmod", None)
+        if fchmod is not None:
+            fchmod(fd, 0o700)
+        else:
+            os.chmod(path, 0o700, follow_symlinks=False)
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            raise OSError(errno.EACCES, "Cove storage directory is not private")
+    finally:
+        os.close(fd)
+
+
 if is_portable():
-    _portable = Path(portable_data_dir("cove-download-manager"))
+    _portable = Path(_exe_dir()) / "cove-app-data" / "cove-download-manager"
+    prepare_private_directory(_portable)
     CONFIG_DIR = _portable
     DATA_DIR = _portable
 else:
@@ -365,8 +400,8 @@ class Settings:
 
     @classmethod
     def load(cls) -> "Settings":
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        prepare_private_directory(CONFIG_DIR)
+        prepare_private_directory(DATA_DIR)
         if not CONFIG_FILE.exists():
             s = cls()
             s.rpc_secret = _new_rpc_secret()
@@ -533,8 +568,8 @@ class Settings:
         return s
 
     def save(self) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        prepare_private_directory(CONFIG_DIR)
+        prepare_private_directory(DATA_DIR)
         data = asdict(self)
         # Write atomically with restrictive perms so the RPC secret isn't
         # readable by other local users. NOTE: chmod 0o600 only restricts

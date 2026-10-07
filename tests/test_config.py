@@ -6,6 +6,7 @@ against a temp config directory rather than mutating the real one.
 """
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,138 @@ import pytest
 
 from cove import config
 from cove.search.indexers import CustomTorznabIndexer
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes do not describe Windows ACLs")
+@pytest.mark.parametrize("mask", [0o022, 0o000], ids=["umask022", "umask000"])
+@pytest.mark.parametrize("parent_exists", [True, False], ids=["existing-parent", "missing-parent"])
+def test_s04_portable_leaf_private_at_creation(tmp_path, mask, parent_exists):
+    """C4: observe the first mkdir, before any later permission repair."""
+    exe = tmp_path / "exe"
+    exe.mkdir()
+    exe.chmod(0o775)
+    parent = exe / "cove-app-data"
+    if parent_exists:
+        parent.mkdir()
+        parent.chmod(0o755)
+    script = r'''
+import json, os, stat, sys
+from pathlib import Path
+exe = Path(sys.argv[1])
+leaf = exe / "cove-app-data" / "cove-download-manager"
+sys.argv[0] = str(exe / "cove")
+original_mkdir = os.mkdir
+created = []
+def observe_mkdir(path, mode=0o777, *, dir_fd=None):
+    result = original_mkdir(path, mode, dir_fd=dir_fd)
+    info = os.stat(path, dir_fd=dir_fd)
+    if leaf.exists() and (info.st_dev, info.st_ino) == (leaf.stat().st_dev, leaf.stat().st_ino):
+        created.append([mode, stat.S_IMODE(info.st_mode)])
+    return result
+os.mkdir = observe_mkdir
+previous = os.umask(int(sys.argv[2]))
+try:
+    from cove import config
+    assert config.CONFIG_DIR == config.DATA_DIR == leaf
+    print(json.dumps({"created": created, "leaf": stat.S_IMODE(leaf.stat().st_mode),
+                      "parent": stat.S_IMODE(leaf.parent.stat().st_mode),
+                      "exe": stat.S_IMODE(exe.stat().st_mode)}))
+finally:
+    os.umask(previous)
+'''
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(exe), str(mask)],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+        timeout=10, check=True,
+        env=dict(os.environ, COVE_PORTABLE="1", PYTHONDONTWRITEBYTECODE="1",
+                 XDG_CONFIG_HOME=str(tmp_path / "xdg-config"), XDG_DATA_HOME=str(tmp_path / "xdg-data")),
+    )
+    observed = json.loads(result.stdout)
+    assert observed["created"] == [[0o700, 0o700]], observed
+    assert observed["leaf"] == 0o700
+    assert observed["exe"] == 0o775
+    assert observed["parent"] == (0o755 if parent_exists else 0o777 & ~mask)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes do not describe Windows ACLs")
+@pytest.mark.parametrize("mask", [0o022, 0o000], ids=["umask022", "umask000"])
+@pytest.mark.parametrize("operation", ["load", "save"])
+def test_s04_settings_create_private_leaves(tmp_path, monkeypatch, mask, operation):
+    """D4: only Cove leaves are private, including at mkdir time."""
+    config_home = tmp_path / "xdg-config"
+    data_home = tmp_path / "xdg-data"
+    for parent in (config_home, data_home):
+        parent.mkdir()
+        parent.chmod(0o755)
+    config_dir, data_dir = config_home / "cove", data_home / "cove"
+    monkeypatch.setattr(config, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(config, "CONFIG_FILE", config_dir / "settings.json")
+    created_modes = []
+    original_mkdir = os.mkdir
+
+    def observe_mkdir(path, mode=0o777, *, dir_fd=None):
+        result = original_mkdir(path, mode, dir_fd=dir_fd)
+        made = os.stat(path, dir_fd=dir_fd)
+        for owned in (config_dir, data_dir):
+            if owned.exists() and (made.st_dev, made.st_ino) == (
+                owned.stat().st_dev, owned.stat().st_ino,
+            ):
+                created_modes.append(stat.S_IMODE(made.st_mode))
+        return result
+
+    monkeypatch.setattr(os, "mkdir", observe_mkdir)
+    previous = os.umask(mask)
+    try:
+        if operation == "load":
+            settings = config.Settings.load()
+        else:
+            settings = config.Settings(
+                proxy_username="s04user", proxy_password="S04_ARGV_SECRET_9f3c",
+                rpc_secret="S04_RPC_SECRET_settings",
+            )
+            settings.save()
+        loaded = config.Settings.load()
+    finally:
+        os.umask(previous)
+
+    assert loaded.rpc_secret == settings.rpc_secret
+    assert loaded.proxy_password == settings.proxy_password
+    assert stat.S_IMODE(config.CONFIG_FILE.stat().st_mode) == 0o600
+    assert [stat.S_IMODE(p.stat().st_mode) for p in (config_home, data_home)] == [0o755] * 2
+    assert created_modes == [0o700, 0o700], "Cove leaves must be private at creation"
+    assert [stat.S_IMODE(p.stat().st_mode) for p in (config_dir, data_dir)] == [0o700] * 2
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX modes do not describe Windows ACLs")
+@pytest.mark.parametrize("operation", ["load", "save"])
+def test_s04_settings_tighten_existing_leaves(tmp_path, monkeypatch, operation):
+    config_dir, data_dir = tmp_path / "config", tmp_path / "data"
+    for directory in (config_dir, data_dir):
+        directory.mkdir()
+        directory.chmod(0o755)
+    path = config_dir / "settings.json"
+    path.write_text(json.dumps({
+        "rpc_secret": "S04_RPC_SECRET_existing", "api_token": "S04_API_TOKEN_existing",
+        "proxy_password": "S04_ARGV_SECRET_9f3c",
+    }))
+    path.chmod(0o600)
+    monkeypatch.setattr(config, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(config, "DATA_DIR", data_dir)
+    monkeypatch.setattr(config, "CONFIG_FILE", path)
+    previous = os.umask(0o022)
+    try:
+        settings = config.Settings.load() if operation == "load" else config.Settings(
+            rpc_secret="S04_RPC_SECRET_existing", api_token="S04_API_TOKEN_existing",
+            proxy_password="S04_ARGV_SECRET_9f3c",
+        )
+        if operation == "save":
+            settings.save()
+    finally:
+        os.umask(previous)
+    assert settings.rpc_secret == "S04_RPC_SECRET_existing"
+    assert json.loads(path.read_text())["proxy_password"] == "S04_ARGV_SECRET_9f3c"
+    assert [stat.S_IMODE(p.stat().st_mode) for p in (config_dir, data_dir)] == [0o700] * 2
 
 
 def _load_close_to_tray(tmp_path, raw: dict):
