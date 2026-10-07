@@ -204,7 +204,7 @@ def test_staged_requirements_carries_the_checkout_path(completed_build):
 
     assert lines[-1] == str(completed_build.checkout.resolve())
     assert "PySide6>=6.5" in lines
-    assert "requests>=2.31" in lines
+    assert "requests>=2.32.4" in lines
     assert "yt-dlp>=2025.1.0" in lines
 
 

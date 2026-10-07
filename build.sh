@@ -30,7 +30,7 @@ chmod -R u+w "$STAGED_RECIPE"
 # Point python-appimage's requirements at this checkout by absolute path.
 cat > "$STAGED_RECIPE/requirements.txt" <<EOF
 PySide6>=6.5
-requests>=2.31
+requests>=2.32.4
 yt-dlp>=2025.1.0
 ${HERE}
 EOF
