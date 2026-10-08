@@ -13,11 +13,13 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Optional
+from urllib.parse import urlsplit
 
 from PySide6.QtCore import QCoreApplication, QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal, Slot
 
@@ -39,6 +41,10 @@ from .output_paths import (
 from .torrent import TorrentError
 
 URL_RE = re.compile(r"https?://\S+|ftp://\S+|magnet:\?\S+", re.IGNORECASE)
+_MEDIA_URL_UNSUPPORTED_MESSAGE = (
+    "Only standard YouTube video page addresses can be downloaded through a specific network interface. "
+    'Select "Any interface" under Settings → BitTorrent, or use another source.'
+)
 
 # Suffixes yt-dlp leaves behind mid-run. None of these is ever the finished
 # file, so they can never be the single legitimate publication candidate.
@@ -903,6 +909,8 @@ class QueueManager(QObject):
         self.tasks: dict[int, DownloadTask] = {}
         self._running = True
         self._scheduler_allows = True
+        self._scheduling = False
+        self._schedule_rerun = False
         self._pool = QThreadPool.globalInstance()
         self._inflight: set[_RpcCall] = set()
         self._auto_paused: set[int] = set()
@@ -4510,36 +4518,126 @@ class QueueManager(QObject):
         ))
 
     def _maybe_start_next(self) -> None:
-        if not self._running or not self._scheduler_allows:
+        if self._scheduling:
+            self._schedule_rerun = True
             return
-        slots = max(0, self.settings.max_concurrent - self._active_count())
-        ready = sorted(
-            # `not t.gid` guards against relaunching a task that already has
-            # an aria2 gid (e.g. an adopted external download) — doing so
-            # would start a duplicate download. A task whose add RPC is
-            # still in flight has no gid *yet* and needs the same guard:
-            # resuming it before the gid lands would otherwise add it to
-            # aria2 twice.
-            (
-                t for t in self.tasks.values()
-                if t.status == "queued"
-                and not t.gid
-                and t.id not in self._pending_launch
-                and t.id not in self._removing
-                and t.id not in self._extractor_pause_pending
-            ),
-            key=lambda t: t.created_at,
-        )
-        for t in ready:
-            if t.id in self._unreconciled:
-                # Retry reuses this task's already occupied backend slot.
-                if not self._refuse_unreconciled_torrent_retry(t):
+
+        def run_pass() -> None:
+            if not self._running or not self._scheduler_allows:
+                return
+            slots = max(0, self.settings.max_concurrent - self._active_count())
+            ready = sorted(
+                # `not t.gid` guards against relaunching a task that already has
+                # an aria2 gid (e.g. an adopted external download) — doing so
+                # would start a duplicate download. A task whose add RPC is
+                # still in flight has no gid *yet* and needs the same guard:
+                # resuming it before the gid lands would otherwise add it to
+                # aria2 twice.
+                (
+                    t for t in self.tasks.values()
+                    if t.status == "queued"
+                    and not t.gid
+                    and t.id not in self._pending_launch
+                    and t.id not in self._removing
+                    and t.id not in self._extractor_pause_pending
+                ),
+                key=lambda t: t.created_at,
+            )
+            for t in ready:
+                if t.id in self._unreconciled:
+                    # Retry reuses this task's already occupied backend slot.
+                    if not self._refuse_unreconciled_torrent_retry(t):
+                        self._launch(t)
+                elif slots > 0:
                     self._launch(t)
-            elif slots > 0:
-                self._launch(t)
-                slots -= 1
+                    slots -= 1
+
+        self._scheduling = True
+        try:
+            # Unproductive reruns must not monopolize the Qt thread.
+            for _ in range(len(self.tasks) + 2):
+                self._schedule_rerun = False
+                run_pass()
+                if not self._schedule_rerun:
+                    break
+        finally:
+            self._scheduling = False
+            self._schedule_rerun = False
+
+    def _media_engine_source_address(self, t: DownloadTask) -> str:
+        """Validate current named-interface policy before touching engine work."""
+        name = str(getattr(self.settings, "torrent_network_interface", "") or "")
+        if not name:
+            return ""
+
+        def refuse(reason: str, message: str) -> None:
+            # Only a reason code: proxy values and browser data are secrets.
+            self._diag_task_failed(t, reason)
+            raise netiface.NetworkInterfaceUnavailable(message)
+
+        if t.backend == "ffmpeg":
+            refuse(
+                "media_hls_binding_unsupported",
+                "Streaming (HLS/.m3u8) downloads cannot use a specific network interface: "
+                "ffmpeg cannot bind their playlist, key and segment requests, so Cove will not "
+                'start the download. Select "Any interface" under Settings → BitTorrent, or use another source.',
+            )
+        if not sys.platform.startswith("linux"):
+            refuse(
+                "media_extractor_platform_unsupported",
+                "yt-dlp downloads through a specific network interface are only supported on Linux. "
+                'Select "Any interface" under Settings → BitTorrent, or use another source.',
+            )
+        try:
+            scheme = urlsplit(t.url).scheme.lower()
+        except (AttributeError, TypeError, ValueError):
+            scheme = ""
+        if scheme not in {"http", "https"}:
+            refuse(
+                "media_url_scheme_unsupported",
+                "Only HTTP and HTTPS addresses can be downloaded through a specific network interface. "
+                'Select "Any interface" under Settings → BitTorrent, or use another source.',
+            )
+        from .extractor import is_extractor_url
+
+        if t.backend == "yt-dlp" and not is_extractor_url(t.url):
+            refuse("media_url_unsupported", _MEDIA_URL_UNSUPPORTED_MESSAGE)
+        if not netiface.interface_exists(name):
+            refuse(
+                "media_interface_missing",
+                f"Network interface '{name}' was not found. Cove is configured "
+                "to bind all downloads to it and will not fall back to another "
+                "interface. Reconnect it, or pick a different interface under "
+                "Settings → BitTorrent.",
+            )
+        address = netiface.interface_address(name)
+        if not address:
+            refuse(
+                "media_interface_no_address",
+                f"Network interface '{name}' has no usable address right now. "
+                "Reconnect it, or pick a different interface under Settings → BitTorrent.",
+            )
+        proxies = [
+            key for key in (
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY",
+                "http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
+            ) if os.environ.get(key)
+        ]
+        if proxies:
+            refuse(
+                "media_proxy_conflict",
+                "Proxy environment variables (" + ", ".join(proxies) + ") conflict with "
+                "binding downloads to a specific network interface. Unset them and restart Cove, "
+                'or select "Any interface" under Settings → BitTorrent.',
+            )
+        return address
 
     def _launch_hls(self, t: DownloadTask) -> None:
+        try:
+            self._media_engine_source_address(t)
+        except netiface.NetworkInterfaceUnavailable as exc:
+            self._fail_task(t.id, str(exc))
+            return
         from .hls import ffmpeg_command, parse_ffmpeg_progress
 
         requested = t.filename or "stream.mp4"
@@ -4674,11 +4772,34 @@ class QueueManager(QObject):
         proc.start(cmd[0], cmd[1:])
 
     def _launch_extractor(self, t: DownloadTask) -> None:
+        try:
+            source_address = self._media_engine_source_address(t)
+        except netiface.NetworkInterfaceUnavailable as exc:
+            self._fail_task(t.id, str(exc))
+            return
         from .extractor import (
             parse_ytdlp_final_path,
             parse_ytdlp_progress,
+            resolve_ytdlp,
             ytdlp_command,
+            ytdlp_request_handlers,
         )
+
+        executable = resolve_ytdlp() or "yt-dlp"
+        if source_address:
+            # Inspect synchronously at the launch boundary: optional handlers
+            # can change without the binary changing, so cached/async results
+            # cannot authorize this launch.
+            handlers = ytdlp_request_handlers(executable)
+            if not handlers or "requests" not in handlers:
+                self._diag_task_failed(t, "media_ytdlp_unverified")
+                self._fail_task(
+                    t.id,
+                    "Cove could not verify that yt-dlp binds all of its network requests to the selected "
+                    'interface (its "requests" HTTP handler is missing or yt-dlp could not be inspected). '
+                    'Update yt-dlp and its dependencies, or select "Any interface" under Settings → BitTorrent.',
+                )
+                return
 
         requested = t.filename or "video.mp4"
         try:
@@ -4728,6 +4849,8 @@ class QueueManager(QObject):
         cmd = ytdlp_command(
             t.url,
             output_template,
+            executable=executable,
+            source_address=source_address,
             cookies=t.cookies,
             referrer=t.referrer,
             user_agent=t.user_agent,
@@ -4814,7 +4937,25 @@ class QueueManager(QObject):
                 self._cleanup_engine_work(work)
                 t.status = "error"
                 last_lines = "\n".join(output.splitlines()[-5:])
-                t.error = last_lines or f"yt-dlp exited with code {exit_code}"
+                if source_address and exit_code == 101:
+                    t.error = (
+                        "Live streams are not supported through a specific network interface. "
+                        'Select "Any interface" under Settings → BitTorrent, or use another source.'
+                    )
+                elif source_address and exit_code == 2 and "no such option" in output.lower():
+                    t.error = (
+                        "This yt-dlp is too old to bind to a specific network interface. "
+                        'Update yt-dlp or select "Any interface" under Settings → BitTorrent.'
+                    )
+                else:
+                    t.error = last_lines or f"yt-dlp exited with code {exit_code}"
+                    if source_address and "Requested format is not available" in output:
+                        t.error += (
+                            "\nOnly direct HTTP formats are available through a specific network interface. "
+                            'Select "Any interface" under Settings → BitTorrent, or use another source.'
+                        )
+                    if source_address and "Unsupported URL" in output:
+                        t.error += "\n" + _MEDIA_URL_UNSUPPORTED_MESSAGE
                 t.finished_at = time.time()
             self._persist(t)
             self.task_changed.emit(t.id)

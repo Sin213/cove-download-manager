@@ -3,6 +3,7 @@
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -47,17 +48,46 @@ def resolve_ytdlp() -> str | None:
     return shutil.which("yt-dlp")
 
 
+def ytdlp_request_handlers(executable: str) -> tuple[str, ...] | None:
+    """Inspect the actual engine without supplying a URL or user config."""
+    try:
+        result = subprocess.run(
+            [executable, "--ignore-config", "--no-plugin-dirs", "-v"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            errors="replace", timeout=10, check=False, env=os.environ.copy(),
+        )
+        # With no URL yt-dlp normally exits 2 after printing its debug header.
+        for line in (result.stdout + "\n" + result.stderr).splitlines():
+            match = re.fullmatch(r"(?:\[debug\]\s*)?Request Handlers:\s*(.*)", line.strip())
+            if match:
+                handlers = tuple(name.strip() for name in match[1].split(",") if name.strip())
+                return handlers or None
+    except Exception:
+        return None
+    return None
+
+
 def ytdlp_command(
     url: str,
     output_template: str,
     executable: str | None = None,
     *,
+    source_address: str = "",
     cookies: str = "",
     referrer: str = "",
     user_agent: str = "",
 ) -> list[str]:
-    cmd = [
-        executable or resolve_ytdlp() or "yt-dlp",
+    cmd = [executable or resolve_ytdlp() or "yt-dlp"]
+    if source_address:
+        # Ignore user configuration and plugins before all other options so
+        # neither can replace the bound downloader. Older binaries fail closed:
+        # an unknown option exits with code 2 before making network requests.
+        cmd += [
+            "--ignore-config", "--no-plugin-dirs", "--use-extractors", "youtube.*,end",
+            "--source-address", source_address,
+            "--break-match-filters", "!is_live",
+        ]
+    cmd += [
         "--newline",
         "--no-playlist",
         "--merge-output-format",
@@ -68,7 +98,11 @@ def ytdlp_command(
         "--print",
         f"after_move:{FINAL_PATH_MARKER}%(filepath)s",
         "-f",
-        "bv*[height<=1080]+ba/b[height<=1080]/b",
+        (
+            "bv*[height<=1080][protocol~='^https?$']+ba[protocol~='^https?$']/"
+            "b[height<=1080][protocol~='^https?$']/b[protocol~='^https?$']"
+            if source_address else "bv*[height<=1080]+ba/b[height<=1080]/b"
+        ),
     ]
     # A browser's full cookie jar for a YouTube page is large enough that
     # YouTube answers yt-dlp's webpage/API requests with HTTP 413. Public

@@ -3534,6 +3534,785 @@ def _assert_no_work_dirs(tmp_path):
     assert list(tmp_path.glob(".cove-work-*")) == []
 
 
+_MEDIA_PROXY_NAMES = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "ftp_proxy",
+)
+_BOUND_MEDIA_FORMAT = (
+    "bv*[height<=1080][protocol~='^https?$']+ba[protocol~='^https?$']/"
+    "b[height<=1080][protocol~='^https?$']/b[protocol~='^https?$']"
+)
+_MEDIA_URL_REFUSAL = (
+    "Only standard YouTube video page addresses can be downloaded through a specific network interface. "
+    'Select "Any interface" under Settings → BitTorrent, or use another source.'
+)
+_MEDIA_HLS_REFUSAL = (
+    "Streaming (HLS/.m3u8) downloads cannot use a specific network interface: "
+    "ffmpeg cannot bind their playlist, key and segment requests, so Cove will not "
+    'start the download. Select "Any interface" under Settings → BitTorrent, or use another source.'
+)
+_MEDIA_PLATFORM_REFUSAL = (
+    "yt-dlp downloads through a specific network interface are only supported on Linux. "
+    'Select "Any interface" under Settings → BitTorrent, or use another source.'
+)
+_MEDIA_FORMAT_HINT = (
+    "Only direct HTTP formats are available through a specific network interface. "
+    'Select "Any interface" under Settings → BitTorrent, or use another source.'
+)
+_MEDIA_OLD_YTDLP_REFUSAL = (
+    "This yt-dlp is too old to bind to a specific network interface. "
+    'Update yt-dlp or select "Any interface" under Settings → BitTorrent.'
+)
+_MEDIA_SCHEME_REFUSAL = (
+    "Only HTTP and HTTPS addresses can be downloaded through a specific network interface. "
+    'Select "Any interface" under Settings → BitTorrent, or use another source.'
+)
+_MEDIA_UNVERIFIED_REFUSAL = (
+    "Cove could not verify that yt-dlp binds all of its network requests to the selected "
+    'interface (its "requests" HTTP handler is missing or yt-dlp could not be inspected). '
+    'Update yt-dlp and its dependencies, or select "Any interface" under Settings → BitTorrent.'
+)
+
+
+@pytest.fixture
+def media_binding_env(queue_env, fake_process, monkeypatch, tmp_path):
+    """Only local queue calls: no backend, account or external network."""
+    import sys
+    import cove.extractor as extractor
+
+    for name in _MEDIA_PROXY_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    # Mock platform only at the policy boundary, without asking the host's
+    # executable lookup to implement Windows APIs on Linux.
+    monkeypatch.setattr(extractor, "resolve_ytdlp", lambda: "/usr/bin/yt-dlp")
+    if hasattr(extractor, "ytdlp_request_handlers"):
+        monkeypatch.setattr(extractor, "ytdlp_request_handlers", lambda _exe: ("urllib", "requests"))
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: True)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: "127.0.0.2")
+    created = []
+    original_init = fake_process.__init__
+
+    def recording_init(proc, parent):
+        created.append(proc)
+        original_init(proc, parent)
+
+    monkeypatch.setattr(fake_process, "__init__", recording_init)
+    queue, _rpc, db_path = queue_env(torrent_network_interface="test-vpn")
+    diag = []
+    monkeypatch.setattr(queue, "_diag", lambda *args, **kw: diag.append((args, kw)))
+    untouched = tmp_path / "movie.mp4"
+    untouched.write_bytes(b"pre-existing user file")
+    changed = []
+    queue.task_changed.connect(changed.append)
+    return queue, fake_process, db_path, created, diag, changed
+
+
+def _media_task(env, tmp_path, engine, url=None):
+    queue = env[0]
+    url = url or (
+        "https://example.com/live/stream.m3u8" if engine == "ffmpeg"
+        else "https://www.youtube.com/watch?v=fake"
+    )
+    tid = queue.add_url(url, out_dir=str(tmp_path), filename="movie.mp4")
+    task = queue.tasks[tid]
+    assert task.backend == engine
+    return task
+
+
+def _assert_media_refused(env, task, tmp_path, message):
+    _queue, processes, db_path, created, diag, changed = env
+    assert processes.instances == [], "an unbound engine was started"
+    assert created == [], "policy must run before QProcess construction"
+    assert task.status == "error"
+    assert message in task.error
+    assert task.output_path == ""
+    assert (tmp_path / "movie.mp4").read_bytes() == b"pre-existing user file"
+    _assert_no_work_dirs(tmp_path)
+    assert task.id in changed
+    assert _persisted_row(db_path, task.id)["status"] == "error"
+    assert "SECRETPW" not in task.error + repr(diag)
+
+
+@pytest.mark.parametrize("engine", ["ffmpeg", "yt-dlp"])
+def test_media_binding_any_keeps_golden_launch(media_binding_env, tmp_path, monkeypatch, engine):
+    env = media_binding_env
+    queue = env[0]
+    queue.settings.torrent_network_interface = ""
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SECRETPW@proxy.invalid:8080")
+
+    def forbidden_lookup(_name):
+        pytest.fail("Any interface must not consult interface lookups")
+
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", forbidden_lookup)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", forbidden_lookup)
+    task = _media_task(env, tmp_path, engine)
+    task.cookies, task.referrer, task.user_agent = "session=abc", "https://example.com/page", "TestUA"
+    queue._launch(task)
+    proc = env[1].instances[-1]
+    assert task.status == "active"
+    assert isinstance(proc.args, list)
+    if engine == "ffmpeg":
+        assert [proc.program, *proc.args] == [
+            "ffmpeg", "-n", "-headers", "Cookie: session=abc\r\nReferer: https://example.com/page\r\n",
+            "-user_agent", "TestUA", "-i", task.url, "-c", "copy", str(_hls_private_path(proc)),
+        ]
+    else:
+        assert proc.program == "/usr/bin/yt-dlp"
+        assert proc.args == [
+            "--newline", "--no-playlist", "--merge-output-format", "mp4",
+            "--no-overwrites", "--no-post-overwrites", "--progress", "--print",
+            f"after_move:{FINAL_PATH_MARKER}%(filepath)s", "-f",
+            "bv*[height<=1080]+ba/b[height<=1080]/b", "--referer", task.referrer,
+            "--user-agent", "TestUA", "-o", str(_extractor_private_path(proc)).replace(".mp4", ".%(ext)s"), task.url,
+        ]
+    for option in ("--ignore-config", "--no-plugin-dirs", "--use-extractors", "--source-address", "--break-match-filters", "-local_addr"):
+        assert option not in proc.args
+
+
+@pytest.mark.parametrize("engine", ["ffmpeg", "yt-dlp"])
+@pytest.mark.parametrize("reason", ["missing", "no_address"])
+def test_media_binding_interface_unavailable(media_binding_env, tmp_path, monkeypatch, engine, reason):
+    env = media_binding_env
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: reason != "missing")
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: None)
+    task = _media_task(env, tmp_path, engine)
+    # Direct entry points must enforce the gate too.
+    launch = env[0]._launch_hls if engine == "ffmpeg" else env[0]._launch_extractor
+    launch(task)
+    expected = (
+        _MEDIA_HLS_REFUSAL if engine == "ffmpeg"
+        else "was not found" if reason == "missing" else "no usable address right now"
+    )
+    _assert_media_refused(env, task, tmp_path, expected)
+    if engine == "yt-dlp" and reason == "missing":
+        assert task.error == (
+            "Network interface 'test-vpn' was not found. Cove is configured "
+            "to bind all downloads to it and will not fall back to another "
+            "interface. Reconnect it, or pick a different interface under Settings → BitTorrent."
+        )
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin", "freebsd"])
+@pytest.mark.parametrize("url", ["https://example.com/stream.m3u8", "https://example.com/hls/master.m3u8"])
+def test_media_binding_hls_always_refused(media_binding_env, tmp_path, monkeypatch, platform, url):
+    import sys
+
+    env = media_binding_env
+    task = _media_task(env, tmp_path, "ffmpeg", url)
+    monkeypatch.setattr(sys, "platform", platform)
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, _MEDIA_HLS_REFUSAL)
+    assert task.error == _MEDIA_HLS_REFUSAL
+    assert "Any interface" in task.error
+    assert "-local_addr" not in task.error
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin", "freebsd"])
+def test_media_binding_extractor_platform_refused(media_binding_env, tmp_path, monkeypatch, platform):
+    import sys
+
+    env = media_binding_env
+    task = _media_task(env, tmp_path, "yt-dlp")
+    monkeypatch.setattr(sys, "platform", platform)
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, _MEDIA_PLATFORM_REFUSAL)
+    assert task.error == _MEDIA_PLATFORM_REFUSAL
+
+
+@pytest.mark.parametrize("engine", ["ffmpeg", "yt-dlp"])
+@pytest.mark.parametrize("variable", _MEDIA_PROXY_NAMES)
+def test_media_binding_proxy_conflict(media_binding_env, tmp_path, monkeypatch, engine, variable):
+    env = media_binding_env
+    monkeypatch.setenv(variable, "http://user:SECRETPW@proxy.invalid:8080")
+    task = _media_task(env, tmp_path, engine)
+    env[0]._launch(task)
+    expected = _MEDIA_HLS_REFUSAL if engine == "ffmpeg" else (
+        f"Proxy environment variables ({variable}) conflict with binding downloads to a "
+        'specific network interface. Unset them and restart Cove, or select "Any interface" '
+        "under Settings → BitTorrent."
+    )
+    _assert_media_refused(env, task, tmp_path, expected)
+    assert task.error == expected
+    if engine == "yt-dlp":
+        assert "restart Cove" in task.error
+        assert "Any interface" in task.error
+        assert variable in task.error
+    assert "proxy.invalid" not in task.error + repr(env[4])
+
+
+def test_media_binding_proxy_message_names_all_conflicts(media_binding_env, tmp_path, monkeypatch):
+    env = media_binding_env
+    for name in ("HTTPS_PROXY", "http_proxy"):
+        monkeypatch.setenv(name, "http://user:SECRETPW@proxy.invalid:8080")
+    task = _media_task(env, tmp_path, "yt-dlp")
+    env[0]._launch(task)
+    expected = (
+        "Proxy environment variables (HTTPS_PROXY, http_proxy) conflict with binding downloads "
+        'to a specific network interface. Unset them and restart Cove, or select "Any interface" '
+        "under Settings → BitTorrent."
+    )
+    _assert_media_refused(env, task, tmp_path, expected)
+    assert task.error == expected
+
+
+@pytest.mark.parametrize("engine,platform,expected,reason", [
+    ("ffmpeg", "linux", _MEDIA_HLS_REFUSAL, "media_hls_binding_unsupported"),
+    ("yt-dlp", "win32", _MEDIA_PLATFORM_REFUSAL, "media_extractor_platform_unsupported"),
+])
+def test_media_binding_unsupported_precedes_interface_and_proxy(
+    media_binding_env, tmp_path, monkeypatch, engine, platform, expected, reason
+):
+    import sys
+
+    env = media_binding_env
+    calls = []
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: calls.append("exists") or False)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: calls.append("address") or None)
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SECRETPW@proxy.invalid:8080")
+    task = _media_task(env, tmp_path, engine)
+    monkeypatch.setattr(sys, "platform", platform)
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, expected)
+    assert task.error == expected
+    assert calls == []
+    reasons = [kw["reason"] for _args, kw in env[4] if "reason" in kw]
+    assert reasons == [reason]
+
+
+@pytest.mark.parametrize("stage,expected,reason,calls_expected", [
+    ("missing", "was not found", "media_interface_missing", ["exists"]),
+    ("no_address", "no usable address right now", "media_interface_no_address", ["exists", "address"]),
+    ("proxy", "Proxy environment variables", "media_proxy_conflict", ["exists", "address"]),
+])
+def test_media_binding_linux_refusal_order(
+    media_binding_env, tmp_path, monkeypatch, stage, expected, reason, calls_expected
+):
+    env = media_binding_env
+    calls = []
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: calls.append("exists") or stage != "missing")
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: calls.append("address") or (None if stage == "no_address" else "127.0.0.2"))
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SECRETPW@proxy.invalid:8080")
+    task = _media_task(env, tmp_path, "yt-dlp")
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, expected)
+    assert calls == calls_expected
+    reasons = [kw["reason"] for _args, kw in env[4] if "reason" in kw]
+    assert reasons == [reason]
+
+
+@pytest.mark.parametrize("variable", [*_MEDIA_PROXY_NAMES, "NO_PROXY"])
+def test_media_binding_empty_proxy_and_no_proxy_allowed(media_binding_env, tmp_path, monkeypatch, variable):
+    env = media_binding_env
+    monkeypatch.setenv(variable, "*" if variable == "NO_PROXY" else "")
+    task = _media_task(env, tmp_path, "yt-dlp")
+    env[0]._launch(task)
+    assert len(env[1].instances) == 1
+    assert task.status == "active"
+    assert "--source-address" in env[1].instances[0].args
+
+
+def test_media_binding_extractor_exact_argv(media_binding_env, tmp_path, monkeypatch):
+    env = media_binding_env
+    seen = []
+
+    def address(name):
+        seen.append(name)
+        return "192.0.2.17"
+
+    monkeypatch.setattr(queue_module.netiface, "interface_address", address)
+    task = _media_task(env, tmp_path, "yt-dlp")
+    task.cookies, task.referrer, task.user_agent = "SID=private", "https://example.com/page", "TestUA"
+    env[0]._launch(task)
+    proc = env[1].instances[-1]
+    assert seen == ["test-vpn"]
+    assert proc.args == [
+        "--ignore-config", "--no-plugin-dirs", "--use-extractors", "youtube.*,end",
+        "--source-address", "192.0.2.17",
+        "--break-match-filters", "!is_live", "--newline", "--no-playlist",
+        "--merge-output-format", "mp4", "--no-overwrites", "--no-post-overwrites",
+        "--progress", "--print", f"after_move:{FINAL_PATH_MARKER}%(filepath)s",
+        "-f", _BOUND_MEDIA_FORMAT, "--referer", task.referrer, "--user-agent", "TestUA",
+        "-o", str(_extractor_private_path(proc)).replace(".mp4", ".%(ext)s"), task.url,
+    ]
+    assert isinstance(proc.args, list)
+    assert proc.args.count("--use-extractors") == 1
+    assert "SID=private" not in repr(env[4]) + repr(proc.args)
+
+
+@pytest.mark.parametrize("change", ["removed", "no_address", "new_address", "any", "other"])
+def test_media_binding_retry_fresh_settings(media_binding_env, tmp_path, monkeypatch, change):
+    env = media_binding_env
+    queue, processes = env[:2]
+    lookups = []
+    current_address = ["127.0.0.2"]
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda name: lookups.append(name) or current_address[0])
+    task = _media_task(env, tmp_path, "yt-dlp")
+    queue.force_start(task.id)
+    first = processes.instances[-1]
+    assert "--source-address" in first.args
+    first.finish(1)
+    assert task.status == "error"
+    if change == "removed":
+        monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: False)
+    elif change == "no_address":
+        current_address[0] = None
+    elif change == "new_address":
+        current_address[0] = "127.0.0.3"
+    else:
+        queue.settings.torrent_network_interface = "" if change == "any" else "other-vpn"
+    _running(queue)
+    queue.resume(task.id)  # Retry uses this public API.
+    if change in {"removed", "no_address"}:
+        assert task.status == "error"
+        assert len(processes.instances) == 1
+        _assert_no_work_dirs(tmp_path)
+    else:
+        second = processes.instances[-1]
+        assert second is not first
+        assert task.status == "active"
+        if change == "any":
+            assert "--source-address" not in second.args
+            assert lookups == ["test-vpn"]
+        else:
+            assert second.args[second.args.index("--source-address") + 1] == current_address[0]
+            assert lookups == ["test-vpn", "other-vpn" if change == "other" else "test-vpn"]
+
+
+def test_media_binding_resume_refusal_preserves_paused_work(media_binding_env, tmp_path, monkeypatch):
+    env = media_binding_env
+    queue, processes = env[:2]
+    task = _media_task(env, tmp_path, "yt-dlp")
+    queue.force_start(task.id)
+    first = processes.instances[-1]
+    private = _extractor_private_path(first)
+    partial = private.with_suffix(".mp4.part")
+    partial.write_bytes(b"resumable partial")
+    work = queue._extractor_work[task.id]
+    queue.pause(task.id)
+    assert task.status == "paused"
+    assert task.id in queue._extractor_paused_work
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: False)
+    _running(queue)
+    queue.resume(task.id)
+    assert task.status == "error"
+    assert len(processes.instances) == 1
+    assert queue._extractor_work[task.id] is work
+    assert task.id in queue._extractor_paused_work
+    assert partial.read_bytes() == b"resumable partial"
+    queue.settings.torrent_network_interface = ""
+    queue.resume(task.id)
+    second = processes.instances[-1]
+    assert second is not first
+    assert task.status == "active"
+    assert _extractor_private_path(second).parent == work.path
+    assert partial.read_bytes() == b"resumable partial"
+
+
+def test_media_binding_pause_resume_uses_current_address(media_binding_env, tmp_path, monkeypatch):
+    env = media_binding_env
+    queue, processes = env[:2]
+    task = _media_task(env, tmp_path, "yt-dlp")
+    queue.force_start(task.id)
+    first = processes.instances[-1]
+    queue.pause(task.id)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: "127.0.0.3")
+    _running(queue)
+    queue.resume(task.id)
+    second = processes.instances[-1]
+    assert second is not first
+    assert second.args[second.args.index("--source-address") + 1] == "127.0.0.3"
+
+
+@pytest.mark.parametrize("named", [True, False])
+@pytest.mark.parametrize("exit_code", [101, 1])
+def test_media_binding_extractor_exit_messages(media_binding_env, tmp_path, named, exit_code):
+    env = media_binding_env
+    queue = env[0]
+    queue.settings.torrent_network_interface = "test-vpn" if named else ""
+    task = _media_task(env, tmp_path, "yt-dlp")
+    queue._launch(task)
+    proc = env[1].instances[-1]
+    # Changing the setting mid-run must not change this run's live-stream policy.
+    queue.settings.torrent_network_interface = "" if named else "test-vpn"
+    proc.emit_output("ordinary engine failure\n")
+    proc.finish(exit_code)
+    assert task.status == "error"
+    assert len(env[1].instances) == 1
+    if named and exit_code == 101:
+        assert "Live streams are not supported through a specific network interface" in task.error
+        assert "Any interface" in task.error
+    else:
+        assert task.error == "ordinary engine failure"
+
+
+@pytest.mark.parametrize("named", [True, False])
+@pytest.mark.parametrize("exit_code,diagnostic,expected", [
+    (1, "ERROR: [generic] video: Requested format is not available", _MEDIA_FORMAT_HINT),
+    (2, "ERROR: no such option: --no-plugin-dirs", _MEDIA_OLD_YTDLP_REFUSAL),
+    (2, "ERROR: NO SUCH OPTION: --source-address", _MEDIA_OLD_YTDLP_REFUSAL),
+    (1, "ERROR: no such option: unrelated failure", None),
+    (2, "ordinary engine failure", None),
+    (1, "ERROR: Unsupported URL: https://example.invalid/page", _MEDIA_URL_REFUSAL),
+])
+def test_media_binding_extractor_actionable_failures(
+    media_binding_env, tmp_path, named, exit_code, diagnostic, expected
+):
+    env = media_binding_env
+    queue = env[0]
+    queue.settings.torrent_network_interface = "test-vpn" if named else ""
+    task = _media_task(env, tmp_path, "yt-dlp")
+    queue._launch(task)
+    proc = env[1].instances[-1]
+    # Search all captured output, but preserve the existing last-five-line text.
+    tail = "\n".join(f"engine detail {i}" for i in range(6))
+    proc.emit_output(diagnostic + "\n" + tail + "\n")
+    queue.settings.torrent_network_interface = "" if named else "test-vpn"
+    proc.finish(exit_code)
+    last_lines = "\n".join(tail.splitlines()[-5:])
+    assert task.status == "error"
+    if named and expected in {_MEDIA_FORMAT_HINT, _MEDIA_URL_REFUSAL}:
+        assert task.error == last_lines + "\n" + expected
+    elif named and expected == _MEDIA_OLD_YTDLP_REFUSAL:
+        assert task.error == expected
+    else:
+        assert task.error == last_lines
+    assert len(env[1].instances) == 1
+    _assert_no_work_dirs(tmp_path)
+    assert _persisted_row(env[2], task.id)["error"] == task.error
+
+
+@pytest.mark.parametrize("url", [
+    "ftp://youtu.be:2121/file.mp4", "FTP://youtu.be/x", "file:///etc/passwd",
+    "https://[broken", "http://[::1",
+])
+def test_media_binding_url_scheme_refused_before_interface(media_binding_env, tmp_path, monkeypatch, url):
+    env = media_binding_env
+    task = _media_task(env, tmp_path, "yt-dlp")
+    task.url = url  # Exercise the launch boundary even for stale/imported URLs.
+    calls = []
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: calls.append("exists") or False)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: calls.append("address") or None)
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SECRETPW@proxy.invalid:8080")
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, _MEDIA_SCHEME_REFUSAL)
+    assert task.error == _MEDIA_SCHEME_REFUSAL
+    assert calls == []
+    reasons = [kw["reason"] for _args, kw in env[4] if "reason" in kw]
+    assert reasons == ["media_url_scheme_unsupported"]
+    assert url not in task.error + repr(env[4])
+
+
+@pytest.mark.parametrize("url", ["HTTP://www.youtube.com/watch?v=abc", "https://youtu.be/abc"])
+def test_media_binding_http_schemes_allowed(media_binding_env, tmp_path, url):
+    env = media_binding_env
+    task = _media_task(env, tmp_path, "yt-dlp", url)
+    env[0]._launch(task)
+    assert task.status == "active"
+    assert len(env[1].instances) == 1
+    assert env[1].instances[0].args[-1] == url
+    assert "--source-address" in env[1].instances[0].args
+
+
+def test_media_binding_any_ftp_keeps_original_argv(media_binding_env, tmp_path):
+    env = media_binding_env
+    queue = env[0]
+    queue.settings.torrent_network_interface = ""
+    task = _media_task(env, tmp_path, "yt-dlp", "ftp://youtu.be:2121/file.mp4")
+    queue._launch(task)
+    assert task.status == "active"
+    assert len(env[1].instances) == 1
+    proc = env[1].instances[0]
+    assert proc.args == [
+        "--newline", "--no-playlist", "--merge-output-format", "mp4",
+        "--no-overwrites", "--no-post-overwrites", "--progress", "--print",
+        f"after_move:{FINAL_PATH_MARKER}%(filepath)s", "-f",
+        "bv*[height<=1080]+ba/b[height<=1080]/b", "-o",
+        str(_extractor_private_path(proc)).replace(".mp4", ".%(ext)s"), task.url,
+    ]
+
+
+def test_media_binding_scheduler_refusal_does_not_launch_next_twice(media_binding_env, tmp_path):
+    env = media_binding_env
+    queue = env[0]
+    queue.settings.max_concurrent = 2
+    refused = _media_task(env, tmp_path, "ffmpeg")
+    permitted = _media_task(env, tmp_path, "yt-dlp")
+    active_notifications = []
+    queue.task_changed.connect(
+        lambda tid: active_notifications.append(tid) if queue.tasks[tid].status == "active" else None
+    )
+    _running(queue)
+    queue._maybe_start_next()
+    assert refused.status == "error"
+    assert permitted.status == "active"
+    assert len(env[1].instances) == 1, "a re-entered pass launched the permitted task twice"
+    assert env[1].instances[0].args[-1] == permitted.url
+    assert active_notifications.count(permitted.id) == 1
+
+
+def test_media_binding_scheduler_handles_400_refusals_without_recursion(media_binding_env, tmp_path):
+    env = media_binding_env
+    queue = env[0]
+    tasks = [
+        _media_task(env, tmp_path, "ffmpeg", f"https://example.com/stream/{i}.m3u8")
+        for i in range(400)
+    ]
+    _running(queue)
+    queue._maybe_start_next()
+    assert all(t.status == "error" and t.error == _MEDIA_HLS_REFUSAL for t in tasks)
+    assert env[1].instances == []
+    assert env[3] == []
+    _assert_no_work_dirs(tmp_path)
+    assert getattr(queue, "_scheduling", False) is False
+    assert getattr(queue, "_schedule_rerun", False) is False
+
+
+def test_media_binding_scheduler_exception_resets_flags(media_binding_env, tmp_path, monkeypatch):
+    env = media_binding_env
+    queue = env[0]
+    task = _media_task(env, tmp_path, "yt-dlp")
+    calls = []
+    original_launch = queue._launch
+
+    def failing_launch(candidate):
+        calls.append(candidate.id)
+        if len(calls) == 1:
+            queue._maybe_start_next()
+            raise RuntimeError("controlled scheduling failure")
+
+    monkeypatch.setattr(queue, "_launch", failing_launch)
+    _running(queue)
+    with pytest.raises(RuntimeError, match="controlled scheduling failure"):
+        queue._maybe_start_next()
+    assert calls == [task.id], "an exception path re-entered the scheduling pass"
+    assert getattr(queue, "_scheduling", False) is False
+    assert getattr(queue, "_schedule_rerun", False) is False
+    monkeypatch.setattr(queue, "_launch", original_launch)
+    queue._maybe_start_next()
+    assert task.status == "active"
+    assert len(env[1].instances) == 1
+    assert getattr(queue, "_scheduling", False) is False
+    assert getattr(queue, "_schedule_rerun", False) is False
+
+
+def test_media_binding_scheduler_bounds_unproductive_reruns(media_binding_env, tmp_path, monkeypatch):
+    env = media_binding_env
+    queue = env[0]
+    task = _media_task(env, tmp_path, "yt-dlp")
+    calls = []
+    pass_limit = len(queue.tasks) + 2
+
+    def never_launch(candidate):
+        calls.append(candidate.id)
+        # Terminate RED quickly instead of allowing an infinite UI-thread loop.
+        if len(calls) > pass_limit + 1:
+            raise RuntimeError("unproductive scheduling exceeded its pass bound")
+        queue._maybe_start_next()
+
+    monkeypatch.setattr(queue, "_launch", never_launch)
+    _running(queue)
+    queue._maybe_start_next()
+    assert calls == [task.id] * pass_limit
+    assert task.status == "queued"
+    assert env[1].instances == []
+    assert env[3] == []
+    assert queue._scheduling is False
+    assert queue._schedule_rerun is False
+    calls.clear()
+    queue._maybe_start_next()
+    assert calls == [task.id] * pass_limit
+    assert queue._scheduling is False
+    assert queue._schedule_rerun is False
+
+
+def test_media_binding_scheduler_any_ordinary_tasks_keep_capacity(queue_env, tmp_path, monkeypatch):
+    queue, _rpc, _db_path = queue_env(max_concurrent=2)
+    tasks = [
+        queue.tasks[queue.add_url(f"https://example.invalid/file{i}.zip", out_dir=str(tmp_path))]
+        for i in range(3)
+    ]
+    launched = []
+
+    def launch(task):
+        launched.append(task.id)
+        task.status = "active"
+
+    monkeypatch.setattr(queue, "_launch", launch)
+    _running(queue)
+    queue._maybe_start_next()
+    assert launched == [tasks[0].id, tasks[1].id]
+    assert [t.status for t in tasks] == ["active", "active", "queued"]
+    queue._maybe_start_next()
+    assert launched == [tasks[0].id, tasks[1].id]
+    tasks[0].status = "completed"
+    queue._maybe_start_next()
+    assert launched == [t.id for t in tasks]
+    assert [t.status for t in tasks] == ["completed", "active", "active"]
+
+
+@pytest.mark.parametrize("handlers", [("urllib", "websockets"), None, ()])
+def test_media_binding_handler_unverified_refuses(media_binding_env, tmp_path, monkeypatch, handlers):
+    import cove.extractor as extractor
+
+    env = media_binding_env
+    calls = []
+    # Adding the future probe stub keeps RED on the existing launch behavior.
+    monkeypatch.setattr(extractor, "ytdlp_request_handlers", lambda exe: calls.append(exe) or handlers, raising=False)
+    task = _media_task(env, tmp_path, "yt-dlp")
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, _MEDIA_UNVERIFIED_REFUSAL)
+    assert task.error == _MEDIA_UNVERIFIED_REFUSAL
+    assert calls == ["/usr/bin/yt-dlp"]
+    reasons = [kw["reason"] for _args, kw in env[4] if "reason" in kw]
+    assert reasons == ["media_ytdlp_unverified"]
+    assert "/usr/bin/yt-dlp" not in task.error + repr(env[4])
+
+
+@pytest.mark.parametrize("relaunch", ["retry", "pause_resume"])
+@pytest.mark.parametrize("changing_executable", [False, True])
+def test_media_binding_handler_probe_each_launch_same_executable(
+    media_binding_env, tmp_path, monkeypatch, relaunch, changing_executable
+):
+    import cove.extractor as extractor
+
+    env = media_binding_env
+    queue = env[0]
+    task = _media_task(env, tmp_path, "yt-dlp")
+    resolutions, probes = [], []
+
+    def resolve():
+        exe = f"/tmp/fake-yt-dlp-{len(resolutions) if changing_executable else 0}"
+        resolutions.append(exe)
+        return exe
+
+    monkeypatch.setattr(extractor, "resolve_ytdlp", resolve)
+    monkeypatch.setattr(extractor, "ytdlp_request_handlers", lambda exe: probes.append(exe) or ("requests",), raising=False)
+    queue._launch(task)
+    first = env[1].instances[-1]
+    if relaunch == "retry":
+        first.finish(1)
+    else:
+        queue.pause(task.id)
+    _running(queue)
+    queue.resume(task.id)
+    second = env[1].instances[-1]
+    expected = ["/tmp/fake-yt-dlp-0", "/tmp/fake-yt-dlp-1" if changing_executable else "/tmp/fake-yt-dlp-0"]
+    assert probes == resolutions == expected
+    assert [first.program, second.program] == probes
+    assert second is not first
+    assert task.status == "active"
+
+
+@pytest.mark.parametrize("earlier", ["any", "ffmpeg", "ftp", "non_youtube", "platform", "missing", "no_address", "proxy"])
+def test_media_binding_handler_probe_skipped_after_earlier_gate(
+    media_binding_env, tmp_path, monkeypatch, earlier
+):
+    import sys
+    import cove.extractor as extractor
+
+    env = media_binding_env
+    queue = env[0]
+    calls = []
+    monkeypatch.setattr(extractor, "ytdlp_request_handlers", lambda exe: calls.append(exe) or None, raising=False)
+    task = _media_task(env, tmp_path, "ffmpeg" if earlier == "ffmpeg" else "yt-dlp")
+    if earlier == "any":
+        queue.settings.torrent_network_interface = ""
+    elif earlier == "ftp":
+        task.url = "ftp://youtu.be:2121/file.mp4"
+    elif earlier == "non_youtube":
+        task.url = "https://example.com/video.mp4"
+    elif earlier == "platform":
+        monkeypatch.setattr(sys, "platform", "win32")
+    elif earlier == "missing":
+        monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: False)
+    elif earlier == "no_address":
+        monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: None)
+    elif earlier == "proxy":
+        monkeypatch.setenv("HTTPS_PROXY", "http://user:SECRETPW@proxy.invalid:8080")
+    queue._launch(task)
+    assert calls == []
+    if earlier == "any":
+        assert task.status == "active"
+        assert env[1].instances[0].program == "/usr/bin/yt-dlp"
+    else:
+        assert task.status == "error"
+        assert env[1].instances == []
+        assert env[3] == []
+        _assert_no_work_dirs(tmp_path)
+        assert "media_ytdlp_unverified" not in repr(env[4])
+
+
+def test_media_binding_extractor_probe_exact_argv_real_engine(queue_env, fake_process, tmp_path, monkeypatch):
+    import cove.extractor as extractor
+
+    recorded = tmp_path / "probe-record.json"
+    executable = tmp_path / "recording-yt-dlp"
+    executable.write_text(
+        "#!/usr/bin/python3\nimport sys, os, json\n"
+        f"open({str(recorded)!r}, 'w').write(json.dumps(dict(argv=sys.argv, marker=os.environ.get('COVE_TEST_PROBE'))))\n"
+        "print('[debug] Request Handlers: urllib, requests', file=sys.stderr)\nsys.exit(2)\n"
+    )
+    executable.chmod(0o700)
+    monkeypatch.setenv("COVE_TEST_PROBE", "queue-proof-marker")
+    for name in _MEDIA_PROXY_NAMES:
+        monkeypatch.delenv(name, raising=False)
+    # Supply interface availability; neither the probe nor command builder is stubbed.
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: True)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: "127.0.0.2")
+    monkeypatch.setattr(extractor, "resolve_ytdlp", lambda: str(executable))
+    queue, _rpc, _db_path = queue_env(torrent_network_interface="test-vpn")
+    tid = queue.add_url("https://www.youtube.com/watch?v=fake", out_dir=str(tmp_path), filename="movie.mp4")
+    queue._launch(queue.tasks[tid])
+    assert queue.tasks[tid].status == "active"
+    assert len(fake_process.instances) == 1
+    proc = fake_process.instances[0]
+    record = json.loads(recorded.read_text())
+    assert record["argv"] == [str(executable), "--ignore-config", "--no-plugin-dirs", "-v"]
+    assert record["argv"][1:] == ["--ignore-config", "--no-plugin-dirs", "-v"]
+    assert record["marker"] == "queue-proof-marker"
+    assert proc.program == record["argv"][0] == str(executable)
+    assert "--source-address" in proc.args
+
+
+@pytest.mark.parametrize("url", ["https://example.com/video.mp4", "https://www.reddit.com/r/videos/comments/fake"])
+def test_media_binding_extractor_non_youtube_refused_before_other_gates(media_binding_env, tmp_path, monkeypatch, url):
+    import cove.extractor as extractor
+
+    env = media_binding_env
+    task = _media_task(env, tmp_path, "yt-dlp")
+    task.url = url
+    lookups, probes = [], []
+    monkeypatch.setattr(queue_module.netiface, "interface_exists", lambda _name: lookups.append("exists") or False)
+    monkeypatch.setattr(queue_module.netiface, "interface_address", lambda _name: lookups.append("address") or None)
+    monkeypatch.setattr(extractor, "ytdlp_request_handlers", lambda exe: probes.append(exe) or None)
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SECRETPW@proxy.invalid:8080")
+    env[0]._launch(task)
+    _assert_media_refused(env, task, tmp_path, _MEDIA_URL_REFUSAL)
+    assert task.error == _MEDIA_URL_REFUSAL
+    assert lookups == probes == []
+    assert [kw["reason"] for _args, kw in env[4] if "reason" in kw] == ["media_url_unsupported"]
+    assert url not in task.error + repr(env[4])
+
+
+def test_media_binding_extractor_any_non_youtube_golden(media_binding_env, tmp_path):
+    env = media_binding_env
+    env[0].settings.torrent_network_interface = ""
+    task = _media_task(env, tmp_path, "yt-dlp")
+    task.url = "https://example.com/video.mp4"
+    env[0]._launch(task)
+    proc = env[1].instances[-1]
+    assert task.status == "active"
+    assert proc.args == [
+        "--newline", "--no-playlist", "--merge-output-format", "mp4",
+        "--no-overwrites", "--no-post-overwrites", "--progress", "--print",
+        f"after_move:{FINAL_PATH_MARKER}%(filepath)s", "-f",
+        "bv*[height<=1080]+ba/b[height<=1080]/b", "-o",
+        str(_extractor_private_path(proc)).replace(".mp4", ".%(ext)s"), task.url,
+    ]
+    assert "--use-extractors" not in proc.args
+
+
 def test_fake_extractor_pause_preserves_and_resume_reuses_private_work(
     queue_env, fake_process, tmp_path
 ):
