@@ -159,6 +159,13 @@ received to its download engine, which then requests the file from the site the
 address points at. That request carries your session cookies for that site, in
 the same way your browser's own download would have.
 
+Streaming (HLS) downloads are the exception: Cove does not send your
+browser-supplied cookies to the stream's servers. It sends only the referring
+page's origin (scheme, host, and port) as the referrer when that page address is
+valid, and otherwise omits the referrer. FFmpeg can still forward cookies issued
+by stream servers across hosts; this does not provide complete credential
+containment.
+
 If Cove cannot be reached on a right-click handoff, the extension falls back to
 letting the browser download the file, which likewise contacts that site.
 

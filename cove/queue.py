@@ -4638,7 +4638,7 @@ class QueueManager(QObject):
         except netiface.NetworkInterfaceUnavailable as exc:
             self._fail_task(t.id, str(exc))
             return
-        from .hls import ffmpeg_command, parse_ffmpeg_progress
+        from .hls import browser_login_failure_hint, ffmpeg_command, parse_ffmpeg_progress
 
         requested = t.filename or "stream.mp4"
         try:
@@ -4658,7 +4658,6 @@ class QueueManager(QObject):
         cmd = ffmpeg_command(
             t.url,
             str(output_path),
-            cookies=t.cookies,
             referrer=t.referrer,
             user_agent=t.user_agent,
         )
@@ -4737,6 +4736,9 @@ class QueueManager(QObject):
                 t.status = "error"
                 last_lines = "\n".join(stderr.splitlines()[-5:])
                 t.error = last_lines or f"ffmpeg exited with code {exit_code}"
+                hint = browser_login_failure_hint(t.cookies, exit_code, stderr)
+                if hint:
+                    t.error += "\n" + hint
                 t.finished_at = time.time()
             self._persist(t)
             self.task_changed.emit(t.id)

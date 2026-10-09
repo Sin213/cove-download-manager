@@ -3654,7 +3654,7 @@ def test_media_binding_any_keeps_golden_launch(media_binding_env, tmp_path, monk
     assert isinstance(proc.args, list)
     if engine == "ffmpeg":
         assert [proc.program, *proc.args] == [
-            "ffmpeg", "-n", "-headers", "Cookie: session=abc\r\nReferer: https://example.com/page\r\n",
+            "ffmpeg", "-n", "-headers", "Referer: https://example.com/\r\n",
             "-user_agent", "TestUA", "-i", task.url, "-c", "copy", str(_hls_private_path(proc)),
         ]
     else:
@@ -4674,6 +4674,100 @@ def test_fake_hls_failure_cleans_private_output_and_keeps_public_target(
     assert existing.read_bytes() == b"original"
     assert not (tmp_path / "movie (1).mp4").exists()
     _assert_no_work_dirs(tmp_path)
+
+
+@pytest.mark.parametrize("cookies,exit_code,diagnostic,expected_hint", [
+    ("session=abc", 1, "HTTP error 403 Forbidden", True),
+    ("session=abc", 1, "HTTP error 401", True),
+    ("session=abc", 1, "HTTP error 401 Unauthorized", True),
+    ("session=abc", 1, "HTTP error 403", True),
+    ("session=abc", 1, "Server returned 403 Forbidden (access denied)", True),
+    ("session=abc", 1, "Server returned 401", True),
+    ("session=abc", 1, "sErVeR rEtUrNeD 403", True),
+    ("session=abc", 1, "uNaUtHoRiZeD", True),
+    ("session=abc", 1, "fOrBiDdEn", True),
+    ("session=abc", 1, "ACCESS DENIED", True),
+    ("", 1, "HTTP error 403 Forbidden", False),
+    ("session=abc", 0, "HTTP error 403 Forbidden", False),
+    ("session=abc", 1, "Invalid data found when processing input", False),
+    ("session=abc", 1, "", False),
+])
+def test_fake_hls_browser_login_failure_hint(
+    queue_env, fake_process, tmp_path, cookies, exit_code, diagnostic, expected_hint
+):
+    sentence = (
+        "This stream may require a browser login. Cove does not send browser logins "
+        "to streaming (HLS) servers, so login-only streams cannot be downloaded yet."
+    )
+    queue, _rpc, db_path = queue_env()
+    tid = queue.add_url(
+        "https://example.com/live/stream.m3u8", out_dir=str(tmp_path),
+        filename="movie.mp4", cookies=cookies,
+        referrer="https://example.com/page/secret?token=SECRET_PAGE_TOKEN",
+    )
+    task = queue.tasks[tid]
+    queue._launch_hls(task)
+    proc = fake_process.instances[-1]
+    assert all("Cookie" not in arg and "session=abc" not in arg for arg in proc.args)
+    if exit_code == 0:
+        _hls_private_path(proc).write_bytes(b"hls output")
+    proc.emit_output(diagnostic)
+    proc.finish(exit_code)
+
+    assert task.status == ("completed" if exit_code == 0 else "error")
+    assert (task.error or "").count(sentence) == int(expected_hint)
+    if exit_code != 0:
+        original = diagnostic or f"ffmpeg exited with code {exit_code}"
+        assert task.error == original + ("\n" + sentence if expected_hint else "")
+    assert "session=abc" not in sentence and "https://" not in sentence
+    assert "Referer" not in sentence and "Cookie" not in sentence
+    row = _persisted_row(db_path, task.id)
+    assert task.cookies == row["cookies"] == cookies
+    assert row["error"] == task.error
+    _assert_no_work_dirs(tmp_path)
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "frame=  401",
+    "size=4031kB",
+    "time=00:00:04.01",
+    "bitrate=4031.5kbits/s",
+    "401",
+    "403",
+    "HTTP error 4031",
+    "Server returned 4010",
+    "unauthorizedness",
+    "notforbidden",
+    "access deniedness",
+])
+def test_fake_hls_numeric_noise_does_not_suggest_browser_login(
+    queue_env, fake_process, tmp_path, diagnostic
+):
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+    task.cookies = "session=abc"
+    proc.emit_output(diagnostic)
+    proc.finish(1)
+    assert task.status == "error"
+    assert task.error == diagnostic
+
+
+def test_fake_hls_login_hint_uses_captured_stderr_and_preserves_last_five_lines(
+    queue_env, fake_process, tmp_path
+):
+    sentence = (
+        "This stream may require a browser login. Cove does not send browser logins "
+        "to streaming (HLS) servers, so login-only streams cannot be downloaded yet."
+    )
+    queue, _rpc, _db_path = queue_env()
+    task, proc = _start_hls(queue, fake_process, tmp_path)
+    task.cookies = "session=abc"
+    proc.emit_output("HTTP error 403 Forbidden\n")
+    tail = "\n".join(f"diagnostic {n}" for n in range(5))
+    proc.emit_output(tail)
+    proc.finish(1)
+    assert task.status == "error"
+    assert task.error == tail + "\n" + sentence
 
 
 def test_fake_hls_cancellation_cleans_private_output_without_publishing(

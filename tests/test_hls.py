@@ -60,17 +60,16 @@ class TestFfmpegCommand:
             "-c", "copy", "/tmp/out.mp4",
         ]
 
-    def test_browser_headers_are_input_options(self):
+    def test_page_origin_and_user_agent_are_input_options(self):
         cmd = ffmpeg_command(
             "https://example.com/stream.m3u8",
             "/tmp/out.mp4",
-            cookies="session=abc",
             referrer="https://example.com/page",
             user_agent="TestUA/1.0",
         )
         headers_idx = cmd.index("-headers")
         assert cmd[headers_idx + 1] == (
-            "Cookie: session=abc\r\nReferer: https://example.com/page\r\n"
+            "Referer: https://example.com/\r\n"
         )
         ua_idx = cmd.index("-user_agent")
         assert cmd[ua_idx + 1] == "TestUA/1.0"
