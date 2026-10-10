@@ -1,6 +1,8 @@
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -616,8 +618,38 @@ def test_windows_packaging_explicitly_includes_api_server():
 # ---------------------------------------------------------------------------
 
 
-def test_settings_endpoint_omits_every_debrid_credential_including_torbox(tmp_path):
+def test_s08b1_settings_test_uses_only_isolated_paths(tmp_path, monkeypatch):
+    from cove.portable import is_portable
+
+    monkeypatch.delenv("COVE_PORTABLE", raising=False)
+    assert is_portable() is False
+    sentinel = tmp_path / "sentinel"
+    sentinel.mkdir()
+    child_env = os.environ.copy()
+    child_env.pop("COVE_PORTABLE", None)
+    assert "COVE_PORTABLE" not in child_env
+    # A marker beside the child's pytest entry point is outside this isolation.
+    child_env.update(HOME=str(sentinel), XDG_DATA_HOME=str(sentinel / "d"),
+                     XDG_CONFIG_HOME=str(sentinel / "c"), PYTHONDONTWRITEBYTECODE="1")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         f"{__file__}::test_settings_endpoint_omits_every_debrid_credential_including_torbox"],
+        env=child_env, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    paths = list(sentinel.rglob("*"))
+    assert not [path for path in paths if path.name == "cove" or
+                path.name.endswith((".db", "-journal", "-wal"))]
+
+
+def test_settings_endpoint_omits_every_debrid_credential_including_torbox(tmp_path, monkeypatch):
     app = QCoreApplication.instance() or QCoreApplication([])
+    database = tmp_path / "cove.db"
+    original_init = db.init
+    original_connect = db.connect
+    monkeypatch.setattr(db, "init", lambda: original_init(database))
+    monkeypatch.setattr(db, "connect", lambda: original_connect(database))
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     settings = Settings(
         download_dir=str(tmp_path),
         api_token=TOKEN,

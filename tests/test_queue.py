@@ -6,14 +6,16 @@ a persisted queued/active/paused task was restored on startup.
 """
 
 import errno
+import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
 import time
-from dataclasses import replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,7 +26,7 @@ from cove import config, db, debrid
 from cove.config import CategoryDirs, Settings
 from cove.aria2 import Aria2Error, Aria2RpcError
 from cove.debrid import ALL_DEBRID, DebridError, Unrestricted
-from cove.extractor import FINAL_PATH_MARKER
+from cove.extractor import FINAL_PATH_MARKER, is_extractor_url
 import cove.output_paths as output_paths
 import cove.queue as queue_module
 from cove.output_paths import (
@@ -103,7 +105,7 @@ def test_video_row_restores_browser_headers(tmp_path):
             user_agent="TestUA/1.0",
         )
         task = _task_from_persisted_row(row)
-    assert task.cookies == "session=abc"
+    assert task.cookies == ""
     assert task.referrer == "https://example.com/page"
     assert task.user_agent == "TestUA/1.0"
 
@@ -10660,7 +10662,7 @@ def test_s08a_legacy_cookie_load_persist_and_hint_remain(s08a_queue, fake_proces
             backend="ffmpeg", filename="legacy.mp4", cookies=_S08A_COOKIE,
         )
     task = _task_from_persisted_row(row)
-    assert task.cookies == _S08A_COOKIE
+    assert task.cookies == ""
     assert task.browser_cookies_seen is False
     queue.tasks[task.id] = task
     with sqlite3.connect(path) as conn:
@@ -10670,7 +10672,7 @@ def test_s08a_legacy_cookie_load_persist_and_hint_remain(s08a_queue, fake_proces
     proc = fake_process.instances[-1]
     proc.emit_output("HTTP error 403 Forbidden")
     proc.finish(1)
-    assert "This stream may require a browser login." in task.error
+    assert task.error == "HTTP error 403 Forbidden"
     with sqlite3.connect(path) as conn:
         after = conn.execute("SELECT CAST(cookies AS BLOB) FROM downloads WHERE id=?", (task.id,)).fetchone()[0]
     assert before == after == _S08A_COOKIE.encode()
@@ -10733,6 +10735,299 @@ def test_s08a_browser_gate_real_queue_discards_new_value(s08a_queue):
     task = next(iter(queue.tasks.values()))
     _s08a_assert_new_task_clean(path, task)
     assert task.browser_cookies_seen is True
+
+
+_S08B1_COOKIE = "COVE_S08B1_COOKIE=synthetic"
+_S08B1_SHAPES = (
+    _S08B1_COOKIE, " \t ", _S08B1_COOKIE + "\r\nextra=1",
+    _S08B1_COOKIE + "x" * 32768, _S08B1_COOKIE.encode(), None, "",
+)
+
+
+@pytest.mark.parametrize("backend", ["aria2", "ffmpeg", "yt-dlp"])
+@pytest.mark.parametrize("status", ["queued", "active", "paused"])
+@pytest.mark.parametrize("source_type", ["", "torrent", "torrent_file"])
+@pytest.mark.parametrize("route", ["", "torbox"])
+@pytest.mark.parametrize("cookie", _S08B1_SHAPES,
+                         ids=["text", "spaces", "crlf", "32k", "blob", "null", "empty"])
+def test_s08b1_restore_matrix(tmp_path, monkeypatch, backend, status, source_type, route, cookie):
+    QCoreApplication.instance() or QCoreApplication([])
+    original_init, original_connect = db.init, db.connect
+    restored = []
+    for name, stored in (("legacy", cookie), ("empty", "")):
+        path = tmp_path / (name + ".db")
+        original_init(path)
+        with original_connect(path) as conn:
+            row = _row(
+                conn, id=41, url="https://legacy-site.example/page/video",
+                filename="legacy.mp4", out_dir=str(tmp_path), connections=7,
+                speed_limit_kbps=123, status=status, total_bytes=900,
+                completed_bytes=300, created_at=1234.5, segments=3,
+                backend=backend, work_dir="/legacy/work", output_path="/legacy/output",
+                referrer="https://example.com/page", user_agent="LegacyUA/1.0",
+                source_type=source_type, info_hash="a" * 40, torrent_name="Legacy torrent",
+                torrent_path="/legacy/source.torrent", selected_files="0,2",
+                debrid_route=route, debrid_item_id="item-17", debrid_file_id="file-19",
+                cookies=stored,
+            )
+            shape, raw = conn.execute(
+                "SELECT typeof(cookies), CAST(cookies AS BLOB) FROM downloads"
+            ).fetchone()
+            assert shape == ("blob" if isinstance(stored, bytes) else "null" if stored is None else "text")
+            assert raw == (stored.encode() if isinstance(stored, str) else stored)
+        monkeypatch.setattr(db, "init", lambda: original_init(path))
+        monkeypatch.setattr(db, "connect", lambda: original_connect(path))
+        monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+        queue = QueueManager(Settings(download_dir=str(tmp_path)), _FakeRpc())
+        queue._poll.stop()
+        queue._ext_poll.stop()
+        assert list(queue.tasks) == [41]
+        restored.append(queue.tasks[41])
+    expected = dict(
+        id=41, url="https://legacy-site.example/page/video", filename="legacy.mp4",
+        out_dir=str(tmp_path), connections=7, speed_limit_kbps=123,
+        status="paused" if status == "paused" else "queued", total_bytes=900,
+        completed_bytes=300, created_at=1234.5, segments=3, backend=backend,
+        work_dir="/legacy/work", output_path="/legacy/output",
+        referrer="https://example.com/page", user_agent="LegacyUA/1.0",
+        source_type=source_type, info_hash="a" * 40, torrent_name="Legacy torrent",
+        torrent_path="/legacy/source.torrent", selected_files=(0, 2),
+        debrid_route=route, debrid_item_id="item-17", debrid_file_id="file-19",
+    )
+    for task in restored:
+        assert task.cookies == "", "historical cookies entered the restored task"
+        assert all(_S08B1_COOKIE not in repr(value) for value in asdict(task).values())
+        assert {key: getattr(task, key) for key in expected} == expected
+    assert asdict(restored[0]) == asdict(restored[1])
+
+
+def test_s08b1_restore_function_boundary(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    with db.connect(path) as conn:
+        task = _task_from_persisted_row(_row(conn, cookies=_S08B1_COOKIE))
+    assert task.cookies == ""
+    assert _S08B1_COOKIE not in repr(asdict(task))
+
+
+def _s08b1_database_snapshot(path):
+    with sqlite3.connect(path) as conn:
+        return (
+            conn.execute("SELECT id, CAST(cookies AS BLOB) FROM downloads ORDER BY id").fetchall(),
+            conn.execute("PRAGMA user_version").fetchone(),
+            conn.execute("PRAGMA table_info(downloads)").fetchall(),
+            conn.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall(),
+        )
+
+
+def test_s08b1_database_untouched(queue_env, tmp_path, monkeypatch):
+    # queue_env selects all paths before the first QueueManager exists.
+    path = tmp_path / "cove.db"
+    db.init()
+    with db.connect() as conn:
+        for cookie in _S08B1_SHAPES:
+            _row(conn, cookies=cookie, created_at=1234.5)
+    before = _s08b1_database_snapshot(path)
+    assert before[1] == (8,)
+    assert len(db._MIGRATIONS) == 8
+    traced = []
+    original_connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        assert Path(args[0]) == path
+        conn = original_connect(*args, **kwargs)
+        conn.set_trace_callback(traced.append)
+        return conn
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", traced_connect)
+        queue, _rpc, _path = queue_env()
+    normalized = sorted({re.sub(r"finished_at=\d+\.\d+", "finished_at=<time>", sql) for sql in traced})
+    print("S08B1_CONSTRUCTION_SQL=" + json.dumps(normalized))
+    # Exact v8 construction set captured at HEAD before restore suppression.
+    expected = [
+        "\nCREATE INDEX IF NOT EXISTS idx_downloads_gid ON downloads(gid);",
+        "\nCREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);",
+        "\nCREATE TABLE IF NOT EXISTS downloads (\n"
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+        "    url TEXT NOT NULL,\n"
+        "    filename TEXT,\n"
+        "    out_dir TEXT NOT NULL,\n"
+        "    connections INTEGER NOT NULL DEFAULT 16,\n"
+        "    speed_limit_kbps INTEGER NOT NULL DEFAULT 0,\n"
+        "    status TEXT NOT NULL DEFAULT 'queued',\n"
+        "    gid TEXT,\n"
+        "    total_bytes INTEGER NOT NULL DEFAULT 0,\n"
+        "    completed_bytes INTEGER NOT NULL DEFAULT 0,\n"
+        "    error TEXT,\n"
+        "    created_at REAL NOT NULL,\n"
+        "    finished_at REAL,\n"
+        "    category TEXT NOT NULL DEFAULT 'Other',\n"
+        "    segments INTEGER NOT NULL DEFAULT 0\n"
+        ");",
+        "BEGIN ",
+        "COMMIT",
+        "DELETE FROM downloads WHERE status='removing' AND (gid IS NULL OR gid='')",
+        "PRAGMA user_version",
+        "SELECT * FROM downloads WHERE status IN ('queued','active','paused')",
+        "SELECT * FROM downloads WHERE status='removing'",
+        "UPDATE downloads SET status='error', error='Conversion no longer supported', "
+        "finished_at=<time> WHERE status='converting'",
+    ]
+    assert normalized == expected
+    assert not any(re.search(
+        r"""UPDATE\s+["'`\[]?downloads["'`\]]?\s+SET[^;]*["'`\[]?\bcookies\b["'`\]]?\s*=|VACUUM|wal_checkpoint|\bALTER\b|user_version\s*=""",
+        sql, re.I,
+    ) for sql in traced)
+    assert _s08b1_database_snapshot(path) == before
+    for task in queue.tasks.values():
+        queue._persist(task)
+    tid = next(iter(queue.tasks))
+    queue.pause(tid)
+    queue.resume(tid)
+    assert _s08b1_database_snapshot(path) == before
+    assert all(task.cookies == "" for task in queue.tasks.values())
+
+
+@pytest.mark.parametrize("backend,url", [
+    ("aria2", "https://example.com/file.zip"),
+    ("ffmpeg", "https://example.com/live/stream.m3u8"),
+    ("yt-dlp", "https://legacy-site.example/page/video"),
+])
+def test_s08b1_restored_engines(s08a_queue, fake_process, tmp_path, monkeypatch, backend, url):
+    queue, rpc, path = s08a_queue
+    with db.connect() as conn:
+        row = _row(conn, url=url, backend=backend, cookies=_S08B1_COOKIE,
+                   out_dir=str(tmp_path), filename="legacy.mp4")
+    restored = QueueManager(queue.settings, rpc)
+    restored._scheduler_allows = False
+    restored._poll.stop()
+    restored._ext_poll.stop()
+    head_calls, other_transport = [], []
+
+    class RecordingSession:
+        def head(self, target, **kwargs):
+            head_calls.append((target, kwargs))
+            return SimpleNamespace(ok=True, headers={
+                "Content-Length": "8", "Accept-Ranges": "bytes",
+            })
+
+        def __getattr__(self, name):
+            other_transport.append(name)
+            raise AssertionError("Unexpected transport use: " + name)
+
+    session = RecordingSession()
+    monkeypatch.setattr(restored, "_bound_session", lambda: session)
+    task = restored.tasks[row["id"]]
+    if backend == "aria2":
+        assert _probe_prepared(restored, task) == "gid-1"
+        assert head_calls == [(url, {"timeout": 5, "allow_redirects": True})]
+        assert rpc.added[0]["uris"] == [url]
+        assert _S08B1_COOKIE not in repr(rpc.added)
+        restored._cleanup_engine_work(queue_module.adopt_work_directory(task.out_dir, task.work_dir))
+        assert task.cookies == ""
+    else:
+        if backend == "yt-dlp":
+            assert not is_extractor_url(url)
+        restored._launch(task)
+        proc = fake_process.instances[-1]
+        argv = [proc.program, *proc.args]
+        # Check argv first: baseline yt-dlp actually sends the legacy header.
+        assert _S08B1_COOKIE not in repr(argv)
+        assert all("Cookie" not in arg for arg in argv)
+        proc.emit_output("HTTP error 403 Forbidden")
+        proc.finish(1)
+        assert task.status == "error"
+        if backend == "ffmpeg":
+            assert task.error == "HTTP error 403 Forbidden"
+        assert task.cookies == ""
+    assert other_transport == []
+    if backend != "aria2":
+        assert head_calls == []
+    assert _persisted_row(path, task.id)["cookies"] == _S08B1_COOKIE
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_s08b1_production_cookie_ast():
+    root = Path(queue_module.__file__).parent
+    calls = set()
+    violations = []
+    for path in sorted(root.rglob("*.py")):
+        if "search" in path.relative_to(root).parts:
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Call):
+                name = getattr(node.func, "id", getattr(node.func, "attr", ""))
+                if any(keyword.arg == "cookies" for keyword in node.keywords):
+                    calls.add(name)
+                    if name == "DownloadTask":
+                        violations.append((path.name, node.lineno, name))
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(isinstance(part, ast.Attribute) and part.attr == "cookies"
+                       for target in targets for part in ast.walk(target)):
+                    violations.append((path.name, node.lineno, "cookie assignment"))
+    assert not violations
+    assert calls == {"add_url", "prepare_url", "ytdlp_command"}
+
+
+def test_s08b1_compatibility_and_new_admission(s08a_queue, fake_process, tmp_path, monkeypatch):
+    from cove.source_info import source_details
+
+    queue, _rpc, path = s08a_queue
+    with db.connect() as conn:
+        legacy = _task_from_persisted_row(_row(conn, cookies=_S08B1_COOKIE))
+    traced = []
+    original_sqlite = sqlite3.connect
+
+    def trace_connect(*args, **kwargs):
+        assert Path(args[0]) == path
+        connection = original_sqlite(*args, **kwargs)
+        connection.set_trace_callback(traced.append)
+        return connection
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", trace_connect)
+        tid = queue.add_url(_S08A_URLS[1], cookies=_S08B1_COOKIE, filename="new.mp4")
+    inserts = [sql for sql in traced if re.match(r"\s*INSERT INTO downloads", sql, re.I)]
+    assert len(inserts) == 1
+    assert "cookies" not in inserts[0].split("VALUES")[0]
+    assert "cookies" not in {field.name for field in fields(queue_module.PreparedDownload)}
+    task = queue.tasks[tid]
+    assert task.cookies == "" and task.browser_cookies_seen is True
+    queue._launch_hls(task)
+    proc = fake_process.instances[-1]
+    proc.emit_output("HTTP error 403 Forbidden")
+    proc.finish(1)
+    assert "This stream may require a browser login." in task.error
+    assert all(label != "Browser cookies" for label, _ in source_details(legacy))
+    _assert_no_work_dirs(tmp_path)
+
+
+_S08B1_DOC_REPLACEMENTS = (
+    ("PRIVACY.md", "and downloads added by earlier versions of Cove may still have cookies stored on your computer (see Cookies below)", "and downloads added by earlier versions of Cove may still have cookies stored on your computer, which Cove no longer restores into download tasks (see Cookies below)"),
+    ("PRIVACY.md", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not remove them, and certain older downloads may still be able to use those stored cookies when they are retried or resumed. This change does not remove all cookie exposure.", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not erase them: the historical values can remain in that database file. Cove no longer restores those stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Reading the database can still briefly load these values into memory, and cookie values still pass from the browser to Cove. This change does not remove all cookie exposure."),
+    ("PRIVACY.md", "Certain older downloads whose cookies were stored by earlier versions may still be able to use them.", "Cove no longer restores cookies stored by earlier versions into download tasks, so they are not forwarded to the download engine through the normal restored-download path."),
+    ("README.md", "Cookies stored with downloads added by earlier versions are not removed, and cookies still pass through the extension handoff until the extension changes.", "Cookies stored with downloads added by earlier versions are not erased and can remain in Cove's database, but Cove no longer restores them into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes."),
+    ("README.md", "and cookies stored by earlier versions are not removed.", "and cookies stored by earlier versions are not erased, but Cove no longer restores them into download tasks."),
+)
+
+
+@pytest.mark.parametrize("filename,old,new", _S08B1_DOC_REPLACEMENTS)
+def test_s08b1_documentation(filename, old, new):
+    text = " ".join((Path(queue_module.__file__).parent.parent / filename).read_text().split())
+    assert text.count(new) == 1
+    assert old not in text
+    # Audit the approved cookie paragraphs, retaining only truthful negations.
+    paragraphs = re.split(r"\n\n|\n(?=- )", (Path(queue_module.__file__).parent.parent / filename).read_text())
+    for paragraph in paragraphs:
+        if "cookies" not in paragraph.lower() or "earlier versions" not in paragraph:
+            continue
+        cleaned = paragraph.replace("does not erase", "").replace("are not erased", "")
+        cleaned = cleaned.replace("does not remove all cookie exposure", "")
+        assert not re.search(r"\b(eras\w*|remov\w*|clear\w*|secur\w*)\b", cleaned, re.I)
+        assert not re.search(r"(never|not|absent|no longer)[^.]*\bmemory\b", paragraph, re.I)
+        assert "\u2013" not in paragraph and "\u2014" not in paragraph
 
 
 def test_s08a_default_admission_has_no_presence(s08a_queue):

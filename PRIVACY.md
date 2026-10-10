@@ -29,8 +29,9 @@ happens, it is called out.
   and Cove does not pass them to its download engines; a file that needs your
   browser login may therefore not download in Cove. The cookie values still pass
   from the extension to Cove over the local handoff, and downloads added by
-  earlier versions of Cove may still have cookies stored on your computer (see
-  Cookies below). The download itself is a normal network request to that site.
+  earlier versions of Cove may still have cookies stored on your computer, which
+  Cove no longer restores into download tasks (see Cookies below). The download
+  itself is a normal network request to that site.
   "Local handoff" describes how Cove is reached, not the download.
 - Settings and a bounded diagnostics log are stored in your browser's local
   storage on your device.
@@ -137,9 +138,13 @@ and Cove's local handoff on your computer before they are discarded. If that
 header would exceed 32 KB it is dropped entirely rather than truncated.
 
 Downloads added by earlier versions of Cove may still have their cookies stored
-in Cove's local database on your computer. This version does not remove them,
-and certain older downloads may still be able to use those stored cookies when
-they are retried or resumed. This change does not remove all cookie exposure.
+in Cove's local database on your computer. This version does not erase them:
+the historical values can remain in that database file. Cove no longer restores
+those stored values into download tasks, so they are not forwarded to download
+engines through the normal restored-download path, and older downloads that
+relied on them may fail. Reading the database can still briefly load these
+values into memory, and cookie values still pass from the browser to Cove. This
+change does not remove all cookie exposure.
 
 The extension does not read cookies for any other site, and does not store
 cookies anywhere.
@@ -173,8 +178,9 @@ Reaching Cove is local. The download is not.
 To perform the download, Cove's download engine requests the file from the site
 the address points at. For new downloads, Cove does not pass your cookies to the
 engine, so that request does not carry your browser session the way your
-browser's own download would. Certain older downloads whose cookies were stored
-by earlier versions may still be able to use them.
+browser's own download would. Cove no longer restores cookies stored by earlier
+versions into download tasks, so they are not forwarded to the download engine
+through the normal restored-download path.
 
 For streaming (HLS) downloads Cove sends only the referring
 page's origin (scheme, host, and port) as the referrer when that page address is

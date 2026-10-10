@@ -692,7 +692,7 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         backend=_row_get(row, "backend", "aria2"),
         work_dir=_row_get(row, "work_dir", "") or "",
         output_path=_row_get(row, "output_path", "") or "",
-        cookies=_clean_header(_row_get(row, "cookies", "")),
+        # Legacy stored Cookie values are intentionally never restored (S08B-1).
         referrer=_clean_header(_row_get(row, "referrer", "")),
         user_agent=_clean_header(_row_get(row, "user_agent", "")),
         source_type=_row_get(row, "source_type", "") or "",

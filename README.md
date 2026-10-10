@@ -101,9 +101,11 @@ https://github.com/user-attachments/assets/d45ce6fc-dbe1-484f-bc7a-8b77a12eaa5b
   agent passed along. For new downloads, Cove discards the browser cookies it
   receives before creating the download and does not pass them to its download
   engines (public videos need no account cookies). Cookies stored with downloads
-  added by earlier versions are not removed, and cookies still pass through the
-  extension handoff until the extension changes. Downloads that depend on a
-  browser login may therefore not work in Cove.
+  added by earlier versions are not erased and can remain in Cove's database,
+  but Cove no longer restores them into download tasks or forwards them to
+  download engines through the normal restored-download path, and cookies still
+  pass through the extension handoff until the extension changes. Downloads that
+  depend on a browser login may therefore not work in Cove.
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
 - **In-page video pill** - a floating "Download with Cove" pill appears on
@@ -341,7 +343,8 @@ file types and minimum size, then sends them to Cove with cookies, referrer,
 and user-agent headers. For new downloads, Cove discards the cookies before
 creating the download and does not pass them to its download engines, so
 downloads that need a browser login may not work in Cove. The cookies still pass
-through this handoff first, and cookies stored by earlier versions are not removed.
+through this handoff first, and cookies stored by earlier versions are not erased,
+but Cove no longer restores them into download tasks.
 
 ### Settings
 
