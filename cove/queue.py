@@ -167,7 +167,8 @@ class PreparedDownload:
     filename: Optional[str] = None
     connections: int = MAX_CONNECTIONS_PER_SERVER
     speed_limit_kbps: int = 0
-    cookies: str = ""
+    # A derived presence flag, never a cookie value.
+    browser_cookies_seen: bool = False
     referrer: str = ""
     user_agent: str = ""
     source_type: str = SOURCE_PLAIN
@@ -180,6 +181,10 @@ class PreparedDownload:
     # None is the absence of a choice and means every file, which is what
     # every non-torrent request and every pre-selection torrent carries.
     selected_files: Optional[tuple[int, ...]] = None
+
+    def __post_init__(self) -> None:
+        if type(self.browser_cookies_seen) is not bool:
+            raise TypeError("browser_cookies_seen must be a bool")
 
 
 class _P2PConsentGrant:
@@ -739,6 +744,8 @@ class DownloadTask:
     # authenticated or anti-hotlink media. Empty for plain aria2 tasks
     # (the direct extension -> aria2 path passes headers via RPC instead).
     cookies: str = ""
+    # Memory-only presence for new downloads; never persisted or restored.
+    browser_cookies_seen: bool = field(default=False, init=False, repr=False)
     referrer: str = ""
     user_agent: str = ""
     # Torrent provenance, persisted by the v6 schema.
@@ -1484,6 +1491,9 @@ class QueueManager(QObject):
     ) -> Optional[int]:
         """Add one URL to the queue.
 
+        For new downloads, the browser cookie value is discarded at admission,
+        before the prepared request or task is created.
+
         The `source_type`/`info_hash`/... arguments are internal: they are
         set by Cove's own torrent routing below and by `add_torrent_file`,
         never by anything that carries user input (the local API and the
@@ -1536,6 +1546,9 @@ class QueueManager(QObject):
     ) -> Optional[PreparedDownload]:
         """Classify one URL and compute its task specification.
 
+        For new downloads, the browser cookie value is discarded at admission;
+        the prepared request carries only its cleaned presence, never its value.
+
         Purely local and side-effect free: no database row, no DownloadTask,
         no aria2 call, no backend launch, no provider request and no
         persistent task state. Returns None for exactly the requests the
@@ -1550,7 +1563,7 @@ class QueueManager(QObject):
         recreate the exact legacy task.
         """
         url = url.strip()
-        cookies = _clean_header(cookies)
+        browser_cookies_seen = bool(_clean_header(cookies))
         referrer = _clean_header(referrer)
         user_agent = _clean_header(user_agent)
         if source_type not in SOURCE_TYPES:
@@ -1645,7 +1658,7 @@ class QueueManager(QObject):
             filename=filename,
             connections=effective_connections,
             speed_limit_kbps=speed_limit_kbps,
-            cookies=cookies,
+            browser_cookies_seen=browser_cookies_seen,
             referrer=referrer,
             user_agent=user_agent,
             source_type=source_type,
@@ -1679,7 +1692,6 @@ class QueueManager(QObject):
             speed_limit_kbps=prepared.speed_limit_kbps,
             backend=prepared.backend,
             filename=prepared.filename,
-            cookies=prepared.cookies,
             referrer=prepared.referrer,
             user_agent=prepared.user_agent,
             source_type=prepared.source_type,
@@ -1689,16 +1701,17 @@ class QueueManager(QObject):
             selected_files=prepared.selected_files,
             debrid_route=prepared.debrid_route,
         )
+        t.browser_cookies_seen = prepared.browser_cookies_seen
         with db.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO downloads
                     (url, out_dir, connections, speed_limit_kbps, status,
                      created_at, category, backend, filename,
-                     cookies, referrer, user_agent,
+                     referrer, user_agent,
                      source_type, info_hash, torrent_name, torrent_path,
                      selected_files, debrid_route)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     prepared.url,
@@ -1710,7 +1723,6 @@ class QueueManager(QObject):
                     prepared.category,
                     prepared.backend,
                     prepared.filename,
-                    prepared.cookies,
                     prepared.referrer,
                     prepared.user_agent,
                     prepared.source_type,
@@ -4736,7 +4748,7 @@ class QueueManager(QObject):
                 t.status = "error"
                 last_lines = "\n".join(stderr.splitlines()[-5:])
                 t.error = last_lines or f"ffmpeg exited with code {exit_code}"
-                hint = browser_login_failure_hint(t.cookies, exit_code, stderr)
+                hint = browser_login_failure_hint(bool(t.cookies) or t.browser_cookies_seen, exit_code, stderr)
                 if hint:
                     t.error += "\n" + hint
                 t.finished_at = time.time()

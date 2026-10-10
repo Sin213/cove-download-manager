@@ -23,9 +23,15 @@ happens, it is called out.
   local Cove desktop app. On Firefox it also passes your browser's user-agent
   string when you grant the optional technical-data permission, and omits it
   when you do not. On Chrome the user-agent is always included.
-- Cove then contacts the site you chose in order to download the file, using
-  those cookies and headers. The download itself is a normal network request to
-  that site. "Local handoff" describes how Cove is reached, not the download.
+- Cove then contacts the site you chose in order to download the file. For new
+  downloads, Cove discards the cookie values it receives before it creates the
+  download, so they are not kept in the new download's record or database entry,
+  and Cove does not pass them to its download engines; a file that needs your
+  browser login may therefore not download in Cove. The cookie values still pass
+  from the extension to Cove over the local handoff, and downloads added by
+  earlier versions of Cove may still have cookies stored on your computer (see
+  Cookies below). The download itself is a normal network request to that site.
+  "Local handoff" describes how Cove is reached, not the download.
 - Settings and a bounded diagnostics log are stored in your browser's local
   storage on your device.
 
@@ -121,9 +127,19 @@ unchanged.
 
 At the moment a download is handed off, the extension reads the cookies your
 browser holds **for that download address only**, using the browser's cookie
-API. They are combined into one request header and passed to Cove so that a
-file behind a session you are already logged into can still be fetched. If that
+API. They are combined into one request header and passed to Cove over the local
+handoff. For new downloads, Cove discards the cookie values before it creates
+the download: it keeps only a note that your browser held cookies for the address,
+does not store the values in the download's record or database entry, and does
+not pass them to its download engines. Until a later change to the extension,
+the cookie values still pass through the browser's native messaging channel
+and Cove's local handoff on your computer before they are discarded. If that
 header would exceed 32 KB it is dropped entirely rather than truncated.
+
+Downloads added by earlier versions of Cove may still have their cookies stored
+in Cove's local database on your computer. This version does not remove them,
+and certain older downloads may still be able to use those stored cookies when
+they are retried or resumed. This change does not remove all cookie exposure.
 
 The extension does not read cookies for any other site, and does not store
 cookies anywhere.
@@ -154,17 +170,17 @@ currently running, so it can show connection status and progress.
 
 Reaching Cove is local. The download is not.
 
-To perform the download, Cove passes the cookies, referrer, and user-agent it
-received to its download engine, which then requests the file from the site the
-address points at. That request carries your session cookies for that site, in
-the same way your browser's own download would have.
+To perform the download, Cove's download engine requests the file from the site
+the address points at. For new downloads, Cove does not pass your cookies to the
+engine, so that request does not carry your browser session the way your
+browser's own download would. Certain older downloads whose cookies were stored
+by earlier versions may still be able to use them.
 
-Streaming (HLS) downloads are the exception: Cove does not send your
-browser-supplied cookies to the stream's servers. It sends only the referring
+For streaming (HLS) downloads Cove sends only the referring
 page's origin (scheme, host, and port) as the referrer when that page address is
 valid, and otherwise omits the referrer. FFmpeg can still forward cookies issued
-by stream servers across hosts; this does not provide complete credential
-containment.
+by stream servers across hosts; this is a known open limitation and does not
+provide complete credential containment.
 
 If Cove cannot be reached on a right-click handoff, the extension falls back to
 letting the browser download the file, which likewise contacts that site.

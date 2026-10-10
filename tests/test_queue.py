@@ -4722,7 +4722,8 @@ def test_fake_hls_browser_login_failure_hint(
     assert "session=abc" not in sentence and "https://" not in sentence
     assert "Referer" not in sentence and "Cookie" not in sentence
     row = _persisted_row(db_path, task.id)
-    assert task.cookies == row["cookies"] == cookies
+    assert task.cookies == row["cookies"] == ""
+    assert task.browser_cookies_seen == bool(cookies)
     assert row["error"] == task.error
     _assert_no_work_dirs(tmp_path)
 
@@ -8883,7 +8884,6 @@ def _prepared_fields(prepared):
         "filename": prepared.filename,
         "connections": prepared.connections,
         "speed_limit_kbps": prepared.speed_limit_kbps,
-        "cookies": prepared.cookies,
         "referrer": prepared.referrer,
         "user_agent": prepared.user_agent,
         "source_type": prepared.source_type,
@@ -10451,6 +10451,296 @@ def test_a_metadata_status_cove_cannot_read_does_not_authorise_removal(
     assert tid in queue.tasks
     assert queue.tasks[tid].gid == "gid-meta"
     assert errors
+
+
+# S08A: new admissions discard values; legacy rows and handoff transit remain.
+_S08A_COOKIE = "COVE_S08A_COOKIE=synthetic"
+_S08A_URLS = (
+    "https://example.com/file.zip",
+    "https://example.com/live/stream.m3u8",
+    "https://www.youtube.com/watch?v=synthetic",
+)
+
+
+@pytest.fixture
+def s08a_queue(queue_env, fake_process, monkeypatch):
+    import cove.extractor as extractor
+
+    # Admission and launches are offline, with executable lookup deterministic.
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(extractor, "resolve_ytdlp", lambda: "/usr/bin/yt-dlp")
+    queue, rpc, path = queue_env()
+    monkeypatch.setattr(queue, "_bound_session", lambda: SimpleNamespace(
+        head=lambda *args, **kwargs: SimpleNamespace(
+            ok=True, headers={"Content-Length": "8", "Accept-Ranges": "bytes"},
+        ),
+    ))
+    return queue, rpc, path
+
+
+def _s08a_assert_object_clean(value):
+    from dataclasses import asdict
+
+    assert _S08A_COOKIE not in str(asdict(value))
+    assert _S08A_COOKIE not in repr(value)
+
+
+def _s08a_assert_bytes_clean(path):
+    for suffix in ("", "-journal", "-wal"):
+        candidate = Path(str(path) + suffix)
+        if candidate.exists():
+            assert _S08A_COOKIE.encode() not in candidate.read_bytes(), candidate
+
+
+def _s08a_assert_new_task_clean(path, task):
+    row = _persisted_row(path, task.id)
+    assert task.cookies == row["cookies"] == ""
+    assert all(_S08A_COOKIE not in str(row[key]) for key in row.keys())
+    _s08a_assert_object_clean(task)
+    _s08a_assert_bytes_clean(path)
+
+
+@pytest.mark.parametrize("url,cookies", [
+    *[(url, _S08A_COOKIE) for url in _S08A_URLS],
+    (_S08A_URLS[0], "\r\n" + _S08A_COOKIE + "\r\nInjected: value"),
+])
+def test_s08a_add_url_retains_no_cookie_value(s08a_queue, url, cookies):
+    queue, _rpc, path = s08a_queue
+    tid = queue.add_url(
+        url, cookies=cookies, referrer="https://example.com/page", user_agent="TestUA",
+    )
+    task = queue.tasks[tid]
+    _s08a_assert_new_task_clean(path, task)
+    assert task.browser_cookies_seen is True
+    assert task.referrer == "https://example.com/page"
+    assert task.user_agent == "TestUA"
+
+
+def test_s08a_prepared_download_rejects_cookie_field():
+    from dataclasses import fields
+
+    assert "cookies" not in {item.name for item in fields(queue_module.PreparedDownload)}
+    with pytest.raises(TypeError):
+        queue_module.PreparedDownload(url=_S08A_URLS[0], cookies=_S08A_COOKIE)
+
+
+def test_s08a_prepared_download_rejects_non_bool_presence():
+    for seen in (True, False):
+        prepared = queue_module.PreparedDownload(
+            url=_S08A_URLS[0], browser_cookies_seen=seen,
+        )
+        assert prepared.browser_cookies_seen is seen
+        assert replace(prepared, filename="renamed.zip").browser_cookies_seen is seen
+    for invalid in (_S08A_COOKIE, 1, None):
+        with pytest.raises(TypeError, match="must be a bool") as exc:
+            queue_module.PreparedDownload(
+                url=_S08A_URLS[0], browser_cookies_seen=invalid,
+            )
+        assert _S08A_COOKIE not in str(exc.value)
+
+
+@pytest.mark.parametrize("cookies,seen", [
+    (_S08A_COOKIE, True),
+    ("\r\n" + _S08A_COOKIE + "\r\n", True),
+    ("", False),
+    (" \t ", False),
+    ("\r\n", False),
+    (None, False),
+])
+def test_s08a_prepare_derives_only_cleaned_presence(s08a_queue, cookies, seen):
+    queue, rpc, path = s08a_queue
+    kwargs = {} if cookies is None else {"cookies": cookies}
+    prepared = queue.prepare_url(_S08A_URLS[0], **kwargs)
+    _s08a_assert_object_clean(prepared)
+    assert prepared.browser_cookies_seen is seen
+    assert _rows(path) == []
+    assert rpc.added == []
+
+
+@pytest.mark.parametrize("seen", [False, True])
+def test_s08a_direct_commit_uses_cookie_column_default(s08a_queue, monkeypatch, seen):
+    from contextlib import contextmanager
+
+    queue, _rpc, path = s08a_queue
+    prepared = queue_module.PreparedDownload(
+        url=_S08A_URLS[0], out_dir=queue.settings.download_dir,
+        browser_cookies_seen=seen,
+    )
+    statements = []
+    original_connect = db.connect
+
+    @contextmanager
+    def traced_connect():
+        with original_connect() as conn:
+            conn.set_trace_callback(statements.append)
+            yield conn
+
+    monkeypatch.setattr(db, "connect", traced_connect)
+    tid = queue.commit_prepared(prepared)
+    task = queue.tasks[tid]
+    _s08a_assert_new_task_clean(path, task)
+    assert task.browser_cookies_seen is seen
+    inserts = [sql for sql in statements if "INSERT INTO downloads" in sql]
+    assert len(inserts) == 1
+    assert "cookies" not in inserts[0].split("VALUES", 1)[0]
+
+
+@pytest.mark.parametrize("journal_mode", ["DELETE", "WAL"])
+def test_s08a_hls_lifecycle_retains_no_new_cookie_bytes(
+    s08a_queue, fake_process, tmp_path, journal_mode,
+):
+    queue, _rpc, path = s08a_queue
+    with sqlite3.connect(path) as control:
+        assert control.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0] == journal_mode.lower()
+        assert control.execute("SELECT count(*) FROM downloads").fetchone()[0] == 0
+        # Keep WAL open so companion bytes are scanned before checkpointing.
+        tid = queue.add_url(_S08A_URLS[1], cookies=_S08A_COOKIE, filename="movie.mp4")
+        task = queue.tasks[tid]
+        _s08a_assert_new_task_clean(path, task)
+        queue._launch_hls(task)
+        _s08a_assert_new_task_clean(path, task)
+        proc = fake_process.instances[-1]
+        proc.emit_output("HTTP error 403 Forbidden")
+        proc.finish(1)
+        assert task.status == "error"
+        assert "This stream may require a browser login." in task.error
+        _s08a_assert_new_task_clean(path, task)
+        queue._persist(task)
+        _s08a_assert_new_task_clean(path, task)
+        task.status = "queued"
+        queue._persist(task)
+        queue._launch_hls(task)
+        task.status = "active"
+        queue.pause(tid)
+        assert task.status == "paused"
+        _s08a_assert_new_task_clean(path, task)
+        queue._launch_hls(task)
+        proc = fake_process.instances[-1]
+        _hls_private_path(proc).write_bytes(b"synthetic media output")
+        proc.finish(0)
+        assert task.status == "completed"
+        assert (tmp_path / "movie.mp4").read_bytes() == b"synthetic media output"
+        _s08a_assert_new_task_clean(path, task)
+        if journal_mode == "WAL":
+            assert Path(str(path) + "-wal").exists()
+        # Observe rollback journal bytes while a real update is uncommitted.
+        control.execute("BEGIN IMMEDIATE")
+        control.execute("UPDATE downloads SET status='paused' WHERE id=?", (tid,))
+        assert Path(str(path) + ("-journal" if journal_mode == "DELETE" else "-wal")).exists()
+        _s08a_assert_bytes_clean(path)
+        control.rollback()
+    _s08a_assert_bytes_clean(path)
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_s08a_restart_loses_presence_and_login_hint(s08a_queue, fake_process, tmp_path):
+    queue, rpc, path = s08a_queue
+    tid = queue.add_url(_S08A_URLS[1], cookies=_S08A_COOKIE, filename="movie.mp4")
+    restored_queue = QueueManager(queue.settings, rpc)
+    restored_queue._scheduler_allows = False
+    restored_queue._poll.stop()
+    restored_queue._ext_poll.stop()
+    task = restored_queue.tasks[tid]
+    _s08a_assert_new_task_clean(path, task)
+    assert task.browser_cookies_seen is False
+    restored_queue._launch_hls(task)
+    proc = fake_process.instances[-1]
+    proc.emit_output("HTTP error 403 Forbidden")
+    proc.finish(1)
+    assert task.error == "HTTP error 403 Forbidden"
+    _s08a_assert_new_task_clean(path, task)
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_s08a_legacy_cookie_load_persist_and_hint_remain(s08a_queue, fake_process, tmp_path):
+    queue, _rpc, path = s08a_queue
+    with db.connect() as conn:
+        row = _row(
+            conn, url=_S08A_URLS[1], out_dir=str(tmp_path),
+            backend="ffmpeg", filename="legacy.mp4", cookies=_S08A_COOKIE,
+        )
+    task = _task_from_persisted_row(row)
+    assert task.cookies == _S08A_COOKIE
+    assert task.browser_cookies_seen is False
+    queue.tasks[task.id] = task
+    with sqlite3.connect(path) as conn:
+        before = conn.execute("SELECT CAST(cookies AS BLOB) FROM downloads WHERE id=?", (task.id,)).fetchone()[0]
+    queue._persist(task)
+    queue._launch_hls(task)
+    proc = fake_process.instances[-1]
+    proc.emit_output("HTTP error 403 Forbidden")
+    proc.finish(1)
+    assert "This stream may require a browser login." in task.error
+    with sqlite3.connect(path) as conn:
+        after = conn.execute("SELECT CAST(cookies AS BLOB) FROM downloads WHERE id=?", (task.id,)).fetchone()[0]
+    assert before == after == _S08A_COOKIE.encode()
+    _assert_no_work_dirs(tmp_path)
+
+
+@pytest.mark.parametrize("url", _S08A_URLS)
+def test_s08a_engine_arguments_have_no_browser_cookie(
+    s08a_queue, fake_process, tmp_path, url,
+):
+    # Already-green boundary coverage at baseline; retention tests supply RED.
+    queue, rpc, _path = s08a_queue
+    tid = queue.add_url(url, cookies=_S08A_COOKIE, filename="engine.mp4")
+    task = queue.tasks[tid]
+    if task.backend == "aria2":
+        assert _probe_prepared(queue, task) == "gid-1"
+        assert _S08A_COOKIE not in repr(rpc.added)
+        assert rpc.added[0]["uris"] == [url]
+        queue._cleanup_engine_work(queue_module.adopt_work_directory(task.out_dir, task.work_dir))
+    else:
+        launch = queue._launch_hls if task.backend == "ffmpeg" else queue._launch_extractor
+        launch(task)
+        proc = fake_process.instances[-1]
+        assert _S08A_COOKIE not in repr([proc.program, *proc.args])
+        assert all("Cookie" not in arg for arg in proc.args)
+        output = _hls_private_path(proc) if task.backend == "ffmpeg" else _extractor_private_path(proc)
+        output.write_bytes(b"synthetic successful output")
+        if task.backend == "yt-dlp":
+            proc.emit_output(FINAL_PATH_MARKER + str(output) + "\n")
+        proc.finish(0)
+        assert task.status == "completed"
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_s08a_source_details_distinguishes_new_and_legacy(s08a_queue):
+    from cove.source_info import source_details
+
+    queue, _rpc, _path = s08a_queue
+    tid = queue.add_url(_S08A_URLS[0], cookies=_S08A_COOKIE)
+    task = queue.tasks[tid]
+    assert all(label != "Browser cookies" for label, _ in source_details(task))
+    legacy = replace(task, cookies="session=supersecret")
+    rows = source_details(legacy)
+    assert ("Browser cookies", "Stored, not shown") in rows
+    assert "session=supersecret" not in repr(rows)
+
+
+def test_s08a_browser_gate_real_queue_discards_new_value(s08a_queue):
+    from cove.app import BrowserDownloadGate
+
+    queue, _rpc, path = s08a_queue
+    gate = BrowserDownloadGate()
+    gate.queue = queue
+    gate.ready = True
+    assert gate.accept({
+        "url": _S08A_URLS[0], "cookies": _S08A_COOKIE,
+        "referrer": "https://example.com/page", "user_agent": "TestUA",
+    }) is True
+    assert len(queue.tasks) == 1
+    task = next(iter(queue.tasks.values()))
+    _s08a_assert_new_task_clean(path, task)
+    assert task.browser_cookies_seen is True
+
+
+def test_s08a_default_admission_has_no_presence(s08a_queue):
+    queue, _rpc, path = s08a_queue
+    tid = queue.add_url(_S08A_URLS[0])
+    task = queue.tasks[tid]
+    _s08a_assert_new_task_clean(path, task)
+    assert task.browser_cookies_seen is False
 
 
 def test_a_settled_torrent_removal_asks_aria2_nothing_it_does_not_need(

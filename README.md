@@ -98,10 +98,12 @@ https://github.com/user-attachments/assets/d45ce6fc-dbe1-484f-bc7a-8b77a12eaa5b
   override, because a proxy cannot be trusted to cover peer traffic.
 - **YouTube and video sites** - links yt-dlp supports are extracted and
   downloaded through it automatically, with the browser's referrer and user
-  agent passed along. Browser cookies are deliberately not forwarded for
-  YouTube pages, because sending a full cookie jar makes YouTube reject the
-  request outright; public videos need no account cookies. Cookies are still
-  forwarded for direct file and HLS downloads that depend on them.
+  agent passed along. For new downloads, Cove discards the browser cookies it
+  receives before creating the download and does not pass them to its download
+  engines (public videos need no account cookies). Cookies stored with downloads
+  added by earlier versions are not removed, and cookies still pass through the
+  extension handoff until the extension changes. Downloads that depend on a
+  browser login may therefore not work in Cove.
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
 - **In-page video pill** - a floating "Download with Cove" pill appears on
@@ -336,7 +338,10 @@ published Web Store id are whitelisted in the native host's
 
 Once connected, the extension intercepts downloads matching your configured
 file types and minimum size, then sends them to Cove with cookies, referrer,
-and user-agent headers so authenticated downloads work seamlessly.
+and user-agent headers. For new downloads, Cove discards the cookies before
+creating the download and does not pass them to its download engines, so
+downloads that need a browser login may not work in Cove. The cookies still pass
+through this handoff first, and cookies stored by earlier versions are not removed.
 
 ### Settings
 
