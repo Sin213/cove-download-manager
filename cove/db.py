@@ -2,10 +2,87 @@ import errno
 import os
 import sqlite3
 import stat
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from .config import DATA_DIR, DB_FILE, MAX_CONNECTIONS_PER_SERVER, prepare_private_directory
+
+COOKIE_CLEANUP_BUDGET_S = 3.0
+
+
+@dataclass(frozen=True)
+class CookieCleanup:
+    status: str
+    reason: str = ""
+    rows: int = 0
+    error_type: str = ""
+
+
+def clear_legacy_cookies(path=None):
+    """Clear the active logical cookie column and verify on a later connection.
+
+    This budget bounds this helper's own accumulated lock waiting only. It is
+    not a startup deadline: real SQL and I/O time, stalled storage, db.init and
+    the later restoration queries are not covered.
+    """
+    deadline = time.monotonic() + COOKIE_CLEANUP_BUDGET_S
+    committed = False
+    detect = "SELECT EXISTS(SELECT 1 FROM downloads WHERE cookies IS NOT NULL AND cookies <> '')"
+
+    def arm(conn):
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        conn.execute(f"PRAGMA busy_timeout={remaining_ms}")
+
+    def connection():
+        return connect() if path is None else connect(path)
+
+    try:
+        with connection() as conn:
+            try:
+                arm(conn)
+                conn.execute("PRAGMA secure_delete=ON")
+                if not conn.execute(detect).fetchone()[0]:
+                    return CookieCleanup("not_needed")
+                arm(conn)
+                conn.execute("BEGIN IMMEDIATE")
+                arm(conn)
+                rows = conn.execute("UPDATE downloads SET cookies='' WHERE cookies IS NOT NULL AND cookies <> ''").rowcount
+                arm(conn)
+                conn.commit()
+                committed = True
+            except Exception:
+                conn.rollback()
+                raise
+        with connection() as conn:
+            arm(conn)
+            if conn.execute(detect).fetchone()[0]:
+                return CookieCleanup("incomplete", "unverified")
+        return CookieCleanup("complete", rows=rows) if rows else CookieCleanup("not_needed")
+    except sqlite3.Error as exc:
+        if committed:
+            return CookieCleanup("incomplete", "unverified")
+        if hasattr(exc, "sqlite_errorcode"):
+            reason = {5: "locked", 6: "locked", 13: "disk_full", 10: "io_error",
+                      8: "readonly", 14: "unwritable", 11: "corrupt", 26: "corrupt"}.get(
+                          exc.sqlite_errorcode & 255, "unexpected")
+        else:
+            text = str(exc).lower()  # Python 3.10 only; never emitted.
+            reason = next((reason for needle, reason in (
+                ("locked", "locked"), ("busy", "locked"), ("readonly", "readonly"),
+                ("full", "disk_full"), ("disk i/o", "io_error"), ("malformed", "corrupt"),
+                ("not a database", "corrupt"), ("unable to open", "unwritable"),
+            ) if needle in text), "unexpected")
+        return CookieCleanup("incomplete" if reason in ("locked", "disk_full", "io_error") else "blocked", reason)
+    except OSError:
+        return CookieCleanup("incomplete", "unverified") if committed else CookieCleanup("blocked", "unwritable")
+    except Exception as exc:
+        if not committed:
+            raise
+        name = type(exc).__name__
+        return CookieCleanup("incomplete", "unverified", error_type=(
+            name if name.isidentifier() and len(name) <= 64 else "Exception"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS downloads (

@@ -519,6 +519,14 @@ def _ask_magnet_offer(parent) -> bool:
     return answer == QMessageBox.Yes
 
 
+LEGACY_COOKIE_CLEANUP_NOTICE = (
+    "Cove could not finish clearing old browser cookie data from its download history, "
+    "or could not confirm that it did, so some of that data may still be stored. "
+    "Cove will try again the next time it starts. Cove only clears the cookie field "
+    "in the database this copy of Cove uses, and does not erase the database file, backups or snapshots."
+)
+
+
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -1225,6 +1233,15 @@ class MainWindow(QMainWindow):
         """
         self._extension_setup_error = details
         self.extension_problem.setVisible(True)
+
+    def note_legacy_cookie_cleanup_incomplete(self) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(f"{APP_NAME} - download history")
+        box.setText(LEGACY_COOKIE_CLEANUP_NOTICE)
+        box.setStandardButtons(QMessageBox.Ok)
+        self._legacy_cookie_cleanup_notice = box
+        box.open()
 
     def note_aria2_unavailable(self, message: str) -> None:
         """aria2 died mid-session; say it where it cannot be missed.

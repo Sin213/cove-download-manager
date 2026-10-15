@@ -10738,6 +10738,147 @@ def test_s08a_browser_gate_real_queue_discards_new_value(s08a_queue):
 
 
 _S08B1_COOKIE = "COVE_S08B1_COOKIE=synthetic"
+
+
+@pytest.fixture
+def legacy_cookies_kept(monkeypatch):
+    monkeypatch.setattr(db, "clear_legacy_cookies", lambda: db.CookieCleanup("not_needed"))
+
+
+@pytest.mark.parametrize("status", ["not_needed", "complete", "incomplete", "blocked", "RuntimeError", "OperationalError"])
+def test_s08b2_K_L_wrapper(queue_env, monkeypatch, capsys, caplog, status):
+    events = []
+    def cleanup():
+        if status.endswith("Error"):
+            raise {"RuntimeError": RuntimeError, "OperationalError": sqlite3.OperationalError}[status]("S08B2_SYNTH_COOKIE_exception")
+        return db.CookieCleanup(status, "locked" if status == "incomplete" else "", 7)
+    monkeypatch.setattr(db, "clear_legacy_cookies", cleanup)
+    monkeypatch.setattr(QueueManager, "_diag", lambda self, *args, **kw: events.append((args, kw)))
+    queue, _rpc, _path = queue_env()
+    result = queue.legacy_cookie_cleanup
+    assert result.status == ("blocked" if status.endswith("Error") else status)
+    assert result.error_type == (status if status.endswith("Error") else "")
+    expected = dict(status=result.status, reason=result.reason, rows=result.rows)
+    if result.error_type:
+        expected["error_type"] = result.error_type
+    assert events == [(("queue", "legacy_cookie_cleanup", "INFO" if status in ("complete", "not_needed") else "WARNING"), expected)]
+    captured = capsys.readouterr()
+    assert "S08B2_SYNTH_COOKIE_" not in repr(events) + captured.out + captured.err + caplog.text
+
+
+@pytest.mark.parametrize("backend", ["aria2", "ffmpeg", "yt-dlp"])
+@pytest.mark.parametrize("status", ["queued", "active", "paused", "complete"])
+@pytest.mark.parametrize("source", ["", "torrent", "torrent_file"])
+def test_s08b2_J_enabled_order(queue_env, monkeypatch, tmp_path, backend, status, source):
+    path = tmp_path / "cove.db"
+    db.init()
+    with db.connect() as conn:
+        _row(conn, cookies="S08B2_SYNTH_COOKIE_legacy", backend=backend, status=status, source_type=source)
+    original = sqlite3.connect
+    traced = []
+    def factory(*args, **kw):
+        conn = original(*args, **kw)
+        conn.set_trace_callback(traced.append)
+        return conn
+    monkeypatch.setattr(sqlite3, "connect", factory)
+    queue, _rpc, _path = queue_env()
+    assert queue.legacy_cookie_cleanup == db.CookieCleanup("complete", rows=1)
+    assert all(task.cookies == "" for task in queue.tasks.values())
+    assert len(queue.tasks) == int(status != "complete")
+    restore = next(i for i, sql in enumerate(traced) if sql.startswith("SELECT * FROM downloads"))
+    cleanup = next(i for i, sql in enumerate(traced) if sql.startswith("UPDATE downloads SET cookies="))
+    verify = [i for i, sql in enumerate(traced) if sql.startswith("SELECT EXISTS")]
+    assert cleanup < verify[-1] < restore
+    assert traced.count("BEGIN IMMEDIATE") == 1
+    allowed = {"PRAGMA user_version", "PRAGMA secure_delete=ON", "BEGIN ", "BEGIN IMMEDIATE", "COMMIT",
+               "SELECT EXISTS(SELECT 1 FROM downloads WHERE cookies IS NOT NULL AND cookies <> '')",
+               "UPDATE downloads SET cookies='' WHERE cookies IS NOT NULL AND cookies <> ''",
+               "SELECT * FROM downloads WHERE status IN ('queued','active','paused')",
+               "SELECT * FROM downloads WHERE status='removing'",
+               "DELETE FROM downloads WHERE status='removing' AND (gid IS NULL OR gid='')",
+               "UPDATE downloads SET status='error', error='Conversion no longer supported', finished_at=<time> WHERE status='converting'"}
+    normalized = {re.sub(r"finished_at=\d+\.\d+", "finished_at=<time>", sql) for sql in traced}
+    assert {s for s in normalized if not s.startswith(("\nCREATE", "PRAGMA busy_timeout="))} == allowed
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT cookies FROM downloads").fetchone() == ("",)
+
+
+@pytest.mark.parametrize("backend,url", [("aria2", "https://example.com/file.zip"),
+                                       ("ffmpeg", "https://example.com/live.m3u8"),
+                                       ("yt-dlp", "https://example.com/video")])
+def test_s08b2_J_enabled_engines(s08a_queue, fake_process, tmp_path, backend, url):
+    queue, rpc, path = s08a_queue
+    with db.connect() as conn:
+        row = _row(conn, url=url, backend=backend, cookies="S08B2_SYNTH_COOKIE_engine",
+                   out_dir=str(tmp_path), filename="legacy.mp4")
+    restored = QueueManager(queue.settings, rpc)
+    restored._scheduler_allows = False
+    restored._poll.stop()
+    restored._ext_poll.stop()
+    task = restored.tasks[row["id"]]
+    assert restored.legacy_cookie_cleanup.status == "complete" and task.cookies == ""
+    if backend == "aria2":
+        restored._bound_session = queue._bound_session
+        assert _probe_prepared(restored, task) == "gid-1"
+        assert "S08B2_SYNTH_COOKIE_" not in repr(rpc.added)
+        restored._cleanup_engine_work(queue_module.adopt_work_directory(task.out_dir, task.work_dir))
+    else:
+        restored._launch(task)
+        proc = fake_process.instances[-1]
+        assert not any("Cookie" in arg or "S08B2_SYNTH_COOKIE_" in arg for arg in [proc.program, *proc.args])
+        proc.finish(1)
+    assert _persisted_row(path, task.id)["cookies"] == ""
+    _assert_no_work_dirs(tmp_path)
+
+
+def test_s08b2_S_transient_lock(queue_env, monkeypatch, tmp_path):
+    import threading
+    path = tmp_path / "cove.db"
+    db.init()
+    with db.connect() as conn:
+        _row(conn, cookies="S08B2_SYNTH_COOKIE_locked")
+    monkeypatch.setattr(db, "COOKIE_CLEANUP_BUDGET_S", 0.3)
+    locked, release = threading.Event(), threading.Event()
+    def hold():
+        with sqlite3.connect(path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE downloads SET cookies=cookies")
+            locked.set()
+            release.wait(0.8)
+            conn.rollback()
+    worker = threading.Thread(target=hold)
+    worker.start()
+    assert locked.wait(2)
+    try:
+        queue, _rpc, _path = queue_env()
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert queue.legacy_cookie_cleanup == db.CookieCleanup("incomplete", "locked")
+    assert queue.legacy_cookie_cleanup.status in ("incomplete", "blocked")  # app notice path
+    assert all(task.cookies == "" for task in queue.tasks.values())
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT cookies FROM downloads").fetchone() == ("S08B2_SYNTH_COOKIE_locked",)
+
+
+@pytest.mark.parametrize("malformed", [True, False], ids=["invalid-text", "blob"])
+def test_s08b2_Q_malformed_startup(queue_env, tmp_path, malformed):
+    path = tmp_path / "cove.db"
+    db.init()
+    with db.connect() as conn:
+        _row(conn, cookies=b"S08B2_SYNTH_COOKIE_\xff\xfe")
+        if malformed:
+            conn.execute("UPDATE downloads SET cookies=CAST(cookies AS TEXT)")
+    try:
+        queue, _rpc, _path = queue_env()
+    except sqlite3.OperationalError:
+        pytest.fail("legacy malformed cookies prevented startup")
+    assert all(task.cookies == "" for task in queue.tasks.values())
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT cookies FROM downloads").fetchone() == ("",)
+
+
 _S08B1_SHAPES = (
     _S08B1_COOKIE, " \t ", _S08B1_COOKIE + "\r\nextra=1",
     _S08B1_COOKIE + "x" * 32768, _S08B1_COOKIE.encode(), None, "",
@@ -10750,7 +10891,7 @@ _S08B1_SHAPES = (
 @pytest.mark.parametrize("route", ["", "torbox"])
 @pytest.mark.parametrize("cookie", _S08B1_SHAPES,
                          ids=["text", "spaces", "crlf", "32k", "blob", "null", "empty"])
-def test_s08b1_restore_matrix(tmp_path, monkeypatch, backend, status, source_type, route, cookie):
+def test_s08b1_restore_matrix(tmp_path, monkeypatch, backend, status, source_type, route, cookie, legacy_cookies_kept):
     QCoreApplication.instance() or QCoreApplication([])
     original_init, original_connect = db.init, db.connect
     restored = []
@@ -10820,7 +10961,7 @@ def _s08b1_database_snapshot(path):
         )
 
 
-def test_s08b1_database_untouched(queue_env, tmp_path, monkeypatch):
+def test_s08b1_database_untouched(queue_env, tmp_path, monkeypatch, legacy_cookies_kept):
     # queue_env selects all paths before the first QueueManager exists.
     path = tmp_path / "cove.db"
     db.init()
@@ -10894,7 +11035,7 @@ def test_s08b1_database_untouched(queue_env, tmp_path, monkeypatch):
     ("ffmpeg", "https://example.com/live/stream.m3u8"),
     ("yt-dlp", "https://legacy-site.example/page/video"),
 ])
-def test_s08b1_restored_engines(s08a_queue, fake_process, tmp_path, monkeypatch, backend, url):
+def test_s08b1_restored_engines(legacy_cookies_kept, s08a_queue, fake_process, tmp_path, monkeypatch, backend, url):
     queue, rpc, path = s08a_queue
     with db.connect() as conn:
         row = _row(conn, url=url, backend=backend, cookies=_S08B1_COOKIE,
@@ -11004,29 +11145,37 @@ def test_s08b1_compatibility_and_new_admission(s08a_queue, fake_process, tmp_pat
     _assert_no_work_dirs(tmp_path)
 
 
-_S08B1_DOC_REPLACEMENTS = (
-    ("PRIVACY.md", "and downloads added by earlier versions of Cove may still have cookies stored on your computer (see Cookies below)", "and downloads added by earlier versions of Cove may still have cookies stored on your computer, which Cove no longer restores into download tasks (see Cookies below)"),
-    ("PRIVACY.md", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not remove them, and certain older downloads may still be able to use those stored cookies when they are retried or resumed. This change does not remove all cookie exposure.", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not erase them: the historical values can remain in that database file. Cove no longer restores those stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Reading the database can still briefly load these values into memory, and cookie values still pass from the browser to Cove. This change does not remove all cookie exposure."),
-    ("PRIVACY.md", "Certain older downloads whose cookies were stored by earlier versions may still be able to use them.", "Cove no longer restores cookies stored by earlier versions into download tasks, so they are not forwarded to the download engine through the normal restored-download path."),
-    ("README.md", "Cookies stored with downloads added by earlier versions are not removed, and cookies still pass through the extension handoff until the extension changes.", "Cookies stored with downloads added by earlier versions are not erased and can remain in Cove's database, but Cove no longer restores them into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes."),
-    ("README.md", "and cookies stored by earlier versions are not removed.", "and cookies stored by earlier versions are not erased, but Cove no longer restores them into download tasks."),
+_S08B2_DOC_REPLACEMENTS = (
+    ("PRIVACY.md", "and downloads added by earlier versions of Cove may still have cookies stored on your computer, which Cove no longer restores into download tasks (see Cookies below)", "and downloads added by earlier versions of Cove may have stored cookies on your computer, which Cove attempts to clear when it starts and no longer restores into download tasks (see Cookies below)"),
+    ("PRIVACY.md", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not erase them: the historical values can remain in that database file. Cove no longer restores those stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Reading the database can still briefly load these values into memory, and cookie values still pass from the browser to Cove. This change does not remove all cookie exposure.", "Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. Cookie values still pass from the browser to Cove. This change does not remove all cookie exposure."),
+    ("README.md", "Cookies stored with downloads added by earlier versions are not erased and can remain in Cove's database, but Cove no longer restores them into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes.", "When it starts, Cove attempts to clear the cookie field of downloads added by earlier versions in the database it uses, and tries again at the next start if that is incomplete or cannot be confirmed. Other fields, other Cove installations or portable copies, backups, snapshots and leftover parts of the database file are not cleaned, so old copies can remain there and are not erased. Cove no longer restores stored cookies into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes."),
+    ("README.md", "and cookies stored by earlier versions are not erased, but Cove no longer restores them into download tasks.", "and Cove attempts to clear cookies stored by earlier versions from the cookie field of the database it uses when it starts (old copies can remain in the database file, in backups and in snapshots, and are not erased) and no longer restores them into download tasks."),
 )
 
 
-@pytest.mark.parametrize("filename,old,new", _S08B1_DOC_REPLACEMENTS)
+@pytest.mark.parametrize("filename,old,new", _S08B2_DOC_REPLACEMENTS)
 def test_s08b1_documentation(filename, old, new):
+    from datetime import date
     text = " ".join((Path(queue_module.__file__).parent.parent / filename).read_text().split())
     assert text.count(new) == 1
     assert old not in text
-    # Audit the approved cookie paragraphs, retaining only truthful negations.
+    if filename == "PRIVACY.md":
+        updated = re.search(r"_Last updated: (\d{4}-\d{2}-\d{2})_", text)
+        assert updated and date.fromisoformat(updated[1]) >= date(2026, 10, 14)
+        assert "Cove no longer restores cookies stored by earlier versions into download tasks, so they are not forwarded to the download engine through the normal restored-download path." in text
+        assert text.count("After a confirmed success the cookie field of those records no longer holds cookie values.") == 1
+        assert "those records no longer hold cookie values" not in text
+        assert text.count("are not changed by this cleanup") == 1
+    retired = "Your downloads are " + "not affected"
+    assert retired not in text
+    assert all(retired not in p.read_text() for p in Path(queue_module.__file__).parent.glob("*.py"))
     paragraphs = re.split(r"\n\n|\n(?=- )", (Path(queue_module.__file__).parent.parent / filename).read_text())
     for paragraph in paragraphs:
         if "cookies" not in paragraph.lower() or "earlier versions" not in paragraph:
             continue
-        cleaned = paragraph.replace("does not erase", "").replace("are not erased", "")
-        cleaned = cleaned.replace("does not remove all cookie exposure", "")
-        assert not re.search(r"\b(eras\w*|remov\w*|clear\w*|secur\w*)\b", cleaned, re.I)
-        assert not re.search(r"(never|not|absent|no longer)[^.]*\bmemory\b", paragraph, re.I)
+        cleaned = paragraph.replace("does not erase the database file", "").replace("no promise that they are erased", "").replace("are not erased", "")
+        assert not re.search(r"\berase\w*\b", cleaned, re.I)
+        assert not re.search(r"\b(secure|securely|permanent|wipe|shred|forensic|physical|guarantee|unchanged|not affected)\b", paragraph, re.I)
         assert "\u2013" not in paragraph and "\u2014" not in paragraph
 
 

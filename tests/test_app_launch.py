@@ -13,6 +13,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -220,6 +221,12 @@ class FakeQueueManager:
         from unittest.mock import MagicMock
         self.error = MagicMock()
 
+    @property
+    def legacy_cookie_cleanup(self):
+        from types import SimpleNamespace
+        calls["constructed"].append("cleanup_read")
+        return SimpleNamespace(status=__CLEANUP_STATUS__)
+
     def add_url(self, url):
         if url == __BAD_URL__:
             return None  # simulates a rejected/duplicate magnet
@@ -235,6 +242,7 @@ class FakeAria2Daemon:
         calls["constructed"].append("Aria2Daemon")
 
     def start(self):
+        calls["constructed"].append("daemon_start")
         if __DAEMON_FAILS__:
             raise Aria2Error("aria2 missing")
 
@@ -281,7 +289,10 @@ class FakeMainWindow:
         return False
 
     def show(self):
-        pass
+        calls["constructed"].append("window_show")
+
+    def note_legacy_cookie_cleanup_incomplete(self):
+        calls["constructed"].append("cleanup_notice")
 
     def raise_(self):
         pass
@@ -368,9 +379,68 @@ print(json.dumps(calls))
 '''
 
 
+_CHILD_GUARD = '''import os,sys
+from pathlib import Path
+assert not any(n == 'cove' or n.startswith('cove.') for n in sys.modules)
+sentinel = Path(os.environ['S08B2_CHILD_SENTINEL']).resolve()
+assert 'COVE_PORTABLE' not in os.environ and not getattr(sys, 'frozen', False)
+for key in ('HOME','XDG_DATA_HOME','XDG_CONFIG_HOME','USERPROFILE','APPDATA','LOCALAPPDATA'):
+    if key in os.environ:
+        assert os.environ[key] and Path(os.environ[key]).resolve().is_relative_to(sentinel)
+assert Path.cwd().resolve().is_relative_to(sentinel)
+for directory in (Path(__file__).resolve().parent, Path(sys.argv[0]).resolve().parent, Path.cwd()):
+    assert not (directory / 'portable.marker').exists()
+    assert not (directory / 'cove-app-data').exists()
+print('S08B2_GUARD_BEFORE_IMPORT', flush=True)
+from cove import config
+from cove.portable import is_portable
+assert not is_portable()
+assert all(Path(p).resolve().is_relative_to(sentinel) for p in (config.DB_FILE,config.DATA_DIR,config.CONFIG_FILE))
+'''
+
+
+def _assert_child_clean(*roots):
+    for root in roots:
+        assert not [p for p in root.rglob('*') if p.name in ('cove.db', 'cove-app-data', 'portable.marker')], 'child data artifact'
+
+
+def _isolated_child(script, *, control="", input=None):
+    # TEST-DISCIPLINE: choose the sentinel before any child filesystem operation.
+    with tempfile.TemporaryDirectory(prefix="s08b2-app-") as temporary:
+        root = Path(temporary)
+        for name in ('home', 'data', 'config', 'work', 'scripts', 'guard', 'profile', 'appdata', 'localappdata'):
+            (root / name).mkdir()
+        target = root / 'scripts' / 'child.py'
+        env = {k: os.environ[k] for k in ('PATH','LD_LIBRARY_PATH','LANG','DISPLAY',
+               'SYSTEMROOT','SYSTEMDRIVE','PATHEXT','COMSPEC') if k in os.environ}
+        env.update(HOME=str(root / 'home'), XDG_DATA_HOME=str(root / 'data'),
+                   XDG_CONFIG_HOME=str(root / 'config'), S08B2_CHILD_SENTINEL=str(root),
+                   USERPROFILE=str(root / 'profile'), APPDATA=str(root / 'appdata'),
+                   LOCALAPPDATA=str(root / 'localappdata'),
+                   PYTHONPATH=str(REPO_ROOT), PYTHONDONTWRITEBYTECODE='1', QT_QPA_PLATFORM='offscreen')
+        if control == 'marker':
+            (target.parent / 'portable.marker').touch()
+        if control == 'portable':
+            env['COVE_PORTABLE'] = '1'
+        if control == 'outside':
+            env['XDG_DATA_HOME'] = '/'
+        if control == 'outside-profile':
+            env['USERPROFILE'] = '/'
+        guard = root / 'guard' / 'guard.py'
+        guard.write_text("import sys\nsys.argv = sys.argv[1:]\n" + _CHILD_GUARD +
+                         "import runpy\nrunpy.run_path(sys.argv[0], run_name='__main__')\n")
+        target.write_text(script)
+        result = subprocess.run([sys.executable, '-B', str(guard), str(target)], cwd=root / 'work',
+                                env=env, capture_output=True, text=True, timeout=20, input=input)
+        if control == 'marker':
+            (target.parent / 'portable.marker').unlink()
+        _assert_child_clean(root, root / 'work', target.parent)
+        return result
+
+
 def _run_harness(argv, is_primary, daemon_fails=False, early_ipc=None, late_ipc=None,
                   forward_ok=True, bad_url="", return_raw=False,
-                  settings_unreadable=False):
+                  settings_unreadable=False, cleanup_status="not_needed"):
     script = (
         _HARNESS
         .replace("__ARGV__", repr(argv))
@@ -381,17 +451,9 @@ def _run_harness(argv, is_primary, daemon_fails=False, early_ipc=None, late_ipc=
         .replace("__LATE_IPC__", repr(late_ipc))
         .replace("__FORWARD_OK__", repr(forward_ok))
         .replace("__BAD_URL__", repr(bad_url))
+        .replace("__CLEANUP_STATUS__", repr(cleanup_status))
     )
-    env = dict(os.environ)
-    env["QT_QPA_PLATFORM"] = "offscreen"
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(REPO_ROOT),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=20,
-    )
+    result = _isolated_child(script)
     assert result.returncode in (0, 1), result.stderr
     out = json.loads(result.stdout.strip().splitlines()[-1])
     if return_raw:
@@ -525,19 +587,54 @@ def test_native_messaging_bypasses_single_instance_and_gui():
         "rc = app_mod.run()\n"
         "print('OK', rc)\n"
     )
-    env = dict(os.environ)
-    env["QT_QPA_PLATFORM"] = "offscreen"
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=str(REPO_ROOT),
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=10,
-        input="",
-    )
+    result = _isolated_child(script, input="")
     assert result.returncode == 0, result.stderr
     assert "OK" in result.stdout
+
+
+@pytest.mark.parametrize('status', ['not_needed', 'complete', 'incomplete', 'blocked'])
+def test_s08b2_K_launch_order(status):
+    out, result = _run_harness([MAGNET], True, cleanup_status=status, return_raw=True)
+    events = out['constructed']
+    assert events.count('cleanup_read') == 1
+    assert events.index('window_show') < events.index('cleanup_read') < events.index('daemon_start') < events.index('resume_persisted')
+    assert events.count('cleanup_notice') == int(status in ('incomplete', 'blocked'))
+    assert out['add_url'] == [MAGNET] and out['returncode'] == 0 and result.returncode == 0
+    assert 'S08B2_GUARD_BEFORE_IMPORT' in result.stdout
+
+
+@pytest.mark.parametrize('control', ['marker', 'portable', 'outside', 'outside-profile'])
+def test_s08b2_M_guard_refusal(control):
+    result = _isolated_child("raise AssertionError('import reached')\n", control=control)
+    assert result.returncode != 0
+    assert 'S08B2_GUARD_BEFORE_IMPORT' not in result.stdout
+    assert 'import reached' not in result.stderr
+
+
+def test_s08b2_M_parent_detection():
+    for script in ("from cove import db\nwith db.connect(): pass\n",
+                   "import importlib,os\nos.environ['COVE_PORTABLE']='1'\nfrom cove import config\nimportlib.reload(config)\nfrom cove import db\nwith db.connect(): pass\n",
+                   "from pathlib import Path\nPath('cove-app-data').mkdir()\n",
+                   "from pathlib import Path\nPath('portable.marker').touch()\n"):
+        with pytest.raises(AssertionError, match='child data artifact'):
+            _isolated_child(script)
+
+
+def test_s08b2_U_M_structure():
+    import ast
+    for filename in ('queue.py', 'app.py', 'main_window.py'):
+        tree = ast.parse((REPO_ROOT / 'cove' / filename).read_text())
+        if filename != 'queue.py':
+            assert not any(isinstance(n, ast.ImportFrom) and n.module in ('cove.db', 'db') for n in ast.walk(tree))
+            assert not any(isinstance(n, ast.ImportFrom) and any(a.name == 'db' for a in n.names) for n in ast.walk(tree))
+            assert not any(isinstance(n, ast.Import) and any(a.name == 'cove.db' for a in n.names) for n in ast.walk(tree))
+            assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == 'clear_legacy_cookies' for n in ast.walk(tree))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Try):
+                calls = [ast.unparse(n.func) for n in ast.walk(node) if isinstance(n, ast.Call)]
+                assert 'QueueManager' not in calls
+                if filename == 'queue.py':
+                    assert 'db.init' not in calls and 'self._load_persisted' not in calls
 
 
 def test_unreadable_settings_exits_without_constructing_services():

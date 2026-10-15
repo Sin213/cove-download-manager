@@ -516,6 +516,8 @@ def run() -> int:
 
     window.show()
     app.processEvents()
+    if queue.legacy_cookie_cleanup.status in ("incomplete", "blocked"):
+        window.note_legacy_cookie_cleanup_incomplete()
 
     # Registration shells out to flatpak (up to 10 s per browser); run it
     # off the GUI thread so a slow or hung flatpak can't freeze the window.

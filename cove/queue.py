@@ -1035,10 +1035,25 @@ class QueueManager(QObject):
         self._ext_poll.start()
         self._purge_legacy_drop_dir()
         db.init()
+        self.legacy_cookie_cleanup = self._clear_legacy_cookies()
         self._load_persisted()
         app = QCoreApplication.instance()
         if app is not None:
             app.aboutToQuit.connect(self._drain_publications)
+
+    def _clear_legacy_cookies(self):
+        try:
+            result = db.clear_legacy_cookies()
+        except Exception as exc:
+            name = type(exc).__name__
+            result = db.CookieCleanup("blocked", "unexpected", error_type=(
+                name if name.isidentifier() and len(name) <= 64 else "Exception"))
+        facts = dict(status=result.status, reason=result.reason, rows=result.rows)
+        if result.error_type:
+            facts["error_type"] = result.error_type
+        self._diag("queue", "legacy_cookie_cleanup",
+                   "INFO" if result.status in ("complete", "not_needed") else "WARNING", **facts)
+        return result
 
     # ---- persistence --------------------------------------------------
 

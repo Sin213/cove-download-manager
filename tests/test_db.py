@@ -13,6 +13,334 @@ import pytest
 
 from cove import config, db
 
+# TEST-DISCIPLINE: synthetic paths, behavioral RED, isolated direct children.
+_S08B2_DETECT = "SELECT EXISTS(SELECT 1 FROM downloads WHERE cookies IS NOT NULL AND cookies <> '')"
+
+
+_S08B2_CHILD_GUARD = '''import os,sys
+from pathlib import Path
+assert not any(n == 'cove' or n.startswith('cove.') for n in sys.modules)
+sentinel = Path(os.environ['S08B2_CHILD_SENTINEL']).resolve()
+assert 'COVE_PORTABLE' not in os.environ and not getattr(sys, 'frozen', False)
+for key in ('HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA'):
+    if key in os.environ:
+        assert os.environ[key] and Path(os.environ[key]).resolve().is_relative_to(sentinel)
+assert Path.cwd().resolve().is_relative_to(sentinel)
+for directory in (Path(__file__).resolve().parent, Path(sys.argv[0]).resolve().parent, Path.cwd()):
+    assert not (directory / 'portable.marker').exists()
+    assert not (directory / 'cove-app-data').exists()
+'''
+
+
+def _s08b2_child(tmp_path, script, *args, timeout=12):
+    sentinel = tmp_path / "child-sentinel"
+    scratch, scripts = sentinel / "work", sentinel / "scripts"
+    for directory in (scratch, scripts, sentinel / "home", sentinel / "data", sentinel / "config",
+                      sentinel / "profile", sentinel / "appdata", sentinel / "localappdata"):
+        directory.mkdir(parents=True, exist_ok=True)
+    target = scripts / script.name
+    target.write_text(_S08B2_CHILD_GUARD + script.read_text())
+    env = {key: os.environ[key] for key in ("PATH", "LD_LIBRARY_PATH", "LANG", "SYSTEMROOT",
+           "SYSTEMDRIVE", "PATHEXT", "COMSPEC") if key in os.environ}
+    env.update(HOME=str(sentinel / "home"), XDG_DATA_HOME=str(sentinel / "data"),
+               XDG_CONFIG_HOME=str(sentinel / "config"), S08B2_CHILD_SENTINEL=str(sentinel),
+               USERPROFILE=str(sentinel / "profile"), APPDATA=str(sentinel / "appdata"),
+               LOCALAPPDATA=str(sentinel / "localappdata"),
+               PYTHONPATH=str(Path(__file__).resolve().parents[1]), PYTHONDONTWRITEBYTECODE="1")
+    try:
+        return subprocess.run([sys.executable, "-B", str(target), *map(str, args)],
+                              cwd=scratch, env=env, capture_output=True, text=True, timeout=timeout)
+    finally:
+        for root in (sentinel, scratch, scripts):
+            assert not [p for p in root.rglob("*") if p.name in ("cove.db", "cove-app-data", "portable.marker")], "child data artifact"
+
+
+@pytest.fixture
+def legacy_db(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    shapes = ["S08B2_SYNTH_COOKIE_text", "", " \t", "\r\n", "S08B2_SYNTH_COOKIE_" + "x" * 1048576,
+              b"S08B2_SYNTH_COOKIE_blob", b"", None, "bad", "\0S08B2_SYNTH_COOKIE_nul", 17, 2.5]
+    with sqlite3.connect(path) as conn:
+        for i, cookie in enumerate(shapes):
+            conn.execute("INSERT INTO downloads(url,out_dir,created_at,cookies,backend,status,source_type,error) "
+                         "VALUES(?,?,?,?,?,?,?,?)", ("https://example.com/" + str(i), str(tmp_path), i,
+                         cookie, ["aria2", "ffmpeg", "yt-dlp"][i % 3],
+                         ["queued", "active", "paused", "complete"][i % 4],
+                         ["", "torrent", "torrent_file"][i % 3], "S08B2_SYNTH_COOKIE_saved_error"))
+        conn.execute("UPDATE downloads SET cookies=CAST(x'53303842325f53594e54485f434f4f4b49455ffffe' AS TEXT) WHERE id=9")
+    return path
+
+
+def _s08b2_snapshot(path):
+    import hashlib
+    with sqlite3.connect(path) as conn:
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(downloads)") if r[1] != "cookies"]
+        expr = ",".join('typeof("{0}"),CAST("{0}" AS BLOB)'.format(c) for c in columns)
+        data = [conn.execute("SELECT " + expr + " FROM downloads ORDER BY id").fetchall()]
+        for sql in ("SELECT * FROM sqlite_master ORDER BY name", "PRAGMA user_version",
+                    "SELECT * FROM sqlite_sequence", "PRAGMA table_info(downloads)", "SELECT count(*) FROM downloads"):
+            data.append(conn.execute(sql).fetchall())
+        data.append(conn.execute("SELECT id,typeof(cookies),CAST(cookies AS BLOB) FROM downloads WHERE id IN (2,8) ORDER BY id").fetchall())
+    return hashlib.sha256(repr(data).encode()).hexdigest()
+
+
+def test_s08b2_A_C_removed_mixed(legacy_db, tmp_path):
+    with sqlite3.connect(legacy_db) as conn:
+        count = conn.execute("SELECT count(*) FROM downloads WHERE cookies IS NOT NULL AND cookies <> ''").fetchone()[0]
+        assert count == 10
+        assert conn.execute("SELECT sum(instr(CAST(cookies AS BLOB),?)) FROM downloads", (b"S08B2_SYNTH_COOKIE_",)).fetchone()[0] > 0
+    result = db.clear_legacy_cookies(legacy_db)
+    assert result == db.CookieCleanup("complete", rows=count)
+    script = tmp_path / "recount.py"
+    script.write_text("import sqlite3,sys\nwith sqlite3.connect(sys.argv[1]) as c:\n"
+                      " assert c.execute(" + repr(_S08B2_DETECT) + ").fetchone()[0] == 0\n"
+                      " assert c.execute(\"SELECT coalesce(sum(instr(CAST(cookies AS BLOB),?)),0) FROM downloads\", (b'S08B2_SYNTH_COOKIE_',)).fetchone()[0] == 0\n")
+    child = _s08b2_child(tmp_path, script, legacy_db)
+    assert child.returncode == 0, child.stdout + child.stderr
+
+
+def test_s08b2_B_preservation(legacy_db):
+    before = _s08b2_snapshot(legacy_db)
+    db.clear_legacy_cookies(legacy_db)
+    assert _s08b2_snapshot(legacy_db) == before
+
+
+def test_s08b2_D_H_retry_clean_reintroduced(legacy_db, tmp_path):
+    import hashlib
+    assert db.clear_legacy_cookies(legacy_db).status == "complete"
+    before = (hashlib.sha256(legacy_db.read_bytes()).hexdigest(), legacy_db.stat().st_mtime_ns)
+    assert db.clear_legacy_cookies(legacy_db).status == "not_needed"
+    assert (hashlib.sha256(legacy_db.read_bytes()).hexdigest(), legacy_db.stat().st_mtime_ns) == before
+    assert not Path(str(legacy_db) + "-journal").exists()
+    for replace in (False, True):
+        if replace:
+            legacy_db.rename(tmp_path / "old.db")
+            db.init(legacy_db)
+            with sqlite3.connect(legacy_db) as conn:
+                conn.execute("INSERT INTO downloads(url,out_dir,created_at) VALUES('https://example.com', '', 0)")
+        with sqlite3.connect(legacy_db) as conn:
+            conn.execute("UPDATE downloads SET cookies='S08B2_SYNTH_COOKIE_again'")
+        assert db.clear_legacy_cookies(legacy_db).status == "complete"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX SIGKILL oracle; Windows D6 kill smoke outstanding")
+@pytest.mark.parametrize("point", ["K1", "K2"])
+def test_s08b2_E_interruption(legacy_db, tmp_path, point):
+    import signal
+    witness = tmp_path / "witness"
+    with sqlite3.connect(legacy_db) as conn:
+        conn.executemany("INSERT INTO downloads(url,out_dir,created_at,cookies) VALUES('https://example.com','',0,?)",
+                         [("S08B2_SYNTH_COOKIE_interrupt",)] * 298)
+    before = _s08b2_snapshot(legacy_db)
+    script = tmp_path / "interrupt.py"
+    script.write_text('''import os,signal,sys
+from contextlib import contextmanager
+from pathlib import Path
+from cove import db
+original = db.connect
+seen = False
+@contextmanager
+def factory():
+    global seen
+    with original(Path(sys.argv[1])) as conn:
+        def trace(sql):
+            global seen
+            if (sys.argv[3] == 'K2' and seen) or (sys.argv[3] == 'K1' and sql == 'COMMIT'):
+                Path(sys.argv[2]).write_text(sys.argv[3] + ':' + sql)
+                os.kill(os.getpid(), signal.SIGKILL)
+            if sql == 'COMMIT': seen = True
+        conn.set_trace_callback(trace)
+        yield conn
+db.connect = factory
+db.clear_legacy_cookies()
+''')
+    child = _s08b2_child(tmp_path, script, legacy_db, witness, point)
+    assert child.returncode == -signal.SIGKILL, child.stdout + child.stderr
+    assert witness.read_text().startswith(point + ":")
+    if point == "K1":
+        assert witness.read_text() == "K1:COMMIT"
+    with sqlite3.connect(legacy_db) as conn:
+        remaining = conn.execute("SELECT count(*) FROM downloads WHERE cookies IS NOT NULL AND cookies <> ''").fetchone()[0]
+        print("KILL_WITNESS", witness.read_text(), "remaining", remaining, "of", 308)
+        assert remaining in (0, 308), "partial transaction after witnessed kill"
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert _s08b2_snapshot(legacy_db) == before
+    assert db.clear_legacy_cookies(legacy_db).status in ("complete", "not_needed")
+
+
+@pytest.mark.parametrize("lock", ["writer", "reader"])
+def test_s08b2_F_G_real_locks(legacy_db, monkeypatch, lock):
+    monkeypatch.setattr(db, "COOKIE_CLEANUP_BUDGET_S", 0.3)
+    with closing(sqlite3.connect(legacy_db)) as holder:
+        if lock == "writer":
+            holder.execute("BEGIN IMMEDIATE")
+            holder.execute("UPDATE downloads SET cookies=cookies")
+        else:
+            cursor = holder.execute("SELECT * FROM downloads")
+            cursor.fetchone()
+        start = time.monotonic()
+        result = db.clear_legacy_cookies(legacy_db)
+        elapsed = time.monotonic() - start
+        print("LOCK", lock, "elapsed", elapsed)
+        assert result == db.CookieCleanup("incomplete", "locked")
+        assert elapsed < 1.5
+        if lock == "reader":
+            cursor.close()
+        holder.rollback()
+    with sqlite3.connect(legacy_db) as conn:
+        assert conn.execute("SELECT count(*) FROM downloads WHERE cookies IS NOT NULL AND cookies <> ''").fetchone()[0] == 10
+    assert db.clear_legacy_cookies(legacy_db).status == "complete"
+
+
+@pytest.mark.parametrize("fault", ["order", "update", "commit", "zero", "zero-clean", "verify-os", "verify-sql", "verify-bug", "read-bug"])
+def test_s08b2_G_connections_faults(legacy_db, monkeypatch, fault):
+    from contextlib import contextmanager
+    original = db.connect
+    events = []
+    @contextmanager
+    def factory(path):
+        number = sum(e == "open" for e in events) + 1
+        events.append("open")
+        if number == 2 and fault.startswith("verify-"):
+            raise {"verify-os": OSError, "verify-sql": sqlite3.OperationalError,
+                   "verify-bug": RuntimeError}[fault]("S08B2_SYNTH_COOKIE_exception")
+        with original(path) as conn:
+            class Proxy:
+                def execute(self, sql):
+                    events.append((number, sql))
+                    if fault == "read-bug" and number == 2 and sql.startswith("SELECT"):
+                        raise RuntimeError("S08B2_SYNTH_COOKIE_exception")
+                    if fault == "update" and sql.startswith("UPDATE"):
+                        raise sqlite3.OperationalError("database is locked")
+                    if fault in ("zero", "zero-clean") and sql.startswith("UPDATE"):
+                        if fault == "zero-clean":
+                            conn.execute(sql)
+                        return type("Cursor", (), {"rowcount": 0})()
+                    return conn.execute(sql)
+                def commit(self):
+                    events.append((number, "COMMIT"))
+                    if fault == "commit":
+                        raise sqlite3.OperationalError("database is locked")
+                    conn.commit()
+                def rollback(self):
+                    events.append((number, "ROLLBACK"))
+                    conn.rollback()
+            try:
+                yield Proxy()
+            finally:
+                events.append("close")
+    monkeypatch.setattr(db, "connect", factory)
+    result = db.clear_legacy_cookies(legacy_db)
+    if fault in ("update", "commit"):
+        assert result == db.CookieCleanup("incomplete", "locked")
+        assert events.count("open") == 1 and (1, "ROLLBACK") in events
+        with sqlite3.connect(legacy_db) as conn:
+            assert conn.execute(_S08B2_DETECT).fetchone()[0] == 1
+    else:
+        assert events.count("open") == 2
+        assert events.index((1, "COMMIT")) < events.index("close") < events.index("open", 1)
+        if fault == "order":
+            assert result == db.CookieCleanup("complete", rows=10)
+        elif fault == "zero-clean":
+            assert result == db.CookieCleanup("not_needed")
+        else:
+            assert result.status == "incomplete" and result.reason == "unverified"
+            assert result.error_type == ("RuntimeError" if fault in ("verify-bug", "read-bug") else "")
+        with sqlite3.connect(legacy_db) as conn:
+            assert conn.execute(_S08B2_DETECT).fetchone()[0] == int(fault == "zero")
+
+
+@pytest.mark.parametrize("action", ["ABORT", "IGNORE"])
+def test_s08b2_G_P_trigger_fault(legacy_db, action):
+    with sqlite3.connect(legacy_db) as conn:
+        clause = "ABORT,'synthetic update fault'" if action == "ABORT" else "IGNORE"
+        conn.execute("CREATE TRIGGER fault BEFORE UPDATE OF cookies ON downloads WHEN OLD.id=6 BEGIN SELECT RAISE(" + clause + "); END")
+    result = db.clear_legacy_cookies(legacy_db)
+    assert result.status == ("blocked" if action == "ABORT" else "incomplete")
+    assert result.reason == ("unexpected" if action == "ABORT" else "unverified")
+    with sqlite3.connect(legacy_db) as conn:
+        assert conn.execute("SELECT count(*) FROM downloads WHERE cookies IS NOT NULL AND cookies <> ''").fetchone()[0] == (10 if action == "ABORT" else 1)
+
+
+def test_s08b2_N_O_sql_allowlist(legacy_db, monkeypatch):
+    import inspect
+    from contextlib import contextmanager
+    original = db.connect
+    traced = []
+    @contextmanager
+    def factory(path):
+        with original(path) as conn:
+            conn.set_trace_callback(traced.append)
+            yield conn
+    monkeypatch.setattr(db, "connect", factory)
+    db.clear_legacy_cookies(legacy_db)
+    normalized = ["PRAGMA busy_timeout" if sql.startswith("PRAGMA busy_timeout") else sql for sql in traced]
+    assert normalized == ["PRAGMA busy_timeout", "PRAGMA secure_delete=ON", _S08B2_DETECT,
+                          "PRAGMA busy_timeout", "BEGIN IMMEDIATE", "PRAGMA busy_timeout",
+                          "UPDATE downloads SET cookies='' WHERE cookies IS NOT NULL AND cookies <> ''",
+                          "PRAGMA busy_timeout", "COMMIT", "PRAGMA busy_timeout", _S08B2_DETECT]
+    source = inspect.getsource(db.clear_legacy_cookies)
+    assert not any(word.lower() in source.lower() for word in
+                   ("VACUUM", "wal_checkpoint", "ALTER ", "user_version", ".backup(", "iterdump", "shutil", "os.replace", "os.rename", "DELETE FROM"))
+
+
+@pytest.mark.parametrize("code,reason", [(5,"locked"),(6,"locked"),(13,"disk_full"),(266,"io_error"),
+                                         (8,"readonly"),(14,"unwritable"),(11,"corrupt"),(26,"corrupt"),(1,"unexpected")])
+@pytest.mark.parametrize("fallback", [False, True])
+def test_s08b2_G_classification(tmp_path, monkeypatch, code, reason, fallback):
+    from contextlib import contextmanager
+    path = tmp_path / "cove.db"
+    messages = {5:"database is locked",6:"table is locked",13:"database or disk is full",266:"disk I/O error",
+                8:"attempt to write a readonly database",14:"unable to open database file",11:"database disk image is malformed",26:"file is not a database",1:"S08B2_SYNTH_COOKIE_error"}
+    error = sqlite3.OperationalError(messages[code] if fallback else "database is locked S08B2_SYNTH_COOKIE_error")
+    if not fallback:
+        error.sqlite_errorcode = code
+    @contextmanager
+    def fail(path):
+        raise error
+        yield
+    monkeypatch.setattr(db, "connect", fail)
+    assert db.clear_legacy_cookies(path) == db.CookieCleanup("incomplete" if reason in ("locked","disk_full","io_error") else "blocked", reason)
+
+
+def test_s08b2_R_consumed_budget(tmp_path):
+    path = tmp_path / "cove.db"
+    db.init(path)
+    with sqlite3.connect(path) as conn:
+        conn.executemany("INSERT INTO downloads(url,out_dir,created_at,cookies) VALUES('https://example.com','',0,?)",
+                         [("S08B2_SYNTH_COOKIE_" + "x" * 2100,)] * 6000)
+    script = tmp_path / "budget.py"
+    script.write_text('''import sqlite3,sys,time
+from pathlib import Path
+from contextlib import contextmanager
+from cove import db
+path = Path(sys.argv[1])
+reader = sqlite3.connect(path)
+cursor = reader.execute('SELECT id FROM downloads'); cursor.fetchone()
+original = db.connect
+witness = []
+@contextmanager
+def factory(path):
+    with original(path) as conn:
+        def trace(sql):
+            if sql == 'BEGIN IMMEDIATE':
+                witness.append(sql); time.sleep(0.9)
+        conn.set_trace_callback(trace)
+        yield conn
+db.connect = factory
+db.COOKIE_CLEANUP_BUDGET_S = 1.5
+start = time.monotonic(); result = db.clear_legacy_cookies(path); elapsed = time.monotonic() - start
+cursor.close(); reader.close()
+print('elapsed', elapsed, 'witness', witness, 'result', result, flush=True)
+assert witness == ['BEGIN IMMEDIATE']
+assert result == db.CookieCleanup('incomplete', 'locked')
+assert elapsed <= 1.95
+''')
+    child = _s08b2_child(tmp_path, script, path, timeout=12)
+    print(child.stdout)
+    assert child.returncode == 0, child.stdout + child.stderr
+
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fcntl lock regression")
 @pytest.mark.parametrize("mode", [0o600, 0o644], ids=["private", "migration"])

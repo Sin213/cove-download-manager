@@ -1,6 +1,6 @@
 # Privacy Policy - Cove Download Manager (browser extension)
 
-_Last updated: 2026-09-12_
+_Last updated: 2026-10-14_
 
 Cove Download Manager is a browser extension that hands downloads off to the
 Cove Download Manager desktop application running on the same computer. This
@@ -29,8 +29,7 @@ happens, it is called out.
   and Cove does not pass them to its download engines; a file that needs your
   browser login may therefore not download in Cove. The cookie values still pass
   from the extension to Cove over the local handoff, and downloads added by
-  earlier versions of Cove may still have cookies stored on your computer, which
-  Cove no longer restores into download tasks (see Cookies below). The download
+  earlier versions of Cove may have stored cookies on your computer, which Cove attempts to clear when it starts and no longer restores into download tasks (see Cookies below). The download
   itself is a normal network request to that site.
   "Local handoff" describes how Cove is reached, not the download.
 - Settings and a bounded diagnostics log are stored in your browser's local
@@ -137,14 +136,7 @@ the cookie values still pass through the browser's native messaging channel
 and Cove's local handoff on your computer before they are discarded. If that
 header would exceed 32 KB it is dropped entirely rather than truncated.
 
-Downloads added by earlier versions of Cove may still have their cookies stored
-in Cove's local database on your computer. This version does not erase them:
-the historical values can remain in that database file. Cove no longer restores
-those stored values into download tasks, so they are not forwarded to download
-engines through the normal restored-download path, and older downloads that
-relied on them may fail. Reading the database can still briefly load these
-values into memory, and cookie values still pass from the browser to Cove. This
-change does not remove all cookie exposure.
+Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. Cookie values still pass from the browser to Cove. This change does not remove all cookie exposure.
 
 The extension does not read cookies for any other site, and does not store
 cookies anywhere.
