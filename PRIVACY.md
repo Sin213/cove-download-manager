@@ -1,6 +1,6 @@
 # Privacy Policy - Cove Download Manager (browser extension)
 
-_Last updated: 2026-10-14_
+_Last updated: 2026-10-15_
 
 Cove Download Manager is a browser extension that hands downloads off to the
 Cove Download Manager desktop application running on the same computer. This
@@ -176,9 +176,15 @@ through the normal restored-download path.
 
 For streaming (HLS) downloads Cove sends only the referring
 page's origin (scheme, host, and port) as the referrer when that page address is
-valid, and otherwise omits the referrer. FFmpeg can still forward cookies issued
-by stream servers across hosts; this is a known open limitation and does not
-provide complete credential containment.
+valid, and otherwise omits the referrer. For downloads Cove performs with yt-dlp,
+the referrer that Cove itself supplies is likewise limited to that origin, or
+omitted. yt-dlp and its extractors may add their own referrer headers, and the
+origin can be received by other servers the download engine contacts, for example
+after a redirect. FFmpeg can still forward cookies issued by stream servers
+across hosts; this is a known open limitation and does not provide complete
+credential containment.
+
+For new downloads, Cove stores only that origin as the referrer in the download record, not the full page address. Download records created by earlier versions of Cove can still contain the full page address that the browser reported, including its path and query string. This version does not rewrite those stored values; it reduces them to their origin before using or showing them. The stored text can remain in the database file, in backups and in file system snapshots.
 
 If Cove cannot be reached on a right-click handoff, the extension falls back to
 letting the browser download the file, which likewise contacts that site.

@@ -27,6 +27,7 @@ from . import db, debrid, dedup, diagnostics, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, Aria2RpcError, bittorrent_enabled, generate_gid
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
+from .hls import referrer_origin
 from .output_paths import (
     MissingEngineOutputError,
     OutputPathError,
@@ -693,7 +694,8 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         work_dir=_row_get(row, "work_dir", "") or "",
         output_path=_row_get(row, "output_path", "") or "",
         # Legacy stored Cookie values are intentionally never restored (S08B-1).
-        referrer=_clean_header(_row_get(row, "referrer", "")),
+        # Historical stored referrer text is intentionally not rewritten.
+        referrer=referrer_origin(_row_get(row, "referrer", "")),
         user_agent=_clean_header(_row_get(row, "user_agent", "")),
         source_type=_row_get(row, "source_type", "") or "",
         info_hash=_row_get(row, "info_hash", "") or "",
@@ -1563,6 +1565,7 @@ class QueueManager(QObject):
 
         For new downloads, the browser cookie value is discarded at admission;
         the prepared request carries only its cleaned presence, never its value.
+        Browser-provided referrers retain only a valid origin, or are omitted.
 
         Purely local and side-effect free: no database row, no DownloadTask,
         no aria2 call, no backend launch, no provider request and no
@@ -1579,7 +1582,7 @@ class QueueManager(QObject):
         """
         url = url.strip()
         browser_cookies_seen = bool(_clean_header(cookies))
-        referrer = _clean_header(referrer)
+        referrer = referrer_origin(referrer)
         user_agent = _clean_header(user_agent)
         if source_type not in SOURCE_TYPES:
             return None

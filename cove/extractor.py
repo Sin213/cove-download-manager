@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .hls import referrer_origin
+
 
 _YOUTUBE_PATH = re.compile(r"^/(?:shorts|live|embed)/[^/]+")
 _PROGRESS = re.compile(r"\[download\]\s+(\d+(?:\.\d+)?)%")
@@ -110,8 +112,9 @@ def ytdlp_command(
     # extract rather than trusting each browser call site to omit it.
     if cookies and not is_extractor_url(url):
         cmd += ["--add-header", f"Cookie: {cookies}"]
-    if referrer:
-        cmd += ["--referer", referrer]
+    origin = referrer_origin(referrer)
+    if origin:
+        cmd += ["--referer", origin]
     if user_agent:
         cmd += ["--user-agent", user_agent]
     cmd += ["-o", output_template, url]

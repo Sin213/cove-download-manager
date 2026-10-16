@@ -106,7 +106,7 @@ def test_video_row_restores_browser_headers(tmp_path):
         )
         task = _task_from_persisted_row(row)
     assert task.cookies == ""
-    assert task.referrer == "https://example.com/page"
+    assert task.referrer == "https://example.com/"
     assert task.user_agent == "TestUA/1.0"
 
 
@@ -3637,7 +3637,8 @@ def _assert_media_refused(env, task, tmp_path, message):
 
 
 @pytest.mark.parametrize("engine", ["ffmpeg", "yt-dlp"])
-def test_media_binding_any_keeps_golden_launch(media_binding_env, tmp_path, monkeypatch, engine):
+@pytest.mark.parametrize("referrer", ["https://example.com/page", "https://example.com/"], ids=["full", "origin"])
+def test_media_binding_any_keeps_golden_launch(media_binding_env, tmp_path, monkeypatch, engine, referrer):
     env = media_binding_env
     queue = env[0]
     queue.settings.torrent_network_interface = ""
@@ -3649,7 +3650,7 @@ def test_media_binding_any_keeps_golden_launch(media_binding_env, tmp_path, monk
     monkeypatch.setattr(queue_module.netiface, "interface_exists", forbidden_lookup)
     monkeypatch.setattr(queue_module.netiface, "interface_address", forbidden_lookup)
     task = _media_task(env, tmp_path, engine)
-    task.cookies, task.referrer, task.user_agent = "session=abc", "https://example.com/page", "TestUA"
+    task.cookies, task.referrer, task.user_agent = "session=abc", referrer, "TestUA"
     queue._launch(task)
     proc = env[1].instances[-1]
     assert task.status == "active"
@@ -3665,7 +3666,7 @@ def test_media_binding_any_keeps_golden_launch(media_binding_env, tmp_path, monk
             "--newline", "--no-playlist", "--merge-output-format", "mp4",
             "--no-overwrites", "--no-post-overwrites", "--progress", "--print",
             f"after_move:{FINAL_PATH_MARKER}%(filepath)s", "-f",
-            "bv*[height<=1080]+ba/b[height<=1080]/b", "--referer", task.referrer,
+            "bv*[height<=1080]+ba/b[height<=1080]/b", "--referer", "https://example.com/",
             "--user-agent", "TestUA", "-o", str(_extractor_private_path(proc)).replace(".mp4", ".%(ext)s"), task.url,
         ]
     for option in ("--ignore-config", "--no-plugin-dirs", "--use-extractors", "--source-address", "--break-match-filters", "-local_addr"):
@@ -3814,7 +3815,8 @@ def test_media_binding_empty_proxy_and_no_proxy_allowed(media_binding_env, tmp_p
     assert "--source-address" in env[1].instances[0].args
 
 
-def test_media_binding_extractor_exact_argv(media_binding_env, tmp_path, monkeypatch):
+@pytest.mark.parametrize("referrer", ["https://example.com/page", "https://example.com/"], ids=["full", "origin"])
+def test_media_binding_extractor_exact_argv(media_binding_env, tmp_path, monkeypatch, referrer):
     env = media_binding_env
     seen = []
 
@@ -3824,7 +3826,7 @@ def test_media_binding_extractor_exact_argv(media_binding_env, tmp_path, monkeyp
 
     monkeypatch.setattr(queue_module.netiface, "interface_address", address)
     task = _media_task(env, tmp_path, "yt-dlp")
-    task.cookies, task.referrer, task.user_agent = "SID=private", "https://example.com/page", "TestUA"
+    task.cookies, task.referrer, task.user_agent = "SID=private", referrer, "TestUA"
     env[0]._launch(task)
     proc = env[1].instances[-1]
     assert seen == ["test-vpn"]
@@ -3834,7 +3836,7 @@ def test_media_binding_extractor_exact_argv(media_binding_env, tmp_path, monkeyp
         "--break-match-filters", "!is_live", "--newline", "--no-playlist",
         "--merge-output-format", "mp4", "--no-overwrites", "--no-post-overwrites",
         "--progress", "--print", f"after_move:{FINAL_PATH_MARKER}%(filepath)s",
-        "-f", _BOUND_MEDIA_FORMAT, "--referer", task.referrer, "--user-agent", "TestUA",
+        "-f", _BOUND_MEDIA_FORMAT, "--referer", "https://example.com/", "--user-agent", "TestUA",
         "-o", str(_extractor_private_path(proc)).replace(".mp4", ".%(ext)s"), task.url,
     ]
     assert isinstance(proc.args, list)
@@ -10514,7 +10516,7 @@ def test_s08a_add_url_retains_no_cookie_value(s08a_queue, url, cookies):
     task = queue.tasks[tid]
     _s08a_assert_new_task_clean(path, task)
     assert task.browser_cookies_seen is True
-    assert task.referrer == "https://example.com/page"
+    assert task.referrer == "https://example.com/"
     assert task.user_agent == "TestUA"
 
 
@@ -10930,7 +10932,7 @@ def test_s08b1_restore_matrix(tmp_path, monkeypatch, backend, status, source_typ
         status="paused" if status == "paused" else "queued", total_bytes=900,
         completed_bytes=300, created_at=1234.5, segments=3, backend=backend,
         work_dir="/legacy/work", output_path="/legacy/output",
-        referrer="https://example.com/page", user_agent="LegacyUA/1.0",
+        referrer="https://example.com/", user_agent="LegacyUA/1.0",
         source_type=source_type, info_hash="a" * 40, torrent_name="Legacy torrent",
         torrent_path="/legacy/source.torrent", selected_files=(0, 2),
         debrid_route=route, debrid_item_id="item-17", debrid_file_id="file-19",
@@ -11883,3 +11885,294 @@ def test_a_parent_status_error_other_than_a_missing_gid_refuses_the_removal(
     assert tid in queue.tasks
     assert queue.tasks[tid].gid == "gid-meta"
     assert errors
+
+
+# S08C: browser-provided referrer values at admission, restore and argv construction.
+_S08C_FULL = "https://media.example.test/account/video?id=123&token=SECRET_S08C#play"
+_S08C_ORIGIN = "https://media.example.test/"
+_S08C_MARKERS = ("/account", "id=123", "SECRET_S08C", "#play", "user:pw", "X-Evil")
+_S08C_EDGES = [
+    ('ET-01', _S08C_FULL, 'https://media.example.test/'), ('ET-02', 'https://media.example.test/', 'https://media.example.test/'), ('ET-03', 'HTTPS://MEDIA.Example.TEST:8443/p', 'https://media.example.test:8443/'), ('ET-04', 'http://example.com:80/', 'http://example.com:80/'), ('ET-05', 'https://a.test:0443/', 'https://a.test:443/'), ('ET-06', 'https://a.test:65535/', 'https://a.test:65535/'), ('ET-07', 'https://a.test:0/', 'https://a.test:0/'), ('ET-08', 'https://[2001:db8::1]:9443/p?q=1', 'https://[2001:db8::1]:9443/'), ('ET-09', 'http://[::1]/', 'http://[::1]/'), ('ET-10', 'https://user:pw@[::1]:8080/x', 'https://[::1]:8080/'), ('ET-11', 'https://user:pw@example.com/p', 'https://example.com/'), ('ET-12', 'https://user%40x@host.test/p', 'https://host.test/'), ('ET-13', 'https://example.com%2F@evil.example/', 'https://evil.example/'),
+    ('ET-14', 'https://a.test?x=1', 'https://a.test/'), ('ET-15', 'https://a.test#frag', 'https://a.test/'), ('ET-16', 'https://example.com/%0d%0aX: y', 'https://example.com/'), ('ET-17', 'https://a.test/p\\q', 'https://a.test/'), ('ET-18', 'https://a.test/p q', 'https://a.test/'), ('ET-19', 'https://a.test/\xfc', 'https://a.test/'), ('ET-20', 'https://a.test/p\x85', 'https://a.test/'), ('ET-21', 'https://a.test/p\u2028', 'https://a.test/'), ('ET-22', 'https://example.com/p\xa0', 'https://example.com/'), ('ET-23', "https://example.com/" + "p" * 100000, 'https://example.com/'), ('ET-24', 'https://xn--bcher-kva.example/p', 'https://xn--bcher-kva.example/'), ('ET-25', 'http://0x7f.1/', 'http://0x7f.1/'), ('ET-26', 'http://127.1/', 'http://127.1/'),
+    ('ET-27', 'https://under_score.test/', 'https://under_score.test/'), ('ET-28', "https://" + "a" * 63 + ".test/", 'https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test/'), ('ET-29', 'https://K.example/p', 'https://k.example/'), ('ET-30', 'HTTP://A.TEST', 'http://a.test/'), ('ET-31', 'hTtPs://a.test/', 'https://a.test/'), ('ET-32', ' https://example.com/p', "https://example.com/"), ('ET-33', 'https://example.com/p ', "https://example.com/"), ('ET-40', 'https://example.com\\@evil.example/', ''), ('ET-41', 'https://a.test\\p', ''), ('ET-42', 'https:// example.com/', ''), ('ET-43', '\xa0https://example.com/p', ''), ('ET-44', '   ', ''), ('ET-45', 'https://exa%2Fmple.test/', ''),
+    ('ET-46', 'https://exa%23mple.test/', ''), ('ET-47', 'https://exa%3Ample.test/', ''), ('ET-48', 'https://example.com%40evil.test/', ''), ('ET-49', 'https://a.test%2F.evil/', ''), ('ET-50', 'https://a.test:65536/', ''), ('ET-51', 'https://a.test:-1/', ''), ('ET-52', 'https://a.test:+80/', ''), ('ET-53', 'https://a.test: 80/', ''), ('ET-54', 'https://a.test:\uff18\uff10/', ''), ('ET-55', 'https://a.test:80:80/', ''), ('ET-56', 'https://a.test:/p', ''), ('ET-57', 'http://[fe80::1%25eth0]/', ''), ('ET-58', 'https://[::1/', ''),
+    ('ET-59', 'https://[::1]x/', ''), ('ET-60', 'https:///p', ''), ('ET-61', 'https://:443/', ''), ('ET-62', 'https://', ''), ('ET-63', 'http:', ''), ('ET-64', '//media.example.test/p', ''), ('ET-65', 'media.example.test/p', ''), ('ET-66', 'javascript:alert(1)', ''), ('ET-67', 'data:text/html,x', ''), ('ET-68', 'file:///etc/passwd', ''), ('ET-69', 'ftp://example.com/', ''), ('ET-70', 'https://b\xfccher.example/p', ''), ('ET-71', 'https://ex\u0430mple.com/', ''),
+    ('ET-72', 'https://\uff45xample.com/', ''), ('ET-73', 'https://\u212a.example/p', ''), ('ET-74', 'https://\u212a@a.test/p', ''), ('ET-75', 'https://Ke\u212avin.example/p', ''), ('ET-76', 'https://-bad.test/', ''), ('ET-77', 'https://a..test/', ''), ('ET-78', 'https://a.test./', ''), ('ET-79', "https://" + "a" * 64 + ".test/", ''), ('ET-80', 'https://a.test/p\x00', ''), ('ET-81', 'https://a.test/p\x7f', ''), ('ET-82', 'https://a.test/p\x1f', ''), ('ET-83', '\thttps://a.test/p', ''), ('ET-84', 'https://a.test/p\n', ''),
+    ('ET-85', 'https://a.test/p\r\nX-Evil: 1', ''), ('ET-86', 'https://exa\r\nmple.test/p', ''), ('ET-87', 'https://good.test/p\rX', ''), ('ET-88', 'https://good.test\r/p', ''), ('ET-89', '', ''), ('ET-90', None, ''), ('ET-91', 5, ''), ('ET-92', b'https://a.test/', ''), ('ET-93', ['https://a.test/'], ''),
+]
+
+
+def _s08c_matrix_items(request, name):
+    assert len(_S08C_EDGES) == len({r[0] for r in _S08C_EDGES}) == 87
+    if request.config.getoption("keyword") or request.config.getoption("markexpr"): pytest.skip("Matrix collection requires an unfiltered session")
+    return [i for i in request.session.items if getattr(i, "originalname", None) == name]
+
+
+def test_s08c_layer_executed_count(request):
+    items = _s08c_matrix_items(request, "test_s08c_B2_B3_B4_B5_B6_edges")
+    assert len(items) == 261
+    assert {(i.callspec.params["edge_id"], i.callspec.params["layer"]) for i in items} == {(r[0], layer) for r in _S08C_EDGES for layer in ("E1", "E2", "cross")}
+
+
+def test_s08c_restore_executed_count(request):
+    items = _s08c_matrix_items(request, "test_s08c_legacy_restore")
+    assert len(items) == 88 * 3 * 3
+    assert len({(i.callspec.params["edge_id"], i.callspec.params["backend"], i.callspec.params["status"]) for i in items}) == 88 * 3 * 3
+
+
+@pytest.mark.parametrize("layer", ["E1", "E2", "cross"])
+@pytest.mark.parametrize("edge_id,raw,expected", _S08C_EDGES, ids=[r[0] for r in _S08C_EDGES])
+def test_s08c_B2_B3_B4_B5_B6_edges(s08a_queue, layer, edge_id, raw, expected):
+    from cove.extractor import ytdlp_command
+    queue, _rpc, path = s08a_queue
+    with db.connect() as conn:
+        row = dict(_row(conn))
+    row["referrer"] = raw  # Exercise non-SQLite types at the row-reader boundary too.
+    prepared = queue.prepare_url(_S08A_URLS[0], referrer=raw)
+    restored = _task_from_persisted_row(row)
+    if layer == "E1":
+        tid = queue.add_url(_S08A_URLS[0], referrer=raw)
+        stored = _persisted_row(path, tid)
+        values = [prepared.referrer, queue.tasks[tid].referrer, stored["referrer"]]
+        with db.connect() as conn:
+            assert conn.execute("SELECT typeof(referrer) FROM downloads WHERE id=?", (tid,)).fetchone()[0] == "text"
+    elif layer == "E2":
+        values = [restored.referrer]
+    else:
+        command = ytdlp_command("https://youtu.be/id", "/tmp/movie.%(ext)s", referrer=raw)
+        sink = command[command.index("--referer") + 1] if "--referer" in command else ""
+        values = [prepared.referrer, restored.referrer, sink]
+    for actual in values:
+        if edge_id in ("ET-32", "ET-33"):
+            assert actual in {"", expected}
+        else:
+            assert actual == expected
+    assert all(value == values[0] for value in values)
+
+
+@pytest.mark.parametrize("url", _S08A_URLS)
+@pytest.mark.parametrize("raw,expected", [(_S08C_FULL, _S08C_ORIGIN), (_S08C_ORIGIN, _S08C_ORIGIN),
+                                        ("javascript:SECRET_S08C", "")], ids=["full", "origin", "invalid"])
+@pytest.mark.parametrize("check", ["D1", "F1", "Q1"])
+def test_s08c_new_admission(s08a_queue, url, raw, expected, check):
+    from cove.source_info import source_details
+    queue, _rpc, path = s08a_queue
+    prepared = queue.prepare_url(url, referrer=raw)
+    tid = queue.add_url(url, referrer=raw)
+    task, row = queue.tasks[tid], _persisted_row(path, tid)
+    if check == "D1":
+        assert (prepared.referrer, task.referrer, row["referrer"]) == (expected,) * 3
+    elif check == "F1":
+        with db.connect() as conn:
+            assert conn.execute("SELECT typeof(referrer) FROM downloads WHERE id=?", (tid,)).fetchone()[0] == "text"
+        assert row["referrer"] == expected
+        assert not any(marker in repr(tuple(row)) for marker in _S08C_MARKERS)
+    else:
+        details = dict(source_details(task))
+        assert details.get("Referrer", "") == expected
+        assert ("Referrer" in details) == bool(expected)
+
+
+def _s08c_restore(queue, rpc):
+    restored = QueueManager(queue.settings, rpc)
+    restored._scheduler_allows = False
+    restored._poll.stop()
+    restored._ext_poll.stop()
+    return restored
+
+
+def test_s08c_F2_round_trip(s08a_queue):
+    queue, rpc, path = s08a_queue
+    tid = queue.add_url(_S08A_URLS[0], referrer=_S08C_FULL)
+    restored = _s08c_restore(queue, rpc)
+    assert restored.tasks[tid].referrer == _persisted_row(path, tid)["referrer"]
+
+
+@pytest.mark.parametrize("backend", ["aria2", "ffmpeg", "yt-dlp"])
+@pytest.mark.parametrize("status", ["queued", "active", "paused"])
+@pytest.mark.parametrize("edge_id,raw,expected", [
+    *[r for r in _S08C_EDGES if r[0] != "ET-93"],  # Lists are tested at the row-reader boundary.
+    ("userinfo-full", _S08C_FULL.replace("https://", "https://user:pw@"), _S08C_ORIGIN),
+    ("long-authority", "https://" + "a" * 100000, ""),
+], ids=[r[0] for r in _S08C_EDGES if r[0] != "ET-93"] + ["userinfo-full", "long-authority"])
+def test_s08c_legacy_restore(legacy_cookies_kept, s08a_queue, backend, status, edge_id, raw, expected):
+    from cove.source_info import source_details
+    queue, rpc, _path = s08a_queue
+    with db.connect() as conn:
+        row = _row(conn, backend=backend, status=status, referrer=raw, cookies=_S08B1_COOKIE,
+                   filename="legacy.mp4", connections=7, speed_limit_kbps=123, created_at=1234.5,
+                   segments=3, selected_files="0,2", user_agent="LegacyUA/1.0", debrid_route="torbox",
+                   debrid_item_id="item-17", debrid_file_id="file-19")
+    task = _s08c_restore(queue, rpc).tasks[row["id"]]
+    if edge_id in ("ET-32", "ET-33"):
+        assert task.referrer in {"", expected}
+        expected = task.referrer
+    baseline = asdict(_task_from_persisted_row(dict(row, referrer="")))
+    baseline["referrer"] = expected
+    assert asdict(task) == baseline
+    assert task.cookies == ""
+    assert dict(source_details(task)).get("Referrer", "") == expected
+
+
+def test_s08c_E2a_E2b_E2c_E2d_historical_storage(s08a_queue, monkeypatch):
+    queue, rpc, path = s08a_queue
+    with db.connect() as conn:
+        for status in ("queued", "active", "paused", "completed", "error"):
+            _row(conn, status=status, referrer=_S08C_FULL, created_at=1234.5, filename="legacy.zip",
+                 connections=7, speed_limit_kbps=123, segments=3, selected_files="0,2",
+                 debrid_route="torbox", debrid_item_id="item-17", debrid_file_id="file-19", user_agent="LegacyUA/1.0")
+    def snapshot():
+        with db.connect() as conn:
+            rows = [dict(row) for row in conn.execute("SELECT * FROM downloads ORDER BY id")]
+            blobs = [tuple(row) for row in conn.execute("SELECT id, typeof(referrer), CAST(referrer AS BLOB) FROM downloads ORDER BY id")]
+        return rows, blobs
+    before, traced = snapshot(), []
+    original_connect = sqlite3.connect
+    def traced_connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        conn.set_trace_callback(traced.append)
+        return conn
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", traced_connect)
+        restored = _s08c_restore(queue, rpc)
+        assert snapshot() == before  # E2a: construction leaves historical bytes and all fields intact.
+        assert set(restored.tasks) == {row["id"] for row in before[0] if row["status"] not in ("completed", "error")}
+        for task in restored.tasks.values():
+            was_paused = task.status == "paused"
+            restored._persist(task)
+            restored.pause(task.id)
+            restored.resume(task.id)
+            if was_paused:
+                restored.pause(task.id)
+            restored.task_changed.emit(task.id)
+        restored.stop_queue()
+        restored.start_queue()
+        restored.resume_persisted()
+        after = snapshot()
+    expected_rows = [dict(row, status="queued" if row["status"] == "active" else row["status"]) for row in before[0]]
+    assert after == (expected_rows, before[1])
+    assert not any(re.search(r"\bINSERT\b|\b(?:UPDATE|DELETE)\b[^;]*\breferrer\b", sql, re.I) for sql in traced)
+    assert len(after[0]) == len(before[0]) == 5
+
+
+def test_s08c_E2e_secondary_constructors(queue_env, monkeypatch):
+    queue, rpc, path = queue_env(**_torrent_settings())
+    _sync_spawn(queue)
+    rpc.tell_external_snapshot = lambda: [{"gid": "gid-ext", "status": "active", "files": [
+        {"path": "/dl/a.bin", "uris": [{"uri": "https://example.com/a.bin"}]}]}]
+    queue._ext_poll.timeout.emit()
+    assert len(queue.tasks) == 1
+    adopted = next(iter(queue.tasks.values()))
+    assert adopted.referrer == _persisted_row(path, adopted.id)["referrer"] == ""
+    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: _cached())
+    tid = queue.add_url(MAGNET)
+    queue.force_start(tid)
+    children = [task for task in queue.tasks.values() if task.source_type == SOURCE_TORRENT_FILE]
+    assert len(children) == 2 and any(task.id != tid for task in children)
+    assert all(task.referrer == _persisted_row(path, task.id)["referrer"] == "" for task in children)
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("raw", [_S08C_FULL, _S08C_ORIGIN], ids=["full", "origin"])
+def test_s08c_G1_direct_launch(media_binding_env, tmp_path, bound, raw):
+    queue = media_binding_env[0]
+    if not bound:
+        queue.settings.torrent_network_interface = ""
+    task = _media_task(media_binding_env, tmp_path, "yt-dlp")
+    task.referrer = raw
+    queue._launch_extractor(task)
+    command = media_binding_env[1].instances[-1].args
+    assert command[command.index("--referer") + 1] == _S08C_ORIGIN
+
+
+@pytest.mark.parametrize("check", ["I1", "I2"])
+def test_s08c_engine_failure(s08a_queue, fake_process, check):
+    queue, _rpc, path = s08a_queue
+    tid = queue.add_url(_S08A_URLS[2], referrer="javascript:" + _S08C_FULL + " user:pw X-Evil")
+    task = queue.tasks[tid]
+    queue._launch_extractor(task)
+    proc = fake_process.instances[-1]
+    proc.emit_output("HTTP Error 403: Forbidden\n")
+    proc.finish(1)
+    QCoreApplication.processEvents()
+    assert task.status == "error"
+    if check == "I1":
+        assert not any(marker in repr((task.error, tuple(_persisted_row(path, tid)))) for marker in _S08C_MARKERS)
+    else:
+        assert len(fake_process.instances) == 1
+
+
+@pytest.mark.parametrize("raw,ingress,expected", [
+    (_S08C_FULL, _S08C_FULL, _S08C_ORIGIN),
+    ("https://good.test/p\r\nX-Evil: 1", "https://good.test/pX-Evil: 1", "https://good.test/"),
+    ("https://exa\r\nmple.test/", "https://example.test/", "https://example.test/"),
+], ids=["FULL", "path-crlf", "authority-crlf"])
+@pytest.mark.parametrize("check", ["J1_K3a", "D2_J2_K3b"])
+def test_s08c_browser_handoff(s08a_queue, raw, ingress, expected, check):
+    from cove.app import BrowserDownloadGate
+    from cove.single_instance import validate_browser_download
+    queue, _rpc, path = s08a_queue
+    request = validate_browser_download({"url": _S08A_URLS[0], "referrer": raw})
+    assert request["referrer"] == ingress
+    if check == "D2_J2_K3b":
+        gate = BrowserDownloadGate()
+        gate.queue, gate.ready = queue, True
+        assert gate.accept(request) is True
+        task = next(iter(queue.tasks.values()))
+        prepared = queue.prepare_url(request["url"], referrer=request["referrer"])
+        assert (prepared.referrer, task.referrer, _persisted_row(path, task.id)["referrer"]) == (expected,) * 3
+
+
+def test_s08c_J3_Q3_display_and_snapshot(s08a_queue):
+    from cove.api_server import task_snapshot
+    from cove.source_info import source_details
+    queue, _rpc, _path = s08a_queue
+    task = queue.tasks[queue.add_url(_S08A_URLS[0], referrer=_S08C_ORIGIN)]
+    assert ("Referrer", _S08C_ORIGIN) in source_details(task)
+    assert "referrer" not in task_snapshot(task)
+
+
+_S08C_DOC_REPLACEMENTS = [
+    ("PRIVACY.md", "For streaming (HLS) downloads Cove sends only the referring page's origin (scheme, host, and port) as the referrer when that page address is valid, and otherwise omits the referrer. For downloads Cove performs with yt-dlp, the referrer that Cove itself supplies is likewise limited to that origin, or omitted. yt-dlp and its extractors may add their own referrer headers, and the origin can be received by other servers the download engine contacts, for example after a redirect. FFmpeg can still forward cookies issued by stream servers across hosts; this is a known open limitation and does not provide complete credential containment."),
+    ("PRIVACY.md", "For new downloads, Cove stores only that origin as the referrer in the download record, not the full page address. Download records created by earlier versions of Cove can still contain the full page address that the browser reported, including its path and query string. This version does not rewrite those stored values; it reduces them to their origin before using or showing them. The stored text can remain in the database file, in backups and in file system snapshots."),
+    ("README.md", "downloaded through it automatically, with the origin of the browser's referring page (not its full address) and the user agent passed along."),
+    ("README.md", "URL, the origin of the referring page, the save folder"),
+]
+
+
+@pytest.mark.parametrize("filename,new", _S08C_DOC_REPLACEMENTS, ids=["privacy-argv", "privacy-storage", "readme-engine", "readme-source"])
+def test_s08c_N1_documentation(filename, new):
+    text = " ".join((Path(queue_module.__file__).parent.parent / filename).read_text().split())
+    for sentence in new.split(". "):
+        assert text.count(sentence.rstrip(".")) == 1
+
+
+@pytest.mark.parametrize("check", ["adjacency", "date"])
+def test_s08c_N2_documentation(check):
+    text = " ".join((Path(queue_module.__file__).parent.parent / "PRIVACY.md").read_text().split())
+    if check == "adjacency":
+        assert "otherwise omits the referrer. FFmpeg can still forward cookies" not in text
+    else:
+        updated = re.search(r"_Last updated: (\d{4}-\d{2}-\d{2})_", text)
+        assert updated and updated[1] >= "2026-10-15"
+
+
+def test_s08c_K2_raw_admission(s08a_queue):
+    assert s08a_queue[0].prepare_url(_S08A_URLS[0], referrer="https://good.test/p\r\nX-Evil: 1").referrer == ""
+
+
+def _s08c_claim_violation(doc, filename, new):
+    text = " ".join(doc.split())
+    if filename == "PRIVACY.md":
+        added = next(" ".join(p.split()) for p in doc.split("\n\n") if new.split(". ")[0] in " ".join(p.split()))
+    else:
+        added = text[text.index(new):text.index("For new downloads, Cove discards" if new.endswith(".") else "Credentials, signed-link tokens", text.index(new))]
+    return re.search(r"every request|all requests|only YouTube|isolat|cross-origin|erased|removed from the database|no longer contain|token|guarantee|never sent|ignore-config|[\u2013\u2014]", added, re.I)
+
+
+@pytest.mark.parametrize("filename,new", _S08C_DOC_REPLACEMENTS, ids=["privacy-argv", "privacy-storage", "readme-engine", "readme-source"])
+def test_s08c_N3_claims(filename, new):
+    doc = "\n\n".join(" ".join(p.split()) for p in (Path(queue_module.__file__).parent.parent / filename).read_text().split("\n\n"))
+    assert not _s08c_claim_violation(doc, filename, new)
+    end = doc.index(".", doc.index(new.split(". ")[0])) + 1
+    assert _s08c_claim_violation(doc[:end] + " Every request sends an origin-only referrer." + doc[end:], filename, new)

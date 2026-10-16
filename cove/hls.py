@@ -57,7 +57,7 @@ def browser_login_failure_hint(cookies: str, exit_code: int, stderr: str) -> str
     return ""
 
 
-def _referrer_origin(referrer: str) -> str:
+def referrer_origin(referrer: str) -> str:
     if not isinstance(referrer, str) or any(ord(char) < 0x20 or ord(char) == 0x7f for char in referrer):
         return ""
     try:
@@ -116,7 +116,7 @@ def ffmpeg_command(
     # No explicit "-bsf:a aac_adtstoasc": the MP4 muxer auto-inserts it for
     # ADTS AAC input, and forcing it fails HLS streams with non-AAC audio.
     cmd = ["ffmpeg", "-n"]
-    origin = _referrer_origin(referrer)
+    origin = referrer_origin(referrer)
     if origin:
         # Input options must precede -i; the hls demuxer forwards these
         # http options to every segment request.

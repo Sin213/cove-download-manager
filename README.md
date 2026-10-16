@@ -40,7 +40,7 @@ https://github.com/user-attachments/assets/d45ce6fc-dbe1-484f-bc7a-8b77a12eaa5b
   link. Only short labels are shown, never a full signed link or a magnet
   carrying a tracker passkey.
 - **View source** - right-click any task to see where it came from: the
-  URL, the referring page, the save folder, and for torrents the name and
+  URL, the origin of the referring page, the save folder, and for torrents the name and
   info hash. Credentials, signed-link tokens, and tracker passkeys are
   masked on screen, cookies are never shown at all, and copying the
   unmasked URL is a separate deliberate button.
@@ -97,8 +97,8 @@ https://github.com/user-attachments/assets/d45ce6fc-dbe1-484f-bc7a-8b77a12eaa5b
   Local BitTorrent stays blocked while a proxy is set unless you enable the
   override, because a proxy cannot be trusted to cover peer traffic.
 - **YouTube and video sites** - links yt-dlp supports are extracted and
-  downloaded through it automatically, with the browser's referrer and user
-  agent passed along. For new downloads, Cove discards the browser cookies it
+  downloaded through it automatically, with the origin of the browser's referring
+  page (not its full address) and the user agent passed along. For new downloads, Cove discards the browser cookies it
   receives before creating the download and does not pass them to its download
   engines (public videos need no account cookies). When it starts, Cove attempts to clear the cookie field of downloads added by earlier versions in the database it uses, and tries again at the next start if that is incomplete or cannot be confirmed. Other fields, other Cove installations or portable copies, backups, snapshots and leftover parts of the database file are not cleaned, so old copies can remain there and are not erased. Cove no longer restores stored cookies into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes. Downloads that
   depend on a browser login may therefore not work in Cove.
