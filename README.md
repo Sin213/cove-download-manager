@@ -593,10 +593,12 @@ info hash it validated, the same way it already does for GOG Games.
 |---|---|---|
 | Settings | `~/.config/cove/settings.json` | `%USERPROFILE%\.config\cove\settings.json` |
 | Queue DB | `~/.local/share/cove/cove.db` | `%USERPROFILE%\.local\share\cove\cove.db` |
-| aria2 session / log | `~/.local/share/cove/aria2.{session,log}` | `%USERPROFILE%\.local\share\cove\aria2.{session,log}` |
+| aria2 log | `~/.local/share/cove/aria2.log` | `%USERPROFILE%\.local\share\cove\aria2.log` |
 | Debrid host cache | `~/.local/share/cove/debrid_hosts.json` | `%USERPROFILE%\.local\share\cove\debrid_hosts.json` |
 | Torrent copies | `~/.local/share/cove/torrents/` | `%USERPROFILE%\.local\share\cove\torrents\` |
 | Diagnostics logs | `~/.local/share/cove/logs/` | `%USERPROFILE%\.local\share\cove\logs\` |
+
+Earlier versions of Cove kept an `aria2.session` file in this folder. Cove no longer creates that file or uses it to restore downloads; recovery uses the queue database and aria2's separate `.aria2` control files. When Cove starts its aria2 engine, it attempts to remove a leftover `aria2.session` in its current data folder only when a local connection check on its RPC port is explicitly refused and the configured path is an ordinary regular file. This does not prove that no aria2 process is running. It skips removal after daemon reclamation, when the port is in use or the check is inconclusive (for example, a timeout), when the file is missing or is not an ordinary file, or when removal fails; a later eligible start can try again. Removing a file does not guarantee that its contents are physically erased. Copies may remain in backups, snapshots, synced folders, hard links, or unused disk space. The cleanup does not target other installations' separate data folders or stop older Cove versions, which may recreate the file. This change does not touch `aria2.log`, the queue database, or saved `.torrent` files, which can still contain download addresses.
 
 Portable builds keep everything in a `cove-app-data` folder next to the
 executable instead.

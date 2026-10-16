@@ -8,6 +8,7 @@ should never block on these.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 import secrets
@@ -179,8 +180,39 @@ def _hidden_console_kwargs() -> dict:
     return {"start_new_session": True}
 
 
+def _remove_legacy_session_file() -> None:
+    # Name-based ownership does not prove Cove created the file.
+    # Substituting the final component or an ancestor between lstat and unlink
+    # can target aria2.session in another directory; at most one such entry is
+    # unlinked, without recursion.
+    # Cleanup requires explicit connection refusal from the local RPC probe;
+    # timeouts and other errors skip. Refusal does not prove no aria2 writer exists.
+    # No process-ownership check is implemented: writers on other RPC ports
+    # or binding between the port check and spawn cannot be detected.
+    # Hard-linked copies, backups, snapshots and free space are not addressed.
+    path = ARIA2_SESSION
+    if path.name != "aria2.session" or path.parent != DATA_DIR:
+        return
+    log = logging.getLogger("cove")
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode):
+            log.info("legacy_aria2_session_cleanup_skipped: reason=not_regular_file")
+            return
+        if getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            log.info("legacy_aria2_session_cleanup_skipped: reason=reparse_point")
+            return
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log.warning("legacy_aria2_session_cleanup_failed: errno=%s", exc.errno)
+
+
 class Aria2Daemon:
     """Owns the aria2c process. Idempotent start/stop."""
+
+    _rpc_refused = False  # An unprobed daemon has no explicit refusal.
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -203,7 +235,6 @@ class Aria2Daemon:
                 hint = "Install it: sudo apt install aria2  (or your distro's equivalent)"
             raise Aria2Error(f"aria2c not found. {hint}")
         conf_path = self._write_rpc_conf()
-        ARIA2_SESSION.touch(exist_ok=True)
         connections = min(
             max(int(self.settings.connections_per_server), 1),
             MAX_CONNECTIONS_PER_SERVER,
@@ -223,8 +254,6 @@ class Aria2Daemon:
             "--allow-overwrite=false",
             "--auto-file-renaming=true",
             f"--dir={self.settings.download_dir}",
-            f"--save-session={ARIA2_SESSION}",
-            "--save-session-interval=10",
             # Cove participates in the swarm only while a torrent is still
             # downloading. Once aria2 reports the download complete it must
             # stop seeding, so the UI's "done" is the truth. Everything else
@@ -257,8 +286,14 @@ class Aria2Daemon:
         # doomed child: it needs a moment to fail its bind and exit, so
         # poll() can still read "alive" while the RPC reply is really coming
         # from the leftover daemon.
+        self._rpc_refused = False
         if self._port_in_use():
             self._reclaim_stale_daemon()
+            logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_busy")
+        elif self._rpc_refused:
+            _remove_legacy_session_file()
+        else:
+            logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
         self._spawn(args)
         last_err = self._await_rpc()
         if last_err is None:
@@ -401,10 +436,14 @@ class Aria2Daemon:
         return last_err
 
     def _port_in_use(self) -> bool:
+        self._rpc_refused = False
         with socket.socket() as probe:
             probe.settimeout(0.2)
             try:
                 probe.connect(("127.0.0.1", int(self.settings.rpc_port)))
+            except ConnectionRefusedError:
+                self._rpc_refused = True
+                return False
             except OSError:
                 return False
         return True
