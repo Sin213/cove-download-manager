@@ -34,9 +34,10 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          rejectSettingsRead = false,
                          breakStorage = false, slowStorage = false,
                          storedDiag = null, media = true, cookies = [],
-                         tabs = [], downloadSearch = () => [],
-                         storedIntercepted = null, eraseThrows = false,
-                         slowInterceptedIds = false,
+                         tabs = [], tabsById = new Map(), timers = false,
+                         downloadSearch = () => [], downloadState = null, searchHook = null,
+                         storedIntercepted = null, eraseThrows = false, eraseFailures = 0,
+                         slowInterceptedIds = false, hydrationGate = null,
                          cookieHook = null, nativeHook = null, settingsReadHook = null,
                          settingsWriteHook = null, permissionsHook = null,
                          worker = false, missingScripts = [],
@@ -53,7 +54,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   let confirmationTokenSequence = 0;
   const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
                   notifications: [], cookies: [], settingsWrites: [], tabsCreated: [],
-                  console: [], order: [],
+                  console: [], order: [], tabsGet: [], searches: [], eraseAttempts: [], settingsReads: 0,
                   // One entry per permissions.getAll(). Counted so a test can
                   // prove the consent state is read fresh for each handoff
                   // rather than cached from startup.
@@ -64,6 +65,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     contextMenuClicked: event(),
     downloadErased: event(),
     message: event(),
+    headersReceived: event(), tabUpdated: event(), tabRemoved: event(), tabActivated: event(),
     // The keyboard shortcut is a settings writer, so a test has to be able to
     // fire it rather than infer it.
     command: event(),
@@ -73,6 +75,21 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   };
   events.calls = calls;
   const browserDownloads = [];
+  const records = downloadState === null ? null : new Map(downloadState.map((r) => [r.id, r]));
+  function replaceDownloadRecord(id, record) {
+    if (!records) throw new Error("downloadState must be enabled");
+    if (record === undefined) records.delete(id);
+    else records.set(id, record);
+  }
+  const pendingTimers = new Map();
+  let timerId = 0;
+  function fireTimers(ms) {
+    for (const [id, timer] of [...pendingTimers]) {
+      if (timer.ms !== ms) continue;
+      pendingTimers.delete(id);
+      timer.callback(...timer.args);
+    }
+  }
   const quietEvent = () => event();
   // A real key/value store, so the diagnostics ring can be inspected the way
   // the popup would read it back.
@@ -85,6 +102,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     data: {},
     async get(key) {
       if (key === "settings") {
+        calls.settingsReads += 1;
         // A real storage read can fail. background.js swallows that failure
         // and resolves with defaults, so a test cannot infer the failure from
         // the resolved value and has to produce it here instead.
@@ -96,6 +114,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
         if (settingsReadHook) await settingsReadHook();
         return snapshot ? { settings: snapshot } : {};
       }
+      if (hydrationGate && key === "_interceptedIds") await hydrationGate.promise;
       if (slowInterceptedIds && key === "_interceptedIds") {
         for (let i = 0; i < 8; i += 1) await Promise.resolve();
       }
@@ -206,13 +225,32 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
       onErased: events.downloadErased,
-      async cancel(id) { calls.order.push("cancel"); calls.cancel.push(id); },
+      async cancel(id) {
+        calls.order.push("cancel"); calls.cancel.push(id);
+        if (records && records.has(id)) {
+          const record = records.get(id);
+          // Preserve privacy descriptors without reading getters or mutating fixtures.
+          records.set(id, Object.create(Object.getPrototypeOf(record), {
+            ...Object.getOwnPropertyDescriptors(record),
+            state: { value: "interrupted", enumerable: true, writable: true, configurable: true },
+          }));
+        }
+      },
       async erase(query) {
-        if (eraseThrows) throw new Error("erase failed");
+        calls.eraseAttempts.push(query);
+        if (eraseThrows || eraseFailures > 0) {
+          if (eraseFailures > 0) eraseFailures -= 1;
+          throw new Error("erase failed");
+        }
         calls.erase.push(query);
         calls.order.push("erase");
+        if (records) records.delete(query.id);
       },
-      async search(query) { return downloadSearch(query); },
+      async search(query) {
+        calls.searches.push(query);
+        if (searchHook) await searchHook(query);
+        return records ? (records.has(query.id) ? [records.get(query.id)] : []) : downloadSearch(query);
+      },
       async download(options) { browserDownloads.push(options); },
     },
     notifications: { async create(options) {
@@ -243,13 +281,22 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     },
     tabs: {
       async create(details) { calls.tabsCreated.push(details); return { id: 99, ...details }; },
+      async get(id) {
+        calls.tabsGet.push(id);
+        if (!tabsById.has(id)) throw new Error("tab unavailable");
+        const result = tabsById.get(id);
+        if (result instanceof Error) throw result;
+        return result;
+      },
       async query() { return tabs; },
       async sendMessage() {},
-      onRemoved: quietEvent(),
-      onUpdated: quietEvent(),
-      onActivated: quietEvent(),
+      onRemoved: events.tabRemoved,
+      onUpdated: events.tabUpdated,
+      onActivated: events.tabActivated,
     },
-    webRequest: { onHeadersReceived: quietEvent() },
+    webRequest: { onHeadersReceived: events.headersReceived },
+    windows: { async getCurrent() { return { incognito: false }; } },
+    extension: { inIncognitoContext: false },
   };
   // Both browsers expose permissions.getAll(). Firefox's built-in consent adds
   // a `data_collection` array to the answer, and Mozilla documents the
@@ -292,8 +339,12 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       randomUUID: () => "123e4567-e89b-42d3-a456-" +
         String(confirmationTokenSequence++).padStart(12, "0"),
     },
-    setTimeout,
-    clearTimeout,
+    setTimeout: timers ? (callback, ms, ...args) => {
+      const id = ++timerId;
+      pendingTimers.set(id, { callback, ms, args });
+      return id;
+    } : setTimeout,
+    clearTimeout: timers ? (id) => pendingTimers.delete(id) : clearTimeout,
   });
   if (worker) {
     // A worker fetches every argument before evaluating any of them, so a
@@ -359,7 +410,8 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     store.data.settings = next;
   }
   return { calls, events, browserDownloads, store, context, badge, installedMenus,
-           setSettings, writeSettingsSilently, readSettings: () => storedSettings };
+           fireTimers, replaceDownloadRecord, setSettings, writeSettingsSilently,
+           readSettings: () => storedSettings };
 }
 
 async function settle() {
@@ -367,12 +419,1074 @@ async function settle() {
   await new Promise((resolve) => setImmediate(resolve));
 }
 
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+
+function popupSender() {
+  return { url: EXTENSION_ORIGIN + "popup/popup.html" };
+}
+
+function seedStream(loaded, tabId, url) {
+  loaded.events.headersReceived.emit({
+    tabId, url, responseHeaders: [{ name: "content-type", value: "application/vnd.apple.mpegurl" }],
+  });
+}
+
+const POPUP_STREAM_URL = "https://example.test/live.m3u8";
+const NORMAL_STREAM_TAB = Object.freeze({ id: 7, url: "https://example.test/watch", incognito: false });
+const STREAM_DECLINE = "Cove did not take this stream: its window could not be confirmed as a normal window.";
+
+// Explicit normal fixture; loadBackground's raw-returning mocks remain unchanged.
+function popupStreamFixture(options = {}, url = POPUP_STREAM_URL) {
+  const loaded = loadBackground({ tabsById: new Map([[7, NORMAL_STREAM_TAB]]), ...options });
+  seedStream(loaded, 7, url);
+  return loaded;
+}
+
+function popupStreamClick(loaded, sender = popupSender(), url = POPUP_STREAM_URL) {
+  return sendRuntimeMessage(loaded.events, { type: "downloadStream", url, filename: "live.mp4" }, sender);
+}
+
+async function popupStreamControl(deferredLookup = false) {
+  let nativeDownloads = 0;
+  const gate = deferred();
+  const loaded = popupStreamFixture({ timers: true, tabs: [NORMAL_STREAM_TAB],
+    tabsById: new Map([[7, deferredLookup ? gate.promise : NORMAL_STREAM_TAB]]), nativeHook: (msg) => {
+    if (msg.action === "download") nativeDownloads += 1;
+  } });
+  await settle();
+  loaded.calls.native.length = 0;
+  const result = popupStreamClick(loaded);
+  await settle();
+  gate.resolve(NORMAL_STREAM_TAB);
+  if (deferredLookup) await settle();
+  assert.equal(result.returned, true, "S11 PC: accepted popup keeps response channel open");
+  assert.equal(result.responses.length, 1, "S11 PC: accepted popup answers once");
+  assert.equal(result.responses[0].ok, true, "S11 PC: normal detected stream accepted");
+  assert.equal(nativeDownloads, 1, "S11 PC: native hook observes one handoff");
+  assert.equal(downloadsOf(loaded.calls).length, 1, "S11 PC: exactly one native download");
+  assert.equal(loaded.calls.permissionChecks.length, 1, "S11 PC: normal send checks user-agent permission once");
+  assert.equal(Object.hasOwn(downloadsOf(loaded.calls)[0], "cookies"), false);
+  assert.equal(typeof downloadsOf(loaded.calls)[0].userAgent, "string");
+  return loaded;
+}
+
+function popupStreamDeclined(loaded, result, id, url = POPUP_STREAM_URL) {
+  assert.equal(downloadsOf(loaded.calls).length, 0, `${id}: unverified stream never reaches native host`);
+  assert.equal(result.responses.length, 1, `${id}: decline answers exactly once`);
+  assert.deepEqual(plain(result.responses[0]), { ok: false, error: STREAM_DECLINE }, `${id}: fixed decline sentence`);
+  assert.equal(JSON.stringify(result.responses).includes(url), false, `${id}: decline contains no stream URL`);
+}
+
+test("S11 GUARD Firefox: normal popup, seeded stream and normal holder preserve native payload", async () => {
+  await popupStreamControl();
+});
+
+for (const suffix of ["X", ".evil", "/", "../popup.htm", "origin-lookalike", "?x=1", "#x"]) {
+  test(`S1c Firefox: popup URL boundary ${suffix}`, async () => {
+    const loaded = popupStreamFixture({ timers: true });
+    await settle();
+    const accepted = suffix === "?x=1" || suffix === "#x";
+    const url = suffix === "origin-lookalike" ? "chrome-extension://covetestextensionid.evil/popup/popup.html"
+      : EXTENSION_ORIGIN + (suffix === "../popup.htm" ? "popup/popup.htm" : "popup/popup.html" + suffix);
+    const result = popupStreamClick(loaded, { url });
+    await settle();
+    if (!accepted) popupStreamDeclined(loaded, result, "S1c");
+    else { assert.equal(result.responses.length, 1); assert.equal(result.responses[0].ok, true);
+      assert.equal(downloadsOf(loaded.calls).length, 1, "S1c: query/fragment preserves exact popup authority"); }
+  });
+}
+test("S9b Firefox: timeout during user-agent await declines once and prevents late send", async () => {
+  await popupStreamControl();
+  const gate = deferred(); let parked = false;
+  const loaded = popupStreamFixture({ timers: true, permissionsHook: async () => { parked = true; await gate.promise; } });
+  await settle();
+  const result = popupStreamClick(loaded);
+  await settle();
+  assert.equal(parked, true, "S9b: normal holder verification reached user-agent await");
+  assert.deepEqual(loaded.calls.tabsGet, [7]);
+  loaded.fireTimers(3000);
+  popupStreamDeclined(loaded, result, "S9b");
+  gate.resolve(); await settle();
+  popupStreamDeclined(loaded, result, "S9b");
+});
+
+for (const [id, label, sender] of [
+  ["S1", "content-script", { tab: NORMAL_STREAM_TAB, url: NORMAL_STREAM_TAB.url, frameId: 0 }],
+  ["S1", "missing-url", {}], ["S1", "tabless-page", { url: "https://example.test/page" }],
+  ["S1b", "options", { url: EXTENSION_ORIGIN + "options/options.html" }],
+  ["S1b", "confirmation", { url: EXTENSION_ORIGIN + "confirm-exclude.html" }],
+]) {
+  test(`${id} RED Firefox ${label}: only the exact popup page may request a stream`, async () => {
+    await popupStreamControl();
+    const loaded = popupStreamFixture({ timers: true });
+    await settle();
+    loaded.calls.native.length = 0;
+    const result = popupStreamClick(loaded, sender);
+    await settle();
+    popupStreamDeclined(loaded, result, id);
+    assert.deepEqual(loaded.calls.tabsGet, [], `${id}: invalid sender causes no tab lookup`);
+  });
+}
+
+for (const [id, label, holder] of [
+  ["S4", "private", Object.freeze({ id: 7, incognito: true })],
+  ["S5", "rejected", new Error("tab closed")],
+  ...[["missing", undefined], ["null", { value: null }], ["string-false", { value: "false" }],
+    ["throwing", { get() { throw new Error("privacy getter"); } }]]
+    .map(([label, descriptor]) => ["S7", label, () => e2Tab(descriptor)]),
+]) {
+  test(`${id} RED Firefox ${label}: holder must positively report normal privacy`, async () => {
+    await popupStreamControl();
+    const loaded = popupStreamFixture({ timers: true,
+      tabsById: new Map([[7, typeof holder === "function" ? holder() : holder]]) });
+    await settle();
+    loaded.calls.native.length = 0;
+    const result = popupStreamClick(loaded);
+    await settle();
+    popupStreamDeclined(loaded, result, id);
+  });
+}
+
+for (const id of ["S2", "S3", "S6", "S14"]) {
+  test(`${id} RED Firefox: stream membership and every actual holder are required`, async () => {
+    await popupStreamControl();
+    const activeTab = Object.freeze({ id: 9, incognito: false, url: "https://normal-active.test/" });
+    const tabMap = new Map([[7, id === "S14" ? { id: 7, incognito: true } : NORMAL_STREAM_TAB],
+      [8, { id: 8, incognito: true }], [9, activeTab]]);
+    const loaded = id === "S3" ? loadBackground({ timers: true, tabsById: tabMap })
+      : popupStreamFixture({ timers: true, tabsById: tabMap, tabs: [activeTab] });
+    if (id === "S6") seedStream(loaded, 8, POPUP_STREAM_URL);
+    await settle();
+    loaded.calls.native.length = 0;
+    const url = POPUP_STREAM_URL + (id === "S2" ? "?not-detected=1" : "");
+    const result = popupStreamClick(loaded, popupSender(), url);
+    await settle();
+    popupStreamDeclined(loaded, result, id, url);
+  });
+}
+
+for (const id of ["G3/S4", "S5b", "S8", "S9", "S12"]) {
+  test(`${id} RED Firefox: pending holder verification cannot authorize stale or late sends`, async () => {
+    await popupStreamControl(true);
+    const gate = deferred();
+    gate.promise.catch(() => {}); // Baseline never consumes tabs.get; a synthetic rejection must still be handled.
+    const loaded = popupStreamFixture({ timers: true, tabsById: new Map([
+      [7, gate.promise], [8, { id: 8, incognito: true }],
+    ]) });
+    await settle();
+    loaded.calls.native.length = 0;
+    const result = popupStreamClick(loaded);
+    await settle();
+    if (id === "S8") loaded.events.tabUpdated.emit(7, { url: "https://elsewhere.test/" });
+    if (id === "S12") seedStream(loaded, 8, POPUP_STREAM_URL);
+    if (id === "S9") loaded.fireTimers(3000);
+    await settle();
+    const beforeLateResult = downloadsOf(loaded.calls).length;
+    if (id === "S5b") gate.reject(new Error("closed during verification"));
+    else gate.resolve(id === "G3/S4" ? Object.freeze({ id: 7, incognito: true }) : NORMAL_STREAM_TAB);
+    await settle();
+    if (id === "S9") assert.equal(beforeLateResult, 0, "S9: timeout never authorizes native send");
+    popupStreamDeclined(loaded, result, id);
+    if (id === "S8" || id === "S12") assert.equal(loaded.calls.permissionChecks.length, 0,
+      `${id}: changed holder set declines before consulting user-agent permission`);
+  });
+}
+
+test("S13 RED Firefox: holder membership is rechecked after the final user-agent await", async () => {
+  await popupStreamControl();
+  let loaded;
+  loaded = popupStreamFixture({ timers: true, permissionsHook: async () => {
+    if (loaded) loaded.events.tabUpdated.emit(7, { url: "https://elsewhere.test/" });
+  } });
+  await settle();
+  loaded.calls.native.length = 0;
+  const result = popupStreamClick(loaded);
+  await settle();
+  popupStreamDeclined(loaded, result, "S13");
+});
+
+test("S10 GUARD Firefox: two normal popup clicks each send and answer once", async () => {
+  const loaded = await popupStreamControl();
+  const second = popupStreamClick(loaded);
+  await settle();
+  assert.equal(downloadsOf(loaded.calls).length, 2);
+  assert.deepEqual(plain(second.responses), [{ ok: true }]);
+});
+
+test("S10 RED Firefox: a second click reclassifies a holder that became private", async () => {
+  const tabsById = new Map([[7, NORMAL_STREAM_TAB]]);
+  const loaded = popupStreamFixture({ timers: true, tabsById });
+  await settle();
+  loaded.calls.native.length = 0;
+  const first = popupStreamClick(loaded);
+  await settle();
+  assert.deepEqual(plain(first.responses), [{ ok: true }], "S10 PC: first normal click succeeds");
+  assert.equal(downloadsOf(loaded.calls).length, 1, "S10 PC: normal click sends once");
+  tabsById.set(7, Object.freeze({ id: 7, incognito: true }));
+  const second = popupStreamClick(loaded);
+  await settle();
+  assert.equal(downloadsOf(loaded.calls).length, 1, "S10: later private holder cannot reuse prior approval");
+  assert.equal(loaded.calls.tabsGet.length, 2, "S10: each click verifies independently");
+  assert.deepEqual(plain(second.responses), [{ ok: false, error: STREAM_DECLINE }]);
+});
+
+test("S10 RED Firefox: concurrent clicks both decline a private holder", async () => {
+  await popupStreamControl();
+  const loaded = popupStreamFixture({ timers: true, tabsById: new Map([[7, { id: 7, incognito: true }]]) });
+  await settle();
+  loaded.calls.native.length = 0;
+  const clicks = [popupStreamClick(loaded), popupStreamClick(loaded)];
+  await settle();
+  for (const result of clicks) popupStreamDeclined(loaded, result, "S10");
+});
+
+// Only the privacy field varies; no emit-time defaults or coercion.
+function unknownItem(descriptor, overrides = {}) {
+  const item = freshItem(overrides);
+  delete item.incognito;
+  if (descriptor) Object.defineProperty(item, "incognito", {
+    enumerable: true, configurable: true, ...descriptor,
+  });
+  return item;
+}
+
+const E2_DOC_ROWS = [
+  ["E2-P1","PRIVACY.md","  when you do not. On Chrome the user-agent is always included.\n","  when you do not. On Chrome the user-agent is always included.\n- A download that the browser reports as private or incognito is left to the\n  browser and is not handed to Cove; see Private and incognito windows below.\n"],
+  ["E2-P2","PRIVACY.md","This version of the extension does not read or store\nbrowser cookie values.\n\n## What is passed to the Cove desktop app","This version of the extension does not read or store\nbrowser cookie values.\n\n### Private and incognito windows\n\nThe extension does not hand a download to Cove when the browser reports it as\nprivate (Firefox) or incognito (Chrome). It relies on the browser's own report\nof whether a download is private. If the browser reports that a download is\nprivate, or does not say, the extension leaves the download to the browser: it\ndoes not send its address to Cove, does not cancel it, does not erase it from\nthe browser's list and does not start a copy of it. The in-page button is not\noffered in tabs the browser reports as private, and the right-click entry and\nthe Firefox popup's stream button send nothing from them.\n\nWhether the extension runs in private windows at all is your browser's setting\n(Firefox: Run in Private Windows; Chrome: Allow in Incognito). Extension builds\nfrom before this change do not apply this rule and can still hand over private\ndownloads that the browser shows them, and this change does not remove anything\nsuch a build already handed to Cove. This covers what the extension hands to\nCove. It does not hide private browsing from your browser, from websites or from\nother extensions, and a download you add in the Cove app yourself is not\naffected.\n\n## What is passed to the Cove desktop app"],
+  ["E2-P3","PRIVACY.md","accepted, and fall back to a browser download when Cove is unavailable.","accepted, and fall back to a browser download when Cove is unavailable.\n  Downloads the browser reports as private are not handed to Cove."],
+  ["E2-R1","README.md","no longer restores them into download tasks.\n\n### Settings","no longer restores them into download tasks.\n\nDownloads that your browser reports as private (Firefox) or incognito (Chrome) are\nnot taken over by the extension: your browser keeps them, and the in-page button\nis not offered in those tabs.\n\n### Settings\n"],
+  ["E2-C1","docs/chrome-store-listing.md","may not download in Cove\n\n","may not download in Cove\n\n• Downloads that the browser reports as incognito are left to the browser; Cove does not take them over\n\n"],
+  ["E2-C2","docs/chrome-store-listing.md","| Referrer and user-agent are passed on; cookies are not read or sent | `extension/background.js` native payload; `cove/single_instance.py` | `tests/extension_background.test.js` |\n","| Referrer and user-agent are passed on; cookies are not read or sent | `extension/background.js` native payload; `cove/single_instance.py` | `tests/extension_background.test.js` |\n| Downloads the browser reports as incognito are left to the browser | `extension/background.js` `handleCreated`, `pillIdentityAllowed`, context-menu handler | `tests/extension_background.test.js`; manual proof pending |\n"],
+  ["E2-F1","docs/firefox-store-listing.md","browser cookies are not sent\n\n","browser cookies are not sent\n\n• Downloads from private windows that Firefox reports as private are left to the browser; Cove does not take them over\n\n"],
+  ["E2-F2","docs/firefox-store-listing.md","`extension/background.js` native payload (`url`, `referrer`, `filename`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |\n","`extension/background.js` native payload (`url`, `referrer`, `filename`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |\n| downloads Firefox reports as private are left to the browser | `extension/background.js` `handleCreated`, `pillIdentityAllowed`, context-menu handler; `extension/media-sites.js` `downloadStream`; `tests/extension_background.test.js`; manual proof pending |\n"],
+];
+
+const PRIVATE_URL_SENTINEL = "https://private.s08e.test/synth-9c41/file.zip";
+const PRIVATE_TAB_TITLE = "S08E2 private tab title 9c41";
+const E2_CONTEXTS = [
+  ["private", { value: true }], ["missing", undefined], ["undefined", { value: undefined }],
+  ...[["null", null], ["zero", 0], ["one", 1], ["string-false", "false"], ["string-true", "true"],
+    ["object", {}], ["array", []], ["NaN", NaN]].map(([label, value]) => [label, { value }]),
+  ["throwing", { get() { throw new Error("synthetic privacy getter"); } }],
+];
+
+async function e2Created(worker, item, direct = false) {
+  const loaded = loadBackground({ worker, timers: true, downloadState: [item] });
+  await settle();
+  loaded.calls.native.length = 0;
+  loaded.calls.order.length = 0;
+  loaded.context.e2Item = item;
+  evalIn(loaded.context, `globalThis.e2EnsureCalls = 0;
+    const e2OriginalEnsure = ensureSettings;
+    ensureSettings = () => { e2EnsureCalls += 1; return e2OriginalEnsure(); };`);
+  if (direct) await evalIn(loaded.context, "interceptDownload(e2Item)");
+  else loaded.events.downloadCreated.emit(item);
+  await settle();
+  return loaded;
+}
+
+function e2NormalCreated(loaded, id) {
+  assert.equal(downloadsOf(loaded.calls).length, 1, `${id} PC: normal download reaches Cove`);
+  assert.deepEqual(loaded.calls.order.slice(0, 4), ["native:sent", "native:ok", "cancel", "erase"],
+    `${id} PC: acknowledgement precedes cancel and erase`);
+}
+
+for (const worker of [false, true]) {
+  const mode = worker ? "Chrome" : "Firefox";
+  for (const [id, oracle] of [
+    ["E1", (l) => assert.equal(downloadsOf(l.calls).length, 0, "E1: no private native handoff")],
+    ["E2-cancel", (l) => assert.equal(l.calls.cancel.length, 0, "E2: no private cancellation")],
+    ["E2-erase", (l) => assert.equal(l.calls.erase.length, 0, "E2: no private erasure")],
+    ["E2-state", async (l) => assert.equal((await l.context.browser.downloads.search({ id: 90 }))[0]?.state,
+      "in_progress", "E2: browser copy remains running")],
+    ["E3/N6", (l) => assert.equal(JSON.stringify(l.calls.console).includes(PRIVATE_URL_SENTINEL), false,
+      "E3: private URL absent from console")],
+    ["G1", (l) => assert.deepEqual(l.calls.order, [], "G1: private event has no handoff side effects")],
+    ["G4", (l) => assert.equal(evalIn(l.context, "interceptedIds.size"), 0, "G4: private id is not tracked")],
+    ["G6", (l) => assert.equal((l.store.data._interceptedIds || []).includes(90), false,
+      "G6: private id is not persisted")],
+    ["E1-mark", (l) => assert.equal(evalIn(l.context,
+      `wasRecentlyIntercepted(${JSON.stringify(PRIVATE_URL_SENTINEL)})`), false,
+    "E1: private URL is not marked intercepted")],
+  ]) {
+    test(`${id} RED ${mode}: private created item is left to the browser`, async () => {
+      const declined = await e2Created(worker, unknownItem({ value: true }, { url: PRIVATE_URL_SENTINEL }));
+      await oracle(declined);
+      assert.deepEqual(declined.browserDownloads, [], `${id}: no browser fallback`);
+      declined.fireTimers(1000);
+      await settle();
+      assert.equal(JSON.stringify(declined.store.data.coveDiag || {}).includes(PRIVATE_URL_SENTINEL), false,
+        `${id}: private URL absent from stored diagnostics`);
+      e2NormalCreated(await e2Created(worker, freshItem({ url: PRIVATE_URL_SENTINEL })), id);
+    });
+  }
+  for (const [label, descriptor] of E2_CONTEXTS) {
+    for (const id of ["F1", "G2", "G5"]) {
+      test(`${id} RED ${mode} ${label}: only explicit normal privacy proceeds`, async () => {
+        const direct = id === "G5";
+        const item = Object.freeze(unknownItem(descriptor));
+        assert.equal(Object.hasOwn(item, "incognito"), label !== "missing", "raw missing key stays absent");
+        const declined = await e2Created(worker, item, direct);
+        if (id === "G2") assert.equal(declined.context.e2EnsureCalls, 0, "G2: classification precedes ensureSettings");
+        else assert.equal(downloadsOf(declined.calls).length, 0, `${id}: non-normal item never reaches native host`);
+        assert.deepEqual(declined.calls.cancel, [], `${id}: no cancellation`);
+        assert.deepEqual(declined.calls.erase, [], `${id}: no erasure`);
+        assert.equal(evalIn(declined.context, "interceptedIds.size"), 0, `${id}: no tracking`);
+        const normal = await e2Created(worker, freshItem(), direct);
+        e2NormalCreated(normal, id);
+        if (id === "G2") assert.equal(normal.context.e2EnsureCalls, 1, "G2 PC: normal calls ensureSettings once");
+      });
+    }
+  }
+  test(`H5 GUARD ${mode}: rejected and malformed acknowledgements leave normal download running`, async () => {
+    e2NormalCreated(await e2Created(worker, freshItem()), "H5");
+    for (const nativeResult of [null, {}, { status: "error" }, () => Promise.reject(new Error("timeout"))]) {
+      const item = freshItem();
+      const loaded = loadBackground({ worker, timers: true, nativeResult, downloadState: [item] });
+      await settle();
+      loaded.events.downloadCreated.emit(item);
+      await settle();
+      assert.deepEqual(loaded.calls.cancel, []);
+      assert.deepEqual(loaded.calls.erase, []);
+      assert.equal((await loaded.context.browser.downloads.search({ id: item.id }))[0].state, "in_progress");
+    }
+  });
+}
+
+async function e2Menu(worker, tab, fail = false, url = PRIVATE_URL_SENTINEL) {
+  const loaded = loadBackground({ worker, timers: true, nativeResult: fail ? null : { status: "ok" } });
+  await settle();
+  loaded.calls.native.length = 0;
+  await Promise.all(loaded.events.contextMenuClicked.emit(
+    { menuItemId: "download-with-cove", linkUrl: url }, tab));
+  await settle();
+  return loaded;
+}
+
+function e2Tab(descriptor) {
+  const item = unknownItem(descriptor, { id: 7, url: "https://example.test/watch", title: PRIVATE_TAB_TITLE });
+  return Object.freeze(item);
+}
+
+for (const worker of [false, true]) {
+  const mode = worker ? "Chrome" : "Firefox";
+  const normalTab = { id: 7, url: "https://example.test/watch", incognito: false, title: "Normal control" };
+  for (const [label, descriptor] of [...E2_CONTEXTS, ["no-tab", undefined]]) {
+    test(`F2/K1/L1 RED ${mode} ${label}: context menu declines without handoff`, async () => {
+      const normal = await e2Menu(worker, normalTab);
+      assert.equal(downloadsOf(normal.calls).length, 1, "F2 PC: normal menu sends");
+      const declined = await e2Menu(worker, label === "no-tab" ? undefined : e2Tab(descriptor));
+      assert.equal(downloadsOf(declined.calls).length, 0, "F2: non-normal menu never sends");
+      assert.deepEqual(declined.browserDownloads, []);
+      assert.equal(declined.calls.notifications.length, 1, "F2: one decline notification");
+      const notice = JSON.stringify(declined.calls.notifications[0]);
+      assert.equal(notice.includes(PRIVATE_URL_SENTINEL) || notice.includes(PRIVATE_TAB_TITLE), false,
+        "F2: decline notification contains neither URL nor tab title");
+    });
+  }
+  test(`E3m/N6 RED ${mode}: declined menu never logs a private URL`, async () => {
+    const normal = await e2Menu(worker, normalTab);
+    assert.equal(JSON.stringify(normal.calls.console).includes(PRIVATE_URL_SENTINEL), true, "E3m PC: normal logs target");
+    const declined = await e2Menu(worker, e2Tab({ value: true }));
+    assert.equal(JSON.stringify(declined.calls.console).includes(PRIVATE_URL_SENTINEL), false,
+      "E3m: declined menu URL absent from console");
+  });
+  test(`H3 GUARD ${mode}: normal menu retains browser fallback`, async () => {
+    assert.equal((await e2Menu(worker, normalTab, true)).browserDownloads.length, 1);
+  });
+  for (const [label, descriptor] of E2_CONTEXTS) {
+    test(`H4 RED ${mode} ${label}: declined menu cannot fall back into browser history`, async () => {
+      assert.equal((await e2Menu(worker, normalTab, true)).browserDownloads.length, 1, "H4 PC: normal falls back");
+      const declined = await e2Menu(worker, e2Tab(descriptor), true);
+      assert.equal(declined.browserDownloads.length, 0, "H4: non-normal menu never starts browser copy");
+      assert.equal(evalIn(declined.context, `wasRecentlyIntercepted(${JSON.stringify(PRIVATE_URL_SENTINEL)})`), false);
+    });
+  }
+  test(`F2-notice RED ${mode}: decline notification is constant and non-sensitive`, async () => {
+    assert.equal(downloadsOf((await e2Menu(worker, normalTab)).calls).length, 1, "F2 PC: normal menu sends");
+    const first = await e2Menu(worker, e2Tab({ value: true }));
+    const second = await e2Menu(worker, e2Tab({ value: true }), false, "https://private.s08e.test/other-secret.zip");
+    assert.equal(first.calls.notifications.length, 1);
+    assert.equal(JSON.stringify(first.calls.notifications), JSON.stringify(second.calls.notifications),
+      "F2: decline notification is constant");
+    assert.equal(JSON.stringify(first.calls.notifications).includes(PRIVATE_URL_SENTINEL), false);
+    assert.equal(JSON.stringify(first.calls.notifications).includes(PRIVATE_TAB_TITLE), false);
+  });
+  for (const [label, descriptor] of E2_CONTEXTS) {
+    for (const route of ["permission", "download", "direct", "exclude"]) {
+      const id = { permission: "PM1/F3b", download: "PM2", direct: "G5p", exclude: "PM5" }[route];
+      test(`${id} RED ${mode} ${label}: non-normal pill route declines`, async () => {
+        async function run(tab) {
+          const loaded = loadBackground({ worker, timers: true });
+          await settle();
+          loaded.calls.native.length = 0;
+          const sender = Object.freeze({ tab, url: tab.url, frameId: 0 });
+          let reply;
+          if (route === "permission") reply = await pillPermission(loaded.events, tab.url, sender);
+          else if (route === "exclude") ({ reply } = await requestExclude(loaded.events, sender, "example.test"));
+          else if (route === "download") reply = await pillDownload(loaded.events, { url: PRIVATE_URL_SENTINEL }, sender);
+          else {
+            loaded.context.e2Sender = sender;
+            loaded.context.e2Message = { type: "downloadMedia", url: PRIVATE_URL_SENTINEL };
+            loaded.context.e2Reply = (value) => { reply = value; };
+            evalIn(loaded.context, "CoveMedia.handleMessage(e2Message, e2Sender, e2Reply)");
+            await settle();
+          }
+          return { ...loaded, reply };
+        }
+        const normal = await run(normalTab);
+        assert.equal(route === "permission" ? normal.reply.pillAllowed : normal.reply.ok, true, `${id} PC: normal route allowed`);
+        if (route === "download" || route === "direct") assert.equal(downloadsOf(normal.calls).length, 1, `${id} PC: normal sends`);
+        if (route === "exclude") assert.equal(normal.calls.tabsCreated.length, 1, "PM5 PC: normal opens confirmation");
+        const declined = await run(e2Tab(descriptor));
+        assert.equal(route === "permission" ? declined.reply.pillAllowed : declined.reply.ok, false,
+          `${id}: non-normal pill route is refused`);
+        if (route !== "permission") assert.equal(declined.reply.reason, "unsupported");
+        assert.equal(downloadsOf(declined.calls).length, 0);
+        assert.equal(evalIn(declined.context, "interceptClaims.size"), 0);
+        assert.equal(declined.calls.tabsCreated.length, 0);
+        assert.equal(declined.calls.settingsWrites.length, 0);
+      });
+    }
+  }
+  test(`F3 GUARD ${mode}: absent sender.tab refuses pill permission`, async () => {
+    const loaded = loadBackground({ worker, timers: true });
+    const reply = await pillPermission(loaded.events, null, { url: "https://example.test/watch" });
+    assert.equal(reply.pillAllowed, false);
+  });
+}
+
+async function ownSession(worker, options = {}) {
+  const item = freshItem();
+  const loaded = loadBackground({ worker, timers: true, downloadState: [item], ...options });
+  await settle();
+  loaded.calls.native.length = 0;
+  loaded.events.downloadCreated.emit(item);
+  await settle();
+  assert.equal(downloadsOf(loaded.calls).length, 1, "OWN PC: normal item is acknowledged by Cove");
+  assert.deepEqual(loaded.calls.cancel, [item.id], "OWN PC: acknowledged normal item is cancelled");
+  assert.equal(loaded.calls.eraseAttempts.length, 1, "OWN PC: takeover erase is attempted once");
+  assert.equal(loaded.calls.erase.length, options.eraseFailures ? 0 : 1, "OWN PC: takeover erase outcome observed");
+  return { ...loaded, item, takeoverErases: loaded.calls.erase.length };
+}
+
+async function ownTerminal(loaded, count = 1) {
+  const pending = Array.from({ length: count }, () => loaded.events.downloadChanged.emit(
+    { id: loaded.item.id, state: { current: "interrupted" } })).flat();
+  await Promise.all(pending);
+  await settle();
+}
+
+const ownNormalRecord = (item) => ({ ...item, incognito: false, state: "interrupted" });
+
+for (const worker of [false, true]) {
+  const mode = worker ? "Chrome" : "Firefox";
+  test(`OWN-18 ${mode}: bookkeeping without ownership never authorizes a terminal cleanup`, async () => {
+    const owned = await ownSession(worker);
+    owned.replaceDownloadRecord(owned.item.id, ownNormalRecord(owned.item));
+    await ownTerminal(owned);
+    assert.equal(owned.calls.erase.length - owned.takeoverErases, 1, "OWN-18 PC: matching owned record permits one cleanup");
+    const item = ownNormalRecord(freshItem());
+    const loaded = loadBackground({ worker, timers: true, downloadState: [item] });
+    await settle(); evalIn(loaded.context, "interceptedIds.add(90)");
+    assert.equal(evalIn(loaded.context, "ownedDownloads.has(90)"), false);
+    await ownTerminal({ ...loaded, item });
+    assert.deepEqual(loaded.calls.searches, []); assert.deepEqual(loaded.calls.erase, []);
+    assert.deepEqual(loaded.calls.cancel, []); assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+    assert.deepEqual(plain(loaded.store.data._interceptedIds), []);
+  });
+  for (const [label, field, value, equal] of [
+    ["missing-time", "startTime", undefined, false], ["null-time", "startTime", null, false],
+    ["number-time", "startTime", 0, false], ["equal-number-time", "startTime", 0, true],
+    ["empty-time", "startTime", "", true], ["empty-url", "url", "", true],
+  ]) {
+    test(`OWN-IDENTITY RED ${mode} ${label}: unusable acknowledged identity cannot authorize cleanup`, async () => {
+      const item = freshItem({ [field]: value });
+      if (label === "missing-time") delete item.startTime;
+      const loaded = loadBackground({ worker, timers: true, downloadState: [item] });
+      await settle(); loaded.events.downloadCreated.emit(item); await settle();
+      assert.equal(downloadsOf(loaded.calls).length, 1, "real intercept is acknowledged");
+      assert.deepEqual(loaded.calls.cancel, [item.id]);
+      assert.equal(loaded.calls.erase.length, 1, "takeover erase remains permitted and is counted separately");
+      const record = ownNormalRecord(item);
+      if (!equal) record.startTime = "2099-01-01T00:00:00Z";
+      loaded.replaceDownloadRecord(item.id, record);
+      await ownTerminal({ ...loaded, item });
+      assert.equal(loaded.calls.eraseAttempts.length, 1, "unusable ownership identity prevents cleanup erase");
+      assert.equal(loaded.calls.erase.length, 1);
+      assert.equal(loaded.calls.searches.length, 1);
+      assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+      assert.deepEqual(plain(loaded.store.data._interceptedIds), []);
+    });
+  }
+  for (const label of ["normal", "private", "missing", "null", "throwing", "url", "startTime", "empty", "rejected", "in_progress", "erase-failed"]) {
+    test(`OWN-PRUNE ${mode} ${label}: acknowledged ownership racing hydration is revalidated`, async () => {
+      const hydrationGate = deferred(), item = freshItem();
+      const loaded = loadBackground({ worker, timers: true, hydrationGate, storedIntercepted: [901, 902],
+        downloadState: [item, { id: 901, incognito: false }, { id: 902, incognito: true }],
+        eraseFailures: label === "erase-failed" ? 1 : 0,
+        searchHook: async () => { if (label === "rejected") throw new Error("lookup failed"); } });
+      await settle(); loaded.events.downloadCreated.emit(item); await settle();
+      assert.equal(evalIn(loaded.context, "ownedDownloads.has(90)"), true, "ack precedes hydration");
+      assert.equal(loaded.calls.eraseAttempts.length, 0, "takeover erase is still parked");
+      let record = ownNormalRecord(item);
+      if (label === "private") record.incognito = true;
+      if (label === "missing") delete record.incognito;
+      if (label === "null") record.incognito = null;
+      if (label === "throwing") Object.defineProperty(record, "incognito", { get() { throw new Error("privacy getter"); } });
+      if (label === "url") record.url += "?different";
+      if (label === "startTime") record.startTime = "2000-01-01T00:00:00Z";
+      if (label === "in_progress") record.state = "in_progress";
+      loaded.replaceDownloadRecord(item.id, label === "empty" ? undefined : record);
+      hydrationGate.resolve(); await evalIn(loaded.context, "interceptedIdsReady"); await settle();
+      const retained = ["rejected", "in_progress", "erase-failed"].includes(label);
+      assert.deepEqual(plain(loaded.calls.searches), [{ id: item.id }], "inherited extras are never searched");
+      assert.deepEqual(loaded.calls.cancel, [item.id], "one takeover cancellation");
+      assert.equal(loaded.calls.eraseAttempts.length, ["normal", "erase-failed"].includes(label) ? 2 : 1);
+      assert.equal(loaded.calls.erase.length, label === "normal" ? 2 : 1, "count takeover separately from prune");
+      assert.ok(loaded.calls.eraseAttempts.every(q => q.id === item.id), "inherited extras are never erased");
+      assert.equal(evalIn(loaded.context, "interceptedIds.has(90)"), retained);
+      assert.deepEqual(plain(loaded.store.data._interceptedIds), retained ? [item.id] : []);
+    });
+  }
+  test(`HC-HYDRATION GUARD ${mode}: hydration gate parks readiness until explicitly released`, async () => {
+    const hydrationGate = deferred();
+    const loaded = loadBackground({ worker, timers: true, hydrationGate, storedIntercepted: [901] });
+    let ready = false;
+    const readiness = evalIn(loaded.context, "interceptedIdsReady").then(() => { ready = true; });
+    await settle();
+    assert.equal(ready, false);
+    assert.deepEqual(plain(loaded.store.data._interceptedIds), [901]);
+    hydrationGate.resolve();
+    await readiness;
+    await settle();
+    assert.equal(ready, true);
+    assert.deepEqual(plain(loaded.store.data._interceptedIds), []);
+  });
+  test(`OWN-PRUNE-REVOKE ${mode}: onErased during owned startup lookup prevents cleanup erase`, async () => {
+    for (const revoked of [false, true]) {
+      const hydrationGate = deferred(), lookupGate = deferred(), item = freshItem();
+      const record = ownNormalRecord(item);
+      const loaded = loadBackground({ worker, timers: true, hydrationGate, storedIntercepted: [901],
+        searchHook: async () => { await lookupGate.promise; }, downloadSearch: () => [record] });
+      await settle();
+      loaded.events.downloadCreated.emit(item);
+      await settle();
+      assert.equal(evalIn(loaded.context, "ownedDownloads.has(90)"), true, "real acknowledgement establishes ownership");
+      assert.equal(loaded.calls.cancel.length, 0, "takeover waits for hydration readiness");
+      hydrationGate.resolve();
+      await settle();
+      assert.deepEqual(plain(loaded.calls.searches), [{ id: item.id }], "only the owned id is searched");
+      const erased = revoked ? loaded.events.downloadErased.emit(item.id) : [];
+      // The in-flight browser lookup may still return its earlier normal record after onErased.
+      lookupGate.resolve();
+      await Promise.all(erased);
+      await evalIn(loaded.context, "interceptedIdsReady");
+      await settle();
+      assert.deepEqual(loaded.calls.cancel, [item.id], "one acknowledged takeover completes");
+      assert.equal(loaded.calls.erase.length, revoked ? 1 : 2,
+        revoked ? "revoked ownership prevents prune erase; only takeover erase remains" : "positive control: one prune erase plus one takeover erase");
+      assert.deepEqual(plain(loaded.store.data._interceptedIds), []);
+      assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+    }
+  });
+}
+
+const OWN_RECORD_CASES = [
+  ...E2_CONTEXTS.map(([label, descriptor]) => ({ label,
+    id: label === "private" ? "IID-C2" : ["missing", "undefined"].includes(label) ? "IID-C3"
+      : label === "null" ? "IID-C4" : "IID-C5",
+    record: (item) => unknownItem(descriptor, { ...item, state: "interrupted" }) })),
+  { label: "no-record", id: "OWN-8/IID-C6", record: () => undefined },
+  { label: "rejected", id: "OWN-9/IID-C7", record: ownNormalRecord, rejected: true },
+  { label: "different-id", id: "IID-C8", record: (item) => ({ ...ownNormalRecord(item), id: item.id + 1 }) },
+  { label: "different-url", id: "OWN-7b", record: (item) => ({ ...ownNormalRecord(item), url: "https://unrelated.test/file.zip" }) },
+  { label: "different-startTime", id: "OWN-7b", record: (item) => ({ ...ownNormalRecord(item), startTime: "2000-01-01T00:00:00Z" }) },
+];
+
+for (const worker of [false, true]) {
+  const mode = worker ? "Chrome" : "Firefox";
+  test(`HC-OWN GUARD ${mode}: erase failures, search hooks and raw replacements are controllable`, async () => {
+    const item = Object.freeze(freshItem());
+    const gate = deferred();
+    let failSearch = false;
+    const loaded = loadBackground({ worker, timers: true, downloadState: [item], eraseFailures: 1,
+      searchHook: async () => { await gate.promise; if (failSearch) throw new Error("lookup failed"); } });
+    await settle();
+    const downloads = loaded.context.browser.downloads;
+    let finished = false;
+    const lookup = downloads.search({ id: item.id }).then((rows) => { finished = true; return rows; });
+    await settle();
+    assert.equal(finished, false);
+    const replacement = Object.freeze(unknownItem({ get() { throw new Error("privacy getter"); } }, item));
+    loaded.replaceDownloadRecord(item.id, replacement);
+    gate.resolve();
+    assert.strictEqual((await lookup)[0], replacement);
+    await assert.rejects(downloads.erase({ id: item.id }), /erase failed/);
+    assert.strictEqual((await downloads.search({ id: item.id }))[0], replacement);
+    await downloads.erase({ id: item.id });
+    assert.deepEqual(await downloads.search({ id: item.id }), []);
+    failSearch = true;
+    await assert.rejects(downloads.search({ id: item.id }), /lookup failed/);
+    assert.equal(loaded.calls.eraseAttempts.length, 2);
+    assert.equal(loaded.calls.erase.length, 1);
+    assert.equal(item.state, "in_progress");
+  });
+  for (const [id, eraseFailures] of [["OWN-1", 0], ["OWN-1", 1], ["OWN-16", 0]]) {
+    test(`${id} GUARD ${mode} takeover-failures-${eraseFailures}: real normal acknowledgement permits terminal cleanup`, async () => {
+      const loaded = await ownSession(worker, { eraseFailures });
+      assert.equal(loaded.takeoverErases, eraseFailures ? 0 : 1, `${id}: takeover erase counted separately`);
+      if (!eraseFailures) loaded.replaceDownloadRecord(loaded.item.id, ownNormalRecord(loaded.item));
+      await ownTerminal(loaded);
+      assert.equal(loaded.calls.erase.length - loaded.takeoverErases, 1);
+      assert.equal(loaded.calls.cancel.length, 1);
+      assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+    });
+  }
+  for (const [label, descriptor] of E2_CONTEXTS) {
+    const id = label === "private" ? "OWN-2" : "OWN-3";
+    test(`${id} RED ${mode} ${label}: declined creation establishes no takeover`, async () => {
+      await ownSession(worker);
+      const loaded = await e2Created(worker, Object.freeze(unknownItem(descriptor)));
+      assert.equal(downloadsOf(loaded.calls).length, 0, `${id}: no non-normal native handoff`);
+      assert.deepEqual(loaded.calls.cancel, []);
+      assert.deepEqual(loaded.calls.erase, []);
+      assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+    });
+  }
+  for (const row of OWN_RECORD_CASES) {
+    test(`${row.id} RED ${mode} ${row.label}: owned cleanup requires matching normal browser evidence`, async () => {
+      let rejectLookup = false;
+      const loaded = await ownSession(worker, { searchHook: async () => {
+        if (rejectLookup) throw new Error("lookup failed");
+      } });
+      loaded.replaceDownloadRecord(loaded.item.id, row.record(loaded.item));
+      rejectLookup = !!row.rejected;
+      await ownTerminal(loaded);
+      assert.equal(loaded.calls.erase.length - loaded.takeoverErases, 0, `${row.id}: unsafe cleanup never erases`);
+      assert.equal(evalIn(loaded.context, "interceptedIds.has(90)"), !!row.rejected, `${row.id}: lookup-failure retention`);
+      assert.equal((loaded.store.data._interceptedIds || []).includes(90), !!row.rejected);
+    });
+  }
+  const inheritedRows = [...OWN_RECORD_CASES,
+    { label: "terminal-normal", record: ownNormalRecord },
+    { label: "in-progress", record: (item) => ({ ...item, incognito: false }) }];
+  for (const row of inheritedRows) {
+    const id = row.label === "private" ? "OWN-4" : row.label === "terminal-normal" ? "OWN-6"
+      : row.label === "different-url" ? "OWN-7a" : E2_CONTEXTS.some(([label]) => label === row.label) ? "OWN-5" : "OWN-12";
+    test(`${id === "OWN-12" ? id : id + "/OWN-12"}/IID-S RED ${mode} ${row.label}: inherited bookkeeping authorizes no lookup or destruction`, async () => {
+      await ownSession(worker);
+      const item = freshItem();
+      const loaded = loadBackground({ worker, timers: true, storedIntercepted: [item.id], downloadState: [],
+        searchHook: row.rejected ? async () => { throw new Error("lookup failed"); } : null });
+      loaded.replaceDownloadRecord(item.id, row.record(item));
+      await settle();
+      assert.equal(loaded.calls.searches.length, 0, "IID-S: inherited ids are never searched");
+      assert.deepEqual(loaded.calls.cancel, []);
+      assert.deepEqual(loaded.calls.erase, []);
+      assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+      assert.deepEqual(Array.from(loaded.store.data._interceptedIds), []);
+    });
+  }
+  for (const failure of [false, true]) {
+    const id = failure ? "OWN-11/IID-X-substitute" : "OWN-10/IID-C-dup";
+    test(`${id} RED ${mode}: concurrent terminal events share one lookup outcome`, async () => {
+      const gate = deferred();
+      const loaded = await ownSession(worker, { searchHook: async () => {
+        await gate.promise; if (failure) throw new Error("lookup failed");
+      } });
+      loaded.replaceDownloadRecord(loaded.item.id, ownNormalRecord(loaded.item));
+      const completion = ownTerminal(loaded, 2);
+      await settle();
+      gate.resolve();
+      await completion;
+      assert.equal(loaded.calls.erase.length - loaded.takeoverErases, failure ? 0 : 1,
+        `${id}: concurrent cleanup erases at most once and never after lookup failure`);
+      assert.equal(loaded.calls.searches.length, 1, `${id}: one shared in-flight lookup`);
+      assert.equal(evalIn(loaded.context, "interceptedIds.has(90)"), failure);
+    });
+  }
+  // onChanged awaits interceptedIdsReady: initial startup pruning and that event cannot overlap (IID-X).
+  test(`OWN-13 RED ${mode}: terminal event for a storage-only id cannot erase or search`, async () => {
+    await ownSession(worker);
+    const item = freshItem();
+    const loaded = loadBackground({ worker, timers: true, storedIntercepted: [item.id], downloadState: [item] });
+    await settle();
+    loaded.calls.searches.length = 0;
+    await ownTerminal({ ...loaded, item });
+    assert.equal(loaded.calls.erase.length, 0, "OWN-13: storage-only terminal event never erases");
+    assert.equal(loaded.calls.searches.length, 0);
+  });
+  test(`OWN-14 RED ${mode}: hydrated ids never become current-session ownership`, async () => {
+    await ownSession(worker);
+    const item = ownNormalRecord(freshItem());
+    const loaded = loadBackground({ worker, timers: true, storedIntercepted: [item.id], downloadState: [item] });
+    await settle();
+    assert.equal(loaded.calls.searches.length, 0, "OWN-14: inherited ids never trigger a browser lookup");
+    assert.equal(evalIn(loaded.context, 'typeof ownedDownloads !== "undefined" && ownedDownloads.has(90)'), false,
+      "OWN-14: hydration never promotes ownership");
+    await ownTerminal({ ...loaded, item });
+    assert.equal(loaded.calls.erase.length, 0, "OWN-14: later normal record cannot authorize inherited erase");
+  });
+  for (const [label, nativeResult] of [["non-ok", { status: "error" }], ["null", null], ["malformed", {}],
+    ["rejected", () => Promise.reject(new Error("rejected"))], ["timeout", () => Promise.reject(new Error("native timeout"))]]) {
+    test(`OWN-15 GUARD ${mode} ${label}: failed native acknowledgement establishes no ownership`, async () => {
+      await ownSession(worker);
+      const item = freshItem();
+      const loaded = loadBackground({ worker, timers: true, nativeResult, downloadState: [item] });
+      await settle();
+      loaded.events.downloadCreated.emit(item);
+      await settle();
+      await ownTerminal({ ...loaded, item });
+      assert.equal(evalIn(loaded.context, 'typeof ownedDownloads !== "undefined" && ownedDownloads.has(90)'), false);
+      assert.equal(evalIn(loaded.context, "interceptedIds.size"), 0);
+      assert.deepEqual(loaded.calls.cancel, []);
+      assert.deepEqual(loaded.calls.erase, []);
+    });
+  }
+  test(`OWN-17 RED ${mode}: inherited bookkeeping is forgotten and persisted separately`, async () => {
+    await ownSession(worker);
+    const item = freshItem();
+    const loaded = loadBackground({ worker, timers: true, storedIntercepted: [item.id], downloadState: [item] });
+    await settle();
+    assert.deepEqual(Array.from(loaded.store.data._interceptedIds), [], "OWN-17: persist forgotten inherited ids");
+    assert.deepEqual(loaded.calls.cancel, []);
+    assert.deepEqual(loaded.calls.erase, []);
+  });
+  test(`IID-C-revoked RED ${mode}: erase event revokes ownership during a pending lookup`, async () => {
+    const gate = deferred();
+    const loaded = await ownSession(worker, { searchHook: () => gate.promise });
+    loaded.replaceDownloadRecord(loaded.item.id, ownNormalRecord(loaded.item));
+    const completion = ownTerminal(loaded);
+    await settle();
+    await Promise.all(loaded.events.downloadErased.emit(loaded.item.id));
+    gate.resolve();
+    await completion;
+    assert.equal(loaded.calls.erase.length - loaded.takeoverErases, 0, "IID-C-revoked: recheck ownership after lookup await");
+  });
+}
+
+const e2Whitespace = (text) => text.replace(/\s+/g, " ").trim();
+const e2Occurrences = (text, part) => text.split(part).length - 1;
+for (const [id, path, old, replacement] of E2_DOC_ROWS) {
+  test(`P1 RED ${id}: approved documentation row occurs exactly once`, () => {
+    const wanted = e2Whitespace(replacement), retired = e2Whitespace(old);
+    const control = e2Whitespace(old.replace(old, replacement));
+    assert.equal(e2Occurrences(control, wanted), 1, `${id} PC: replacement fixture occurs once`);
+    if (!wanted.includes(retired)) assert.equal(e2Occurrences(control, retired), 0, `${id} PC: old-only region removed`);
+    const current = e2Whitespace(fs.readFileSync(path, "utf8"));
+    assert.equal(e2Occurrences(current, wanted), 1, `P1 ${id}: approved text occurs once`);
+    if (!wanted.includes(retired)) assert.equal(e2Occurrences(current, retired), 0, `P1 ${id}: old-only region removed`);
+  });
+}
+
+test("P2 GUARD: existing S08B2 and S08C documentation pins survive", () => {
+  const source = fs.readFileSync("tests/test_queue.py", "utf8");
+  const b = source.match(/_S08B2_DOC_REPLACEMENTS = \(([\s\S]*?)\n\)/)[1];
+  const c = source.match(/_S08C_DOC_REPLACEMENTS = \[([\s\S]*?)\n\]/)[1];
+  const bRows = [...b.matchAll(/\("([^"]+)", "([^"]+)", "([^"]+)"\)/g)];
+  const cRows = [...c.matchAll(/\("([^"]+)", "([^"]+)"\)/g)];
+  assert.equal(bRows.length, 4, "P2 PC: four S08B2 pins loaded");
+  assert.equal(cRows.length, 4, "P2 PC: four S08C pins loaded");
+  for (const [, path, old, replacement] of bRows) {
+    const text = e2Whitespace(fs.readFileSync(path, "utf8"));
+    assert.equal(e2Occurrences(text, replacement), 1, `P2: ${path} S08B2 pin`);
+    assert.equal(text.includes(old), false);
+  }
+  for (const [, path, replacement] of cRows) {
+    const text = e2Whitespace(fs.readFileSync(path, "utf8"));
+    for (const sentence of replacement.split(". ")) assert.equal(e2Occurrences(text, sentence.replace(/\.$/, "")), 1);
+  }
+});
+
+test("P3 GUARD: privacy date is at least the approved baseline date", () => {
+  const match = fs.readFileSync("PRIVACY.md", "utf8").match(/_Last updated: (\d{4}-\d{2}-\d{2})_/);
+  assert.ok(match && match[1] >= "2026-10-17");
+});
+
+test("P4 GUARD: documentation claims no native-browser verification or universal isolation", () => {
+  const forbidden = /verified in Firefox|tested in Chrome|(?:complete|universal|all) private[- ]window isolation/i;
+  assert.match("verified in Firefox", forbidden, "P4 PC: unsupported verification claim detected");
+  for (const path of new Set(E2_DOC_ROWS.map((row) => row[1]))) {
+    assert.doesNotMatch(fs.readFileSync(path, "utf8"), forbidden, `P4: ${path}`);
+  }
+});
+
+test("P5 GUARD: approved rows preserve existing cookie wording", () => {
+  const cookieLines = (text) => text.split("\n").filter((line) => /cookie/i.test(line)).map(e2Whitespace);
+  assert.notDeepEqual(cookieLines("cookies are sent"), cookieLines("cookies are absent"), "P5 PC: wording changes detected");
+  assert.equal(E2_DOC_ROWS.length, 8);
+  for (const [id, , old, replacement] of E2_DOC_ROWS) {
+    assert.deepEqual(cookieLines(replacement), cookieLines(old), `P5: ${id} preserves cookie wording`);
+  }
+});
+
+for (const worker of [false, true]) {
+  test(`K2/PM4 GUARD ${worker ? "Chrome" : "Firefox"}: normal menu and pill still send`, async () => {
+    const tab = { id: 7, url: "https://example.test/watch", incognito: false };
+    assert.equal(downloadsOf((await e2Menu(worker, tab)).calls).length, 1);
+    const loaded = loadBackground({ worker, timers: true });
+    await settle();
+    loaded.calls.native.length = 0;
+    assert.equal((await pillPermission(loaded.events, tab.url, { tab, url: tab.url })).pillAllowed, true);
+    assert.equal((await pillDownload(loaded.events, { url: PRIVATE_URL_SENTINEL }, { tab, url: tab.url })).ok, true);
+    assert.equal(downloadsOf(loaded.calls).length, 1);
+  });
+}
+
+test("L1/L3 RED Chrome: per-item gate survives a worker reload with normal global context", async () => {
+  const privateSends = [];
+  for (let wake = 0; wake < 2; wake += 1) {
+    const loaded = await e2Created(true, freshItem());
+    e2NormalCreated(loaded, "L3");
+    assert.equal(loaded.context.browser.extension.inIncognitoContext, false);
+    assert.equal((await loaded.context.browser.windows.getCurrent()).incognito, false);
+    loaded.events.downloadCreated.emit(unknownItem({ value: true }, { id: 91, url: PRIVATE_URL_SENTINEL }));
+    await settle();
+    privateSends.push(downloadsOf(loaded.calls).length - 1);
+  }
+  assert.deepEqual(privateSends, [0, 0], "L3: private declines before and after worker reload");
+});
+
+test("L2 GUARD Chrome: unsupported stream message makes no tab lookups", async () => {
+  const normal = await e2Created(true, freshItem());
+  e2NormalCreated(normal, "L2");
+  const loaded = loadBackground({ worker: true, timers: true });
+  await settle();
+  loaded.calls.native.length = 0;
+  const { responses } = sendRuntimeMessage(loaded.events,
+    { type: "downloadStream", url: PRIVATE_URL_SENTINEL }, popupSender());
+  await settle();
+  assert.equal(responses.length, 1);
+  assert.equal(responses[0].reason, "unsupported");
+  assert.deepEqual(loaded.calls.tabsGet, []);
+  assert.equal(downloadsOf(loaded.calls).length, 0);
+});
+
+for (const [label, descriptor] of E2_CONTEXTS) {
+  for (const popup of [false, true]) {
+    test(`K3 RED Firefox ${label} ${popup ? "popup" : "content"}: non-normal stream listing is empty`, async () => {
+      async function listing(tab) {
+        const loaded = loadBackground({ timers: true, tabs: [tab] });
+        await settle();
+        seedStream(loaded, tab.id, "https://streams.example.test/live.m3u8");
+        await settle();
+        const { responses } = sendRuntimeMessage(loaded.events, { type: "getDetectedStreams" },
+          popup ? popupSender() : { tab, url: tab.url });
+        await settle();
+        return responses;
+      }
+      const normal = await listing({ id: 7, url: "https://example.test/watch", incognito: false });
+      assert.equal(normal.length, 1, "K3 PC: one normal response");
+      assert.equal(normal[0].length, 1, "K3 PC: normal holder is listed");
+      const declined = await listing(e2Tab(descriptor));
+      assert.equal(declined.length, 1);
+      assert.equal(declined[0].length, 0, "K3: non-normal tab lists no streams");
+    });
+  }
+}
+
+test("K5/L4 GUARD: response-only detector and unchanged manifest privacy surface", () => {
+  const source = fs.readFileSync("extension/media-sites.js", "utf8");
+  const listener = source.slice(source.indexOf("browser.webRequest.onHeadersReceived.addListener"),
+    source.indexOf("function updateStreamBadge"));
+  assert.match(listener, /responseHeaders/, "K5 PC: real response-header listener selected");
+  assert.doesNotMatch(listener, /requestHeaders/);
+  for (const file of ["extension/manifest.json", "extension/manifest.chrome.json"]) {
+    const manifest = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(Object.hasOwn(manifest, "incognito"), false);
+    assert.equal(Object.hasOwn(manifest, "web_accessible_resources"), false);
+    assert.equal(manifest.permissions.includes("cookies"), false);
+    if (file.includes("chrome")) assert.equal(manifest.permissions.includes("webRequest"), false);
+  }
+});
+
+for (const worker of [false, true]) {
+  const mode = worker ? "worker" : "Firefox";
+  test(`HC-D1 GUARD ${mode}: event delivery preserves raw privacy, identity and frozen fixtures`, async () => {
+    const loaded = loadBackground({ worker, timers: true });
+    await settle();
+    let reads = 0;
+    const throwing = { get() { reads += 1; throw new Error("privacy getter"); } };
+    const descriptors = [undefined, ...[undefined, null, true, false, "false", "true", 0, 1, {}, [], NaN]
+      .map((value) => ({ value })), throwing];
+    // Isolate harness delivery from production's legitimate property reads.
+    for (const name of ["downloadCreated", "contextMenuClicked", "message"]) {
+      const delivery = loaded.events[name];
+      delivery.listeners.splice(0);
+      let received;
+      delivery.addListener((...args) => { received = args; });
+      for (const descriptor of descriptors) {
+        const item = Object.freeze(unknownItem(descriptor));
+        const before = Object.getOwnPropertyDescriptors(item);
+        const sender = Object.freeze({ tab: item });
+        if (name === "downloadCreated") delivery.emit(item);
+        else delivery.emit({}, name === "message" ? sender : item);
+        const delivered = name === "downloadCreated" ? received[0]
+          : name === "message" ? received[1].tab : received[1];
+        assert.strictEqual(delivered, item);
+        if (name === "message") assert.strictEqual(received[1], sender);
+        assert.deepEqual(Object.getOwnPropertyDescriptors(item), before);
+        assert.equal(Object.hasOwn(item, "incognito"), descriptor !== undefined);
+        if (descriptor === throwing) assert.throws(() => delivered.incognito, /privacy getter/);
+        else if (descriptor) assert.ok(Object.is(delivered.incognito, descriptor.value));
+      }
+    }
+    assert.equal(reads, 3, "only the three explicit throwing-getter assertions read it");
+  });
+
+  test(`HC-D2 GUARD ${mode}: tab, search and sender mocks preserve supplied objects`, async () => {
+    let reads = 0;
+    const fixtures = [undefined, ...[undefined, null, true, false, "false", 0, {}, [], NaN]
+      .map((value) => ({ value })), { get() { reads += 1; throw new Error("privacy getter"); } }]
+      .map((descriptor, id) => Object.freeze(unknownItem(descriptor, { id })));
+    const tabs = Object.freeze(fixtures);
+    const answers = Object.freeze(fixtures);
+    const loaded = loadBackground({ worker, timers: true, tabs,
+      tabsById: new Map(fixtures.map((item) => [item.id, item])), downloadSearch: () => answers });
+    await settle();
+    const browser = loaded.context.browser;
+    assert.strictEqual(await browser.tabs.query({}), tabs);
+    assert.strictEqual(await browser.downloads.search({ id: 0 }), answers);
+    const stateful = loadBackground({ worker, timers: true, downloadState: fixtures });
+    await settle();
+    for (const item of fixtures) {
+      const before = Object.getOwnPropertyDescriptors(item);
+      assert.strictEqual(await browser.tabs.get(item.id), item);
+      const sender = Object.freeze({ tab: item });
+      assert.strictEqual(completeSender(sender).tab, item);
+      assert.strictEqual(pillSender(item.url, sender), sender);
+      const downloads = stateful.context.browser.downloads;
+      assert.strictEqual((await downloads.search({ id: item.id }))[0], item);
+      await downloads.cancel(item.id);
+      const updated = (await downloads.search({ id: item.id }))[0];
+      assert.deepEqual(Object.getOwnPropertyDescriptor(updated, "incognito"), before.incognito);
+      assert.equal(updated.state, "interrupted");
+      assert.deepEqual(Object.getOwnPropertyDescriptors(item), before);
+    }
+    assert.equal(reads, 0, "mocks and sender helpers never read privacy getters");
+  });
+
+  test(`HC-D3 GUARD ${mode}: unknown builder changes only privacy; context mocks report normal`, async () => {
+    const overrides = { startTime: "2026-10-17T00:00:00Z" };
+    const normal = freshItem(overrides);
+    delete normal.incognito;
+    for (const descriptor of [undefined, { value: null }, { value: "false" }]) {
+      const item = unknownItem(descriptor, overrides);
+      delete item.incognito;
+      assert.deepEqual(item, normal);
+    }
+    const loaded = loadBackground({ worker, timers: true });
+    await settle();
+    assert.equal((await loaded.context.browser.windows.getCurrent()).incognito, false);
+    assert.equal(loaded.context.browser.extension.inIncognitoContext, false);
+    assert.equal(popupSender().url, EXTENSION_ORIGIN + "popup/popup.html");
+  });
+
+  test(`HC3 GUARD ${mode}: tabs.get supports objects, rejection, deferred results and getters`, async () => {
+    const pending = deferred();
+    const lateFailure = deferred();
+    const tab = Object.freeze({ id: 1, incognito: false });
+    const throwing = Object.freeze({ id: 4, get incognito() { throw new Error("privacy getter"); } });
+    const loaded = loadBackground({ worker, timers: true,
+      tabsById: new Map([[1, tab], [2, new Error("closed tab")], [3, pending.promise],
+        [4, throwing], [5, lateFailure.promise]]) });
+    await settle();
+    const get = loaded.context.browser.tabs.get;
+    assert.strictEqual(await get(1), tab);
+    await assert.rejects(get(2), /closed tab/);
+    let settled = false;
+    const lookup = get(3).then((result) => { settled = true; return result; });
+    await settle();
+    assert.equal(settled, false);
+    pending.resolve(tab);
+    assert.strictEqual(await lookup, tab);
+    assert.strictEqual(await get(4), throwing);
+    assert.throws(() => throwing.incognito, /privacy getter/);
+    const rejected = assert.rejects(get(5), /closed later/);
+    lateFailure.reject(new Error("closed later"));
+    await rejected;
+    assert.deepEqual(loaded.calls.tabsGet, [1, 2, 3, 4, 5]);
+  });
+
+  test(`HC4 GUARD ${mode}: controllable timers fire once and respect clearing and delay`, async () => {
+    const loaded = loadBackground({ worker, timers: true });
+    await settle();
+    const fired = [];
+    const schedule = loaded.context.setTimeout;
+    schedule((value) => fired.push(value), 3000, "live");
+    const cleared = schedule(() => fired.push("cleared"), 3000);
+    schedule(() => fired.push("other delay"), 3001);
+    loaded.context.clearTimeout(cleared);
+    loaded.fireTimers(3000);
+    loaded.fireTimers(3000);
+    assert.deepEqual(fired, ["live"]);
+    loaded.fireTimers(3001);
+    assert.deepEqual(fired, ["live", "other delay"]);
+    const real = loadBackground({ worker });
+    await settle();
+    assert.strictEqual(real.context.setTimeout, setTimeout);
+    assert.strictEqual(real.context.clearTimeout, clearTimeout);
+  });
+
+  test(`HC5 GUARD ${mode}: settings reads count a normal handoff`, async () => {
+    const loaded = loadBackground({ worker, timers: true });
+    await settle();
+    assert.equal(loaded.calls.settingsReads, 1, "startup loads settings once");
+    loaded.events.downloadCreated.emit(freshItem());
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 1, "positive control reaches native host");
+    assert.equal(loaded.calls.settingsReads, 1);
+    await loaded.store.get("coveDiag");
+    assert.equal(loaded.calls.settingsReads, 1, "other storage reads do not count");
+    await loaded.store.get("settings");
+    assert.equal(loaded.calls.settingsReads, 2, "another settings read increments the counter");
+  });
+
+  test(`HC6 GUARD ${mode}: cancel and erase update state without mutating supplied records`, async () => {
+    const item = Object.freeze(freshItem());
+    const loaded = loadBackground({ worker, timers: true, downloadState: [item] });
+    await settle();
+    const downloads = loaded.context.browser.downloads;
+    assert.strictEqual((await downloads.search({ id: item.id }))[0], item);
+    await downloads.cancel(item.id);
+    const cancelled = (await downloads.search({ id: item.id }))[0];
+    assert.equal(cancelled.state, "interrupted");
+    assert.equal(cancelled.incognito, false);
+    assert.equal(item.state, "in_progress", "frozen input remains unchanged");
+    await downloads.erase({ id: item.id });
+    assert.deepEqual(await downloads.search({ id: item.id }), []);
+    assert.equal(loaded.calls.searches.length, 3);
+  });
+}
+
+test("HC-D4 GUARD Firefox: seedStream uses the registered response-header listener", async () => {
+  const loaded = loadBackground({ timers: true });
+  await settle();
+  const url = "https://streams.example.test/live.m3u8";
+  assert.equal(loaded.events.headersReceived.listeners.length, 1);
+  seedStream(loaded, 7, url);
+  await settle();
+  assert.equal(evalIn(loaded.context, "detectedStreams.get(7)[0].url"), url);
+  loaded.events.tabUpdated.emit(7, { url: "https://example.test/elsewhere" });
+  await settle();
+  assert.equal(evalIn(loaded.context, "detectedStreams.has(7)"), false);
+  const worker = loadBackground({ worker: true, timers: true });
+  await settle();
+  assert.equal(worker.events.headersReceived.listeners.length, 0, "worker has no stream adapter");
+});
+
 test("restored Chrome download history is never sent to Cove", async () => {
   const { calls, events } = loadBackground();
   await settle();
   calls.native.length = 0; // Ignore the startup ping.
 
   events.downloadCreated.emit({
+    incognito: false,
     id: 1,
     url: "https://example.test/archive.zip",
     filename: "archive.zip",
@@ -381,6 +1495,7 @@ test("restored Chrome download history is never sent to Cove", async () => {
     totalBytes: 2_000_000,
   });
   events.downloadCreated.emit({
+    incognito: false,
     id: 2,
     url: "https://example.test/old.zip",
     filename: "old.zip",
@@ -399,6 +1514,7 @@ test("a fresh eligible download is sent once and then cancelled", async () => {
   await settle();
   calls.native.length = 0;
   const item = {
+    incognito: false,
     id: 3,
     url: "https://example.test/fresh.zip",
     filename: "fresh.zip",
@@ -421,6 +1537,7 @@ test("native rejection leaves the browser download running", async () => {
   calls.native.length = 0;
 
   events.downloadCreated.emit({
+    incognito: false,
     id: 5,
     url: "https://example.test/fallback.zip",
     filename: "fallback.zip",
@@ -435,13 +1552,13 @@ test("native rejection leaves the browser download running", async () => {
 });
 
 test("detected stream reports native-host failure instead of false success", async () => {
-  const { events } = loadBackground({ nativeResult: { status: "error", message: "offline" } });
+  const { events } = popupStreamFixture({ nativeResult: { status: "error", message: "offline" } });
   await settle();
   let response;
 
   events.message.emit(
     { type: "downloadStream", url: "https://example.test/live.m3u8", filename: "live.mp4" },
-    {},
+    popupSender(),
     (value) => { response = value; },
   );
   await settle();
@@ -463,6 +1580,7 @@ test("a native-host timeout leaves the browser download running", async () => {
   calls.native.length = 0;
 
   events.downloadCreated.emit({
+    incognito: false,
     id: 6,
     url: "https://example.test/timeout.zip",
     filename: "timeout.zip",
@@ -485,6 +1603,7 @@ test("a malformed native reply leaves the browser download running", async () =>
     calls.native.length = 0;
 
     events.downloadCreated.emit({
+      incognito: false,
       id: 7,
       url: "https://example.test/malformed.zip",
       filename: "malformed.zip",
@@ -518,6 +1637,7 @@ test("a failed send is retried rather than blocked by the dedup marker", async (
   calls.native.length = 0;
 
   const item = {
+    incognito: false,
     id: 8,
     url: "https://example.test/retry.zip",
     filename: "retry.zip",
@@ -544,7 +1664,7 @@ test("context menu falls back to a browser download when Cove is closed", async 
   await Promise.all(
     events.contextMenuClicked.emit(
       { menuItemId: "download-with-cove", linkUrl: "https://example.test/manual.zip" },
-      {}
+      { incognito: false }
     )
   );
   await settle();
@@ -571,7 +1691,7 @@ test("context menu on a YouTube player sends the watch page, not the blob src", 
         srcUrl: "blob:https://www.youtube.com/2b0f8c1e-0000-4000-8000-000000000000",
         pageUrl: "https://www.youtube.com/watch?v=abc123",
       },
-      { url: "https://www.youtube.com/watch?v=abc123", title: "Clip - YouTube" }
+      { incognito: false, url: "https://www.youtube.com/watch?v=abc123", title: "Clip - YouTube" }
     )
   );
   await settle();
@@ -594,7 +1714,7 @@ test("context menu keeps a real link target on an extractor page", async () => {
         linkUrl: "https://example.test/manual.zip",
         pageUrl: "https://www.youtube.com/watch?v=abc123",
       },
-      { url: "https://www.youtube.com/watch?v=abc123" }
+      { incognito: false, url: "https://www.youtube.com/watch?v=abc123" }
     )
   );
   await settle();
@@ -615,7 +1735,7 @@ test("an extractor page URL is never handed to the browser downloader", async ()
         srcUrl: "blob:https://www.youtube.com/2b0f8c1e-0000-4000-8000-000000000000",
         pageUrl: "https://www.youtube.com/watch?v=abc123",
       },
-      { url: "https://www.youtube.com/watch?v=abc123" }
+      { incognito: false, url: "https://www.youtube.com/watch?v=abc123" }
     )
   );
   await settle();
@@ -638,7 +1758,7 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
         srcUrl: "blob:https://example.test/2b0f8c1e-0000-4000-8000-000000000000",
         pageUrl: "https://example.test/player",
       },
-      { url: "https://example.test/player" }
+      { incognito: false, url: "https://example.test/player" }
     )
   );
   await settle();
@@ -792,7 +1912,7 @@ test("the shared core offers video and audio contexts without any site adapter",
 
 test("the shared core sanitises a title into a filename with no site adapter", () => {
   const { CoveMedia } = loadMediaCore();
-  const tab = { title: "  spaced   out  title...  ", url: "https://example.test/page" };
+  const tab = { incognito: false, title: "  spaced   out  title...  ", url: "https://example.test/page" };
 
   assert.equal(
     CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.mov"),
@@ -802,7 +1922,7 @@ test("the shared core sanitises a title into a filename with no site adapter", (
 
 test("the shared core replaces characters a filename cannot contain", () => {
   const { CoveMedia } = loadMediaCore();
-  const tab = { title: 'a/b:c*d?e"f<g>h|i', url: "https://example.test/page" };
+  const tab = { incognito: false, title: 'a/b:c*d?e"f<g>h|i', url: "https://example.test/page" };
 
   assert.equal(
     CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.mkv"),
@@ -812,7 +1932,7 @@ test("the shared core replaces characters a filename cannot contain", () => {
 
 test("the shared core caps a filename at 180 characters plus its extension", () => {
   const { CoveMedia } = loadMediaCore();
-  const tab = { title: "z".repeat(250), url: "https://example.test/page" };
+  const tab = { incognito: false, title: "z".repeat(250), url: "https://example.test/page" };
 
   const name = CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.mp4");
   assert.equal(name, "z".repeat(180) + ".mp4");
@@ -820,7 +1940,7 @@ test("the shared core caps a filename at 180 characters plus its extension", () 
 
 test("the shared core infers the extension from the media path", () => {
   const { CoveMedia } = loadMediaCore();
-  const tab = { title: "Holiday clip", url: "https://example.test/page" };
+  const tab = { incognito: false, title: "Holiday clip", url: "https://example.test/page" };
 
   assert.equal(
     CoveMedia.mediaFilename(tab, "https://cdn.example.test/v/clip.webm"),
@@ -868,7 +1988,7 @@ test("the shared core has no page fallback and no stream list without an adapter
 
   assert.equal(
     CoveMedia.pageFallbackUrl(
-      { url: "https://www.youtube.com/watch?v=abc123" },
+      { incognito: false, url: "https://www.youtube.com/watch?v=abc123" },
       { pageUrl: "https://www.youtube.com/watch?v=abc123" },
     ),
     "",
@@ -906,7 +2026,7 @@ test("the shared core hands over a manifest when no capability refuses one",
   // nothing here knows a playlist from a file, and the address is forwarded.
   const loaded = loadMediaCore();
   const { kept, replies } = await coreMediaMessage(loaded.CoveMedia, MANIFEST_PILL,
-                                                   { tab: { title: "Clip" } });
+                                                   { tab: { incognito: false, title: "Clip" } });
 
   assert.equal(kept, true);
   assert.deepEqual(replies, [{ ok: true }]);
@@ -922,7 +2042,7 @@ test("an explicit factory capability's refusal is honoured", async () => {
   });
 
   const { kept, replies } = await coreMediaMessage(media, MANIFEST_PILL,
-                                                   { tab: { title: "Clip" } });
+                                                   { tab: { incognito: false, title: "Clip" } });
 
   assert.equal(kept, true);
   assert.deepEqual(replies, [
@@ -944,7 +2064,7 @@ test("a global capability's refusal is honoured with no explicit argument",
   });
 
   const { replies } = await coreMediaMessage(loaded.CoveMedia, MANIFEST_PILL,
-                                             { tab: { title: "Clip" } });
+                                             { tab: { incognito: false, title: "Clip" } });
 
   assert.deepEqual(replies, [
     { ok: false, reason: "unsupported", error: "Unsupported URL" },
@@ -958,7 +2078,7 @@ test("a capability that refuses nothing leaves the handoff alone", async () => {
   });
 
   const { replies } = await coreMediaMessage(loaded.CoveMedia, MANIFEST_PILL,
-                                             { tab: { title: "Clip" } });
+                                             { tab: { incognito: false, title: "Clip" } });
 
   assert.deepEqual(replies, [{ ok: true }]);
   assert.equal(loaded.core.native.length, 1);
@@ -991,7 +2111,7 @@ test("Firefox still hands a playlist address to Cove from the pill", async () =>
       url: "https://cdn.example.test/v/stream.m3u8",
       pageUrl: "https://neutral.example.test/watch",
     },
-    completeSender({ tab: { id: 7, url: "https://neutral.example.test/watch", title: "Clip" } }),
+    completeSender({ tab: { incognito: false, id: 7, url: "https://neutral.example.test/watch", title: "Clip" } }),
     done,
   );
   const reply = await replied;
@@ -1122,7 +2242,7 @@ test("without media.js a blob player src is ignored, not guessed at", async () =
         srcUrl: "blob:https://example.com/2b0f8c1e-0000-4000-8000-000000000000",
         pageUrl: "https://example.com/watch?v=abc123",
       },
-      { url: "https://example.com/watch?v=abc123", title: "Clip" }
+      { incognito: false, url: "https://example.com/watch?v=abc123", title: "Clip" }
     )
   );
   await settle();
@@ -1142,7 +2262,7 @@ test("without media.js a plain file link still downloads", async () => {
         linkUrl: "https://example.com/files/setup.zip",
         pageUrl: "https://example.com/downloads",
       },
-      { url: "https://example.com/downloads", title: "Downloads" }
+      { incognito: false, url: "https://example.com/downloads", title: "Downloads" }
     )
   );
   await settle();
@@ -1186,7 +2306,7 @@ test("without media.js a media download request is refused cleanly", async () =>
 // different origin, or an identity the browser did not supply at all.
 function pillSender(pageUrl, sender) {
   if (sender !== undefined) return sender;
-  return { tab: { id: 42, url: pageUrl }, url: pageUrl, frameId: 0 };
+  return { tab: { incognito: false, id: 42, url: pageUrl }, url: pageUrl, frameId: 0 };
 }
 
 async function pillDownload(events, msg, sender) {
@@ -1313,7 +2433,7 @@ async function requestMedia(events, msg = {}) {
   return sendToBackground(
     events,
     { type: "downloadMedia", url: "https://cdn.example.test/v/movie.mp4", ...msg },
-    { tab: { id: 4, url: "https://news.example.test/x" } },
+    { tab: { incognito: false, id: 4, url: "https://news.example.test/x" } },
   );
 }
 
@@ -1428,7 +2548,7 @@ test("a content script can record through the background", async () => {
     { type: "coveDiag", component: "extension.content",
       event: "video_download_requested", level: "INFO", requestId: "51c2a711",
       fields: { trigger: "pill" } },
-    { tab: { id: 4, url: "https://news.example.test/x" } },
+    { tab: { incognito: false, id: 4, url: "https://news.example.test/x" } },
   );
 
   const report = await diagReport(events);
@@ -1445,7 +2565,7 @@ test("a forbidden field sent by a content script is still dropped", async () => 
     events,
     { type: "coveDiag", component: "extension.content", event: "video_pill_result",
       fields: { pageUrl: "https://news.example.test/private", result: "ok" } },
-    { tab: { id: 4 } },
+    { tab: { incognito: false, id: 4 } },
   );
 
   const report = await diagReport(events);
@@ -1565,22 +2685,22 @@ const COOKIE_SENTINEL = "s08e-synth-cookie-9c41";
 
 // Synthetic handoffs through the shipped VM runtime, never a browser store.
 async function s08eHandoff(route, options = {}) {
-  const loaded = loadBackground(options);
+  const url = "https://cdn.example.test/clip.mp4";
+  const loaded = route === "stream" ? popupStreamFixture(options, url) : loadBackground(options);
   await settle();
   loaded.calls.native.length = 0;
-  const url = "https://cdn.example.test/clip.mp4";
   if (route === "interception") {
     loaded.events.downloadCreated.emit(freshItem({ url, filename: "clip.mp4" }));
   } else if (route === "menu") {
     await Promise.all(loaded.events.contextMenuClicked.emit(
       { menuItemId: "download-with-cove", linkUrl: url, pageUrl: "https://example.test/watch" },
-      { id: 7, url: "https://example.test/watch" },
+      { incognito: false, id: 7, url: "https://example.test/watch" },
     ));
   } else {
     const { responses } = sendRuntimeMessage(loaded.events, {
       type: route === "pill" ? "downloadMedia" : "downloadStream",
       url, filename: "clip.mp4", pageUrl: "https://example.test/watch",
-    }, pillSender("https://example.test/watch"));
+    }, route === "stream" ? popupSender() : pillSender("https://example.test/watch"));
     await settle();
     assert.equal(responses.length, 1, `${route}: one reply`);
     assert.equal(responses[0].ok, true, `${route}: accepted`);
@@ -1769,6 +2889,7 @@ function jarOfSize(total) {
 
 function freshItem(overrides = {}) {
   return {
+    incognito: false,
     id: 90,
     url: "https://example.test/big.zip",
     filename: "big.zip",
@@ -1854,7 +2975,7 @@ test("a media count never overwrites the disabled OFF badge", async () => {
   // look active.
   const { context, badge } = loadBackground({
     settings: { enabled: false },
-    tabs: [{ id: 7 }],
+    tabs: [{ incognito: false, id: 7 }],
   });
   await settle();
 
@@ -1869,7 +2990,7 @@ test("a media count never overwrites the disabled OFF badge", async () => {
 test("a media count still shows while interception is enabled", async () => {
   const { context, badge } = loadBackground({
     settings: { enabled: true },
-    tabs: [{ id: 7 }],
+    tabs: [{ incognito: false, id: 7 }],
   });
   await settle();
 
@@ -1890,35 +3011,33 @@ test("an erased download stops being tracked as intercepted", async () => {
   assert.equal(evalIn(context, 'interceptedIds.has(42)'), false);
 });
 
-test("stored intercepted ids are pruned when they are no longer downloading", async () => {
-  // The set is persisted, so ids left behind by a missed terminal event or an
-  // extension suspension came back on every wake and could suppress events for
-  // a reused id.
+test("IID-S-adapt-1 RED: all inherited ids are forgotten, including in-progress records", async () => {
+  await ownSession(false);
+  // Approved policy: persisted ids are bookkeeping, never current-session ownership.
   const { context, store } = loadBackground({
     settings: { enabled: true },
     storedIntercepted: [1, 2, 3],
-    downloadSearch: ({ id }) => (id === 2 ? [{ id: 2, state: "in_progress" }] : []),
+    downloadSearch: ({ id }) => (id === 2 ? [{ incognito: false, id: 2, state: "in_progress" }] : []),
   });
   await settle();
 
   // Arrays built inside the vm realm are not reference-equal to host ones.
-  assert.deepEqual(Array.from(evalIn(context, '[...interceptedIds]')), [2]);
-  assert.deepEqual(Array.from(store.data._interceptedIds), [2]);
+  assert.deepEqual(Array.from(evalIn(context, '[...interceptedIds]')), [], "IID-S-adapt-1: forget inherited ids");
+  assert.deepEqual(Array.from(store.data._interceptedIds), []);
 });
 
-test("pruning erases a terminal download instead of just forgetting it", async () => {
-  // The persisted set exists to recover cleanup that a missed terminal event
-  // or a suspended worker skipped. Dropping the id without erasing would
-  // strand the cancelled download in the browser's history for good.
+test("IID-S-adapt-2 RED: pruning forgets an inherited terminal id without erasing", async () => {
+  await ownSession(false);
+  // Approved ownership policy leaves earlier-session history with the browser.
   const { context, calls, store } = loadBackground({
     settings: { enabled: true },
     storedIntercepted: [5],
-    downloadSearch: ({ id }) => [{ id, state: "interrupted" }],
+    downloadSearch: ({ id }) => [{ incognito: false, id, state: "interrupted" }],
   });
   await settle();
 
   // Objects built inside the vm realm are not reference-equal to host ones.
-  assert.deepEqual(JSON.parse(JSON.stringify(calls.erase)), [{ id: 5 }]);
+  assert.deepEqual(calls.erase, [], "IID-S-adapt-2: no inherited erase");
   assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), []);
   assert.deepEqual(Array.from(store.data._interceptedIds), []);
 });
@@ -1935,34 +3054,38 @@ test("an id the browser no longer knows about is dropped without erasing", async
   assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), []);
 });
 
-test("an id is kept when its erase fails, for the next startup to retry", async () => {
+test("IID-S-adapt-3 RED: inherited ids are forgotten even when erase would fail", async () => {
+  await ownSession(false);
+  // An inherited id authorizes no erase; an erase failure cannot retain it.
   const { context } = loadBackground({
     settings: { enabled: true },
     storedIntercepted: [7],
-    downloadSearch: ({ id }) => [{ id, state: "complete" }],
+    downloadSearch: ({ id }) => [{ incognito: false, id, state: "complete" }],
     eraseThrows: true,
   });
   await settle();
 
-  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), [7]);
+  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), [], "IID-S-adapt-3: forget unowned id");
 });
 
-test("an erase during hydration is not lost", async () => {
+test("IID-S-adapt-4 RED: erase during hydration cannot retain other inherited ids", async () => {
+  await ownSession(false);
+  // Hydration forgets every inherited id, not only the id in the erase event.
   // The stored set arrives asynchronously. An erase handled before it lands
   // would operate on an empty Set, and the id would come back on the next
   // startup as though it had never been cleaned up.
   const { events, context, store } = loadBackground({
     settings: { enabled: true },
     storedIntercepted: [11, 12],
-    downloadSearch: ({ id }) => [{ id, state: "in_progress" }],
+    downloadSearch: ({ id }) => [{ incognito: false, id, state: "in_progress" }],
     slowInterceptedIds: true,
   });
 
   events.downloadErased.emit(11);   // fires before hydration completes
   await settle();
 
-  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), [12]);
-  assert.deepEqual(Array.from(store.data._interceptedIds), [12]);
+  assert.deepEqual(Array.from(evalIn(context, "[...interceptedIds]")), [], "IID-S-adapt-4: forget inherited hydration remainder");
+  assert.deepEqual(Array.from(store.data._interceptedIds), []);
 });
 
 test("overlapping persists leave the newest state stored", async () => {
@@ -2053,7 +3176,7 @@ test("a missing media module leaves a build that says it has no media",
   let reply = null;
   const kept = events.message.emit(
     { type: "downloadMedia", url: "https://cdn.example.test/v/clip.mp4" },
-    { tab: { id: 3, url: "https://example.test/watch" } },
+    { tab: { incognito: false, id: 3, url: "https://example.test/watch" } },
     (r) => { reply = r; },
   );
   await settle();
@@ -2157,7 +3280,7 @@ test("Firefox still registers its menu once, unchanged", async () => {
 // address is substituted; what each entry point accepts has to be driven
 // through its own dispatch.
 
-const CHROME_TAB = { id: 7, url: "https://example.test/watch", title: "Clip" };
+const CHROME_TAB = { incognito: false, id: 7, url: "https://example.test/watch", title: "Clip" };
 
 async function chromeMediaMessage(msg, options = {}) {
   const loaded = chromeWorker(options);
@@ -2439,7 +3562,7 @@ test("Chrome and Firefox send the same native message for the same direct media"
     pageUrl: "https://neutral.example.test/watch",
     requestId: "abcd1234",
   };
-  const sender = completeSender({ tab: { id: 7, url: "https://neutral.example.test/watch",
+  const sender = completeSender({ tab: { incognito: false, id: 7, url: "https://neutral.example.test/watch",
                                          title: "Neutral clip" } });
 
   const messages = [];
@@ -2543,6 +3666,7 @@ test("two pill activations for the same media produce one native download",
 
   await chromePillSend(loaded, "https://cdn.example.test/v/clip.mp4");
   loaded.events.downloadCreated.emit({
+    incognito: false,
     id: 1,
     url: "https://cdn.example.test/v/clip.mp4",
     filename: "clip.mp4",
@@ -2634,6 +3758,7 @@ test("cross-event dedup is the worker's, so a restart between the two loses it",
   await settle();
   restarted.calls.native.length = 0;
   restarted.events.downloadCreated.emit({
+    incognito: false,
     id: 1,
     url: "https://cdn.example.test/v/clip.mp4",
     filename: "clip.mp4",
@@ -2665,6 +3790,7 @@ test("Chrome keeps interception and the pill as two separate settings",
   assert.equal(loaded.calls.native.length, 1);
 
   loaded.events.downloadCreated.emit({
+    incognito: false,
     id: 2,
     url: "https://cdn.example.test/other.zip",
     filename: "other.zip",
@@ -2859,6 +3985,7 @@ test("browser-download interception is untouched by the media guard",
   loaded.calls.native.length = 0;
 
   loaded.events.downloadCreated.emit({
+    incognito: false,
     id: 9,
     url: "https://cdn.example.test/live/master.m3u8",
     filename: "master.m3u8",
@@ -3069,6 +4196,7 @@ test("a download under the minimum size is left to the browser", async () => {
   calls.native.length = 0;
 
   events.downloadCreated.emit({
+    incognito: false,
     id: 41,
     url: "https://example.test/small.zip",
     filename: "small.zip",
@@ -3092,6 +4220,7 @@ test("a download the browser reports no size for is still intercepted",
   // not a 0-byte file, and treating it as one would silently disable
   // interception for every chunked response.
   events.downloadCreated.emit({
+    incognito: false,
     id: 42,
     url: "https://example.test/unknown.zip",
     filename: "unknown.zip",
@@ -3215,7 +4344,7 @@ test("a malformed legacy stream payload closes its channel without throwing",
 
 test("Firefox still forwards a detected stream with the message it shipped",
      async () => {
-  const { calls, events } = loadBackground();
+  const { calls, events } = popupStreamFixture();
   await settle();
   calls.native.length = 0;
 
@@ -3223,7 +4352,7 @@ test("Firefox still forwards a detected stream with the message it shipped",
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
   assert.equal(returned, true, "the response channel stays open for the native reply");
   await settle();
 
@@ -3241,14 +4370,14 @@ test("Firefox still forwards a detected stream with the message it shipped",
 });
 
 test("Firefox falls back to an empty stream filename as it did", async () => {
-  const { calls, events } = loadBackground();
+  const { calls, events } = popupStreamFixture();
   await settle();
   calls.native.length = 0;
 
   sendRuntimeMessage(events, {
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
-  });
+  }, popupSender());
   await settle();
 
   assert.equal(calls.native.length, 1);
@@ -3256,7 +4385,7 @@ test("Firefox falls back to an empty stream filename as it did", async () => {
 });
 
 test("Firefox refuses a stream URL that is not HTTP(S)", async () => {
-  const { calls, events } = loadBackground();
+  const { calls, events } = popupStreamFixture();
   await settle();
   calls.native.length = 0;
 
@@ -3264,7 +4393,7 @@ test("Firefox refuses a stream URL that is not HTTP(S)", async () => {
     type: "downloadStream",
     url: "ftp://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
 
   assert.equal(returned, undefined);
   assert.equal(responses.length, 1);
@@ -3273,14 +4402,14 @@ test("Firefox refuses a stream URL that is not HTTP(S)", async () => {
 });
 
 test("Firefox reports a malformed native reply as unavailable", async () => {
-  const { events } = loadBackground({ nativeResult: null });
+  const { events } = popupStreamFixture({ nativeResult: null });
   await settle();
 
   const { responses } = sendRuntimeMessage(events, {
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
   await settle();
 
   assert.equal(responses.length, 1);
@@ -3288,7 +4417,7 @@ test("Firefox reports a malformed native reply as unavailable", async () => {
 });
 
 test("Firefox reports a rejected native send as unavailable", async () => {
-  const { events } = loadBackground({
+  const { events } = popupStreamFixture({
     nativeResult: () => Promise.reject(new Error("Native host has exited.")),
   });
   await settle();
@@ -3297,7 +4426,7 @@ test("Firefox reports a rejected native send as unavailable", async () => {
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
   await settle();
 
   assert.equal(responses.length, 1, "a rejection must still produce one answer");
@@ -3327,6 +4456,7 @@ const DEFAULT_MINIMUM_BYTES = 1024 * 1024;
 // is the only variable, so nothing but the size can decide the outcome.
 function sizedItem(totalBytes, extra = {}) {
   return {
+    incognito: false,
     id: 900,
     url: "https://example.test/payload.zip",
     filename: "payload.zip",
@@ -3569,7 +4699,7 @@ async function pillPermission(events, pageUrl, sender) {
 // which is what an embedded player produces and what `all_frames: true` in
 // both manifests makes reachable.
 function framedSender(pageUrl, frameUrl) {
-  return { tab: { id: 7, url: pageUrl }, url: frameUrl, frameId: 3 };
+  return { tab: { incognito: false, id: 7, url: pageUrl }, url: frameUrl, frameId: 3 };
 }
 
 test("an excluded page is refused the pill", async () => {
@@ -3642,12 +4772,12 @@ test("an identity the browser did not supply is refused the pill", async () => {
   const senders = [
     undefined,
     {},
-    { tab: {} },
-    { tab: { id: 1, url: "https://example.test/x" } },       // no frame url
+    { tab: { incognito: false } },
+    { tab: { incognito: false, id: 1, url: "https://example.test/x" } },       // no frame url
     { url: "https://example.test/x" },                        // no tab
-    { tab: { id: 1, url: "not a url" }, url: "https://example.test/x" },
-    { tab: { id: 1, url: "https://example.test/x" }, url: "not a url" },
-    { tab: { id: 1, url: "" }, url: "" },
+    { tab: { incognito: false, id: 1, url: "not a url" }, url: "https://example.test/x" },
+    { tab: { incognito: false, id: 1, url: "https://example.test/x" }, url: "not a url" },
+    { tab: { incognito: false, id: 1, url: "" }, url: "" },
   ];
   for (const sender of senders) {
     const reply = await pillPermission(events, null, sender);
@@ -4939,6 +6069,7 @@ async function firefoxDownloadHandoff(options) {
 // reached the consent gate and would prove nothing about consent.
 function nextItem(n) {
   return sizedItem(5 * 1024 * 1024, {
+    incognito: false,
     id: 900 + n,
     url: `https://example.test/payload-${n}.zip`,
     filename: `payload-${n}.zip`,
@@ -4953,7 +6084,7 @@ async function menuHandoff(loaded) {
       srcUrl: "https://cdn.example.test/v/clip.mp4",
       pageUrl: "https://example.test/watch",
     },
-    { id: 7, url: "https://example.test/watch" },
+    { incognito: false, id: 7, url: "https://example.test/watch" },
   ));
   await settle();
   return downloadsOf(loaded.calls);
@@ -5150,27 +6281,27 @@ test("U6c the media/pill route carries the user-agent only with consent",
 
 test("U6d the detected-stream route carries the user-agent only with consent",
      async () => {
-  const granted = loadBackground({ dataConsent: [CONSENT] });
+  const granted = popupStreamFixture({ dataConsent: [CONSENT] });
   await settle();
   granted.calls.native.length = 0;
   sendRuntimeMessage(granted.events, {
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
   await settle();
   const sentGranted = downloadsOf(granted.calls);
   assert.equal(sentGranted.length, 1, "the stream handoff happens");
   assert.equal(sentGranted[0].userAgent, REAL_UA);
 
-  const denied = loadBackground({ dataConsent: [] });
+  const denied = popupStreamFixture({ dataConsent: [] });
   await settle();
   denied.calls.native.length = 0;
   const { returned } = sendRuntimeMessage(denied.events, {
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
   assert.equal(returned, true,
                "the reply is still asynchronous: the contract is unchanged");
   await settle();
@@ -5183,7 +6314,7 @@ test("U6d the detected-stream route carries the user-agent only with consent",
 
 test("U6e a denied-consent sweep across all three routes leaks no user-agent",
      async () => {
-  const loaded = loadBackground({ dataConsent: [] });
+  const loaded = popupStreamFixture({ dataConsent: [] });
   await settle();
   loaded.calls.native.length = 0;
 
@@ -5195,7 +6326,7 @@ test("U6e a denied-consent sweep across all three routes leaks no user-agent",
     type: "downloadStream",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
-  });
+  }, popupSender());
   await settle();
 
   const sent = downloadsOf(loaded.calls);
@@ -5313,6 +6444,7 @@ function assertS03FinalRefusal(loaded, reply) {
 
 function emitS03BrowserDownload(loaded, id) {
   loaded.events.downloadCreated.emit({
+    incognito: false,
     id, url: S03_POLICY_URL, filename: "clip.mp4", state: "in_progress",
     startTime: new Date().toISOString(), totalBytes: 20_000_000,
   });

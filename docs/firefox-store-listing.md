@@ -52,6 +52,8 @@ Features:
 
 • Sends the referrer and user-agent information; browser cookies are not sent
 
+• Downloads from private windows that Firefox reports as private are left to the browser; Cove does not take them over
+
 • Toggle interception on or off with Alt+Shift+D, and set excluded domains and a minimum file size, which applies whenever Firefox gives a usable size at the start of a download
 
 How interception works:
@@ -229,6 +231,7 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 | the excluded host is the top-level page's | `extension/background.js` `excludableHost` reads `sender.tab.url`; `tests/extension_confirm_exclude.test.js` |
 | S08E-1 removes the `cookies` permission | Relative to the approved S08E-1 base commit, this slice removes `"cookies"` from the `permissions` array. It does not change the version, `data_collection_permissions.required`, `strict_min_version`, the Gecko ID, or `gecko_android`. The complete manifest difference from published Firefox 1.4.9 must be rechecked at release preparation. |
 | the declared categories match what is actually sent | `extension/background.js` native payload (`url`, `referrer`, `filename`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |
+| downloads Firefox reports as private are left to the browser | `extension/background.js` `handleCreated`, `pillIdentityAllowed`, context-menu handler; `extension/media-sites.js` `downloadStream`; `tests/extension_background.test.js`; manual proof pending |
 
 ## Before submitting
 

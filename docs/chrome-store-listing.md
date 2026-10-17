@@ -47,6 +47,8 @@ Features:
 
 • The referring page and your browser's user-agent are passed along. Cove does not use your browser's cookies, so a file that needs you to be signed in may not download in Cove
 
+• Downloads that the browser reports as incognito are left to the browser; Cove does not take them over
+
 • Interception can be toggled with a keyboard shortcut, restricted to chosen file types, switched off for domains you list, and held to a minimum file size whenever the browser gives a usable size at the start of a download. When the browser reports the size as unknown, the minimum cannot be applied and a smaller file may still be taken over
 
 What this extension does not do:
@@ -197,6 +199,7 @@ Every claim in section 1 that is about behaviour, and where it is enforced.
 | Chrome requests no `webRequest` | `extension/manifest.chrome.json` | `test_chrome_manifest_still_requests_no_webrequest` |
 | 16 connections per file | `cove/config.py:32`, `cove/config.py:135` | - |
 | Referrer and user-agent are passed on; cookies are not read or sent | `extension/background.js` native payload; `cove/single_instance.py` | `tests/extension_background.test.js` |
+| Downloads the browser reports as incognito are left to the browser | `extension/background.js` `handleCreated`, `pillIdentityAllowed`, context-menu handler | `tests/extension_background.test.js`; manual proof pending |
 | The in-page button is withheld on an excluded site, live | `extension/content/media-tab.js` pill admission; `extension/background.js` `resolvePillPermission` | `tests/extension_media_tab.test.js`, `tests/extension_background.test.js` |
 | The page can only request an exclusion, never persist one | `extension/background.js` `requestExcludeConfirmation` creates a token and opens the extension page; `getExcludeConfirmation`, `confirmExcludeSite` and `cancelExcludeConfirmation` all refuse a sender that is not `confirm-exclude.html` via `fromExtensionPage` | `tests/extension_confirm_exclude.test.js`, `tests/extension_background.test.js` |
 | The confirmed host is the top-level page's, not a frame's or a CDN's | `extension/background.js` `excludableHost` reads `sender.tab.url`; `requestExcludeConfirmation` refuses unless the caller's `expectHost` equals it | `tests/extension_confirm_exclude.test.js` |

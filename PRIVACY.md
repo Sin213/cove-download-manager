@@ -25,6 +25,8 @@ happens, it is called out.
   they are updated. On Firefox it also passes your browser's user-agent
   string when you grant the optional technical-data permission, and omits it
   when you do not. On Chrome the user-agent is always included.
+- A download that the browser reports as private or incognito is left to the
+  browser and is not handed to Cove; see Private and incognito windows below.
 - Cove then contacts the site you chose in order to download the file. For new
   downloads, Cove discards the cookie values it receives before it creates the
   download, so they are not kept in the new download's record or database entry,
@@ -145,6 +147,26 @@ Downloads added by earlier versions of Cove may have stored their cookies in Cov
 
 This version of the extension does not read or store
 browser cookie values.
+
+### Private and incognito windows
+
+The extension does not hand a download to Cove when the browser reports it as
+private (Firefox) or incognito (Chrome). It relies on the browser's own report
+of whether a download is private. If the browser reports that a download is
+private, or does not say, the extension leaves the download to the browser: it
+does not send its address to Cove, does not cancel it, does not erase it from
+the browser's list and does not start a copy of it. The in-page button is not
+offered in tabs the browser reports as private, and the right-click entry and
+the Firefox popup's stream button send nothing from them.
+
+Whether the extension runs in private windows at all is your browser's setting
+(Firefox: Run in Private Windows; Chrome: Allow in Incognito). Extension builds
+from before this change do not apply this rule and can still hand over private
+downloads that the browser shows them, and this change does not remove anything
+such a build already handed to Cove. This covers what the extension hands to
+Cove. It does not hide private browsing from your browser, from websites or from
+other extensions, and a download you add in the Cove app yourself is not
+affected.
 
 ## What is passed to the Cove desktop app
 
@@ -321,6 +343,7 @@ deliberately, and what it contains is what is described above.
 - `nativeMessaging` - to reach the Cove desktop app.
 - `downloads` - to see downloads the browser starts, cancel one that Cove has
   accepted, and fall back to a browser download when Cove is unavailable.
+  Downloads the browser reports as private are not handed to Cove.
 - `contextMenus` - for the "Download with Cove" entry.
 - `notifications` - to report that a handoff succeeded or failed.
 - `storage` - for the settings and the diagnostics log described above.

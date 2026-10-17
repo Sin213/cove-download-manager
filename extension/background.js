@@ -381,12 +381,22 @@ function pillHostname(url) {
   }
 }
 
+// Only the browser's explicit normal classification authorizes a handoff.
+function isNormalContext(record) {
+  try {
+    return record !== null && typeof record === "object" && record.incognito === false;
+  } catch {
+    return false;
+  }
+}
+
 // Both identities come from the browser's own sender record: the top-level
 // page on sender.tab.url and the frame that asked on sender.url. Content
 // scripts run in every frame, so those differ whenever a player is embedded,
 // and excluding either one is meant to take the pill away. Never the media
 // address and never a url carried in the message body - a page chooses those.
 function pillIdentityAllowed(sender, excludedDomains) {
+  if (!isNormalContext(sender && sender.tab)) return false;
   const tabUrl = sender && sender.tab ? sender.tab.url : null;
   const frameUrl = sender ? sender.url : null;
   if (!pillHostname(tabUrl) || !pillHostname(frameUrl)) return false;
@@ -777,6 +787,7 @@ async function handleCreated(downloadItem) {
     if (!Number.isNaN(started) && Date.now() - started > MAX_NEW_DOWNLOAD_AGE_MS) return;
   }
 
+  if (!isNormalContext(downloadItem)) return;
   await ensureSettings();
   const url = downloadItem.url || "";
   if (!settings.enabled) return;
@@ -797,9 +808,48 @@ async function handleCreated(downloadItem) {
   interceptDownload(downloadItem);
 }
 
-// Download ids we cancelled and still want erased from the browser's list.
-// Persisted to session storage so IDs survive MV3 service worker restarts.
+// Persisted ids are bookkeeping only. A restart loses proof of ownership,
+// so earlier-session history entries may remain with the browser by design.
 let interceptedIds = new Set();
+const ownedDownloads = new Map();
+const cleanupInFlight = new Map();
+
+function eraseOwnedIfNormal(id, prefetched) {
+  if (cleanupInFlight.has(id)) return cleanupInFlight.get(id);
+  const owned = ownedDownloads.get(id);
+  const hasPrefetched = arguments.length > 1;
+  const task = Promise.resolve().then(async () => {
+    if (!owned || ownedDownloads.get(id) !== owned) return "not_owned";
+    let record;
+    try {
+      const items = hasPrefetched ? null : await browser.downloads.search({ id });
+      record = hasPrefetched ? prefetched : items && items[0];
+    } catch {
+      return ownedDownloads.get(id) === owned ? "lookup_failed" : "not_owned";
+    }
+    if (ownedDownloads.get(id) !== owned) return "not_owned";
+    if (!record) return "no_record";
+    try {
+      if (typeof owned.url !== "string" || !owned.url ||
+          typeof owned.startTime !== "string" || !owned.startTime ||
+          record.id !== id || record.url !== owned.url || record.startTime !== owned.startTime) return "mismatch";
+    } catch {
+      return "mismatch";
+    }
+    if (!isNormalContext(record)) return "not_normal";
+    if (ownedDownloads.get(id) !== owned) return "not_owned";
+    // The API has no atomic compare-and-erase: the browser record can still
+    // change between this lookup and erase. Ownership checks cannot close that window.
+    try {
+      await browser.downloads.erase({ id });
+    } catch {
+      return ownedDownloads.get(id) === owned ? "erase_failed" : "not_owned";
+    }
+    return ownedDownloads.get(id) === owned ? "erased" : "not_owned";
+  }).finally(() => cleanupInFlight.delete(id));
+  cleanupInFlight.set(id, task);
+  return task;
+}
 
 async function loadInterceptedIds() {
   try {
@@ -812,34 +862,30 @@ async function loadInterceptedIds() {
   await pruneInterceptedIds();
 }
 
-// Drop ids the browser no longer has an in-progress download for. Cleanup used
-// to depend entirely on catching a terminal onChanged, which is missed when it
-// races the insertion below or fires while the extension is suspended - so an
-// id could persist for the whole session and suppress or misclassify later
-// events for a reused id.
+// Hydrated ids never acquire ownership. An acknowledgement racing hydration
+// can establish it, but cleanup still requires the same entry after each await.
 async function pruneInterceptedIds() {
   if (interceptedIds.size === 0) return;
   for (const id of [...interceptedIds]) {
-    let items;
+    const owned = ownedDownloads.get(id);
+    if (!owned) {
+      interceptedIds.delete(id);
+      continue;
+    }
+    let item;
     try {
-      items = await browser.downloads.search({ id });
+      const items = await browser.downloads.search({ id });
+      item = items && items[0];
     } catch {
       continue;  // Cannot tell; leave it alone rather than guess.
     }
-    const item = items && items[0];
-    if (!item) {
-      interceptedIds.delete(id);   // Already gone from the browser's list.
-      continue;
-    }
-    if (item.state === "in_progress") continue;
-    // Terminal, and still listed: this is exactly the missed cleanup the
-    // persisted set exists to recover. Dropping the id without erasing would
-    // strand the cancelled download in the browser's history permanently.
-    try {
-      await browser.downloads.erase({ id });
+    if (ownedDownloads.get(id) !== owned) continue;
+    if (item && item.state === "in_progress") continue;
+    const outcome = await eraseOwnedIfNormal(id, item);
+    if (ownedDownloads.get(id) !== owned) continue;
+    if (outcome !== "lookup_failed" && outcome !== "erase_failed") {
       interceptedIds.delete(id);
-    } catch {
-      // Keep it for the next startup rather than lose track of it.
+      ownedDownloads.delete(id);
     }
   }
   persistInterceptedIds();
@@ -875,6 +921,7 @@ async function forgetIntercepted(id) {
   // operates on an empty Set and is lost - and the id comes back on the next
   // startup as though it were never cleaned up.
   await interceptedIdsReady;
+  ownedDownloads.delete(id);
   if (!interceptedIds.delete(id)) return;
   return persistInterceptedIds();
 }
@@ -886,18 +933,22 @@ browser.downloads.onChanged.addListener(async (delta) => {
   if (!interceptedIds.has(delta.id)) return;
   const state = delta.state && delta.state.current;
   if (state === "interrupted" || state === "complete") {
-    browser.downloads.erase({ id: delta.id }).catch(() => {});
-    await forgetIntercepted(delta.id);
+    const outcome = await eraseOwnedIfNormal(delta.id);
+    if (outcome !== "lookup_failed") await forgetIntercepted(delta.id);
   }
 });
 
 // Terminal in every ordering, including ones onChanged never reports: the item
 // is gone from the browser's list, so there is nothing left to erase.
 browser.downloads.onErased.addListener(async (id) => {
+  // Erased means ownership is stale; revoke before hydration so a pending prune lookup cannot act on it.
+  ownedDownloads.delete(id);
   await forgetIntercepted(id);
 });
 
 async function interceptDownload(downloadItem) {
+  if (!isNormalContext(downloadItem)) return;
+  const ownedIdentity = { url: downloadItem.url, startTime: downloadItem.startTime };
   // Mark synchronously to block concurrent same-URL events before any await.
   markIntercepted(downloadItem.url);
 
@@ -930,6 +981,7 @@ async function interceptDownload(downloadItem) {
   if (result && result.status === "ok") {
     // Confirmed: native host accepted this download. Now cancel the browser copy.
     interceptedIds.add(dlId);
+    ownedDownloads.set(dlId, ownedIdentity);
     await saveInterceptedIds();
     try {
       await browser.downloads.cancel(dlId);
@@ -1049,9 +1101,15 @@ function registerContextMenu() {
 
 registerContextMenu();
 
+const DOWNLOAD_CONTEXT_DECLINE = "Cove did not take this download: its window could not be confirmed as a normal window.";
+
 browser.contextMenus.onClicked.addListener(async (info, tab) => {
-  console.log("Cove: context menu clicked", info.menuItemId, info.linkUrl || info.srcUrl);
   if (info.menuItemId !== "download-with-cove") return;
+  if (!isNormalContext(tab)) {
+    showNotification("Download left to browser", DOWNLOAD_CONTEXT_DECLINE);
+    return;
+  }
+  console.log("Cove: context menu clicked", info.menuItemId, info.linkUrl || info.srcUrl);
 
   // The video and audio targets are new here, and a browser that publishes a
   // media-target policy opts into both halves of it. Firefox publishes none

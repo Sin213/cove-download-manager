@@ -163,21 +163,21 @@ globalThis.CoveMediaCapability = {
     if (msg.type === "getDetectedStreams") {
       // Content scripts have sender.tab; the popup does not and gets the
       // active tab's streams as before.
-      if (sender.tab && typeof sender.tab.id === "number") {
-        sendResponse(detectedStreams.get(sender.tab.id) || []);
+      if (sender.tab) {
+        sendResponse(isNormalContext(sender.tab) ? detectedStreams.get(sender.tab.id) || [] : []);
         return;
       }
       browser.tabs.query({ active: true, currentWindow: true }).then((tabs) => {
-        const tabId = tabs[0] ? tabs[0].id : -1;
-        sendResponse(detectedStreams.get(tabId) || []);
-      });
+        const tab = tabs[0];
+        sendResponse(isNormalContext(tab) ? detectedStreams.get(tab.id) || [] : []);
+      }).catch(() => sendResponse([]));
       return true;
     }
     if (msg.type === "getMediaPageUrl") {
       sendResponse({ url: extractorPageUrl(sender.tab && sender.tab.url) });
       return;
     }
-    if (msg.type === "downloadStream") return downloadStream(msg, sendResponse);
+    if (msg.type === "downloadStream") return downloadStream(msg, sender, sendResponse);
     return false;
   },
 };
@@ -186,35 +186,65 @@ globalThis.CoveMediaCapability = {
 // background, which meant a Chrome bundle with no detector, no stream section
 // and no way for a user to reach it still carried a route that would hand any
 // HTTP(S) address to the native host. It belongs with the detector that
-// produced the address, so it is here, unchanged: same validation, same native
-// message, same replies, same asynchronous lifetime.
+// produced the address. Sending requires popup identity and normal holders;
+// the native message and host-error replies keep their existing format.
 //
-// Returns what the adapter contract requires: true while the native reply is
+// Returns what the adapter contract requires: true while verification or the reply is
 // still outstanding, undefined once it has already answered.
-function downloadStream(msg, sendResponse) {
-  if (typeof msg.url !== "string" || !/^https?:\/\//i.test(msg.url)) {
-    sendResponse({ ok: false, error: "Unsupported stream URL" });
+const STREAM_VERIFY_TIMEOUT_MS = 3000;
+const STREAM_CONTEXT_DECLINE = "Cove did not take this stream: its window could not be confirmed as a normal window.";
+
+function downloadStream(msg, sender, sendResponse) {
+  let answered = false, declined = false, timer;
+  const reply = (value) => {
+    if (answered) return;
+    answered = true;
+    clearTimeout(timer);
+    sendResponse(value);
+  };
+  const decline = () => { declined = true; reply({ ok: false, error: STREAM_CONTEXT_DECLINE }); };
+  if (!fromExtensionPage(sender, "popup/popup.html")) { decline(); return; }
+  const url = msg.url;
+  if (typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+    reply({ ok: false, error: "Unsupported stream URL" });
     return;
   }
-  // The user-agent is resolved first because Firefox's optional
-  // technicalAndInteraction consent governs it and can change at any time.
-  // Kept inside the promise chain so this function still returns true
-  // synchronously, which is what the adapter contract above requires.
-  userAgentField().then((uaField) => sendNativeMessage({
-    action: "download",
-    url: msg.url,
-    filename: msg.filename || "",
-    referrer: "",
-    fileSize: 0,
-    ...uaField,
-  })).then((result) => {
+  // The active tab is presentation, not proof of who holds this exact stream.
+  const holders = () => [...detectedStreams.keys()].filter((id) =>
+    detectedStreams.get(id).some((stream) => stream.url === url));
+  const ids = holders();
+  if (!ids.length) { decline(); return; }
+  const unchanged = () => {
+    const current = holders();
+    return !declined && current.length === ids.length && ids.every((id) => current.includes(id));
+  };
+  timer = setTimeout(decline, STREAM_VERIFY_TIMEOUT_MS);
+  Promise.all(ids.map(async (id) => {
+    const tab = await browser.tabs.get(id);
+    return !declined && tab !== null && typeof tab === "object" && tab.id === id && isNormalContext(tab);
+  })).catch(() => null).then(async (normal) => {
+    if (declined) return;
+    if (!normal || !normal.every(Boolean) || !unchanged()) { decline(); return; }
+    const uaField = await userAgentField();
+    if (!unchanged()) { decline(); return; }
+    clearTimeout(timer);
+    return sendNativeMessage({
+      action: "download",
+      url,
+      filename: msg.filename || "",
+      referrer: "",
+      fileSize: 0,
+      ...uaField,
+    });
+  }).then((result) => {
+    if (declined) return;
     if (result && result.status === "ok") {
-      sendResponse({ ok: true });
+      reply({ ok: true });
     } else {
-      sendResponse({ ok: false, error: (result && result.message) || "Cove is unavailable" });
+      reply({ ok: false, error: (result && result.message) || "Cove is unavailable" });
     }
   }).catch((e) => {
-    sendResponse({ ok: false, error: (e && e.message) || "Cove is unavailable" });
+    if (!declined) reply({ ok: false, error: (e && e.message) || "Cove is unavailable" });
   });
   return true;
 }

@@ -107,7 +107,7 @@ async function send(loaded, body, sender) {
   return reply;
 }
 function contentSender(url = "https://news.example.test/watch", tabId = 42) {
-  return { tab: { id: tabId, url }, url, frameId: 0 };
+  return { tab: { id: tabId, url, incognito: false }, url, frameId: 0 };
 }
 async function createIntent(loaded, sender = contentSender()) {
   const before = loaded.tabsCreated.length;

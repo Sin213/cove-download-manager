@@ -341,7 +341,12 @@ your browser's cookies and does not pass them to its download engines, so
 downloads that need a browser login may not work in Cove. An older extension build
 can still send cookies, which an updated Cove discards (older installed Cove builds are not assumed to), and Cove attempts to clear cookies stored by earlier versions from the cookie field of the database it uses when it starts (old copies can remain in the database file, in backups and in snapshots, and are not erased) and no longer restores them into download tasks.
 
+Downloads that your browser reports as private (Firefox) or incognito (Chrome) are
+not taken over by the extension: your browser keeps them, and the in-page button
+is not offered in those tabs.
+
 ### Settings
+
 
 - **Interception** - toggle automatic download interception on/off, set a
   minimum file size threshold.
