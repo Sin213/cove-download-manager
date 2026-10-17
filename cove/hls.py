@@ -51,8 +51,8 @@ def parse_ffmpeg_progress(line: str, duration_secs: float = 0.0) -> dict:
     return result
 
 
-def browser_login_failure_hint(cookies: str, exit_code: int, stderr: str) -> str:
-    if cookies and exit_code != 0 and _AUTH_FAILURE_RE.search(stderr):
+def browser_login_failure_hint(exit_code: int, stderr: str) -> str:
+    if exit_code != 0 and _AUTH_FAILURE_RE.search(stderr):
         return HLS_BROWSER_LOGIN_FAILURE
     return ""
 

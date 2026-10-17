@@ -100,7 +100,7 @@ https://github.com/user-attachments/assets/d45ce6fc-dbe1-484f-bc7a-8b77a12eaa5b
   downloaded through it automatically, with the origin of the browser's referring
   page (not its full address) and the user agent passed along. For new downloads, Cove discards the browser cookies it
   receives before creating the download and does not pass them to its download
-  engines (public videos need no account cookies). When it starts, Cove attempts to clear the cookie field of downloads added by earlier versions in the database it uses, and tries again at the next start if that is incomplete or cannot be confirmed. Other fields, other Cove installations or portable copies, backups, snapshots and leftover parts of the database file are not cleaned, so old copies can remain there and are not erased. Cove no longer restores stored cookies into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes. Downloads that
+  engines (public videos need no account cookies). When it starts, Cove attempts to clear the cookie field of downloads added by earlier versions in the database it uses, and tries again at the next start if that is incomplete or cannot be confirmed. Other fields, other Cove installations or portable copies, backups, snapshots and leftover parts of the database file are not cleaned, so old copies can remain there and are not erased. Cove no longer restores stored cookies into download tasks or forwards them to download engines through the normal restored-download path, and an older extension build can still send cookies, which an updated Cove discards (older installed Cove builds are not assumed to). Downloads that
   depend on a browser login may therefore not work in Cove.
 - **Official local API** - authenticated loopback API plus an optional
   command-line client designed for AI agents and local automation.
@@ -335,11 +335,11 @@ published Web Store id are whitelisted in the native host's
 `cove/native_host_install.py`).
 
 Once connected, the extension intercepts downloads matching your configured
-file types and minimum size, then sends them to Cove with cookies, referrer,
-and user-agent headers. For new downloads, Cove discards the cookies before
-creating the download and does not pass them to its download engines, so
-downloads that need a browser login may not work in Cove. The cookies still pass
-through this handoff first, and Cove attempts to clear cookies stored by earlier versions from the cookie field of the database it uses when it starts (old copies can remain in the database file, in backups and in snapshots, and are not erased) and no longer restores them into download tasks.
+file types and minimum size, then sends them to Cove with the referrer
+and user-agent; it no longer sends cookies. For new downloads, Cove does not use
+your browser's cookies and does not pass them to its download engines, so
+downloads that need a browser login may not work in Cove. An older extension build
+can still send cookies, which an updated Cove discards (older installed Cove builds are not assumed to), and Cove attempts to clear cookies stored by earlier versions from the cookie field of the database it uses when it starts (old copies can remain in the database file, in backups and in snapshots, and are not erased) and no longer restores them into download tasks.
 
 ### Settings
 
@@ -359,7 +359,7 @@ through this handoff first, and Cove attempts to clear cookies stored by earlier
 Hover or play a `<video>` on any page and a small floating "Download with
 Cove" pill appears in its top-right corner. It remains available during
 playback, including on direct old Reddit post pages. Clicking it sends the
-media URL, page title, cookies, and referrer to Cove so downloads receive a
+media URL, page title, and referrer to Cove so downloads receive a
 useful filename. Direct `http(s)` video sources work in both browsers;
 Firefox also detects HLS (M3U8) streams for the tab. YouTube watch pages are
 handed to Cove for extraction with yt-dlp. The pill can be disabled in the

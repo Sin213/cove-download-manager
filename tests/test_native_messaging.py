@@ -12,6 +12,8 @@ from cove.native_messaging import (
     handle_message,
 )
 
+COOKIE_SENTINEL = "s08e-synth-cookie-9c41"
+
 
 class _ChunkedStream:
     """Stream that returns at most `chunk` bytes per read, to mimic a pipe
@@ -212,8 +214,8 @@ def test_download_succeeds_only_when_the_primary_accepts(tmp_path, monkeypatch):
     assert sent["url"] == "https://example.invalid/file.zip"
     assert sent["filename"] == "file.zip"
     assert sent["referrer"] == "https://example.invalid/page"
-    assert sent["cookies"] == "session=dummy"
     assert sent["user_agent"] == "DummyAgent/1.0"
+    assert "cookies" not in sent, "C1: live host must discard legacy cookies"
 
 
 def test_download_preserves_an_explicitly_requested_directory(tmp_path, monkeypatch):
@@ -253,8 +255,8 @@ def test_download_strips_crlf_from_header_values(tmp_path, monkeypatch):
         settings=MagicMock(),
     )
     sent = delivery.calls[0]
-    assert "\r" not in sent["cookies"] and "\n" not in sent["cookies"]
     assert "\r" not in sent["referrer"] and "\n" not in sent["referrer"]
+    assert "cookies" not in sent, "C1: legacy cookie control characters are ignored"
 
 
 def test_download_fails_when_no_primary_accepts(tmp_path, monkeypatch):
@@ -766,102 +768,86 @@ def test_an_old_host_that_omits_the_request_id_is_still_accepted():
     assert validated["request_id"] is None
 
 
-# ---- Oversized cookie jars -------------------------------------------------
-#
-# An older installed extension joins the whole browser cookie jar into one
-# header. The GUI bounds that field, so the *entire* download was rejected for
-# it. Dropping the header keeps an otherwise valid download; the host mirrors
-# the rule so an extension that has not updated yet still works.
-
-
-def _cookie_limit() -> int:
-    from cove.single_instance import MAX_BROWSER_COOKIES_LENGTH
-
-    return MAX_BROWSER_COOKIES_LENGTH
-
-
-def test_the_host_drops_a_cookie_header_the_gui_would_reject(tmp_path, monkeypatch):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
+# S08E-1: framed legacy messages use the live handler; no sockets or real data.
+@pytest.fixture
+def s08e_host(monkeypatch, host_log):
     delivery = _Delivery(accept=True)
     monkeypatch.setattr(nm, "deliver_to_primary", delivery)
 
-    result = handle_message(
-        {
-            "action": "download",
-            "url": "https://example.invalid/file.zip",
-            "cookies": "c" * (_cookie_limit() + 1),
-        },
-        rpc=MagicMock(),
-        settings=MagicMock(),
-    )
+    def send(**fields):
+        frame = {"action": "download", "url": "https://example.invalid/clip.mp4", **fields}
+        try:
+            return handle_message(decode_message(io.BytesIO(encode_message(frame))), None, None)
+        except Exception:
+            pytest.fail("M18: live host crashed on a framed legacy message")
 
-    assert result["status"] == "ok"
-    assert delivery.calls[0]["cookies"] == ""
-    assert delivery.calls[0]["url"] == "https://example.invalid/file.zip"
+    return send, delivery
 
 
-def test_the_host_never_truncates_a_cookie_header(tmp_path, monkeypatch):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    delivery = _Delivery(accept=True)
-    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
-
-    handle_message(
-        {
-            "action": "download",
-            "url": "https://example.invalid/file.zip",
-            "cookies": "sid=dummysecretcookie" + "c" * _cookie_limit(),
-        },
-        rpc=MagicMock(),
-        settings=MagicMock(),
-    )
-
-    assert delivery.calls[0]["cookies"] == ""
+@pytest.mark.parametrize("cookies", [COOKIE_SENTINEL, COOKIE_SENTINEL + "x" * 32768],
+                         ids=["ordinary", "oversized"])
+def test_s08e_c1_live_host_discards_legacy_cookies(cookies, s08e_host):
+    send, delivery = s08e_host
+    assert send(filename="clip.mp4")["status"] == "ok", "M18: cookie-free frame accepted"
+    assert send(filename="clip.mp4", cookies=cookies)["status"] == "ok"
+    assert delivery.calls[-1]["filename"] == "clip.mp4"
+    assert "cookies" not in delivery.calls[-1], "C1: no cookies in live delivery"
 
 
-def test_a_cookie_header_within_the_limit_is_forwarded_unchanged(tmp_path, monkeypatch):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    delivery = _Delivery(accept=True)
-    monkeypatch.setattr(nm, "deliver_to_primary", delivery)
-    cookies = "c" * _cookie_limit()
-
-    handle_message(
-        {
-            "action": "download",
-            "url": "https://example.invalid/file.zip",
-            "cookies": cookies,
-        },
-        rpc=MagicMock(),
-        settings=MagicMock(),
-    )
-
-    assert delivery.calls[0]["cookies"] == cookies
+def test_s08e_c1n_j3_nested_and_unknown_fields_are_ignored(s08e_host):
+    send, delivery = s08e_host
+    assert send(headers={"Cookie": COOKIE_SENTINEL}, future={"secret": COOKIE_SENTINEL})["status"] == "ok"
+    assert delivery.calls[0]["url"] == "https://example.invalid/clip.mp4"
+    assert "headers" not in delivery.calls[0] and "future" not in delivery.calls[0]
+    assert COOKIE_SENTINEL not in json.dumps(delivery.calls)
 
 
-def test_the_host_cookie_bound_is_the_gui_cookie_bound():
-    assert nm.max_browser_cookies_length() == _cookie_limit()
+def test_s08e_c2_oversized_legacy_cookie_has_no_drop_event(s08e_host, host_log):
+    send, delivery = s08e_host
+    assert send(cookies=COOKIE_SENTINEL + "x" * 32768)["status"] == "ok"
+    assert len(delivery.calls) == 1
+    assert not _events(host_log, "cookies_dropped"), "C2: discarded field has no drop event"
 
 
-def test_dropping_cookies_is_logged_without_any_cookie_content(
-    host_log, tmp_path, monkeypatch
-):
-    monkeypatch.setattr("cove.config.DATA_DIR", tmp_path)
-    monkeypatch.setattr(nm, "deliver_to_primary", _Delivery(accept=True))
+@pytest.mark.parametrize("cookies", [COOKIE_SENTINEL, COOKIE_SENTINEL + "x" * 32768])
+def test_s08e_n2_host_log_contains_no_cookie_value(cookies, s08e_host, host_log):
+    send, delivery = s08e_host
+    assert send(cookies=cookies)["status"] == "ok"
+    assert len(delivery.calls) == 1 and _events(host_log, "reply_sent")
+    assert COOKIE_SENTINEL not in json.dumps(host_log.records())
+    assert COOKIE_SENTINEL.encode() not in (host_log.log_dir / host_log.filename).read_bytes()
 
-    handle_message(
-        {
-            "action": "download",
-            "url": "https://example.invalid/dummysecretpath.zip",
-            "cookies": "sid=dummysecretcookie" + "c" * _cookie_limit(),
-        },
-        rpc=MagicMock(),
-        settings=MagicMock(),
-    )
 
-    dropped = _events(host_log, "cookies_dropped")
-    assert dropped
-    dumped = json.dumps(host_log.records())
-    assert "dummysecretcookie" not in dumped
-    assert "dummysecretpath" not in dumped
+@pytest.mark.parametrize("filename", [{"cookies": COOKIE_SENTINEL}, [COOKIE_SENTINEL],
+                                    0, 1, True, False, 1.5, [], {}])
+def test_s08e_c7_d20_rejects_non_string_filename(filename, s08e_host, host_log):
+    send, delivery = s08e_host
+    assert send(filename="clip.mp4")["status"] == "ok", "C7: valid filename control accepted"
+    assert delivery.calls.pop()["filename"] == "clip.mp4"
+    assert send(url="file:///blocked", filename=filename)["message"] == "Invalid or blocked URL"
+    assert delivery.calls == [], "C7: URL validation still precedes filename validation"
+    reply = send(filename=filename)
+    assert COOKIE_SENTINEL not in json.dumps(reply)
+    assert COOKIE_SENTINEL.encode() not in (host_log.log_dir / host_log.filename).read_bytes()
+    assert reply == {"status": "error", "message": "Cove refused this request: unexpected format."}, "C7: malformed filename must be refused"
+    assert delivery.calls == [], "C7: malformed filename must never reach delivery"
+
+
+@pytest.mark.parametrize("fields", [{}, {"filename": None}, {"filename": ""}, {"filename": "clip.mp4"}])
+def test_s08e_c7_filename_controls(fields, s08e_host):
+    send, delivery = s08e_host
+    assert send(**fields)["status"] == "ok"
+    assert delivery.calls[0]["filename"] == (fields.get("filename") or None)
+
+
+def test_s08e_j2_m18_cookie_free_frame_is_backward_compatible(s08e_host):
+    send, delivery = s08e_host
+    frame = {"action": "download", "url": "https://example.invalid/clip.mp4",
+             "filename": "clip.mp4", "referrer": "", "fileSize": 1, "userAgent": "Test/1"}
+    assert set(frame) <= {"action", "url", "filename", "referrer", "cookies", "fileSize", "userAgent", "requestId"}
+    assert frame.get("cookies", "") == "", "J2: frozen HEAD host defaults missing cookies to empty"
+    assert send(**frame)["status"] == "ok", "M18: live host accepts a cookie-free frame"
+    assert delivery.calls[0]["url"] == frame["url"]
 
 
 def test_an_explicit_gui_rejection_is_not_reported_as_cove_missing(

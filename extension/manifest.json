@@ -21,7 +21,6 @@
 
   "permissions": [
     "downloads",
-    "cookies",
     "contextMenus",
     "nativeMessaging",
     "notifications",

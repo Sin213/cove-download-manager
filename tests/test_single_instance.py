@@ -17,13 +17,13 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from PySide6.QtCore import QCoreApplication
 
 from cove import single_instance
 from cove.single_instance import (
-    MAX_BROWSER_COOKIES_LENGTH,
     MAX_MESSAGE_BYTES,
     MAX_URLS_PER_MESSAGE,
     MessageError,
@@ -815,6 +815,80 @@ def test_no_request_signal_emitted_for_timed_out_connection():
 # and every unavailable/rejected/malformed path must answer ok=False.
 
 BROWSER_URL = "https://example.invalid/dummy-file.bin"
+COOKIE_SENTINEL = "s08e-synth-cookie-9c41"
+
+
+@pytest.mark.parametrize("cookies", [COOKIE_SENTINEL, COOKIE_SENTINEL + "x" * 65536,
+                                    COOKIE_SENTINEL + "\r\n\x00", {"Cookie": COOKIE_SENTINEL}],
+                         ids=["ordinary", "oversized", "controls", "nested"])
+def test_s08e_c3_validator_ignores_legacy_cookies(cookies):
+    frame = {"version": 1, "action": "browser_download", "url": BROWSER_URL}
+    assert single_instance.validate_browser_download(frame)["url"] == BROWSER_URL
+    with pytest.raises(MessageError, match="invalid_url"):
+        single_instance.validate_browser_download({**frame, "url": "x" * 9000})
+    try:
+        request = single_instance.validate_browser_download({**frame, "cookies": cookies})
+    except MessageError as exc:
+        pytest.fail(f"C3: ignored cookies must not cause refusal: {exc}")
+    assert "cookies" not in request, "C3: validator must discard legacy cookies"
+
+
+def test_s08e_c4_sender_serializes_no_cookies(monkeypatch):
+    sock = MagicMock()
+    sock.waitForConnected.return_value = sock.waitForReadyRead.return_value = True
+    sock.readAll.return_value = encode_message({"version": 1, "ok": True})
+    monkeypatch.setattr(single_instance, "QLocalSocket", lambda: sock)
+    for fields in [{}, {"cookies": COOKIE_SENTINEL}]:
+        assert send_browser_download("synthetic-endpoint", {"url": BROWSER_URL, **fields})
+    frames = [json.loads(call.args[0][4:]) for call in sock.write.call_args_list]
+    assert len(frames) == 2 and all(frame["url"] == BROWSER_URL for frame in frames)
+    assert frames[0]["action"] == "browser_download", "C4: cookie-free positive control serialized"
+    assert all("cookies" not in frame for frame in frames), "C4: serialized frames must omit cookies"
+
+
+def test_s08e_n3_gui_logs_no_cookie_value(caplog):
+    from cove.app import BrowserDownloadGate
+
+    gate = BrowserDownloadGate()
+    gate.queue, gate.ready = MagicMock(), True
+    gate.queue.add_url.return_value = 7
+    request = single_instance.validate_browser_download({"url": BROWSER_URL, "cookies": COOKIE_SENTINEL})
+    assert gate.accept(request), "N3: legacy intake accepted"
+    gate.queue.add_url.side_effect = RuntimeError(COOKIE_SENTINEL)
+    assert not gate.accept(request), "N3: exception control handled"
+    assert "browser_download_add_failed" in caplog.text, "N3: capture is active"
+    assert COOKIE_SENTINEL not in caplog.text
+
+
+@pytest.mark.parametrize("origin", ["old_extension", "old_host"])
+def test_s08e_c5_j1_legacy_chain_discards_cookies(origin, monkeypatch, caplog):
+    from cove import native_messaging as nm
+    from cove.app import BrowserDownloadGate
+
+    name, server, seen = _unique_name(), SingleInstanceServer(), []
+    gate = BrowserDownloadGate()
+    gate.queue, gate.ready = MagicMock(), True
+    gate.queue.add_url.return_value = 7
+    try:
+        assert server.try_become_primary(name)
+        server.browser_download_handler = lambda req: (seen.append(req) or gate.accept(req))
+        monkeypatch.setattr(nm, "deliver_to_primary", lambda req: _browser_send_in_subprocess(name, req))
+        assert _browser_send_in_subprocess(name, {"url": BROWSER_URL}), "C5: cookie-free control accepted"
+        assert gate.queue.add_url.call_args.kwargs["cookies"] == ""
+        seen.clear()
+        assert not _raw_ipc_roundtrip(name, {"version": 99, "action": "browser_download", "url": BROWSER_URL})["ok"]
+        assert seen == [], "C5: wrong-version negative control never reaches handler"
+        if origin == "old_extension":
+            assert nm.handle_message({"action": "download", "url": BROWSER_URL,
+                                      "cookies": COOKIE_SENTINEL}, None, None)["status"] == "ok"
+        else:
+            assert _raw_ipc_roundtrip(name, {"version": 1, "action": "browser_download",
+                                           "url": BROWSER_URL, "cookies": COOKIE_SENTINEL})["ok"]
+        assert seen[0]["url"] == BROWSER_URL and COOKIE_SENTINEL not in caplog.text
+        assert gate.queue.add_url.call_args.kwargs["cookies"] == "", "C5: queue must receive no legacy cookie value"
+        assert "cookies" not in seen[0], "C5: GUI handler must receive no cookies key"
+    finally:
+        server.shutdown()
 
 
 def _browser_send_in_subprocess(name: str, payload: dict, timeout: float = 5.0) -> bool:
@@ -862,9 +936,9 @@ def test_browser_download_reaches_handler_and_reports_success():
         assert len(seen) == 1
         assert seen[0]["url"] == BROWSER_URL
         assert seen[0]["filename"] == "dummy-file.bin"
-        assert seen[0]["cookies"] == "sid=dummy"
         assert seen[0]["referrer"] == "https://example.invalid/page"
         assert seen[0]["user_agent"] == "DummyAgent/1.0"
+        assert "cookies" not in seen[0], "C3: handler must not receive cookies"
     finally:
         server.shutdown()
 
@@ -969,7 +1043,7 @@ def test_browser_download_rejects_oversized_header_fields():
                 "version": 1,
                 "action": "browser_download",
                 "url": BROWSER_URL,
-                "cookies": "c" * (MAX_BROWSER_COOKIES_LENGTH + 1),
+                "referrer": "r" * (single_instance.MAX_BROWSER_REFERRER_LENGTH + 1),
             },
         )
         assert resp["ok"] is False
@@ -997,9 +1071,9 @@ def test_browser_download_strips_crlf_from_header_values():
             },
         )
         assert resp["ok"] is True
-        assert seen[0]["cookies"] == "sid=dummyX-Injected: yes"
         assert seen[0]["referrer"] == "https://example.invalid/p"
         assert seen[0]["user_agent"] == "DummyAgent"
+        assert "cookies" not in seen[0], "C3: legacy cookie control characters are ignored"
     finally:
         server.shutdown()
 
@@ -1082,7 +1156,7 @@ def test_browser_download_action_is_rejected_by_the_magnet_validator():
     [
         (
             {"version": 1, "action": "browser_download", "url": BROWSER_URL,
-             "cookies": "c" * (MAX_BROWSER_COOKIES_LENGTH + 1)},
+             "referrer": "r" * (single_instance.MAX_BROWSER_REFERRER_LENGTH + 1)},
             "oversized_message",
         ),
         (

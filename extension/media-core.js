@@ -81,8 +81,8 @@ function buildCoveMedia(capability) {
     //
     // Asked about the resolved address rather than msg.url, so it is the thing
     // actually about to be sent that was judged. Asked here, before anything
-    // is marked, looked up or sent, so a refused address leaves no dedup mark,
-    // no cookie read and no native request behind it. The refusal is not a
+    // is marked or sent, so a refused address leaves no dedup mark
+    // and no native request behind it. The refusal is not a
     // reason to look for a different address: it ends the request.
     const adapter = sites();
     const refused = !!(adapter && adapter.rejectMediaTarget &&
@@ -101,12 +101,6 @@ function buildCoveMedia(capability) {
     // another handoff for the same address.
     const dedupToken = claimIntercepted(url);
 
-    let cookieStr = "";
-    try {
-      const cookies = await browser.cookies.getAll({ url });
-      cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-    } catch {}
-
     let filename = mediaFilename(sender.tab, url);
     if (!filename) {
       try {
@@ -123,20 +117,13 @@ function buildCoveMedia(capability) {
       url: url,
       filename: filename,
       referrer: referrer,
-      cookies: cookieStr,
       fileSize: 0,
     };
     // Additive and optional: an older host ignores an unknown key.
     if (requestId) nativeMessage.requestId = requestId;
 
-    // The admission check that let this request in ran before the cookie read
-    // above, and that read is a suspension point: an exclusion the user commits
-    // during it would otherwise be decided too late. Asked again here, the last
-    // moment before anything leaves the browser, so the jar already in hand is
-    // not sent either. Read through resolvePillPermission, which reads storage
-    // rather than the cached settings, so the options page's committed change is
-    // what answers. Same refusal the early check gives, for the same reason the
-    // pill already renders it.
+    // Revalidate from storage before dispatch so a committed exclusion is
+    // honoured even when this context has not received its change notification.
     // Read before the answer is asked for and compared after it arrives. The
     // answer is a snapshot, so "the snapshot says allowed" is not enough: a
     // write committed while it was in flight would otherwise be decided too

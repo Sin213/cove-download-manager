@@ -45,12 +45,11 @@ _ELECTION_LOCK_STALE_MS = 5000
 _CONNECTION_READ_TIMEOUT_MS = 5000
 
 # Bounds for the browser-download action. A web page controls the URL and
-# (indirectly) the cookie jar behind these values, so every field is capped
+# the accompanying metadata, so every retained field is capped
 # before it can reach the queue or grow the IPC frame.
 MAX_BROWSER_URL_LENGTH = 8 * 1024
 MAX_BROWSER_FILENAME_LENGTH = 512
 MAX_BROWSER_DIRECTORY_LENGTH = 4096
-MAX_BROWSER_COOKIES_LENGTH = 32 * 1024
 MAX_BROWSER_REFERRER_LENGTH = 8 * 1024
 MAX_BROWSER_USER_AGENT_LENGTH = 1024
 MAX_BROWSER_FILE_SIZE = 1 << 62
@@ -349,9 +348,6 @@ def validate_browser_download(obj: dict) -> dict:
         # default download directory still apply.
         "filename": filename or None,
         "directory": directory or None,
-        "cookies": _sanitize_header(
-            obj.get("cookies"), MAX_BROWSER_COOKIES_LENGTH
-        ),
         "referrer": _sanitize_header(
             obj.get("referrer"), MAX_BROWSER_REFERRER_LENGTH
         ),
@@ -792,7 +788,6 @@ def send_browser_download(
         "url",
         "filename",
         "directory",
-        "cookies",
         "referrer",
         "user_agent",
         "file_size",

@@ -407,7 +407,7 @@ async function resolvePillPermission(sender) {
   // The read itself is a window: a change can commit after storage has answered
   // with the old value and before this resumes. An answer computed from settings
   // that were already replaced is not an answer, and every caller acts on it -
-  // the pill shows, and the admission gate marks the url and reads cookies.
+  // the pill shows, and the admission gate claims the url before dispatch.
   //
   // Re-read rather than refuse. A refusal is indistinguishable from an exclusion
   // to every caller, and the content script asks once per change notification,
@@ -897,41 +897,11 @@ browser.downloads.onErased.addListener(async (id) => {
   await forgetIntercepted(id);
 });
 
-// Cove's native handoff bounds the cookie header (single_instance.py,
-// MAX_BROWSER_COOKIES_LENGTH). A large origin's whole jar can exceed it, and
-// Cove then refused the entire download - so an oversized jar is dropped
-// rather than sent. Never truncated: half a cookie header authenticates
-// nothing, and a request Cove accepts without cookies is still better than a
-// request Cove refuses outright.
-const MAX_HANDOFF_COOKIES_LENGTH = 32 * 1024;
-
-async function collectCookies(url) {
-  let cookieStr = "";
-  try {
-    const cookies = await browser.cookies.getAll({ url });
-    cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-  } catch {
-    // No cookies available.
-    return "";
-  }
-  if (cookieStr.length > MAX_HANDOFF_COOKIES_LENGTH) {
-    // Fixed sentence: the jar itself must never reach the browser console.
-    console.log(
-      "Cove: browser cookie header exceeded native handoff limit; sending without cookies"
-    );
-    return "";
-  }
-  return cookieStr;
-}
-
 async function interceptDownload(downloadItem) {
   // Mark synchronously to block concurrent same-URL events before any await.
   markIntercepted(downloadItem.url);
 
   const dlId = downloadItem.id;
-
-  // Gather cookies while the browser download is still running.
-  const cookieStr = await collectCookies(downloadItem.url);
 
   // Extract filename from the download item.
   let filename = null;
@@ -949,7 +919,6 @@ async function interceptDownload(downloadItem) {
     url: downloadItem.url,
     filename: filename,
     referrer: downloadItem.referrer || "",
-    cookies: cookieStr,
     // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
     // not know yet, and the primary's schema refuses a negative size outright.
     fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
@@ -1129,8 +1098,6 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
   const url = /^https?:\/\//i.test(target) ? target : fallbackUrl;
   if (!url) return;
 
-  const cookieStr = await collectCookies(url);
-
   let filename = (fallbackUrl && url === fallbackUrl)
     ? CoveMedia.mediaFilename(tab, url)
     : null;
@@ -1148,7 +1115,6 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     url: url,
     filename: filename,
     referrer: info.pageUrl || "",
-    cookies: cookieStr,
     ...(await userAgentField()),
   });
 
@@ -1337,7 +1303,7 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.type === "downloadMedia") {
       // The pill that sent this may already have been invalidated: a click and
       // an exclusion can cross. Checked here, before delegation, so a refused
-      // request leaves no dedup mark, no cookie read, no native request and no
+      // request leaves no dedup mark, no native request and no
       // notification behind it. "unsupported" is the reason a refused media
       // target already answers with, and the pill already renders it, so this
       // needs no new vocabulary on either side.

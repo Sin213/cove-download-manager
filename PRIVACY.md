@@ -1,6 +1,6 @@
 # Privacy Policy - Cove Download Manager (browser extension)
 
-_Last updated: 2026-10-15_
+_Last updated: 2026-10-17_
 
 Cove Download Manager is a browser extension that hands downloads off to the
 Cove Download Manager desktop application running on the same computer. This
@@ -19,16 +19,20 @@ happens, it is called out.
   download. That is local processing, and it is disclosed here because it is
   still handling of your data.
 - When you start a download, the extension passes the download address, a
-  filename, the referring page address, and cookies for that address to the
-  local Cove desktop app. On Firefox it also passes your browser's user-agent
+  filename, and the referring page address to the local Cove desktop app. The
+  extension no longer reads or sends your browser's cookies; extension builds
+  that are still installed from before this change did, and keep doing so until
+  they are updated. On Firefox it also passes your browser's user-agent
   string when you grant the optional technical-data permission, and omits it
   when you do not. On Chrome the user-agent is always included.
 - Cove then contacts the site you chose in order to download the file. For new
   downloads, Cove discards the cookie values it receives before it creates the
   download, so they are not kept in the new download's record or database entry,
   and Cove does not pass them to its download engines; a file that needs your
-  browser login may therefore not download in Cove. The cookie values still pass
-  from the extension to Cove over the local handoff, and downloads added by
+  browser login may therefore not download in Cove. An updated extension does not
+  send cookie values. An updated Cove desktop app discards any that an older
+  extension still sends; older installed Cove builds are not assumed to do so,
+  and downloads added by
   earlier versions of Cove may have stored cookies on your computer, which Cove attempts to clear when it starts and no longer restores into download tasks (see Cookies below). The download
   itself is a normal network request to that site.
   "Local handoff" describes how Cove is reached, not the download.
@@ -125,21 +129,22 @@ unchanged.
 
 ### Cookies
 
-At the moment a download is handed off, the extension reads the cookies your
-browser holds **for that download address only**, using the browser's cookie
-API. They are combined into one request header and passed to Cove over the local
-handoff. For new downloads, Cove discards the cookie values before it creates
-the download: it keeps only a note that your browser held cookies for the address,
-does not store the values in the download's record or database entry, and does
-not pass them to its download engines. Until a later change to the extension,
-the cookie values still pass through the browser's native messaging channel
-and Cove's local handoff on your computer before they are discarded. If that
-header would exceed 32 KB it is dropped entirely rather than truncated.
+The extension no longer reads your browser's cookies, and it does not send
+cookies to Cove. Extension builds from before this change read the cookies your
+browser held for the download address at the moment of a handoff and passed them
+to Cove over the local handoff. For new downloads, Cove does not use your
+browser's cookies. An updated Cove desktop app discards any cookie value that an
+older extension build still sends: it is not kept in the download's record or
+database entry, is not forwarded to Cove's download queue and is not passed to
+its download engines. Older installed Cove builds are not assumed to have this
+protection. An older extension build still passes the cookie values through the
+browser's native messaging channel to Cove's native helper before an updated
+Cove discards them.
 
-Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. Cookie values still pass from the browser to Cove. This change does not remove all cookie exposure.
+Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. An older extension build that has not been updated still passes cookie values from the browser to Cove's native helper. An updated Cove desktop app discards them; older installed Cove builds are not assumed to. This change does not remove all cookie exposure.
 
-The extension does not read cookies for any other site, and does not store
-cookies anywhere.
+This version of the extension does not read or store
+browser cookie values.
 
 ## What is passed to the Cove desktop app
 
@@ -150,14 +155,16 @@ computer. A handoff carries:
 - a filename, derived from the browser's suggestion, the address, or the page
   title,
 - the referring page address,
-- cookies for the download address,
 - your browser's user-agent string - on Firefox only while you grant the
   optional technical-data permission, and always on Chrome,
 - the file size where the browser knew it,
 - an opaque request id used to match up log entries.
 
 Not every route sends every field. A right-click handoff sends no size. The
-Firefox stream handoff sends no referrer and no cookies. Nothing else about the
+Firefox stream handoff sends no referrer or browser cookie
+values. Earlier builds included an empty `cookies` field
+in this handoff; the updated extension omits that field.
+Nothing else about the
 page, and no page content, is included.
 
 The popup additionally asks Cove for its version and for the list of downloads
@@ -206,8 +213,7 @@ categories:
   to download and the page you chose it from, at the moment you chose it.
 - **Website content**, which in Mozilla's definition covers what is on a page
   and what is embedded in it, including cookies, page headers, and request and
-  response information. That is the media address and the cookies read for the
-  download address, both described above.
+  response information. That is the media address described above.
 - **Website activity**, which covers actions such as saving and downloading.
   That is the handoff itself.
 
@@ -229,7 +235,7 @@ The add-on checks your current choice before each handoff, so turning the
 permission off takes effect on your next download rather than at the next
 restart. It never asks for the permission in the middle of a download.
 
-This optional permission covers the user-agent only. The addresses, cookies,
+This optional permission covers the user-agent only. The addresses,
 referrers and the download action itself are covered by the three required
 categories above and remain necessary for the feature to work; declining the
 technical-data permission does not change them.
@@ -248,8 +254,9 @@ ask you to confirm the declared categories when the add-on updates.
 
 **Credentials are not a declared category.** Mozilla's authentication
 category covers passwords, usernames, PINs, security questions and
-registration details. This extension reads none of those; the cookie case sits
-inside the website-content category above.
+registration details. This extension reads none of those, and it no longer reads
+cookies; the cookie case that earlier builds raised sits inside the
+website-content category above.
 
 ## What is stored on your device
 
@@ -314,7 +321,6 @@ deliberately, and what it contains is what is described above.
 - `nativeMessaging` - to reach the Cove desktop app.
 - `downloads` - to see downloads the browser starts, cancel one that Cove has
   accepted, and fall back to a browser download when Cove is unavailable.
-- `cookies` - to read cookies for a download address at handoff time.
 - `contextMenus` - for the "Download with Cove" entry.
 - `notifications` - to report that a handoff succeeded or failed.
 - `storage` - for the settings and the diagnostics log described above.

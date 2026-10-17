@@ -27,6 +27,7 @@ from cove.config import CategoryDirs, Settings
 from cove.aria2 import Aria2Error, Aria2RpcError
 from cove.debrid import ALL_DEBRID, DebridError, Unrestricted
 from cove.extractor import FINAL_PATH_MARKER, is_extractor_url
+from cove.hls import HLS_BROWSER_LOGIN_FAILURE
 import cove.output_paths as output_paths
 import cove.queue as queue_module
 from cove.output_paths import (
@@ -4691,7 +4692,7 @@ def test_fake_hls_failure_cleans_private_output_and_keeps_public_target(
     ("session=abc", 1, "uNaUtHoRiZeD", True),
     ("session=abc", 1, "fOrBiDdEn", True),
     ("session=abc", 1, "ACCESS DENIED", True),
-    ("", 1, "HTTP error 403 Forbidden", False),
+    ("", 1, "HTTP error 403 Forbidden", True),
     ("session=abc", 0, "HTTP error 403 Forbidden", False),
     ("session=abc", 1, "Invalid data found when processing input", False),
     ("session=abc", 1, "", False),
@@ -10637,7 +10638,65 @@ def test_s08a_hls_lifecycle_retains_no_new_cookie_bytes(
     _assert_no_work_dirs(tmp_path)
 
 
-def test_s08a_restart_loses_presence_and_login_hint(s08a_queue, fake_process, tmp_path):
+def test_s08e_c6_i2_i3_n4_cookie_containment_guard(s08a_queue, fake_process):
+    queue, _rpc, path = s08a_queue
+    sentinel = "s08e-synth-cookie-9c41"
+    prepared = queue.prepare_url(_S08A_URLS[1], cookies=sentinel)
+    assert prepared.browser_cookies_seen is True, "C6: programmatic presence is preserved"
+    assert sentinel not in json.dumps(asdict(prepared)), "C6: prepared value is discarded"
+    with sqlite3.connect(path) as control:
+        assert control.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        assert control.execute("SELECT count(*) FROM downloads").fetchone()[0] == 0
+        tid = queue.add_url(_S08A_URLS[1], cookies=sentinel, intake="extension", filename="guard.mp4")
+        task = queue.tasks[tid]
+        assert task.cookies == _persisted_row(path, tid)["cookies"] == "", "N4: cookie column stays empty"
+        assert task.browser_cookies_seen is True, "C6: add_url signature and presence remain compatible"
+        queue._launch_hls(task)
+        proc = fake_process.instances[-1]
+        assert all("Cookie" not in arg and sentinel not in arg for arg in proc.args), "I3: clean FFmpeg argv"
+        proc.emit_output("Connection reset")
+        proc.finish(1)
+        assert task.error == "Connection reset", "I2: non-auth failure has no login hint"
+        assert Path(str(path) + "-wal").exists(), "N4: scan a live WAL before checkpointing"
+        for candidate in (Path(path), Path(str(path) + "-wal")):
+            assert sentinel.encode() not in candidate.read_bytes(), f"N4: cookie bytes in {candidate.name}"
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_s08e_i3_no_cookie_fallback_after_auth_failure(s08a_queue, fake_process, status):
+    queue, _rpc, _path = s08a_queue
+    sentinel = "s08e-synth-cookie-9c41"
+    tid = queue.add_url(_S08A_URLS[1], cookies=sentinel, intake="extension")
+    queue._launch_hls(queue.tasks[tid])
+    launched = len(fake_process.instances)
+    fake_process.instances[-1].emit_output(f"HTTP error {status}")
+    fake_process.instances[-1].finish(1)
+    assert queue.tasks[tid].error.endswith(HLS_BROWSER_LOGIN_FAILURE)
+    assert len(fake_process.instances) == launched, "M14b: auth failure must not start another process"
+    assert all("Cookie" not in arg and sentinel not in arg
+               for proc in fake_process.instances for arg in [proc.program, *proc.args])
+
+
+def test_s08e_i1_extension_intake_auth_hint(s08a_queue, fake_process):
+    queue, _rpc, _path = s08a_queue
+    for code in (0, 1):
+        tid = queue.add_url(_S08A_URLS[1] + f"?case={code}", intake="extension", filename=f"auth{code}.mp4")
+        task = queue.tasks[tid]
+        assert task.browser_cookies_seen is False and task.cookies == ""
+        queue._launch_hls(task)
+        proc = fake_process.instances[-1]
+        if code == 0:
+            _hls_private_path(proc).write_bytes(b"synthetic successful stream")
+        proc.emit_output("HTTP error 403 Forbidden")
+        proc.finish(code)
+        assert task.status == ("completed" if code == 0 else "error")
+        if code == 0:
+            assert not task.error, "I1: successful-exit positive control adds no hint"
+        else:
+            assert task.error == "HTTP error 403 Forbidden\n" + HLS_BROWSER_LOGIN_FAILURE, "I1: extension intake gets general auth hint"
+
+
+def test_s08a_restart_loses_presence_but_keeps_login_hint(s08a_queue, fake_process, tmp_path):
     queue, rpc, path = s08a_queue
     tid = queue.add_url(_S08A_URLS[1], cookies=_S08A_COOKIE, filename="movie.mp4")
     restored_queue = QueueManager(queue.settings, rpc)
@@ -10651,7 +10710,7 @@ def test_s08a_restart_loses_presence_and_login_hint(s08a_queue, fake_process, tm
     proc = fake_process.instances[-1]
     proc.emit_output("HTTP error 403 Forbidden")
     proc.finish(1)
-    assert task.error == "HTTP error 403 Forbidden"
+    assert task.error == "HTTP error 403 Forbidden\n" + HLS_BROWSER_LOGIN_FAILURE
     _s08a_assert_new_task_clean(path, task)
     _assert_no_work_dirs(tmp_path)
 
@@ -10674,7 +10733,7 @@ def test_s08a_legacy_cookie_load_persist_and_hint_remain(s08a_queue, fake_proces
     proc = fake_process.instances[-1]
     proc.emit_output("HTTP error 403 Forbidden")
     proc.finish(1)
-    assert task.error == "HTTP error 403 Forbidden"
+    assert task.error == "HTTP error 403 Forbidden\n" + HLS_BROWSER_LOGIN_FAILURE
     with sqlite3.connect(path) as conn:
         after = conn.execute("SELECT CAST(cookies AS BLOB) FROM downloads WHERE id=?", (task.id,)).fetchone()[0]
     assert before == after == _S08A_COOKIE.encode()
@@ -11082,7 +11141,7 @@ def test_s08b1_restored_engines(legacy_cookies_kept, s08a_queue, fake_process, t
         proc.finish(1)
         assert task.status == "error"
         if backend == "ffmpeg":
-            assert task.error == "HTTP error 403 Forbidden"
+            assert task.error == "HTTP error 403 Forbidden\n" + HLS_BROWSER_LOGIN_FAILURE
         assert task.cookies == ""
     assert other_transport == []
     if backend != "aria2":
@@ -11149,10 +11208,27 @@ def test_s08b1_compatibility_and_new_admission(s08a_queue, fake_process, tmp_pat
 
 _S08B2_DOC_REPLACEMENTS = (
     ("PRIVACY.md", "and downloads added by earlier versions of Cove may still have cookies stored on your computer, which Cove no longer restores into download tasks (see Cookies below)", "and downloads added by earlier versions of Cove may have stored cookies on your computer, which Cove attempts to clear when it starts and no longer restores into download tasks (see Cookies below)"),
-    ("PRIVACY.md", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not erase them: the historical values can remain in that database file. Cove no longer restores those stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Reading the database can still briefly load these values into memory, and cookie values still pass from the browser to Cove. This change does not remove all cookie exposure.", "Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. Cookie values still pass from the browser to Cove. This change does not remove all cookie exposure."),
-    ("README.md", "Cookies stored with downloads added by earlier versions are not erased and can remain in Cove's database, but Cove no longer restores them into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes.", "When it starts, Cove attempts to clear the cookie field of downloads added by earlier versions in the database it uses, and tries again at the next start if that is incomplete or cannot be confirmed. Other fields, other Cove installations or portable copies, backups, snapshots and leftover parts of the database file are not cleaned, so old copies can remain there and are not erased. Cove no longer restores stored cookies into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes."),
+    ("PRIVACY.md", "Downloads added by earlier versions of Cove may still have their cookies stored in Cove's local database on your computer. This version does not erase them: the historical values can remain in that database file. Cove no longer restores those stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Reading the database can still briefly load these values into memory, and cookie values still pass from the browser to Cove. This change does not remove all cookie exposure.", "Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. An older extension build that has not been updated still passes cookie values from the browser to Cove's native helper. An updated Cove desktop app discards them; older installed Cove builds are not assumed to. This change does not remove all cookie exposure."),
+    ("README.md", "Cookies stored with downloads added by earlier versions are not erased and can remain in Cove's database, but Cove no longer restores them into download tasks or forwards them to download engines through the normal restored-download path, and cookies still pass through the extension handoff until the extension changes.", "When it starts, Cove attempts to clear the cookie field of downloads added by earlier versions in the database it uses, and tries again at the next start if that is incomplete or cannot be confirmed. Other fields, other Cove installations or portable copies, backups, snapshots and leftover parts of the database file are not cleaned, so old copies can remain there and are not erased. Cove no longer restores stored cookies into download tasks or forwards them to download engines through the normal restored-download path, and an older extension build can still send cookies, which an updated Cove discards (older installed Cove builds are not assumed to)."),
     ("README.md", "and cookies stored by earlier versions are not erased, but Cove no longer restores them into download tasks.", "and Cove attempts to clear cookies stored by earlier versions from the cookie field of the database it uses when it starts (old copies can remain in the database file, in backups and in snapshots, and are not erased) and no longer restores them into download tasks."),
 )
+
+
+@pytest.mark.parametrize("filename,check", [("PRIVACY.md", "date"), *[(name, "phrases") for name in (
+    "PRIVACY.md", "README.md", "docs/chrome-store-listing.md", "docs/firefox-store-listing.md")]])
+def test_s08e_p3_p4_documentation(filename, check):
+    from datetime import date
+    text = (Path(queue_module.__file__).parent.parent / filename).read_text()
+    if check == "date":
+        line = next((line for line in text.splitlines() if line.startswith("_Last updated:")), "")
+        updated = re.fullmatch(r"_Last updated: (\d{4}-\d{2}-\d{2})_", line)
+        assert "<" not in line and updated, "P3: real privacy update date required"
+        assert date.fromisoformat(updated[1]) >= date(2026, 10, 15)
+    else:
+        for phrase in ("reads the cookies your browser holds", "`cookies` - to read cookies",
+                       "cookies for the download address,",
+                       "so a file behind a session you are already signed in to still downloads"):
+            assert phrase not in " ".join(text.split()), f"P4: stale cookie phrase remains: {phrase}"
 
 
 @pytest.mark.parametrize("filename,old,new", _S08B2_DOC_REPLACEMENTS)

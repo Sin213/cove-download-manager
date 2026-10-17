@@ -116,21 +116,6 @@ def _sanitize_header(value: Any) -> str:
     return value.replace("\r", "").replace("\n", "")
 
 
-def max_browser_cookies_length() -> int:
-    """The GUI's own cookie bound, read from the one place that defines it.
-
-    Imported lazily because single_instance pulls in Qt networking and a ping
-    must stay cheap. If that import fails the handoff cannot happen at all, so
-    the safe answer is to drop cookies rather than invent a second bound here.
-    """
-    try:
-        from .single_instance import MAX_BROWSER_COOKIES_LENGTH
-
-        return MAX_BROWSER_COOKIES_LENGTH
-    except Exception:
-        return 0
-
-
 def validate_url(url: str) -> bool:
     """Whether a handed-over URL may cross into the queue.
 
@@ -279,22 +264,14 @@ def handle_message(
             # browser console, and the URL may carry a session token.
             return reply({"status": "error", "message": "Invalid or blocked URL"})
 
+        filename = msg.get("filename")
+        if filename is not None and not isinstance(filename, str):
+            return reply({"status": "error", "message": _HANDOFF_SENTENCES["invalid_schema"]})
         requested_dir = msg.get("directory")
-        cookies = _sanitize_header(msg.get("cookies", ""))
-        if len(cookies) > max_browser_cookies_length():
-            # An extension older than this host still joins the browser's whole
-            # cookie jar into one header. The GUI bounds that field and would
-            # refuse the entire request for it, so drop the header instead and
-            # let the download through. Never truncated: a partial cookie
-            # header authenticates nothing and would fail downstream anyway.
-            _log("cookies_dropped", "INFO", request_id=request_id,
-                 reason="over_gui_limit")
-            cookies = ""
         request = {
             "url": url,
-            "filename": msg.get("filename") or None,
+            "filename": filename or None,
             "directory": requested_dir if isinstance(requested_dir, str) else None,
-            "cookies": cookies,
             "referrer": _sanitize_header(msg.get("referrer", "")),
             "user_agent": _sanitize_header(msg.get("userAgent", "")),
             "file_size": msg.get("fileSize") if isinstance(msg.get("fileSize"), int) else 0,

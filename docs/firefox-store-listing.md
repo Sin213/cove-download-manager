@@ -32,7 +32,7 @@ extractor. See `docs/chrome-store-listing.md` for why the Chrome copy differs.
 ```text
 Cove Download Manager (browser extension) hands your downloads off to the Cove desktop app so they download faster and stay organized.
 
-When you start a download, the extension can intercept it and send the link to Cove, along with the page's cookies and referrer so logged-in and protected downloads still work. Cove then downloads the file using multiple connections and manages it in a real queue.
+When you start a download, the extension can intercept it and send the link to Cove, along with the referrer. Cove does not use your browser's cookies, so downloads that need you to be signed in may not work in Cove. Cove then downloads the file using multiple connections and manages it in a real queue.
 
 Features:
 
@@ -50,7 +50,7 @@ Features:
 
 • Supported video pages are handed to Cove for extraction, including HLS (.m3u8) streams
 
-• Sends cookies, referrer, and user-agent information so authenticated downloads work
+• Sends the referrer and user-agent information; browser cookies are not sent
 
 • Toggle interception on or off with Alt+Shift+D, and set excluded domains and a minimum file size, which applies whenever Firefox gives a usable size at the start of a download
 
@@ -129,7 +129,7 @@ Public source: https://github.com/Sin213/cove-download-manager
 
 What changed in 1.4.10
 
-No new API permissions, no new hosts, and no new content scripts. The "permissions" array in manifest.json is byte-identical to 1.4.9. One thing changes in the manifest besides the version: the data-collection declaration, which is corrected as described under "Data collection declaration" below, and which Firefox presents to users as a consent change. Two new files are added to the package, and four existing files change, background.js among them - it now withholds the user-agent unless the optional technical-data permission is currently granted.
+No new API permissions, no new hosts, and no new content scripts. The "permissions" array in manifest.json differs from 1.4.9 only by the removal of "cookies". One other thing changes in the manifest besides the version: the data-collection declaration, which is corrected as described under "Data collection declaration" below, and which Firefox presents to users as a consent change. Two new files are added to the package, and four existing files change, background.js among them - it now withholds the user-agent unless the optional technical-data permission is currently granted.
 
 New feature: exclude the current site from the in-page button.
 
@@ -162,13 +162,11 @@ How the add-on works
 
 Cove Download Manager is the browser half of a desktop download manager. The extension does not download anything itself. It observes a download the user started, and hands the URL to the local desktop app over native messaging, which performs the download with multiple connections and queue management.
 
-Permission justifications, unchanged from previous versions:
+Permission justifications (the cookies permission is no longer requested and its justification is removed; the others are unchanged from previous versions):
 
 • nativeMessaging - the entire purpose of the add-on. It passes download requests to the Cove desktop app via the native host cove_dm_host. Without this the add-on does nothing.
 
 • downloads - to observe downloads the user starts and cancel the browser's copy after Cove has taken it over, so the file is not downloaded twice.
-
-• cookies - authenticated and paywalled downloads fail without the session cookies for the originating site. These are read for the download's own URL and passed to the local desktop app only. They are never sent to any remote server, and never stored by the extension.
 
 • webRequest and <all_urls> - downloads and media can originate from any site, so the add-on cannot enumerate hosts ahead of time. Used to observe request headers for the download being handed off, and to detect media on the page for the in-page pill.
 
@@ -191,7 +189,7 @@ Data collection declaration
     "optional": ["technicalAndInteraction"]
   }
 
-browsingActivity, because the handoff carries the address being downloaded and the address of the page it came from, and Mozilla defines that category as information about the websites users visit, such as specific URLs and domains. websiteContent, because the handoff also carries the media address and the cookies read for that download address - Mozilla's definition of that category explicitly includes cookies, page headers, and request and response information. websiteActivity, because the action being carried out is a download. These three are required because the download cannot be performed without them.
+browsingActivity, because the handoff carries the address being downloaded and the address of the page it came from, and Mozilla defines that category as information about the websites users visit, such as specific URLs and domains. websiteContent, because the handoff also carries the media address (earlier builds also carried the cookies read for that download address) - Mozilla's definition of that category explicitly includes cookies, page headers, and request and response information. websiteActivity, because the action being carried out is a download. These three are required because the download cannot be performed without them.
 
 technicalAndInteraction is optional, and it covers exactly one field: the browser user-agent, which Cove passes so the download can use browser-compatible request headers. Mozilla requires this category to be optional and states that it cannot be required, so the extension reads the user's current grant through permissions.getAll() before every handoff and simply omits the user-agent when it is not granted. The download itself still proceeds. Revoking the permission in about:addons takes effect on the next handoff, with no restart. The extension never calls permissions.request() during a download; the install and about:addons consent flows are the only way it is granted.
 
@@ -229,8 +227,8 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 | bundle is a copy of `extension/` with one composed HTML file | `scripts/build_extension.py` `_copy_shared` and `_compose_popup`; 22 of 23 files sha256-identical, `popup/popup.html` differing only by the two marker substitutions, asserted by `tests/test_extension_bundle.py` |
 | the page can only request, never persist, an exclusion | `extension/background.js` `fromExtensionPage` gates `getExcludeConfirmation`, `confirmExcludeSite` and `cancelExcludeConfirmation`; `tests/extension_confirm_exclude.test.js` |
 | the excluded host is the top-level page's | `extension/background.js` `excludableHost` reads `sender.tab.url`; `tests/extension_confirm_exclude.test.js` |
-| no permission changes | `git diff -- extension/manifest.json` touches the version line and the `data_collection_permissions.required` array, and nothing else. The `permissions` array, `strict_min_version`, the gecko id and `gecko_android` are untouched |
-| the declared categories match what is actually sent | `extension/background.js` `collectCookies` and the native payload (`url`, `referrer`, `filename`, `cookies`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |
+| S08E-1 removes the `cookies` permission | Relative to the approved S08E-1 base commit, this slice removes `"cookies"` from the `permissions` array. It does not change the version, `data_collection_permissions.required`, `strict_min_version`, the Gecko ID, or `gecko_android`. The complete manifest difference from published Firefox 1.4.9 must be rechecked at release preparation. |
+| the declared categories match what is actually sent | `extension/background.js` native payload (`url`, `referrer`, `filename`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |
 
 ## Before submitting
 
@@ -266,7 +264,7 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
   `websiteContent` "covers anything visible on a website - such as text,
   images, videos, and links - and anything embedded, such as cookies, audio,
   page headers, and request and response information", which is the media
-  address and the cookies read for the download address. `websiteActivity`
+  address (earlier builds also passed the cookies read for the download address). `websiteActivity`
   covers user interactions "such as saving and downloading", which is the
   handoff itself.
 
@@ -305,7 +303,7 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
   copy is prepared in the release packet as `amo-inline-privacy-text.txt`. The
   privacy-policy field should also be pointed at the updated `PRIVACY.md`.
   Editing files in this repository does not change what AMO shows.
-- `nativeMessaging`, `cookies`, `webRequest`, and `<all_urls>` are still
+- `nativeMessaging`, `webRequest`, and `<all_urls>` are still
   requested and still need their justifications - they are reproduced in the
   reviewer notes above.
 - **Done: the browser load check.** The 1.4.10 candidate was loaded as a

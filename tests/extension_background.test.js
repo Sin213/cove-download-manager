@@ -37,7 +37,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          tabs = [], downloadSearch = () => [],
                          storedIntercepted = null, eraseThrows = false,
                          slowInterceptedIds = false,
-                         cookieHook = null, settingsReadHook = null,
+                         cookieHook = null, nativeHook = null, settingsReadHook = null,
                          settingsWriteHook = null, permissionsHook = null,
                          worker = false, missingScripts = [],
                          installedMenus = new Map(), menuApi = "lenient",
@@ -53,6 +53,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   let confirmationTokenSequence = 0;
   const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
                   notifications: [], cookies: [], settingsWrites: [], tabsCreated: [],
+                  console: [], order: [],
                   // One entry per permissions.getAll(). Counted so a test can
                   // prove the consent state is read fresh for each handoff
                   // rather than cached from startup.
@@ -205,15 +206,18 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
       onErased: events.downloadErased,
-      async cancel(id) { calls.cancel.push(id); },
+      async cancel(id) { calls.order.push("cancel"); calls.cancel.push(id); },
       async erase(query) {
         if (eraseThrows) throw new Error("erase failed");
         calls.erase.push(query);
+        calls.order.push("erase");
       },
       async search(query) { return downloadSearch(query); },
       async download(options) { browserDownloads.push(options); },
     },
-    notifications: { async create(options) { calls.notifications.push(options); } },
+    notifications: { async create(options) {
+      calls.order.push("notification"); calls.notifications.push(options);
+    } },
     runtime: {
       lastError: null,
       getManifest: () => ({ version: "1.4.4" }),
@@ -225,7 +229,11 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onMessage: events.message,
       async sendNativeMessage(_host, message) {
         calls.native.push(message);
-        return typeof nativeResult === "function" ? nativeResult(message) : nativeResult;
+        calls.order.push("native:sent");
+        if (nativeHook) await nativeHook(message);
+        const result = await (typeof nativeResult === "function" ? nativeResult(message) : nativeResult);
+        calls.order.push(`native:${result && result.status}`);
+        return result;
       },
     },
     storage: {
@@ -273,7 +281,9 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
   events.setDataConsent = (next) => { consentState = next; };
   const context = vm.createContext({
     browser,
-    console: { log() {}, error() {} },
+    console: Object.fromEntries(["log", "error", "warn", "info", "debug"].map(
+      (level) => [level, (...args) => calls.console.push({ level, args })],
+    )),
     navigator: {
       userAgent: "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
     },
@@ -615,7 +625,9 @@ test("an extractor page URL is never handed to the browser downloader", async ()
 });
 
 test("context menu ignores an unusable blob src off an extractor page", async () => {
-  const { calls, events, browserDownloads } = loadBackground();
+  const { calls, events, browserDownloads } = loadBackground({
+    cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+  });
   await settle();
   calls.native.length = 0;
 
@@ -633,6 +645,8 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
 
   assert.equal(calls.native.filter((m) => m.action === "download").length, 0);
   assert.equal(browserDownloads.length, 0);
+  assert.deepEqual(calls.cookies, [], "refused menu reads no cookies");
+  assert.equal(JSON.stringify(calls.native).includes(COOKIE_SENTINEL), false);
 });
 
 // ---- Shared media core, loaded on its own ----
@@ -644,6 +658,7 @@ test("context menu ignores an unusable blob src off an extractor page", async ()
 // run, not a special explicit one.
 
 function loadMediaCore({ capability, nativeResult = { status: "ok" },
+                        cookies = [],
                         // Stands in for background.js's consent gate. The
                         // default is the granted answer, because that is what
                         // this route sent before the gate existed and these
@@ -666,7 +681,7 @@ function loadMediaCore({ capability, nativeResult = { status: "ok" },
     browser: {
       webRequest: null,
       cookies: {
-        async getAll(query) { core.cookies.push(query); return []; },
+        async getAll(query) { core.cookies.push(query); return cookies; },
       },
       tabs: {
         onRemoved: { addListener: noop },
@@ -901,7 +916,7 @@ test("the shared core hands over a manifest when no capability refuses one",
 
 test("an explicit factory capability's refusal is honoured", async () => {
   const seen = [];
-  const loaded = loadMediaCore();
+  const loaded = loadMediaCore({ cookies: [{ name: "session", value: COOKIE_SENTINEL }] });
   const media = loaded.buildCoveMedia({
     rejectMediaTarget(value) { seen.push(value); return value.endsWith(".m3u8"); },
   });
@@ -919,6 +934,7 @@ test("an explicit factory capability's refusal is honoured", async () => {
   // The capability was asked about the address that was about to be sent, not
   // about the message's raw url or the page it came from.
   assert.deepEqual(seen, [MANIFEST_PILL.url]);
+  assert.equal(JSON.stringify(loaded.core.native).includes(COOKIE_SENTINEL), false);
 });
 
 test("a global capability's refusal is honoured with no explicit argument",
@@ -1545,6 +1561,207 @@ test("a clear that storage refuses is reported as a failure", async () => {
 // cookies is strictly better than not sending it at all.
 
 const COOKIE_LIMIT = 32 * 1024;
+const COOKIE_SENTINEL = "s08e-synth-cookie-9c41";
+
+// Synthetic handoffs through the shipped VM runtime, never a browser store.
+async function s08eHandoff(route, options = {}) {
+  const loaded = loadBackground(options);
+  await settle();
+  loaded.calls.native.length = 0;
+  const url = "https://cdn.example.test/clip.mp4";
+  if (route === "interception") {
+    loaded.events.downloadCreated.emit(freshItem({ url, filename: "clip.mp4" }));
+  } else if (route === "menu") {
+    await Promise.all(loaded.events.contextMenuClicked.emit(
+      { menuItemId: "download-with-cove", linkUrl: url, pageUrl: "https://example.test/watch" },
+      { id: 7, url: "https://example.test/watch" },
+    ));
+  } else {
+    const { responses } = sendRuntimeMessage(loaded.events, {
+      type: route === "pill" ? "downloadMedia" : "downloadStream",
+      url, filename: "clip.mp4", pageUrl: "https://example.test/watch",
+    }, pillSender("https://example.test/watch"));
+    await settle();
+    assert.equal(responses.length, 1, `${route}: one reply`);
+    assert.equal(responses[0].ok, true, `${route}: accepted`);
+  }
+  await settle();
+  const sent = downloadsOf(loaded.calls);
+  assert.equal(sent.length, 1, `${route}: positive control sends once`);
+  assert.equal(sent[0].url, url, `${route}: positive control preserves URL`);
+  assert.equal(sent[0].filename, "clip.mp4", `${route}: positive control preserves filename`);
+  return loaded;
+}
+
+for (const [id, route] of [["A1", "interception"], ["A2", "menu"], ["A3", "pill"]]) {
+  test(`S08E ${id}: ${route} never queries cookies`, async () => {
+    await s08eHandoff(route); // A cookie-free fixture must still hand off.
+    const { calls } = await s08eHandoff(route, {
+      cookies: [{ name: "sid", value: COOKIE_SENTINEL }],
+    });
+    assert.deepEqual(calls.cookies, [], `${id}: cookie API must not be queried`);
+  });
+}
+
+test("S08E A4: popup stream omits the cookies key", async () => {
+  const { calls } = await s08eHandoff("stream");
+  assert.equal("cookies" in downloadsOf(calls)[0], false, "A4: cookies key must be absent");
+});
+
+test("S08E A6: shipped extension JavaScript contains no cookie API access", () => {
+  const scan = (source) => [...source.matchAll(/\b(?:browser\s*\.\s*cookies|cookies\s*\.\s*getAll)\b/g)]
+    .map((match) => match[0]);
+  const scratch = fs.mkdtempSync("/tmp/cove-s08e1-scan-");
+  try {
+    const source = fs.readFileSync("extension/diagnostics.js", "utf8");
+    assert.deepEqual(scan(source), [], "A6: diagnostics redaction words are ignored");
+    fs.writeFileSync(`${scratch}/planted.js`, `${source}\nbrowser.cookies.getAll({url: 'https://example.test'});`);
+    assert.ok(scan(fs.readFileSync(`${scratch}/planted.js`, "utf8")).length > 0,
+              "A6: scanner detects a planted API call in a temporary copy");
+    const matches = fs.readdirSync("extension", { recursive: true })
+      .filter((name) => name.endsWith(".js"))
+      .flatMap((name) => scan(fs.readFileSync(`extension/${name}`, "utf8"))
+        .map((match) => `${name}: ${match}`));
+    assert.deepEqual(matches, [], "A6: shipped cookie API accesses must be absent");
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+const S08E_ROUTES = ["interception", "menu", "pill", "stream"];
+for (const route of S08E_ROUTES) {
+  test(`S08E B1: ${route} exact payload keys and consent controls`, async () => {
+    const allowed = await s08eHandoff(route, { dataConsent: [CONSENT] });
+    const denied = await s08eHandoff(route, { dataConsent: [] });
+    assert.equal(downloadsOf(allowed.calls)[0].userAgent, REAL_UA, "B1: consent grants user-agent");
+    assert.equal("userAgent" in downloadsOf(denied.calls)[0], false, "B1: withheld consent omits user-agent");
+    const keys = ["action", "filename", "referrer", "url"];
+    if (route !== "menu") keys.push("fileSize");
+    for (const [loaded, uaKeys] of [[allowed, ["userAgent"]], [denied, []]]) {
+      assert.deepEqual(Object.keys(downloadsOf(loaded.calls)[0]).sort(), [...keys, ...uaKeys].sort(),
+                       `B1: ${route} exact keys must omit cookies`);
+    }
+  });
+
+  test(`S08E ${route === "stream" ? "B2s GUARD" : "B2"}: ${route} sends no sentinel`, async () => {
+    const { calls } = await s08eHandoff(route, {
+      cookies: [{ name: "sid", value: COOKIE_SENTINEL }],
+    });
+    assert.equal(JSON.stringify(calls.native).includes(COOKIE_SENTINEL), false,
+                 `B2: ${route} native payload must not contain sentinel`);
+  });
+
+  test(`S08E B3: ${route} has no nested cookie or header data`, async () => {
+    function forbidden(value, path = "$", hits = []) {
+      if (typeof value === "string" && value.includes(COOKIE_SENTINEL)) hits.push(path);
+      if (value && typeof value === "object") {
+        for (const [key, child] of Object.entries(value)) {
+          if (/cookie|header/i.test(key)) hits.push(`${path}.${key}`);
+          forbidden(child, `${path}.${key}`, hits);
+        }
+      }
+      return hits;
+    }
+    assert.deepEqual(forbidden({ nested: { headers: { Cookie: COOKIE_SENTINEL } } }),
+                     ["$.nested.headers", "$.nested.headers.Cookie", "$.nested.headers.Cookie"],
+                     "B3: walker detects planted nested keys and sentinel");
+    assert.deepEqual(forbidden({ nested: { url: "https://example.test" } }), [],
+                     "B3: walker accepts ordinary nested data");
+    const { calls } = await s08eHandoff(route, {
+      cookies: [{ name: "sid", value: COOKIE_SENTINEL }],
+    });
+    assert.deepEqual(forbidden(calls.native), [], `B3: ${route} recursive payload must be clean`);
+  });
+
+  for (const [id, field] of [["N1", "diagnostics"], ["N5", "console"]]) {
+    test(`S08E ${id} GUARD: ${route} ${field} contains no sentinel`, async () => {
+      const loaded = await s08eHandoff(route, {
+        cookies: [{ name: "sid", value: COOKIE_SENTINEL }],
+      });
+      const report = await diagReport(loaded.events);
+      assert.ok(report.includes("native_message_sent"), `${id}: diagnostic recorder is active`);
+      assert.ok(loaded.calls.console.length > 0, `${id}: console recorder is active`);
+      const captured = field === "diagnostics"
+        ? report + JSON.stringify(loaded.store.data.coveDiag)
+        : JSON.stringify(loaded.calls.console);
+      assert.equal(captured.includes(COOKIE_SENTINEL), false, `${id}: ${field} must not contain sentinel`);
+    });
+  }
+}
+
+for (const oracle of ["collection", "drop log"]) {
+  test(`S08E B4: oversized jar causes no ${oracle}`, async () => {
+    const { calls } = await s08eHandoff("interception", { cookies: jarOfSize(COOKIE_LIMIT + 1) });
+    if (oracle === "collection") {
+      assert.deepEqual(calls.cookies, [], "B4: oversized jar must not be collected");
+    } else {
+      assert.equal(JSON.stringify(calls.console).includes("cookie header exceeded"), false,
+                   "B4: oversized jar must not produce a drop log");
+    }
+  });
+}
+
+test("S08E D1 GUARD: native ok strictly precedes cancel then erase then notification", async () => {
+  let release;
+  let entered = 0;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const loaded = loadBackground({ nativeHook: async (message) => {
+    if (message.action === "download") { entered += 1; await gate; }
+  } });
+  await settle();
+  loaded.calls.order.length = 0;
+  loaded.events.downloadCreated.emit(freshItem());
+  await settle();
+  assert.equal(entered, 1, "D1: native reply suspension reached");
+  assert.deepEqual(loaded.calls.order, ["native:sent"], "D1: browser untouched before acknowledgement");
+  release();
+  await settle();
+  assert.equal(downloadsOf(loaded.calls).length, 1);
+  assert.deepEqual(loaded.calls.order, ["native:sent", "native:ok", "cancel", "erase", "notification"]);
+});
+
+for (const [name, settings, item] of [
+  ["disabled", { enabled: false }, {}],
+  ["blob", {}, { url: "blob:https://example.test/blob" }],
+  ["data", {}, { url: "data:application/zip;base64,AA==" }],
+  ["excluded domain", { excludedDomains: ["example.test"] }, {}],
+  ["extension allowlist", { interceptExtensions: ["mp4"] }, {}],
+]) {
+  test(`S08E D2 GUARD: ${name} filter leaves the browser download alone`, async () => {
+    await s08eHandoff("interception");
+    const { calls, events } = loadBackground({ settings });
+    await settle();
+    events.downloadCreated.emit(freshItem(item));
+    await settle();
+    assert.deepEqual(downloadsOf(calls), [], `D2: ${name} sends nothing`);
+    assert.deepEqual(calls.cancel, []);
+    assert.deepEqual(calls.erase, []);
+  });
+}
+
+// H1 retry and H3 menu fallback are already covered by the pre-existing
+// "a failed send is retried..." and "context menu falls back..." tests.
+for (const mode of ["error reply", "transport rejection"]) {
+  test(`S08E H2 H5 GUARD: observed ${mode} keeps browser ownership and permits retry`, async () => {
+    let attempts = 0;
+    const loaded = loadBackground({ nativeResult: (message) => {
+      if (message.action !== "download" || ++attempts > 1) return { status: "ok" };
+      if (mode === "transport rejection") throw new Error("synthetic lost acknowledgement");
+      return { status: "error", message: "synthetic refusal" };
+    } });
+    await settle();
+    loaded.events.downloadCreated.emit(freshItem());
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 1, "H5: mock host observed request");
+    assert.deepEqual(loaded.calls.cancel, [], "H5: no cancel after failed acknowledgement");
+    assert.deepEqual(loaded.calls.erase, [], "H5: no erase after failed acknowledgement");
+    assert.equal(evalIn(loaded.context, "recentIntercepted.size"), 0, "H5: failed mark cleared");
+    loaded.events.downloadCreated.emit(freshItem());
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 2, "H5: retry reaches host");
+    assert.deepEqual(loaded.calls.cancel, [90], "H5: positive acknowledgement allows cancellation");
+  });
+}
 
 function jarOfSize(total) {
   return [{ name: "sid", value: "c".repeat(Math.max(0, total - 4)) }];
@@ -1562,7 +1779,7 @@ function freshItem(overrides = {}) {
   };
 }
 
-test("a cookie jar within the handoff limit is sent unchanged", async () => {
+test("a cookie jar within the former handoff limit is ignored", async () => {
   const jar = jarOfSize(100);
   const { calls, events } = loadBackground({ cookies: jar });
   await settle();
@@ -1572,11 +1789,11 @@ test("a cookie jar within the handoff limit is sent unchanged", async () => {
   await settle();
 
   const sent = calls.native.find((m) => m.action === "download");
-  assert.equal(sent.cookies, `${jar[0].name}=${jar[0].value}`);
-  assert.equal(sent.cookies.length, 100);
+  assert.ok(sent, "the download still reaches Cove");
+  assert.equal("cookies" in sent, false);
 });
 
-test("an oversized cookie jar is dropped rather than sent or truncated", async () => {
+test("an oversized cookie jar is ignored during handoff", async () => {
   const { calls, events } = loadBackground({ cookies: jarOfSize(COOKIE_LIMIT + 1) });
   await settle();
   calls.native.length = 0;
@@ -1586,7 +1803,7 @@ test("an oversized cookie jar is dropped rather than sent or truncated", async (
 
   const sent = calls.native.find((m) => m.action === "download");
   assert.ok(sent, "the download must still be handed to Cove");
-  assert.equal(sent.cookies, "");
+  assert.equal("cookies" in sent, false);
   assert.equal(sent.url, "https://example.test/big.zip");
 });
 
@@ -2083,7 +2300,7 @@ test("a refused pill handoff leaves nothing behind it", async () => {
       pageUrl: "https://example.test/watch",
       requestId: "ccccdddd",
     },
-    { cookies: [{ name: "session", value: "value" }] },
+    { cookies: [{ name: "session", value: COOKIE_SENTINEL }] },
   );
   await m.done;
 
@@ -2096,6 +2313,7 @@ test("a refused pill handoff leaves nothing behind it", async () => {
     false,
     "a refused address must not be marked as intercepted",
   );
+  assert.equal(JSON.stringify(m.calls.native).includes(COOKIE_SENTINEL), false);
 });
 
 test("a refusal does not poison the request that follows it", async () => {
@@ -2243,7 +2461,6 @@ test("Chrome and Firefox send the same native message for the same direct media"
     url: "https://cdn.example.test/v/clip.mp4",
     filename: "Neutral clip.mp4",
     referrer: "https://neutral.example.test/watch",
-    cookies: "",
     fileSize: 0,
     userAgent: messages[0][0].userAgent,
     requestId: "abcd1234",
@@ -2287,17 +2504,20 @@ test("a Chrome pill handoff records no cookie, token or page title", async () =>
       pageUrl: "https://example.test/watch",
       requestId: "deadbeef",
     },
-    { cookies: [{ name: "session", value: "s3cr3t-cookie-value" }] },
+    { cookies: [{ name: "session", value: COOKIE_SENTINEL }] },
   );
   await m.done;
   await new Promise((resolve) => setTimeout(resolve, 1100));
 
   const serialised = JSON.stringify(m.store.data.coveDiag || []);
-  for (const secret of ["s3cr3t-cookie-value", "s3cr3t-token-value", "Clip"]) {
+  for (const secret of [COOKIE_SENTINEL, "s3cr3t-token-value", "Clip"]) {
     assert.ok(!serialised.includes(secret),
               `${secret} must not reach the diagnostic ring`);
   }
   assert.ok(serialised.includes("deadbeef"), "the request id must correlate");
+  assert.equal(downloadsOf(m.calls).length, 1, "the eligible pill still hands off");
+  assert.deepEqual(m.calls.cookies, [], "the eligible pill never queries cookies");
+  assert.equal(JSON.stringify(m.calls.native).includes(COOKIE_SENTINEL), false);
 });
 
 // ---- Deduplication ----
@@ -3012,7 +3232,6 @@ test("Firefox still forwards a detected stream with the message it shipped",
     url: "https://example.test/live.m3u8",
     filename: "live.mp4",
     referrer: "",
-    cookies: "",
     fileSize: 0,
     userAgent:
       "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
@@ -3216,7 +3435,7 @@ test("a known positive size reaches the native host unchanged", async () => {
   assert.equal(sent[0].fileSize, LARGE_BYTES);
   assert.deepEqual(
     Object.keys(sent[0]).sort(),
-    ["action", "cookies", "fileSize", "filename", "referrer", "url", "userAgent"],
+    ["action", "fileSize", "filename", "referrer", "url", "userAgent"],
     "the message shape is unchanged by the repair",
   );
   assert.ok(!("requestId" in sent[0]), "no request correlation is added");
@@ -3508,6 +3727,7 @@ test("a pill decision is neither stored nor mixed into the shared settings", asy
 test("a newly excluded page cannot hand a download over", async () => {
   const { events, calls, browserDownloads, setSettings } = loadBackground({
     settings: { excludedDomains: [] },
+    cookies: [{ name: "session", value: COOKIE_SENTINEL }],
   });
   const url = "https://cdn.other.test/clip.mp4";
   const page = "https://example.test/watch";
@@ -3524,130 +3744,154 @@ test("a newly excluded page cannot hand a download over", async () => {
   assert.equal(calls.cookies.length, 0, "a refused request reads no cookies");
   assert.equal(calls.notifications.length, 0, "no success feedback");
   assert.equal(browserDownloads.length, 0, "no browser fallback");
+  assert.equal(JSON.stringify(calls.native).includes(COOKIE_SENTINEL), false);
 });
 
-// The check before delegation cannot see a change that lands after it. The
-// cookie read is a suspension point in the middle of the handoff, so an
-// exclusion committed during it has to stop the request before anything leaves
-// the browser - and the jar that was already read must not leave with it.
-test("an exclusion committed while the cookie read is pending stops the handoff",
-     async () => {
-  const url = "https://cdn.other.test/clip.mp4";
-  const page = "https://example.test/watch";
-  let exclude = null;
-  const { events, calls, browserDownloads, setSettings } = loadBackground({
-    settings: { excludedDomains: [] },
-    cookies: [{ name: "session", value: "s3cr3t-cookie-value" }],
-    cookieHook: async () => { if (exclude) exclude(); },
-  });
-  // One shot: the retry below has to run with the exclusion gone, so the hook
-  // must not re-exclude the page during that second cookie read.
-  exclude = () => {
-    exclude = null;
-    setSettings({ excludedDomains: ["example.test"] });
+// Each control is bounded and test-only. The first assertion after entering a
+// race is its suspension count; a missing hook fails within twelve turns.
+function tiPause(id) {
+  let count = 0, entered, open;
+  const entry = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { open = resolve; });
+  return {
+    get count() { return count; }, open,
+    async park() { count += 1; entered(); await gate; },
+    async reached() {
+      for (let turn = 0; count === 0 && turn < 12; turn += 1) await settle();
+      assert.equal(count, 1, `${id}: suspension reached exactly once`);
+      await entry;
+    },
   };
+}
 
-  const reply = await pillDownload(events, { url, pageUrl: page });
+function tiStart(loaded, url, page) {
+  return new Promise((resolve) => loaded.events.message.emit(
+    { type: "downloadMedia", url, pageUrl: page }, pillSender(page), resolve,
+  ));
+}
 
-  assert.equal(calls.cookies.length, 1, "the case only holds if the read ran");
-  assert.equal(reply.ok, false);
-  assert.equal(reply.reason, "unsupported");
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "no native download attempt after the exclusion landed");
-  assert.equal(JSON.stringify(calls.native).includes("s3cr3t-cookie-value"),
-               false, "the jar that was already read must not be sent");
-  assert.equal(calls.notifications.length, 0, "no success feedback");
-  assert.equal(browserDownloads.length, 0, "no browser fallback");
+function tiBrowser(loaded, url, id) {
+  loaded.events.downloadCreated.emit(freshItem({ id, url, filename: "clip.mp4" }));
+}
 
-  // The dedup mark is set before the cookie read, so the refusal has to clear
-  // it. Left behind, an ordinary browser download of the same address inside
-  // the dedup window is silently dropped, which is observable here and is the
-  // only thing that shows the mark is really gone.
-  setSettings({ excludedDomains: [] });
-  calls.native.length = 0;
-  events.downloadCreated.emit({
-    id: 11,
-    url,
-    filename: "clip.mp4",
-    state: "in_progress",
-    startTime: new Date().toISOString(),
-    totalBytes: 20_000_000,
-  });
-  await settle();
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 1,
-               "the refused handoff must not leave a dedup mark behind");
-  assert.deepEqual(calls.cancel, [11]);
-
-  const retry = await pillDownload(events, { url, pageUrl: page });
-  assert.equal(retry.ok, true, "a retry once allowed again must go through");
+// TI-1 / M-TI-1: removing the post-UA generation check must fail
+// "TI-1: exclusion prevents native dispatch".
+test("an exclusion committed while the cookie read is pending stops the handoff", async () => {
+  const url = "https://cdn.other.test/clip.mp4", page = "https://example.test/watch";
+  for (const exclude of [false, true]) {
+    const pause = tiPause("TI-1");
+    let armed = true, claimsAtPause;
+    const loaded = loadBackground({
+      settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      permissionsHook: async () => {
+        if (!armed) return;
+        armed = false;
+        claimsAtPause = evalIn(loaded.context, "interceptClaims.size");
+        await pause.park();
+      },
+    });
+    await settle();
+    const pending = tiStart(loaded, url, page);
+    await pause.reached();
+    assert.equal(claimsAtPause, 1, "TI-1: claim open inside UA hook");
+    if (exclude) loaded.setSettings({ excludedDomains: ["example.test"] });
+    pause.open();
+    const reply = await pending;
+    assert.equal(downloadsOf(loaded.calls).length, exclude ? 0 : 1,
+                 "TI-1: exclusion prevents native dispatch");
+    assert.equal(reply.ok, !exclude, "TI-1: unchanged-policy positive control succeeds");
+    assert.equal(evalIn(loaded.context, "interceptClaims.size"), 0);
+    if (!exclude) continue;
+    assert.equal(reply.reason, "unsupported");
+    assert.equal(evalIn(loaded.context, `recentIntercepted.has(${JSON.stringify(url)})`), false);
+    assert.equal(JSON.stringify(loaded.calls.native).includes(COOKIE_SENTINEL), false);
+    assert.equal(loaded.calls.notifications.length, 0);
+    assert.equal(loaded.browserDownloads.length, 0);
+    loaded.setSettings({ excludedDomains: [] });
+    tiBrowser(loaded, url, 11);
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 1, "TI-1: refused claim leaves browser interception available");
+    assert.deepEqual(loaded.calls.cancel, [11]);
+    assert.equal((await tiStart(loaded, url, page)).ok, true, "TI-1: allowed retry succeeds");
+  }
 });
 
-// Revalidating from storage still leaves an ordering question: the answer is a
-// snapshot, and a write can commit after that snapshot is taken. The handoff has
-// to notice that a settings change happened at all, not only that the snapshot
-// it holds says "allowed", or the dispatch decides on settings that no longer
-// exist.
-test("an exclusion that commits after the final permission snapshot stops the handoff",
-     async () => {
-  const url = "https://cdn.other.test/clip.mp4";
-  const page = "https://example.test/watch";
-  let atFinalCheck = null;
-  const loaded = loadBackground({
-    settings: { excludedDomains: [] },
-    cookies: [{ name: "session", value: "s3cr3t-cookie-value" }],
-    // The final revalidation is the only settings read that happens after a
-    // cookie read, which is how this targets that read and not the admission
-    // check before it. The hook commits the exclusion while that read is
-    // pending, so the answer it returns is the already-superseded "allowed".
-    settingsReadHook: async () => { if (atFinalCheck) atFinalCheck(); },
-  });
-  const { events, calls, setSettings } = loaded;
-  atFinalCheck = () => {
-    if (calls.cookies.length === 0) return;
-    atFinalCheck = null;
-    setSettings({ excludedDomains: ["example.test"] });
-  };
-
-  const reply = await pillDownload(events, { url, pageUrl: page });
-
-  assert.equal(reply.ok, false);
-  assert.equal(reply.reason, "unsupported");
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "a stale allowing snapshot must not authorize the dispatch");
-  assert.equal(JSON.stringify(calls.native).includes("s3cr3t-cookie-value"),
-               false, "no cookies leave the browser on a stale answer");
+// TI-7 / M-TI-7: a storage hook alone is masked by the real helper's retry.
+// Park its resolved final snapshot so removing the caller's generation check
+// reaches UA resolution even if the later post-UA guard still refuses. The
+// permission-check count kills that masked mutant (control < 40 lines).
+test("an exclusion that commits after the final permission snapshot stops the handoff", async () => {
+  const url = "https://cdn.other.test/clip.mp4", page = "https://example.test/watch";
+  for (const exclude of [false, true]) {
+    const pause = tiPause("TI-7");
+    let finalReads = 0, armed = true;
+    const loaded = loadBackground({
+      settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      settingsReadHook: async () => {
+        if (armed && evalIn(loaded.context, "interceptClaims.size") > 0) finalReads += 1;
+      },
+    });
+    await settle();
+    loaded.context.tiFinalSnapshot = async (answer) => {
+      if (armed) { armed = false; await pause.park(); }
+      return answer;
+    };
+    evalIn(loaded.context, `const tiPermission = resolvePillPermission;
+      resolvePillPermission = async (sender) => {
+        const answer = await tiPermission(sender);
+        return interceptClaims.size > 0 ? tiFinalSnapshot(answer) : answer;
+      };`);
+    const pending = tiStart(loaded, url, page);
+    await pause.reached();
+    assert.equal(finalReads, 1, "TI-7: real final settings read observed with claim open");
+    if (exclude) loaded.setSettings({ excludedDomains: ["example.test"] });
+    pause.open();
+    const reply = await pending;
+    assert.equal(loaded.calls.permissionChecks.length, exclude ? 0 : 1,
+                 "TI-7: stale final snapshot must not resolve userAgent");
+    assert.equal(downloadsOf(loaded.calls).length, exclude ? 0 : 1,
+                 "TI-7: stale final snapshot cannot dispatch");
+    assert.equal(reply.ok, !exclude, "TI-7: no-exclusion positive control succeeds");
+    if (exclude) {
+      assert.equal(reply.reason, "unsupported");
+      assert.equal(JSON.stringify(loaded.calls.native).includes(COOKIE_SENTINEL), false);
+    }
+  }
 });
 
-// The permission answer itself is a snapshot. A change that lands while its
-// storage read is pending makes the answer stale before it is even returned, and
-// the early admission gate acts on that answer: it marks the url and reads the
-// page's cookies. Those are side effects on a page that is, by then, excluded.
-test("a settings change during the permission read reads no cookies", async () => {
-  const url = "https://cdn.other.test/clip.mp4";
-  const page = "https://example.test/watch";
-  let duringRead = null;
-  const loaded = loadBackground({
-    settings: { excludedDomains: [] },
-    cookies: [{ name: "session", value: "s3cr3t-cookie-value" }],
-    settingsReadHook: async () => { if (duringRead) duringRead(); },
-  });
-  const { events, calls, setSettings } = loaded;
-  // Only the admission read is targeted: it is the one that happens before any
-  // cookie has been read, and it is the one whose answer unlocks the side
-  // effects. Armed just before the click so startup reads are not caught.
-  duringRead = () => {
-    if (calls.cookies.length > 0) return;
-    duringRead = null;
-    setSettings({ excludedDomains: ["example.test"] });
-  };
-
-  const reply = await pillDownload(events, { url, pageUrl: page });
-
-  assert.equal(reply.ok, false);
-  assert.equal(reply.reason, "unsupported");
-  assert.equal(calls.cookies.length, 0,
-               "a stale allowing answer must not unlock the cookie read");
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0);
+// TI-8 / M-TI-8: a stale admission result must fail the token-count oracle,
+// even if the final guard subsequently refuses and releases that claim.
+test("a settings change during the permission read unlocks nothing", async () => {
+  const url = "https://cdn.other.test/clip.mp4", page = "https://example.test/watch";
+  for (const exclude of [false, true]) {
+    const pause = tiPause("TI-8");
+    let armed = false;
+    const loaded = loadBackground({
+      settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      settingsReadHook: async () => {
+        if (!armed || evalIn(loaded.context, "interceptClaims.size") !== 0) return;
+        armed = false;
+        await pause.park();
+      },
+    });
+    await settle();
+    const before = evalIn(loaded.context, "interceptTokenSeq");
+    armed = true;
+    const pending = tiStart(loaded, url, page);
+    await pause.reached();
+    if (exclude) loaded.setSettings({ excludedDomains: ["example.test"] });
+    pause.open();
+    const reply = await pending;
+    assert.equal(evalIn(loaded.context, "interceptTokenSeq"), before + (exclude ? 0 : 1),
+                 "TI-8: stale admission must not create a claim");
+    assert.equal(reply.ok, !exclude, "TI-8: unchanged admission positive control succeeds");
+    assert.equal(downloadsOf(loaded.calls).length, exclude ? 0 : 1);
+    assert.equal(evalIn(loaded.context, "interceptClaims.size"), 0);
+    if (exclude) {
+      assert.equal(reply.reason, "unsupported");
+      assert.equal(evalIn(loaded.context, "recentIntercepted.size"), 0);
+    }
+  }
 });
 
 test("a stale allowing answer is not permission to show the pill", async () => {
@@ -3737,219 +3981,135 @@ test("a settings change before the handoff starts does not cancel it",
   assert.equal(calls.native.filter((m) => m.action === "download").length, 1);
 });
 
-// Clearing the mark is right when the refused request is the one that set it.
-// It is wrong when an earlier request for the same address already sent it to
-// Cove: that mark is what stops the browser's own download of the same file
-// from being sent a second time, and it does not belong to the refused request.
-test("a late refusal does not drop a dedup mark another download relies on",
-     async () => {
+// TI-2 / M-TI-2: deleting by URL on refusal must fail
+// "TI-2: refusal preserves the first download's mark".
+test("a late refusal does not drop a dedup mark another download relies on", async () => {
   const url = "https://cdn.shared.test/clip.mp4";
-  let duringCookieRead = null;
-  const { events, calls, setSettings } = loadBackground({
-    settings: { excludedDomains: [] },
-    cookieHook: async () => { if (duringCookieRead) duringCookieRead(); },
-  });
-
-  // One page hands the address over successfully. Its mark is now the thing
-  // protecting that address. Both requests run in the same background, because
-  // the dedup state they share is what the case is about.
-  const first = await pillDownload(events, {
-    url, pageUrl: "https://first.test/watch",
-  });
-  assert.equal(first.ok, true);
-
-  // A second page asks for the same address and is excluded mid-flight.
-  duringCookieRead = () => {
-    duringCookieRead = null;
-    setSettings({ excludedDomains: ["second.test"] });
-  };
-  const refused = await pillDownload(events, {
-    url, pageUrl: "https://second.test/watch",
-  });
-  assert.equal(refused.ok, false, "the second page is refused");
-
-  // The browser starts its own download of the same address inside the dedup
-  // window. The first page's protection must still be in force.
-  calls.native.length = 0;
-  events.downloadCreated.emit({
-    id: 21,
-    url,
-    filename: "clip.mp4",
-    state: "in_progress",
-    startTime: new Date().toISOString(),
-    totalBytes: 20_000_000,
-  });
-  await settle();
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "a refusal must not erase a mark it did not set");
+  for (const exclude of [false, true]) {
+    const pause = tiPause("TI-2");
+    let armed = false;
+    const loaded = loadBackground({
+      settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      permissionsHook: async () => { if (armed) { armed = false; await pause.park(); } },
+    });
+    await settle();
+    const first = await tiStart(loaded, url, "https://first.test/watch");
+    armed = true;
+    const pending = tiStart(loaded, url, "https://second.test/watch");
+    await pause.reached();
+    assert.equal(first.ok, true, "TI-2: first page completed successfully");
+    if (exclude) loaded.setSettings({ excludedDomains: ["second.test"] });
+    pause.open();
+    assert.equal((await pending).ok, !exclude, "TI-2: second page succeeds without exclusion");
+    assert.equal(downloadsOf(loaded.calls).length, exclude ? 1 : 2);
+    loaded.calls.native.length = 0;
+    tiBrowser(loaded, url, 21);
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 0, "TI-2: refusal preserves the first download's mark");
+    assert.deepEqual(loaded.calls.cancel, []);
+  }
 });
 
-// The mirror image of the case above. Here the refused request DID set the
-// mark, but a later allowed request for the same address replaced it and
-// succeeded. The mark now protects that newer download, so the older refusal
-// must not take it away either: what matters is whether the mark is still the
-// one this request set, not whether this request once set one.
-test("a late refusal does not delete a mark a newer request replaced",
-     async () => {
+// TI-3 / M-TI-3: deleting a newer mark by URL must fail
+// "TI-3: refusal preserves the newer download's mark".
+test("a late refusal does not delete a mark a newer request replaced", async () => {
   const url = "https://cdn.shared.test/clip.mp4";
-  let holdFirst = null;
-  let releaseFirst = null;
-  const { events, calls, setSettings } = loadBackground({
-    settings: { excludedDomains: [] },
-    cookieHook: async () => {
-      if (!holdFirst) return;
-      const wait = holdFirst;
-      holdFirst = null;
-      await wait;
-    },
-  });
-  // The first request parks inside its cookie read, holding the mark it set.
-  holdFirst = new Promise((resolve) => { releaseFirst = resolve; });
-  let firstReply;
-  events.message.emit(
-    { type: "downloadMedia", url, pageUrl: "https://first.test/watch" },
-    pillSender("https://first.test/watch"),
-    (reply) => { firstReply = reply; },
-  );
-  await settle();
-
-  // While it is parked, its page is excluded and a second, still allowed page
-  // hands the same address over successfully, refreshing the mark.
-  setSettings({ excludedDomains: ["first.test"] });
-  const second = await pillDownload(events, {
-    url, pageUrl: "https://second.test/watch",
-  });
-  assert.equal(second.ok, true, "the second page is allowed and succeeds");
-
-  releaseFirst();
-  await settle();
-  await settle();
-  assert.equal(firstReply.ok, false, "the parked first request is refused");
-
-  // The browser's own download of the same address must still be deduplicated:
-  // the mark protecting it belongs to the request that succeeded.
-  calls.native.length = 0;
-  calls.cancel.length = 0;
-  events.downloadCreated.emit({
-    id: 31,
-    url,
-    filename: "clip.mp4",
-    state: "in_progress",
-    startTime: new Date().toISOString(),
-    totalBytes: 20_000_000,
-  });
-  await settle();
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "a refusal must not delete a mark that was replaced under it");
-  assert.deepEqual(calls.cancel, []);
+  for (const exclude of [false, true]) {
+    const pause = tiPause("TI-3");
+    let armed = true;
+    const loaded = loadBackground({
+      settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      permissionsHook: async () => { if (armed) { armed = false; await pause.park(); } },
+    });
+    await settle();
+    const pending = tiStart(loaded, url, "https://first.test/watch");
+    await pause.reached();
+    const second = await tiStart(loaded, url, "https://second.test/watch");
+    assert.equal(second.ok, true, "TI-3: newer page completes while first is suspended");
+    if (exclude) loaded.setSettings({ excludedDomains: ["first.test"] });
+    pause.open();
+    assert.equal((await pending).ok, !exclude, "TI-3: first page succeeds without exclusion");
+    assert.equal(downloadsOf(loaded.calls).length, exclude ? 1 : 2);
+    loaded.calls.native.length = 0;
+    tiBrowser(loaded, url, 31);
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 0, "TI-3: refusal preserves the newer download's mark");
+    assert.deepEqual(loaded.calls.cancel, [], "TI-3: browser duplicate is never cancelled");
+  }
 });
 
-// The reason a handoff claims the address before sending anything: the browser
-// may start its own download of that same direct-file URL while the handoff is
-// still in flight, and Cove must not receive it twice. The claim is what covers
-// that span, so the span has to be observed while it is open.
-test("a handoff in flight suppresses interception of the same address",
-     async () => {
-  const url = "https://cdn.shared.test/clip.mp4";
-  let open = null;
-  const gate = new Promise((resolve) => { open = resolve; });
-  const { events, calls } = loadBackground({
-    settings: { excludedDomains: [] },
-    cookieHook: async () => { await gate; },
+// TI-4a/4b / M-TI-4: ignoring claims must fail the duplicate count while
+// parked, including after the native request has left but before its reply.
+for (const hook of ["permissionsHook", "nativeHook"]) {
+  test(hook === "permissionsHook"
+    ? "a handoff in flight suppresses interception of the same address"
+    : "a handoff in flight suppresses interception of the same address until the native reply (TI-4b)", async () => {
+    const url = "https://cdn.shared.test/clip.mp4";
+    for (const duplicate of [false, true]) {
+      const pause = tiPause(`TI-4 ${hook}`);
+      let armed = true;
+      const loaded = loadBackground({
+        settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+        [hook]: async (message) => {
+          if (!armed || (message && message.action !== "download")) return;
+          armed = false;
+          await pause.park();
+        },
+      });
+      await settle();
+      loaded.calls.native.length = 0;
+      const pending = tiStart(loaded, url, "https://first.test/watch");
+      await pause.reached();
+      assert.equal(evalIn(loaded.context, "interceptClaims.size"), 1, "TI-4: claim remains open");
+      const sentAtPause = hook === "nativeHook" ? 1 : 0;
+      assert.equal(downloadsOf(loaded.calls).length, sentAtPause, "TI-4: expected dispatch stage reached");
+      if (duplicate) tiBrowser(loaded, url, 51);
+      await settle();
+      assert.equal(downloadsOf(loaded.calls).length, sentAtPause,
+                   "TI-4: in-flight claim absorbs browser duplicate");
+      assert.deepEqual(loaded.calls.cancel, []);
+      pause.open();
+      assert.equal((await pending).ok, true, "TI-4: handoff completes with or without duplicate");
+      assert.equal(downloadsOf(loaded.calls).length, 1, "TI-4: exactly one download reaches Cove");
+      assert.equal(evalIn(loaded.context, "interceptClaims.size"), 0);
+    }
   });
-  await settle();
-  calls.native.length = 0;
+}
 
-  let reply;
-  events.message.emit(
-    { type: "downloadMedia", url, pageUrl: "https://first.test/watch" },
-    pillSender("https://first.test/watch"),
-    (r) => { reply = r; },
-  );
-  await settle();
-  assert.equal(calls.cookies.length, 1, "the handoff is parked mid-flight");
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "nothing sent yet");
-
-  // The browser starts the same file while the handoff is still running.
-  events.downloadCreated.emit({
-    id: 51,
-    url,
-    filename: "clip.mp4",
-    state: "in_progress",
-    startTime: new Date().toISOString(),
-    totalBytes: 20_000_000,
-  });
-  await settle();
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "an in-flight handoff must absorb the browser's own download");
-
-  open();
-  await settle();
-  await settle();
-  assert.equal(reply.ok, true, "the handoff itself still completes");
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 1,
-               "exactly one download reaches Cove");
-});
-
-// Two handoffs for one address, both refused. Nothing reached Cove, so nothing
-// may be left protecting that address: the browser's own download of it has to
-// be intercepted normally. The order the two withdraw in must not matter.
+// TI-5 / M-TI-5: committing on refusal must fail
+// "TI-5: refused handoffs leave browser interception available".
 test("two refused handoffs for one address leave it unprotected", async () => {
   const url = "https://cdn.shared.test/clip.mp4";
-  const gates = [];
-  const { events, calls, setSettings } = loadBackground({
-    settings: { excludedDomains: [] },
-    cookieHook: async () => {
-      // Each request parks here until its own gate opens, so both are in flight
-      // at once and the second one's mark lands while the first still holds one.
-      const gate = gates.shift();
-      if (gate) await gate;
-    },
-  });
-  const opens = [];
-  for (let i = 0; i < 2; i += 1) {
-    gates.push(new Promise((resolve) => { opens.push(resolve); }));
-  }
-
-  const replies = [];
-  for (const page of ["https://first.test/watch", "https://second.test/watch"]) {
-    events.message.emit(
-      { type: "downloadMedia", url, pageUrl: page },
-      pillSender(page),
-      (reply) => { replies.push(reply); },
-    );
+  for (const exclude of [false, true]) {
+    const pauses = [tiPause("TI-5 first"), tiPause("TI-5 second")];
+    const queue = [...pauses];
+    const loaded = loadBackground({
+      settings: { excludedDomains: [] }, cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      permissionsHook: async () => { const pause = queue.shift(); if (pause) await pause.park(); },
+    });
     await settle();
+    const first = tiStart(loaded, url, "https://first.test/watch");
+    await pauses[0].reached();
+    const second = tiStart(loaded, url, "https://second.test/watch");
+    await pauses[1].reached();
+    assert.equal(pauses.reduce((sum, pause) => sum + pause.count, 0), 2, "TI-5: both requests suspended");
+    assert.equal(downloadsOf(loaded.calls).length, 0, "TI-5: neither request dispatched while parked");
+    if (exclude) loaded.setSettings({ excludedDomains: ["first.test", "second.test"] });
+    pauses[0].open();
+    const firstReply = await first;
+    pauses[1].open();
+    const secondReply = await second;
+    assert.deepEqual([firstReply.ok, secondReply.ok], [!exclude, !exclude],
+                     "TI-5: both succeed without exclusion; both refuse with it");
+    assert.equal(downloadsOf(loaded.calls).length, exclude ? 0 : 2);
+    assert.equal(evalIn(loaded.context, "interceptClaims.size"), 0);
+    if (!exclude) continue;
+    tiBrowser(loaded, url, 41);
+    await settle();
+    assert.equal(downloadsOf(loaded.calls).length, 1,
+                 "TI-5: refused handoffs leave browser interception available");
+    assert.deepEqual(loaded.calls.cancel, [41]);
   }
-
-  // Both pages are excluded while both requests are parked.
-  setSettings({ excludedDomains: ["first.test", "second.test"] });
-  // Withdrawn oldest first, which is the order that resurrected a dead mark.
-  opens[0]();
-  await settle();
-  await settle();
-  opens[1]();
-  await settle();
-  await settle();
-  assert.equal(replies.length, 2, "both requests answered");
-  assert.deepEqual(replies.map((r) => r.ok), [false, false]);
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 0,
-               "neither refused request reached Cove");
-
-  calls.native.length = 0;
-  calls.cancel.length = 0;
-  events.downloadCreated.emit({
-    id: 41,
-    url,
-    filename: "clip.mp4",
-    state: "in_progress",
-    startTime: new Date().toISOString(),
-    totalBytes: 20_000_000,
-  });
-  await settle();
-  assert.equal(calls.native.filter((m) => m.action === "download").length, 1,
-               "nothing reached Cove, so nothing may suppress this download");
-  assert.deepEqual(calls.cancel, [41]);
 });
 
 test("a refused pill download leaves no dedup mark behind", async () => {
@@ -5046,44 +5206,34 @@ test("U6e a denied-consent sweep across all three routes leaks no user-agent",
   }
 });
 
-test("U7 consent revoked during the pill's settings read is still honoured",
-     async () => {
-  // The media route reads settings between admitting the request and sending
-  // it, and that read is a suspension point. Resolving the user-agent before
-  // it would let a revocation that lands inside the window ship a user-agent
-  // the user had already withdrawn - a time-of-check/time-of-use gap, not a
-  // theoretical one: the same file already re-checks exclusions here for
-  // exactly this reason.
-  let armed = false;
-  let revoked = false;
-  const loaded = loadBackground({
-    dataConsent: [CONSENT],
-    // Arming at the cookie read is what makes this test discriminating. The
-    // handoff reads settings twice: once to admit the request, before the
-    // cookie read, and once more at the last moment before sending. Revoking
-    // on the first would put the revocation ahead of the user-agent in both
-    // the fixed and the broken ordering, and the test would pass either way.
-    // Armed here, only the FINAL read revokes - which is after the broken
-    // ordering has already resolved the user-agent, and before the fixed one
-    // has.
-    cookieHook: async () => { armed = true; },
-    settingsReadHook: async () => {
-      if (!armed || revoked) return;
-      revoked = true;
-      loaded.events.setDataConsent([]);
-    },
-  });
-  await settle();
-  loaded.calls.native.length = 0;
-
-  await requestMedia(loaded.events, { requestId: "ee55ff66" });
-  await settle();
-
-  const sent = downloadsOf(loaded.calls);
-  assert.equal(sent.length, 1, "the download still goes through");
-  assert.ok(revoked, "the revocation really did land during the settings read");
-  assert.ok(!("userAgent" in sent[0]),
-            "a user-agent resolved before the read must not be sent after it");
+// TI-6 / M-TI-6: resolving UA before final revalidation must fail
+// "TI-6: final-read revocation omits userAgent".
+test("U7 consent revoked during the pill's settings read is still honoured", async () => {
+  for (const revoke of [false, true]) {
+    const pause = tiPause("TI-6");
+    let armed = false, revoked = false;
+    const loaded = loadBackground({
+      dataConsent: [CONSENT], cookies: [{ name: "session", value: COOKIE_SENTINEL }],
+      settingsReadHook: async () => {
+        if (!armed || evalIn(loaded.context, "interceptClaims.size") === 0) return;
+        armed = false;
+        await pause.park();
+      },
+    });
+    await settle();
+    armed = true;
+    const pending = tiStart(loaded, "https://cdn.example.test/v/movie.mp4", "https://news.example.test/x");
+    await pause.reached();
+    assert.equal(evalIn(loaded.context, "interceptClaims.size"), 1, "TI-6: final read has an open claim");
+    if (revoke) { revoked = true; loaded.events.setDataConsent([]); }
+    pause.open();
+    await pending;
+    const sent = downloadsOf(loaded.calls);
+    assert.equal(sent.length, 1, "TI-6: download still goes through");
+    assert.equal(revoked, revoke, "TI-6: revocation was performed at the final read");
+    assert.equal("userAgent" in sent[0], !revoke, "TI-6: final-read revocation omits userAgent");
+    if (!revoke) assert.equal(sent[0].userAgent, REAL_UA, "TI-6: no-revocation positive control keeps UA");
+  }
 });
 
 // S03: exercise the real background + core after the final permission read,
@@ -5130,7 +5280,7 @@ async function parkS03FinalPermission({ competingPermissionsHook = null } = {}) 
   });
   await settle();
   assert.ok(parked, "fixture must reach the final UA permission await");
-  assert.equal(loaded.calls.cookies.length, 1, "cookies were collected before the final await");
+  assert.equal(loaded.calls.cookies.length, 0, "the final await never reads cookies");
   assert.equal(downloadsOf(loaded.calls).length, 0, "native dispatch has not started while parked");
   assert.equal(evalIn(loaded.context, `interceptClaims.get(${JSON.stringify(S03_POLICY_URL)}).size`), 1,
                "this request owns one in-flight claim");
@@ -5213,7 +5363,7 @@ test("S03 P3b: consent revoked alone during final UA await sends once without us
   const sent = downloadsOf(loaded.calls);
   assert.equal(sent.length, 1, "today's consent-only behavior still permits the handoff");
   assert.equal("userAgent" in sent[0], false, "revoked consent omits the userAgent key");
-  assert.equal(sent[0].cookies, `session=${S03_COOKIE_SECRET}`);
+  assert.equal("cookies" in sent[0], false);
   assert.equal(loaded.calls.notifications.length, 1);
   assert.equal(evalIn(loaded.context, `interceptClaims.has(${JSON.stringify(S03_POLICY_URL)})`), false);
 });
@@ -5225,7 +5375,7 @@ test("S03 P4: unchanged policy dispatches once, commits one mark and releases it
   const sent = downloadsOf(loaded.calls);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].url, S03_POLICY_URL);
-  assert.equal(sent[0].cookies, `session=${S03_COOKIE_SECRET}`);
+  assert.equal("cookies" in sent[0], false);
   assert.equal(sent[0].userAgent, REAL_UA);
   assert.equal(loaded.calls.notifications.length, 1, "one success notification");
   assert.equal(loaded.calls.notifications[0].title, "Download sent to Cove");

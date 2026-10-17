@@ -205,7 +205,6 @@ function downloadStream(msg, sendResponse) {
     url: msg.url,
     filename: msg.filename || "",
     referrer: "",
-    cookies: "",
     fileSize: 0,
     ...uaField,
   })).then((result) => {

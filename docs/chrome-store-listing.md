@@ -45,7 +45,7 @@ Features:
 
 • A real download queue with start, pause, and per-item controls, a daily schedule window, and a global speed cap
 
-• Session cookies, the referring page, and your browser's user-agent are passed along, so a file behind a session you are already signed in to still downloads
+• The referring page and your browser's user-agent are passed along. Cove does not use your browser's cookies, so a file that needs you to be signed in may not download in Cove
 
 • Interception can be toggled with a keyboard shortcut, restricted to chosen file types, switched off for domains you list, and held to a minimum file size whenever the browser gives a usable size at the start of a download. When the browser reports the size as unknown, the minimum cannot be applied and a smaller file may still be taken over
 
@@ -106,8 +106,8 @@ What it cannot do, by construction:
   Both routes a media address can take now enforce it. The context menu
   consults the refusal in `background.js`, and the in-page button's
   `downloadMedia` handoff consults the same refusal in `handleMediaTabDownload`
-  (`media-core.js`), before the address is marked, before cookies are read, and
-  before anything reaches the native host. A refused request ends there and
+  (`media-core.js`), before the address is marked and before anything reaches the
+  native host. A refused request ends there and
   reports that the address is unsupported.
 
   What this does and does not establish. It is one pathname check on the
@@ -138,14 +138,14 @@ Limits to be honest about in any copy:
 
 ## 3. Permissions and local data use
 
-Permission justifications for the dashboard. These are unchanged from the
-currently requested set; this slice changes no permission.
+Permission justifications for the dashboard. The `cookies` permission is no
+longer requested, so its row is removed; the other justifications are unchanged,
+and no permission is added.
 
 | Permission | Justification |
 | --- | --- |
 | `nativeMessaging` | The only way to reach the Cove desktop app, which is the download engine. |
 | `downloads` | See a download the browser started, cancel it once Cove has accepted it, and fall back to a browser download when Cove is unavailable. |
-| `cookies` | Read cookies for the download address at handoff time so a file behind an existing signed-in session still downloads. |
 | `contextMenus` | The "Download with Cove" entry. |
 | `notifications` | Report that a handoff succeeded or failed. |
 | `storage` | Settings and a bounded local diagnostics log. |
@@ -153,15 +153,15 @@ currently requested set; this slice changes no permission.
 
 Local data use, in the terms the Store's user-data policy uses:
 
-- The extension handles user data, including authentication cookies, website
+- The extension handles user data, including website
   resources (media addresses), and web browsing activity (the addresses it is
   asked to download and the page they came from).
 - Some of that handling is purely local: the content script inspects video
   elements and their geometry in the page and sends nothing as a result.
   Per the Store's User Data FAQ, local-only processing still has to be
   disclosed, and it is, in `PRIVACY.md`.
-- A handoff passes the download address, a filename, the referrer, cookies for
-  that address, and the user-agent to the local desktop app, which then
+- A handoff passes the download address, a filename, the referrer, and
+  the user-agent to the local desktop app, which then
   contacts the download's origin to fetch the file.
 - Settings and a 300-entry sanitised diagnostics ring are stored in
   `storage.local`. Addresses, titles, filenames, cookies, referrers, and
@@ -196,7 +196,7 @@ Every claim in section 1 that is about behaviour, and where it is enforced.
 | No stream download route in Chrome | `extension/background.js` message dispatch; the send lives in `extension/media-sites.js` | "Chrome answers the legacy stream download instead of forwarding it" |
 | Chrome requests no `webRequest` | `extension/manifest.chrome.json` | `test_chrome_manifest_still_requests_no_webrequest` |
 | 16 connections per file | `cove/config.py:32`, `cove/config.py:135` | - |
-| Cookies, referrer, user-agent are passed on | `extension/background.js` `collectCookies`; `cove/single_instance.py`; `cove/aria2.py:515` | `tests/extension_background.test.js` |
+| Referrer and user-agent are passed on; cookies are not read or sent | `extension/background.js` native payload; `cove/single_instance.py` | `tests/extension_background.test.js` |
 | The in-page button is withheld on an excluded site, live | `extension/content/media-tab.js` pill admission; `extension/background.js` `resolvePillPermission` | `tests/extension_media_tab.test.js`, `tests/extension_background.test.js` |
 | The page can only request an exclusion, never persist one | `extension/background.js` `requestExcludeConfirmation` creates a token and opens the extension page; `getExcludeConfirmation`, `confirmExcludeSite` and `cancelExcludeConfirmation` all refuse a sender that is not `confirm-exclude.html` via `fromExtensionPage` | `tests/extension_confirm_exclude.test.js`, `tests/extension_background.test.js` |
 | The confirmed host is the top-level page's, not a frame's or a CDN's | `extension/background.js` `excludableHost` reads `sender.tab.url`; `requestExcludeConfirmation` refuses unless the caller's `expectHost` equals it | `tests/extension_confirm_exclude.test.js` |
@@ -208,8 +208,9 @@ Wording that was deliberately avoided, and why:
 
 - "protected downloads" - reads as bypassing an access restriction. The Store's
   Malicious and Prohibited policy forbids facilitating unauthorized access,
-  naming paywalls and login restrictions. What actually happens is that cookies
-  the browser already holds are reused, so the copy says that.
+  naming paywalls and login restrictions. What actually happens is that the
+  extension hands the address to Cove, which does not reuse the browser's cookies,
+  so the copy says that.
 - "faster" as a bare promise, and "works everywhere" - neither is something the
   extension can guarantee.
 - Any claim that manifest, YouTube, or CDN addresses are globally blocked. The
@@ -271,8 +272,9 @@ Still unread, and not inferable from the source tree or the public page:
 - The live screenshots and promotional images.
 - The permission justifications currently recorded in the dashboard.
 - The privacy-practices declarations currently recorded in the dashboard.
-  In particular, whether the local-only page reading and the cookie read for
-  the download address are declared. No permission changed in this candidate,
+  In particular, whether the local-only page reading is declared and whether a
+  cookie declaration that this version no longer needs is still recorded. The
+  `cookies` permission was removed in this candidate and no permission was added,
   which is not the same as the declarations being correct; "no new
   permissions" is not evidence that the existing disclosures were ever
   reviewed.
@@ -323,8 +325,9 @@ and 1.4.10 add is the A2 half, the exclude-site action and its confirmation.
 - [ ] Point the dashboard's privacy policy field at the current `PRIVACY.md`.
       The repository copy being updated does not update a Store URL.
 - [ ] Declare the Privacy practices data categories. The Chrome bundle reads
-      page content locally to place the in-page button, and reads cookies for
-      the download address, and local-only processing still requires disclosure.
+      page content locally to place the in-page button, and local-only processing
+      still requires disclosure. Remove any cookie declaration the dashboard still
+      holds for this version.
 - [ ] Re-check the description against section 4 after any behaviour change.
 
 ## 7. Release notes for 1.3.11
@@ -343,7 +346,7 @@ The site that gets excluded is the one in the address bar. A video player embedd
 
 Saving the options page preserves an exclusion that was confirmed from another tab while the options page was open, and the unrelated change you made there is still saved.
 
-No permission changes in this version.
+The `cookies` permission is no longer requested, and the extension no longer reads or sends cookies. No permission is added.
 ```
 
 The previous version, 1.3.10, is where the in-page button began respecting

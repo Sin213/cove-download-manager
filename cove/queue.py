@@ -4766,7 +4766,7 @@ class QueueManager(QObject):
                 t.status = "error"
                 last_lines = "\n".join(stderr.splitlines()[-5:])
                 t.error = last_lines or f"ffmpeg exited with code {exit_code}"
-                hint = browser_login_failure_hint(bool(t.cookies) or t.browser_cookies_seen, exit_code, stderr)
+                hint = browser_login_failure_hint(exit_code, stderr)
                 if hint:
                     t.error += "\n" + hint
                 t.finished_at = time.time()

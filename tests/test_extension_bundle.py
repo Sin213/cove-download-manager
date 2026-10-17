@@ -158,6 +158,19 @@ def test_chrome_manifest_registers_the_shared_pill_content_script(bundles):
     assert entry["match_about_blank"] is True
 
 
+@pytest.mark.parametrize("browser", ["chrome", "firefox"])
+def test_s08e_a5_built_manifests_omit_cookie_permission(bundles, browser):
+    manifest = json.loads((bundles / browser / "manifest.json").read_text())
+    assert "nativeMessaging" in manifest["permissions"], "A5: native handoff remains available"
+    assert ("webRequest" in manifest["permissions"]) == (browser == "firefox")
+    if browser == "firefox":
+        assert manifest["browser_specific_settings"]["gecko"]["data_collection_permissions"] == {
+            "required": ["browsingActivity", "websiteContent", "websiteActivity"],
+            "optional": ["technicalAndInteraction"],
+        }
+    assert "cookies" not in manifest["permissions"], "A5: built manifest must omit cookies permission"
+
+
 def test_chrome_manifest_permissions_and_version_are_untouched(bundles):
     """Activating shared code must not widen what Chrome asks the user for."""
     source = json.loads((ROOT / "extension" / "manifest.chrome.json").read_text())
