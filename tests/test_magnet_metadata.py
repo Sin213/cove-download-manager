@@ -1200,10 +1200,12 @@ def test_aria2_distinguishes_a_missing_gid_from_a_failure_to_reach_it(monkeypatc
     """
     calls = []
 
-    def fake_post(self, url, json=None, timeout=None):
+    def fake_post(self, url, json=None, timeout=None, allow_redirects=None):
+        assert allow_redirects is False
         calls.append(json["method"])
 
         class R:
+            status_code = 200
             @staticmethod
             def json():
                 return {"error": {"code": 1,
@@ -1225,7 +1227,8 @@ def test_aria2_distinguishes_a_missing_gid_from_a_failure_to_reach_it(monkeypatc
 
     # A transport failure is an Aria2Error, but never an Aria2RpcError, and
     # so can never be read as "this download is gone".
-    def boom(self, url, json=None, timeout=None):
+    def boom(self, url, json=None, timeout=None, allow_redirects=None):
+        assert allow_redirects is False
         raise __import__("requests").RequestException("connection refused")
 
     monkeypatch.setattr("requests.Session.post", boom)
@@ -1235,8 +1238,9 @@ def test_aria2_distinguishes_a_missing_gid_from_a_failure_to_reach_it(monkeypatc
 
     # An error body that is not an object at all is still an error, not a
     # crash, and still cannot be read as a statement about the download.
-    def odd(self, url, json=None, timeout=None):
+    def odd(self, url, json=None, timeout=None, allow_redirects=None):
         class R:
+            status_code = 200
             @staticmethod
             def json():
                 return {"error": "something unstructured"}
@@ -1940,13 +1944,15 @@ def test_the_batched_snapshot_carries_its_token_the_way_aria2_expects():
     sent = {}
 
     class _Response:
+        status_code = 200
         @staticmethod
         def json():
             return {"result": [[[]], [[]], [[]]]}
 
     class _Session:
         @staticmethod
-        def post(url, json, timeout):
+        def post(url, json, timeout, allow_redirects):
+            assert allow_redirects is False
             sent.update(json)
             return _Response()
 

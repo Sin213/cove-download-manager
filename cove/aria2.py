@@ -545,6 +545,8 @@ class Aria2RPC:
         s = getattr(self._local, "session", None)
         if s is None:
             s = requests.Session()
+            # The RPC token must never go to an environment proxy.
+            s.trust_env = False
             self._local.session = s
         return s
 
@@ -575,10 +577,17 @@ class Aria2RPC:
             "params": [f"token:{self.secret}", *params] if with_token
             else [*params],
         }
+        r = None
         try:
-            r = self._session().post(self.url, json=payload, timeout=self.timeout)
+            r = self._session().post(self.url, json=payload, timeout=self.timeout, allow_redirects=False)
         except requests.RequestException as e:
             raise Aria2Error(f"RPC transport error: {e}") from e
+        except ValueError:
+            pass  # Discard parsing failures before raising a sanitized error.
+        if r is None:
+            raise Aria2Error("RPC message could not be processed")
+        if 300 <= r.status_code < 400:
+            raise Aria2Error(f"RPC unexpected redirect: HTTP {r.status_code}")
         try:
             data = r.json()
         except ValueError as e:

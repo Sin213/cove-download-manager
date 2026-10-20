@@ -1,11 +1,17 @@
 """Tests for the concurrency cap and external-download discovery."""
 import base64
+import json
 import os
+import socket
 import threading
-from urllib.parse import quote
+import traceback
+from collections import namedtuple
+from types import SimpleNamespace
+from urllib.parse import quote, urlsplit
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from cove import aria2, config
 
@@ -646,3 +652,201 @@ def test_is_running_never_restarts_anything():
         for _ in range(5):
             assert daemon.is_running() is False
     assert popen.call_count == 0
+
+
+@pytest.fixture
+def i2r1_wire(monkeypatch):
+    """Send-boundary configuration evidence; no wire traffic is permitted."""
+    for key in ("HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy "
+                "FTP_PROXY ftp_proxy NO_PROXY no_proxy REQUESTS_CA_BUNDLE CURL_CA_BUNDLE").split():
+        monkeypatch.delenv(key, raising=False)
+    wire = SimpleNamespace(rpc=Aria2RPC(Settings(rpc_port=16800, rpc_secret="SYNTH_I2R1_RPC_SECRET_0123456789ab")),
+                           sends=[], errors=[], sockets=[],
+                           proxy="http://proxy-a.invalid:3128", redirect=None, failure=None,
+                           target="http://redirect-target.invalid/leak",
+                           content=b'{"jsonrpc":"2.0","id":"x","result":{"version":"synthetic"}}')
+    Send = namedtuple("Send", "method url body proxies timeout")
+    def no_socket(*args, **kwargs):
+        wire.sockets.append(True)
+        raise AssertionError("I2-R1 unit test touched a socket")
+    def send(adapter, request, **kwargs):
+        body = request.body or b""
+        body = body.encode() if isinstance(body, str) else body
+        wire.sends.append(Send(request.method, request.url, body, dict(kwargs["proxies"]), kwargs["timeout"]))
+        if wire.failure:
+            wire.errors.append(wire.failure("synthetic transport failure", request=request))
+            raise wire.errors[-1]
+        response = requests.Response()
+        response.request, response.url = request, request.url
+        response.status_code, response._content = 200, wire.content
+        if wire.redirect and request.url == wire.rpc.url:
+            response.status_code = wire.redirect
+            response.headers.update({"Location": wire.target} if wire.target is not None else {})
+        return response
+    monkeypatch.setattr(socket.socket, "connect", no_socket)
+    monkeypatch.setattr(socket, "create_connection", no_socket)
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", send)
+    yield wire
+    assert wire.sockets == [], "socket isolation trap fired"
+
+
+@pytest.mark.parametrize("status", [None, 307, 308])
+def test_i2r1_control_unprotected_session_selects_env_proxy(i2r1_wire, monkeypatch, status):
+    i2r1_wire.redirect = status
+    monkeypatch.setenv("HTTP_PROXY", i2r1_wire.proxy)
+    with requests.Session() as session:
+        session.post(i2r1_wire.rpc.url, json={"synthetic": True}, timeout=5.0)
+    assert len(i2r1_wire.sends) == (2 if status else 1), "proxy/redirect recorder is not live"
+    assert i2r1_wire.sends[0].proxies["http"] == i2r1_wire.proxy
+    if status:
+        assert i2r1_wire.sends[1].url == i2r1_wire.target and i2r1_wire.sends[1].body == i2r1_wire.sends[0].body
+
+
+@pytest.mark.parametrize("key", ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "HTTPS_PROXY"])
+def test_i2r1_a_env_proxy_not_selected(i2r1_wire, monkeypatch, key):
+    monkeypatch.setenv(key, i2r1_wire.proxy)
+    i2r1_wire.rpc.get_version()
+    assert len(i2r1_wire.sends) == 1, "no send recorded"
+    assert i2r1_wire.sends[0].url == i2r1_wire.rpc.url and requests.utils.select_proxy(i2r1_wire.rpc.url, i2r1_wire.sends[0].proxies) is None
+
+
+@pytest.mark.parametrize("port", [6800, 16800])
+def test_i2r1_b_plain_rpc_unchanged(i2r1_wire, port):
+    rpc = Aria2RPC(Settings(rpc_port=port, rpc_secret=i2r1_wire.rpc.secret))
+    result = rpc.get_version()
+    assert len(i2r1_wire.sends) == 1, "no send recorded"
+    method, url, body, proxies, timeout = i2r1_wire.sends[0]
+    assert (method, url, proxies, timeout) == ("POST", f"http://127.0.0.1:{port}/jsonrpc", {}, 5.0)
+    payload = json.loads(body)
+    assert result == {"version": "synthetic"} and set(payload) == {"jsonrpc", "id", "method", "params"} and payload["id"]
+    assert (payload["jsonrpc"], payload["method"], payload["params"]) == ("2.0", "aria2.getVersion", [f"token:{rpc.secret}"])
+
+
+def test_i2r1_c_all_proxy_spellings_together(i2r1_wire, monkeypatch):
+    for i, key in enumerate("HTTP_PROXY http_proxy HTTPS_PROXY https_proxy ALL_PROXY all_proxy".split()):
+        monkeypatch.setenv(key, f"http://proxy-{i}.invalid:3128")
+    i2r1_wire.rpc.get_version()
+    assert len(i2r1_wire.sends) == 1, "no send recorded"
+    assert i2r1_wire.sends[0].proxies == {}
+
+
+@pytest.mark.parametrize("key", ["NO_PROXY", "no_proxy"])
+@pytest.mark.parametrize("value", ["", "localhost", "127.0.0.1", "127.0.0.0/8", "*", ".invalid", "example.invalid"])
+def test_i2r1_d_no_proxy_variants_irrelevant(i2r1_wire, monkeypatch, key, value):
+    monkeypatch.setenv("HTTP_PROXY", i2r1_wire.proxy)
+    monkeypatch.setenv(key, value)
+    i2r1_wire.rpc.get_version()
+    assert len(i2r1_wire.sends) == 1, "no send recorded"
+    assert i2r1_wire.sends[0].url == "http://127.0.0.1:16800/jsonrpc" and i2r1_wire.sends[0].proxies == {}
+
+
+def test_i2r1_e_every_thread_session_protected(i2r1_wire, monkeypatch):
+    w, observations = i2r1_wire, []
+    monkeypatch.setenv("HTTP_PROXY", w.proxy)
+    def call(name):
+        w.rpc.get_version()
+        session = w.rpc._session()
+        observations.append((name, session, session is w.rpc._session(), w.sends[-1].proxies))
+    for i in range(3):
+        thread = threading.Thread(target=call, args=(f"worker-{i}",))
+        thread.start()
+        thread.join()
+    call("main")
+    w.rpc.close()
+    call("rebuilt")
+    assert len(w.sends) == len(observations) == 5, "thread sends missing"
+    assert len({id(row[1]) for row in observations}) == 5, "sessions must be distinct"
+    for name, session, reused, proxies in observations:
+        assert reused and proxies == {} and session.trust_env is False, name
+
+
+@pytest.mark.parametrize("case", ["token", "multicall", "dict-error", "other-error", "bad-json"])
+def test_i2r1_f_auth_and_parsing_intact(i2r1_wire, case):
+    i2r1_wire.content = {"dict-error": b'{"error":{"code":7,"message":"synthetic denial"}}',
+                        "other-error": b'{"error":"synthetic denial"}', "bad-json": b'not-json'}.get(case, i2r1_wire.content)
+    method, error = "system.multicall" if case == "multicall" else "aria2.x", None
+    try:
+        result = i2r1_wire.rpc._call(method, [["caller"]], with_token=case != "multicall")
+    except Aria2Error as exc:
+        error = exc
+    assert len(i2r1_wire.sends) == 1, "no send recorded"
+    assert json.loads(i2r1_wire.sends[0].body)["params"] == ([] if case == "multicall" else [f"token:{i2r1_wire.rpc.secret}"]) + [["caller"]]
+    if case in ("token", "multicall"):
+        assert error is None and result == {"version": "synthetic"}
+    else:
+        assert type(error) is (aria2.Aria2RpcError if case == "dict-error" else Aria2Error)
+        assert str(error).startswith("RPC bad response:" if case == "bad-json" else "RPC aria2.x failed: synthetic denial")
+        if case == "dict-error":
+            assert (error.code, error.rpc_message) == (7, "synthetic denial")
+
+
+@pytest.mark.parametrize("failure", [requests.ConnectionError, requests.Timeout, requests.exceptions.ProxyError])
+def test_i2r1_g_transport_failure_keeps_semantics_without_secret(i2r1_wire, caplog, failure):
+    i2r1_wire.failure = failure
+    with caplog.at_level("DEBUG"):
+        with pytest.raises(Aria2Error, match="^RPC transport error:") as caught:
+            i2r1_wire.rpc.get_version()
+        i2r1_wire.rpc.shutdown()
+    assert len(i2r1_wire.sends) == 2, "transport/shutdown sends missing"
+    error = caught.value
+    assert type(error) is Aria2Error and error.__cause__ is i2r1_wire.errors[0]
+    surfaces = str(error) + repr(error) + repr(error.args) + str(error.__cause__) + repr(error.__cause__) + repr(error.__cause__.args) + caplog.text
+    assert i2r1_wire.rpc.secret not in surfaces and "token:" not in surfaces
+
+
+def test_i2r1_h_other_sessions_keep_default_trust_env(i2r1_wire):
+    from cove import netiface
+    i2r1_wire.rpc.get_version()
+    assert len(i2r1_wire.sends) == 1, "no send recorded"
+    with requests.Session() as bare, netiface.bound_requests_session("") as bound:
+        assert len({id(bare), id(bound), id(i2r1_wire.rpc._session())}) == 3
+        assert bare.trust_env is True and bound.trust_env is True
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_i2r1_i_redirects_not_followed(i2r1_wire, status):
+    w, error = i2r1_wire, None
+    w.redirect = status
+    with patch.object(requests.Session, "request", autospec=True, side_effect=requests.Session.request) as request:
+        try:
+            w.rpc.get_version()
+        except Aria2Error as exc:
+            error = exc
+    assert len(w.sends) == 1, "RPC followed redirect beyond loopback"
+    assert all(urlsplit(sent.url).hostname == "127.0.0.1" for sent in w.sends)
+    assert not any(w.rpc.secret.encode() in sent.body for sent in w.sends if urlsplit(sent.url).hostname != "127.0.0.1")
+    assert type(error) is Aria2Error and str(error).startswith(f"RPC unexpected redirect: HTTP {status}")
+    assert all(value not in str(error) for value in (w.rpc.secret, "token:", w.target))
+    assert request.call_args.kwargs.get("allow_redirects") is False  # configuration companion
+
+
+@pytest.mark.parametrize("status,location", [(s, "valid") for s in (300, 304, 305, 306, 399)] +
+                         [(s, k) for s in (307, 308) for k in ("absent", "bracket", "unicode", "credentials")])
+def test_i2r1_i_redirect_edge_cases(i2r1_wire, status, location):
+    w, error = i2r1_wire, None
+    w.redirect, w.target = status, {"absent": None, "bracket": f"http://[{w.rpc.secret}]/",
+                                  "unicode": "http://redirect-target.invalid/\u2603",
+                                  "credentials": f"http://user:hunter2@redirect-target.invalid/?t={w.rpc.secret}"}.get(location, w.target)
+    try:
+        w.rpc.get_version()
+    except Exception as exc:
+        error = exc
+    assert len(w.sends) == 1, "redirect parsing must not trigger a second authenticated send"
+    assert all(urlsplit(sent.url).hostname == "127.0.0.1" for sent in w.sends)
+    assert type(error) is Aria2Error, "post parsing failure escaped the RPC error contract"
+    malformed = location in ("bracket", "unicode")
+    assert str(error) == ("RPC message could not be processed" if malformed else f"RPC unexpected redirect: HTTP {status}")
+    assert not malformed or (error.__cause__ is None and error.__context__ is None)
+    surfaces = str(error) + repr(error) + "".join(traceback.format_exception(error))
+    assert all(value not in surfaces for value in (w.rpc.secret, "token:", "hunter2", w.target) if value)
+
+
+@pytest.mark.parametrize("error", [RuntimeError("synthetic"), KeyError("synthetic"), OSError("synthetic")])
+def test_i2r1_i_unrelated_exceptions_are_not_suppressed(i2r1_wire, error):
+    for injected, expected in ((error, type(error)), (ValueError("synthetic"), Aria2Error)):
+        i2r1_wire.failure = lambda *args, **kwargs: injected
+        with pytest.raises(expected) as caught:
+            i2r1_wire.rpc.get_version()
+        assert type(caught.value) is expected and len(i2r1_wire.sends) == (1 if injected is error else 2)
+        assert (caught.value is error and not isinstance(caught.value, Aria2Error) if injected is error
+                else str(caught.value) == "RPC message could not be processed")
