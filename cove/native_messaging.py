@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import __version__, diagnostics
-from .aria2 import Aria2RPC, Aria2Error
+from .aria2 import Aria2RPC, Aria2Error, read_rpc_record
 from .config import Settings
 
 MAX_MESSAGE_SIZE = 1024 * 1024  # 1 MB
@@ -376,7 +376,7 @@ def main() -> None:
 
     try:
         settings = Settings.load()
-        rpc = Aria2RPC(settings)
+        rpc = Aria2RPC(settings, secret_provider=lambda: read_rpc_record()[1])
     except Exception as e:
         _log("settings_unavailable", "WARNING", exc=e)
         settings = None

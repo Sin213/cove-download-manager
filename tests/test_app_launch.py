@@ -188,7 +188,7 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication as _RealQApplication
 
 import cove.app as app_mod
-from cove.aria2 import Aria2Error
+from cove.aria2 import Aria2Error, Aria2RPC as RealAria2RPC
 
 calls = {"constructed": [], "add_url": [], "activated": 0, "forwarded": None}
 
@@ -200,6 +200,7 @@ class FakeQMessageBox:
 
 
 class FakeSettings:
+    rpc_port, rpc_secret = 16801, "PERSISTED_SECRET_0123456789"
     theme = "dark"
     auto_update_check = False
     api_enabled = False
@@ -240,22 +241,44 @@ class FakeQueueManager:
 class FakeAria2Daemon:
     def __init__(self, *a, **k):
         calls["constructed"].append("Aria2Daemon")
+        FakeAria2Daemon.instance = self; self.ready, self.dead = False, False
+
+    def active_rpc_secret(self):
+        return "ACTIVE_SECRET_0123456789" if self.ready and not self.dead else None
 
     def start(self):
         calls["constructed"].append("daemon_start")
         if __DAEMON_FAILS__:
             raise Aria2Error("aria2 missing")
+        self.ready = True
 
     def stop(self):
-        pass
+        self.ready = False
 
 
-class FakeAria2RPC:
+class FakeAria2RPC(RealAria2RPC):
     def __init__(self, *a, **k):
         calls["constructed"].append("Aria2RPC")
+        super().__init__(*a, **k); self.sends = []; self.probe("before")
+
+    def _session(self):
+        from types import SimpleNamespace
+        import requests
+        def post(url, **kw):
+            self.sends.append(kw["json"]["params"])
+            response = requests.Response(); response.status_code = 200
+            response._content = b'{"result":{"version":"fake"}}'
+            return response
+        return SimpleNamespace(post=post, close=lambda: None)
+
+    def probe(self, phase):
+        before = len(self.sends)
+        try: self.get_version()
+        except Aria2Error as exc: assert "not ready" in str(exc).lower()
+        calls.setdefault("rpc_phases", {})[phase] = self.sends[before:]
 
     def set_overall_speed_limit_kbps(self, v):
-        pass
+        self.probe("ready"); FakeAria2Daemon.instance.dead = True; self.probe("dead")
 
     def shutdown(self):
         pass
@@ -460,6 +483,10 @@ def _run_harness(argv, is_primary, daemon_fails=False, early_ipc=None, late_ipc=
         return out, result
     return out
 
+
+def test_p1_OP16_app_rpc_tracks_daemon_readiness():
+    phases = _run_harness(argv=[], is_primary=True)["rpc_phases"]
+    assert phases == {"before": [], "ready": [["token:ACTIVE_SECRET_0123456789"]], "dead": []}
 
 def test_primary_launch_continues_normal_construction():
     out = _run_harness(argv=[], is_primary=True)

@@ -1,10 +1,14 @@
 """Tests for the native messaging host protocol and download handling."""
 import io
 import json
+import os
 import struct
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from cove import native_messaging as nm
+from cove import aria2, config
+from tests.test_aria2_external import ScriptedRPC
 from cove.native_messaging import (
     encode_message,
     decode_message,
@@ -13,6 +17,47 @@ from cove.native_messaging import (
 )
 
 COOKIE_SENTINEL = "s08e-synth-cookie-9c41"
+
+
+def test_p1_OP15_main_rereads_record_and_recovers(tmp_path, monkeypatch):
+    data = tmp_path / "data"; data.mkdir(); record = data / "aria2.rpc.auth"
+    for module in (config, aria2): monkeypatch.setattr(module, "DATA_DIR", data)
+    w = ScriptedRPC(monkeypatch, data)
+    monkeypatch.setattr(nm.Settings, "load", lambda: config.Settings(rpc_port=16801, rpc_secret="PERSISTED_SECRET_0123456789"))
+    monkeypatch.setattr(nm, "_LOG", MagicMock())
+    states = iter(["FIRST_SECRET_0123456789", "SECOND_SECRET_0123456789", "absent", "invalid", "unreadable", "FIRST_SECRET_0123456789"])
+    stdin, stdout, observations = io.BytesIO(encode_message({"action": "status"}) * 6), io.BytesIO(), []
+    original_decode, original_open, original_osopen = nm.decode_message, Path.open, os.open
+    unreadable, inside, expected = [False], [False], [None]
+    def opened(path, mode="r", *a, **kw):
+        if path == record and unreadable[0]: raise OSError("synthetic transient read failure")
+        assert not inside[0] or not any(c in mode for c in "wax+"), "native host attempted a write"
+        return original_open(path, mode, *a, **kw)
+    def osopened(path, flags, *a, **kw):
+        if Path(path) == record and unreadable[0]: raise OSError("synthetic transient read failure")
+        assert not inside[0] or not flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT), "native host attempted a write"
+        return original_osopen(path, flags, *a, **kw)
+    def decode(stream):
+        if expected[0] is not None: observations.append((expected[0], w.calls[:], {p.name for p in data.iterdir()})); w.calls.clear()
+        inside[0], unreadable[0] = False, False
+        message = original_decode(stream)
+        if message is None: return None
+        state = next(states); expected[0] = state; value = "FIRST_SECRET_0123456789" if state == "unreadable" else state
+        if record.exists(): record.unlink()
+        if state != "absent": temporary = data / "replacement"; temporary.write_text("bad record" if state == "invalid" else f"rpc-secret={value}\n"); temporary.replace(record)
+        unreadable[0] = state == "unreadable"; w.accepted = {value}; inside[0] = True
+        return message
+    monkeypatch.setattr(Path, "open", opened); monkeypatch.setattr(os, "open", osopened)
+    monkeypatch.setattr(nm, "decode_message", decode); monkeypatch.setattr(nm, "_binary_stdio", lambda: (stdin, stdout))
+    nm.main(); stdout.seek(0)
+    for state, sends, files in observations:
+        reply = decode_message(stdout)
+        assert files == (set() if state == "absent" else {record.name}), "native host created a file"
+        if state in ("absent", "invalid", "unreadable"):
+            assert reply["status"] == "error" and not sends
+            assert "not ready" in reply["message"].lower() or "not configured" in reply["message"].lower()
+        else: assert reply == {"status": "ok", "downloads": []} and len(sends) == 1 and sends[0][1][0] == f"token:{state}"
+    assert len(observations) == 6
 
 
 class _ChunkedStream:

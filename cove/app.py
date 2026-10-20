@@ -483,7 +483,7 @@ def run() -> int:
     app.setStyleSheet(theme.QSS)
 
     daemon = Aria2Daemon(settings)
-    rpc = Aria2RPC(settings)
+    rpc = Aria2RPC(settings, secret_provider=daemon.active_rpc_secret)
     queue = QueueManager(settings, rpc)
     browser_gate.queue = queue
     scheduler = Scheduler(settings.schedule)

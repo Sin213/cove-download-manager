@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from cove import aria2, config, db
+from tests.test_aria2_external import ScriptedRPC
 
 PAYLOAD = b"http://x.invalid/file?SYNTH_TOKEN=SYNTH_PASSKEY"
 
@@ -45,7 +46,7 @@ def s(tmp_path, monkeypatch, caplog):
     s.popen = MagicMock(side_effect=lambda *a, **k: s.events.append("spawn") or proc)
     monkeypatch.setattr(aria2.subprocess, "Popen", s.popen)
     monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "synthetic-aria2c")
-    monkeypatch.setattr(aria2.Aria2RPC, "get_version", lambda self: {"version": "1.37.0"})
+    ScriptedRPC(monkeypatch, data)
     monkeypatch.setattr(aria2, "interface_exists", lambda name: True)
     s.connect_error = ConnectionRefusedError(errno.ECONNREFUSED, "synthetic refusal")
     def connect(address):
@@ -125,8 +126,8 @@ def test_A1_A2_A3_A4_no_creation(s, monkeypatch, case):
     assert s.creates == [], f"{case}: start must never create/touch the session"
     assert not s.path.exists()
     if case == "A1":
-        assert {p.name for p in s.data.iterdir()} == {"aria2.rpc.conf"}
-        if os.name != "nt": assert stat.S_IMODE((s.data / "aria2.rpc.conf").stat().st_mode) == 0o600
+        assert {p.name for p in s.data.iterdir()} == {"aria2.rpc.auth"}
+        if os.name != "nt": assert stat.S_IMODE((s.data / "aria2.rpc.auth").stat().st_mode) == 0o600
 
 
 @pytest.mark.parametrize("test_id,prefix", [("B1", "--save-session"), ("C1", "--save-session-interval"),
@@ -269,14 +270,20 @@ def test_I1_I2_I3_I4_I6_I7_lifecycle(s, monkeypatch, caplog, case):
         dead, live = MagicMock(), MagicMock(); dead.poll.return_value = 1; live.poll.return_value = None
         children = iter([dead, live])
         s.popen.side_effect = lambda *a, **k: s.events.append("spawn") or next(children)
-        monkeypatch.setattr(aria2.Aria2RPC, "shutdown", lambda self: None)
+        shutdown = MagicMock(); monkeypatch.setattr(aria2.Aria2RPC, "shutdown", shutdown)
         monkeypatch.setattr(s.daemon, "_wait_for_port_release", lambda: None)
+    if case == "I7":
+        with pytest.raises(aria2.Aria2Error, match="Another aria2 process"): s.daemon.start()
+        assert s.events == ["port", "unlink", "spawn"] and s.popen.call_count == 1
+        shutdown.assert_not_called()
+        assert s.lstats == 1 and not s.path.exists()
+        return
     s.daemon.start()
     if case in ("I1", "I2"):
         assert data(s.path) == PAYLOAD, f"{case}: busy-port start changed session"; s.reclaim.assert_called_once(); skipped(caplog, "rpc_port_busy")
     elif case == "I6": assert s.lstats == 0 and not s.popen.called
     else:
-        assert s.events == ["port", "unlink", "spawn"] + (["spawn"] if case == "I7" else []), f"{case}: cleanup order/count"
+        assert s.events == ["port", "unlink", "spawn"], f"{case}: cleanup order/count"
         assert s.lstats == 1
 
 

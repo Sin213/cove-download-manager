@@ -26,6 +26,7 @@ import pytest
 from cove import aria2, config, db
 from cove.aria2 import Aria2Daemon, Aria2Error, Aria2RPC
 from cove.config import Settings
+from tests.test_aria2_external import ScriptedRPC
 
 
 POSIX_MODES = pytest.mark.skipif(
@@ -47,7 +48,7 @@ def storage(tmp_path, monkeypatch):
     )
     paths.settings = paths.config / "settings.json"
     paths.database = paths.data / "cove.db"
-    paths.conf = paths.data / "aria2.rpc.conf"
+    paths.conf = paths.data / "aria2.rpc.auth"
     for name, value in (
         ("CONFIG_DIR", paths.config), ("CONFIG_FILE", paths.settings),
         ("DATA_DIR", paths.data), ("DB_FILE", paths.database),
@@ -77,11 +78,15 @@ def _settings(storage, **overrides):
 def mock_start(storage, monkeypatch):
     proc = MagicMock()
     proc.poll.return_value = None
-    popen = MagicMock(return_value=proc)
+    def spawned(args, **kwargs):
+        storage.launch = Path(next(a.split("=", 1)[1] for a in args if a.startswith("--conf-path=")))
+        storage.launch_text = storage.launch.read_text()
+        return proc
+    popen = MagicMock(side_effect=spawned)
     monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "aria2c")
     monkeypatch.setattr(aria2.subprocess, "Popen", popen)
     monkeypatch.setattr(Aria2Daemon, "_port_in_use", lambda self: False)
-    monkeypatch.setattr(Aria2RPC, "get_version", lambda self: {"version": "1.37.0"})
+    storage.wire = ScriptedRPC(monkeypatch, storage.data)
     daemons = []
 
     def make(**overrides):
@@ -318,23 +323,25 @@ def test_s04_portable_storage_owns_only_final_leaf(tmp_path, check):
     parent.chmod(0o755)
     script = r'''
 import json, os, stat, sys
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 previous = os.umask(0o022)
 try:
     sys.argv[0] = str(Path(sys.argv[1]) / "cove")
     from cove import config, db, aria2
+    from tests.test_aria2_external import ScriptedRPC
     settings = config.Settings.load()
     settings.download_dir = str(Path(sys.argv[0]).parent / "downloads")
     settings.save()
     db.init()
     proc = MagicMock()
     proc.poll.return_value = None
+    ScriptedRPC(SimpleNamespace(setattr=setattr), config.DATA_DIR)
     daemon = aria2.Aria2Daemon(settings)
     try:
         with patch.object(aria2, "_resolve_aria2c", return_value="aria2c"), \
              patch.object(aria2.subprocess, "Popen", return_value=proc), \
-             patch.object(aria2.Aria2RPC, "get_version", return_value={}), \
              patch.object(aria2.Aria2Daemon, "_port_in_use", return_value=False):
             daemon.start()
     finally:
@@ -427,7 +434,7 @@ def test_s04_conf_and_data_private_at_creation(storage, mock_start, monkeypatch,
     finally:
         os.umask(previous)
     assert popen.called
-    assert _mode(storage.conf) == 0o600
+    assert storage.conf.is_file() and _mode(storage.conf) == 0o600
     assert file_modes and all(mode == 0o600 for mode in file_modes), file_modes
     assert directory_modes == [0o700], "DATA_DIR must be private when first created"
     assert _mode(storage.data) == 0o700
@@ -453,7 +460,7 @@ def test_s04_hostile_conf_symlink_is_replaced_without_touching_target(storage, m
     assert not storage.conf.is_symlink()
     assert storage.conf.is_file() and _mode(storage.conf) == 0o600
     assert storage.conf.read_text().splitlines() == [
-        f"rpc-secret={RPC_SECRET}", f"all-proxy={daemon._build_proxy_url()}",
+        storage.launch_text.splitlines()[0],
     ]
 
 
@@ -467,7 +474,8 @@ def test_s04_startup_failure_is_private_and_does_not_echo_secrets(storage, mock_
     if failure == "spawn":
         popen.side_effect = OSError(message)
     else:
-        monkeypatch.setattr(Aria2RPC, "get_version", MagicMock(side_effect=Aria2Error(message)))
+        import requests
+        storage.wire.failure = requests.ConnectionError(message)
         await_rpc = daemon._await_rpc
         monkeypatch.setattr(daemon, "_await_rpc", lambda: await_rpc(timeout=0.01))
     previous = os.umask(0o000)
@@ -478,7 +486,7 @@ def test_s04_startup_failure_is_private_and_does_not_echo_secrets(storage, mock_
         os.umask(previous)
     assert all(secret not in str(raised.value) for secret in secrets)
     assert _mode(storage.data) == 0o700
-    assert _mode(storage.conf) == 0o600
+    assert storage.conf.is_file() and _mode(storage.conf) == 0o600
     assert all(secret not in "\0".join(popen.call_args.args[0]) for secret in secrets)
     assert all(_mode(path) == 0o600 for path in storage.data.iterdir()
                if path.name not in ("aria2.session", "aria2.log"))
@@ -565,6 +573,8 @@ def real_proxy(storage, monkeypatch):
     legacy_proxy_url = None
 
     def isolated_popen(args, **kwargs):
+        storage.launch = Path(next(a.split("=", 1)[1] for a in args if a.startswith("--conf-path=")))
+        storage.launch_text = storage.launch.read_text()
         # Disable swarm discovery and cap network waits in this HTTP-only test.
         args = [*args, "--enable-dht=false", "--enable-dht6=false", "--enable-peer-exchange=false",
                 "--bt-enable-lpd=false", "--disable-ipv6=true", "--max-tries=1",
@@ -590,7 +600,7 @@ def real_proxy(storage, monkeypatch):
             settings = _settings(storage, rpc_port=_free_port(), proxy_port=proxy.port,
                                  proxy_username=username, proxy_password=password)
             daemon = Aria2Daemon(settings)
-            rpc = Aria2RPC(settings, timeout=0.5)
+            rpc = Aria2RPC(settings, timeout=0.5, secret_provider=daemon.active_rpc_secret)
         except BaseException:
             proxy.stop()
             raise
@@ -696,13 +706,15 @@ def test_s04_real_proxy_secrets_absent_from_process_cmdline(storage, real_proxy)
     assert any(record[-1] for record in proxy.requests)
     if sys.platform.startswith("linux"):
         cmdline = Path(f"/proc/{daemon._proc.pid}/cmdline").read_bytes()
-        for secret in (RPC_SECRET, daemon.settings.proxy_username, daemon.settings.proxy_password,
+        for secret in (RPC_SECRET, daemon.active_rpc_secret(), daemon.settings.proxy_username, daemon.settings.proxy_password,
                        quote(daemon.settings.proxy_password, safe="")):
             assert secret.encode() not in cmdline
         assert b"--all-proxy=" not in cmdline
     assert storage.conf.read_text().splitlines() == [
-        f"rpc-secret={RPC_SECRET}", f"all-proxy={daemon._build_proxy_url()}",
+        f"rpc-secret={daemon.active_rpc_secret()}",
     ]
+    assert storage.launch_text.splitlines() == [storage.conf.read_text().strip(), f"all-proxy={daemon._build_proxy_url()}"]
+    assert not storage.launch.exists()
 
 
 _SPECIAL_CREDENTIALS = [
@@ -733,7 +745,7 @@ def test_s04_special_credentials_conf_is_one_encoded_line(storage, mock_start, u
     daemon, popen = mock_start(proxy_username=username, proxy_password=password)
     daemon.start()
     expected = f"http://{quote(username, safe='')}:{quote(password, safe='')}@127.0.0.1:18080"
-    assert storage.conf.read_text().splitlines() == [f"rpc-secret={RPC_SECRET}", f"all-proxy={expected}"]
+    assert storage.conf.is_file() and storage.launch_text.splitlines() == [storage.conf.read_text().strip(), f"all-proxy={expected}"]
     assert not any(arg.startswith("--all-proxy") for arg in popen.call_args.args[0])
 
 
@@ -744,21 +756,21 @@ def test_s04_special_credentials_round_trip_via_conf(storage, real_proxy, userna
     _download(rpc, storage)
     assert any(record[1:] == (username, password, True) for record in proxy.requests)
     expected = f"http://{quote(username, safe='')}:{quote(password, safe='')}@127.0.0.1:{proxy.port}"
-    assert storage.conf.read_text().splitlines() == [f"rpc-secret={RPC_SECRET}", f"all-proxy={expected}"]
-    assert "all-proxy-user=" not in storage.conf.read_text()
-    assert "all-proxy-passwd=" not in storage.conf.read_text()
+    assert storage.launch_text.splitlines() == [storage.conf.read_text().strip(), f"all-proxy={expected}"]
+    assert "all-proxy-user=" not in storage.launch_text
+    assert "all-proxy-passwd=" not in storage.launch_text
 
 
 def test_s04_rotated_password_used_by_real_proxy(storage, real_proxy):
     """P6: B must actually authenticate after restarting with a rotated conf."""
     daemon, rpc, proxy = real_proxy(password="S04_OLD_PROXY_SECRET")
     _download(rpc, storage, filename="old.bin")
-    first = storage.conf.read_text()
+    first = storage.launch_text
     daemon.stop()
     proxy.password = daemon.settings.proxy_password = "S04_ARGV_SECRET_9f3c_rotated"
     daemon.start()
     _download(rpc, storage, filename="rotated.bin")
     assert any(record[1:] == ("s04user", "S04_ARGV_SECRET_9f3c_rotated", True) for record in proxy.requests)
-    assert "S04_OLD_PROXY_SECRET" not in storage.conf.read_text()
-    assert "S04_ARGV_SECRET_9f3c_rotated" in storage.conf.read_text()
+    assert "S04_OLD_PROXY_SECRET" not in storage.launch_text
+    assert "S04_ARGV_SECRET_9f3c_rotated" in storage.launch_text
     assert "S04_OLD_PROXY_SECRET" in first

@@ -41,6 +41,31 @@ class Aria2Error(RuntimeError):
     pass
 
 
+def read_rpc_record() -> tuple[str, str | None]:
+    """Read only a bounded regular auth record; absence alone permits upgrade."""
+    path = DATA_DIR / "aria2.rpc.auth"
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return "ABSENT", None
+    except OSError:
+        return "PRESENT-INVALID", None
+    try:
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 1024:
+            return "PRESENT-INVALID", None
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as record:
+            opened = os.fstat(record.fileno())
+            if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                return "PRESENT-INVALID", None
+            match = re.fullmatch(rb"rpc-secret=([A-Za-z0-9_-]{16,128})\n", record.read(1025))
+        if match:
+            return "VALID", match[1].decode("ascii")
+    except (OSError, ValueError):
+        pass
+    return "PRESENT-INVALID", None
+
+
 def validate_gid(gid: str) -> None:
     """Reject invalid caller identities before any RPC can admit a download."""
     if not isinstance(gid, str) or re.fullmatch(r"[0-9a-f]{16}", gid) is None or gid == "0" * 16:
@@ -85,6 +110,8 @@ class Aria2RpcError(Aria2Error):
         payload child running. Found by the live harness, not by reasoning
         about the text.
         """
+        if hasattr(self, "_gid_absent"):
+            return self._gid_absent
         message = str(self.rpc_message).lower()
         return any(phrase in message for phrase in self._GID_ABSENT)
 
@@ -217,6 +244,7 @@ class Aria2Daemon:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._proc: subprocess.Popen | None = None
+        self._secret = self._active_secret = self._launch_conf = None
 
     @staticmethod
     def is_installed() -> bool:
@@ -225,6 +253,7 @@ class Aria2Daemon:
     def start(self) -> None:
         if self._proc and self._proc.poll() is None:
             return
+        self._active_secret = self._secret = None
         aria2c = _resolve_aria2c()
         if aria2c is None:
             if sys.platform == "win32":
@@ -234,14 +263,12 @@ class Aria2Daemon:
             else:
                 hint = "Install it: sudo apt install aria2  (or your distro's equivalent)"
             raise Aria2Error(f"aria2c not found. {hint}")
-        conf_path = self._write_rpc_conf()
         connections = min(
             max(int(self.settings.connections_per_server), 1),
             MAX_CONNECTIONS_PER_SERVER,
         )
         args = [
             aria2c,
-            f"--conf-path={conf_path}",
             "--enable-rpc",
             f"--max-concurrent-downloads={MAX_CONCURRENT_DOWNLOADS}",
             f"--rpc-listen-port={self.settings.rpc_port}",
@@ -294,57 +321,40 @@ class Aria2Daemon:
             _remove_legacy_session_file()
         else:
             logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
-        self._spawn(args)
-        last_err = self._await_rpc()
-        if last_err is None:
-            if self._proc.poll() is None:
-                return
-            # RPC answered, but our own child is already dead: an aria2c
-            # from a previous Cove outlived it and still holds the port. It
-            # accepts our secret, so it is ours - but we cannot stop or
-            # restart a process we have no handle on, and when it finally
-            # exits every RPC call fails with "connection refused" mid
-            # session. Shut it down and take ownership instead of driving it.
-            client = Aria2RPC(self.settings)
-            try:
-                client.shutdown()
-            except Exception:
-                pass
-            finally:
-                client.close()
-            self._wait_for_port_release()
+        try:
+            self._secret = secrets.token_urlsafe(32)
+            conf_path = self._write_rpc_conf()
+            self._write_rpc_conf(record=True)
+            args.insert(1, f"--conf-path={conf_path}")
             self._spawn(args)
             last_err = self._await_rpc()
             if last_err is None and self._proc.poll() is None:
+                self._unlink_launch_conf()
+                self._active_secret = self._secret
                 return
+        except BaseException:
             self.stop()
-            raise self._stale_daemon_error()
-        our_proc_died = self._proc.poll() is not None
+            raise
         self.stop()
-        if our_proc_died and "unauthorized" in str(last_err).lower():
-            raise Aria2Error(
-                "Another aria2 process is already using port "
-                f"{self.settings.rpc_port}. Quit it (check your process list "
-                "for a leftover aria2c) or change the RPC port in Cove's "
-                "settings, then restart Cove."
-            )
+        if last_err is None or str(last_err) == str(self._stale_daemon_error()):
+            raise self._stale_daemon_error()
         raise Aria2Error("aria2 RPC did not come up.")
 
-    def _write_rpc_conf(self) -> Path:
+    def _write_rpc_conf(self, record: bool = False) -> Path:
         """Publish a complete private conf; no credential belongs in argv."""
         s = self.settings
-        for value in (s.proxy_host, s.proxy_type, s.proxy_port, s.rpc_secret):
+        for value in (s.proxy_host, s.proxy_type, s.proxy_port):
             if any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in str(value)):
                 raise Aria2Error("Invalid control character in aria2 configuration.")
-        text = f"rpc-secret={s.rpc_secret}\n"
-        if s.proxy_type != "none" and s.proxy_host:
+        text = f"rpc-secret={self._secret}\n"
+        if not record and s.proxy_type != "none" and s.proxy_host:
             text += f"all-proxy={self._build_proxy_url()}\n"
-        conf_path = DATA_DIR / "aria2.rpc.conf"
+        conf_path = DATA_DIR / ("aria2.rpc.auth" if record else f".aria2.launch.{secrets.token_hex(12)}.conf")
         temporary = None
         fd = None
         try:
             prepare_private_directory(DATA_DIR)
-            candidate = DATA_DIR / f".aria2.rpc.conf.{secrets.token_hex(12)}.tmp"
+            candidate = DATA_DIR / f".aria2.auth.{secrets.token_hex(12)}.tmp" if record else conf_path
             fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                          | getattr(os, "O_NOFOLLOW", 0), 0o600)
             temporary = candidate  # Never unlink a candidate we did not create.
@@ -353,7 +363,10 @@ class Aria2Daemon:
                 conf.write(text)
                 conf.flush()
                 os.fsync(conf.fileno())
-            os.replace(temporary, conf_path)
+            if record:
+                os.replace(temporary, conf_path)
+            else:
+                self._launch_conf = conf_path
             temporary = None
             if os.name != "nt":
                 if not stat.S_ISREG(conf_path.lstat().st_mode):
@@ -364,7 +377,7 @@ class Aria2Daemon:
                     raise OSError("aria2 configuration is not private")
             return conf_path
         except (OSError, ValueError):
-            raise Aria2Error("Unable to prepare private aria2 configuration.") from None
+            pass
         finally:
             if fd is not None:
                 os.close(fd)
@@ -373,6 +386,7 @@ class Aria2Daemon:
                     temporary.unlink()
                 except OSError:
                     pass
+        raise Aria2Error("Unable to prepare private aria2 configuration.")
 
     def is_running(self) -> bool:
         """Whether our aria2c child is alive. Cheap enough for a GUI timer.
@@ -416,21 +430,44 @@ class Aria2Daemon:
                 **_hidden_console_kwargs(),
             )
         except OSError:
-            raise Aria2Error("Failed to launch aria2c.") from None
+            pass
+        else:
+            return
+        raise Aria2Error("Failed to launch aria2c.")
 
-    def _await_rpc(self, timeout: float = 5.0) -> Exception | None:
-        """Poll the RPC endpoint. None once it answers, else the last error."""
-        deadline = time.time() + timeout
-        client = Aria2RPC(self.settings)
-        last_err: Exception | None = None
+    def _await_rpc(self, timeout: float = 5.0, secret=None, retry=True) -> Exception | None:
+        """Observe acceptance, then one exact rejection (aria2 delays it ~2s)."""
+        deadline = time.monotonic() + timeout
+        secret = self._secret if secret is None else secret
+        client = Aria2RPC(self.settings, secret_provider=lambda: secret)
+        last_err = Aria2Error("aria2 RPC did not come up.")
         try:
-            while time.time() < deadline:
+            while (remaining := deadline - time.monotonic()) > 0:
                 try:
-                    client.get_version()
-                    return None
-                except Exception as e:
-                    last_err = e
+                    client.timeout = min(timeout, remaining)
+                    version = client.get_version()
+                    if not isinstance(version, dict) or not isinstance(version.get("version"), str):
+                        return last_err
+                    break
+                except Aria2RpcError:
+                    return self._stale_daemon_error()
+                except Aria2Error:
+                    if not retry:
+                        return last_err
                     time.sleep(0.1)
+            else:
+                return last_err
+            wrong = secrets.token_urlsafe(32)
+            secret = wrong if wrong != secret else wrong + "_"
+            client.timeout = max(4.0, timeout)
+            try:
+                client.get_version()
+            except Aria2RpcError as error:
+                if error.http_status == 400 and type(error.code) is int and error.code == 1 and error.rpc_message == "Unauthorized":
+                    return None
+            except Aria2Error:
+                return last_err
+            return self._stale_daemon_error()
         finally:
             client.close()
         return last_err
@@ -465,19 +502,12 @@ class Aria2Daemon:
         - then every call fails with "connection refused" once that process
         finally exits. Shut it down and take ownership instead.
         """
-        client = Aria2RPC(self.settings)
-        try:
-            client.get_version()
-        except Exception as e:
-            if "unauthorized" in str(e).lower():
-                # Someone else's aria2, not ours to shut down.
-                raise self._stale_daemon_error()
-            # Not an aria2 RPC we can talk to. Leave it alone and let the
-            # normal startup path report why our own daemon never came up.
-            return
-        finally:
-            client.close()
-        client = Aria2RPC(self.settings)
+        state, secret = read_rpc_record()
+        if state == "ABSENT":
+            secret = self.settings.rpc_secret
+        if secret is None or self._await_rpc(secret=secret, retry=False) is not None:
+            raise self._stale_daemon_error()
+        client = Aria2RPC(self.settings, secret_provider=lambda: secret)
         try:
             client.shutdown()
         except Exception:
@@ -490,8 +520,8 @@ class Aria2Daemon:
 
     def _wait_for_port_release(self, timeout: float = 5.0) -> None:
         """Give a shut-down daemon time to let go of the RPC port."""
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             with socket.socket() as probe:
                 probe.settimeout(0.2)
                 try:
@@ -513,33 +543,58 @@ class Aria2Daemon:
         return f"{scheme}://{auth}{s.proxy_host}{port}"
 
     def stop(self) -> None:
+        self._active_secret = self._secret = None
+        self._unlink_launch_conf()
         if not self._proc:
             return
         if self._proc.poll() is None:
             try:
                 self._proc.send_signal(signal.SIGTERM)
                 self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
+            except (OSError, subprocess.TimeoutExpired):
                 # Reap the killed child so it can't linger as a zombie or
                 # race a later startup.
                 try:
+                    self._proc.kill()
                     self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
+                except (OSError, subprocess.TimeoutExpired):
                     pass
         self._proc = None
+
+    def _unlink_launch_conf(self) -> None:
+        if self._launch_conf is not None:
+            try:
+                self._launch_conf.unlink()
+                self._launch_conf = None
+            except OSError:
+                pass
+
+    def active_rpc_secret(self) -> str | None:
+        if not self.is_running():
+            self._active_secret = None
+        return self._active_secret
 
 
 class Aria2RPC:
     """Synchronous JSON-RPC client. Call from a worker thread."""
 
-    def __init__(self, settings: Settings, timeout: float = 5.0):
+    def __init__(self, settings: Settings, timeout: float = 5.0, secret_provider=None):
         self.url = f"http://127.0.0.1:{settings.rpc_port}/jsonrpc"
         self.secret = settings.rpc_secret
+        self._secret_provider = secret_provider
         self.timeout = timeout
         # requests.Session is not thread-safe. Calls fan out across a
         # QThreadPool, so give each thread its own session.
         self._local = threading.local()
+
+    @property
+    def secret(self):
+        provider = getattr(self, "_secret_provider", None)
+        return provider() if provider is not None else self._legacy_secret
+
+    @secret.setter
+    def secret(self, value):
+        self._legacy_secret = value
 
     def _session(self) -> requests.Session:
         s = getattr(self._local, "session", None)
@@ -570,38 +625,82 @@ class Aria2RPC:
         # `system.multicall` takes exactly one argument - the batch - and each
         # sub-call carries its own token, so it is the one method that must not
         # have one prepended here.
+        secret = self.secret
+        if secret is None:
+            raise Aria2Error("aria2 is not ready")
+        def sanitize(value):
+            if isinstance(value, dict):
+                return {str(sanitize(k)): sanitize(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [sanitize(v) for v in value]
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and secret and (secret in str(value) or secret in repr(value)):
+                return "[redacted]"
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+                try:
+                    if float(value) == float(secret):
+                        return "[redacted]"
+                except (ValueError, OverflowError):
+                    pass
+            return value.replace(secret, "[redacted]") if isinstance(value, str) and secret else value
+        def redact(value):
+            return str(sanitize(value)).replace(secret, "[redacted]") if secret else str(value)
+        params = list(params)
+        if method == "system.multicall" and params:
+            for call in params[0]:
+                if isinstance(call, dict):
+                    call["params"][0] = f"token:{secret}"
         payload = {
             "jsonrpc": "2.0",
             "id": str(uuid.uuid4()),
             "method": method,
-            "params": [f"token:{self.secret}", *params] if with_token
+            "params": [f"token:{secret}", *params] if with_token
             else [*params],
         }
         r = None
+        failure = None
         try:
             r = self._session().post(self.url, json=payload, timeout=self.timeout, allow_redirects=False)
         except requests.RequestException as e:
-            raise Aria2Error(f"RPC transport error: {e}") from e
+            failure = f"RPC transport error: {redact(e)}"
         except ValueError:
             pass  # Discard parsing failures before raising a sanitized error.
+        if failure is not None:
+            raise Aria2Error(failure)
         if r is None:
             raise Aria2Error("RPC message could not be processed")
         if 300 <= r.status_code < 400:
             raise Aria2Error(f"RPC unexpected redirect: HTTP {r.status_code}")
         try:
             data = r.json()
-        except ValueError as e:
-            raise Aria2Error(f"RPC bad response: {e}") from e
-        if "error" in data:
-            error = data["error"]
-            if not isinstance(error, dict):
-                raise Aria2Error(f"RPC {method} failed: {error}")
-            # aria2 answered and said no. Subclassed so a caller can tell this
-            # apart from the "no answer" cases above without parsing strings
-            # that a transport failure could also produce.
-            raise Aria2RpcError(
-                method, error.get("code"), error.get("message", error)
-            )
+        except (ValueError, RecursionError):
+            data = None
+        if not isinstance(data, dict):
+            raise Aria2Error("RPC bad response: invalid JSON object")
+        if "error" in data and "result" in data:
+            raise Aria2Error("RPC bad response: contradictory envelope")
+        try:
+            if "error" in data:
+                error = data["error"]
+                if not isinstance(error, dict):
+                    raise Aria2Error(f"RPC {method} failed: {redact(error)}")
+                code = error.get("code")
+                message = error.get("message", error)
+                failure = Aria2RpcError(method, sanitize(code), redact(message))
+                failure._gid_absent = any(phrase in str(message).lower() for phrase in Aria2RpcError._GID_ABSENT)
+                failure.http_status = sanitize(r.status_code)
+                raise failure
+            if method == "system.multicall" and isinstance(data.get("result"), list):
+                for answer in data["result"]:
+                    if isinstance(answer, dict):
+                        answer["_gid_absent"] = any(phrase in str(answer.get("faultString", answer.get("message", answer))).lower() for phrase in Aria2RpcError._GID_ABSENT)
+                        answer["faultString"] = redact(answer.get("faultString", answer.get("message", answer)))
+                        for key in ("message", "faultString", "code", "faultCode"):
+                            if key in answer:
+                                answer[key] = sanitize(answer[key])
+        except RecursionError:
+            data = None
+        if data is None:
+            raise Aria2Error("RPC bad response: invalid JSON object")
         return data.get("result")
 
     # ---- Lifecycle -----------------------------------------------------
@@ -835,7 +934,7 @@ class Aria2RPC:
         terminal, and it is read from the newest end where a boundary-created
         child lands, so a full page is not evidence of having missed one.
         """
-        token = f"token:{self.secret}"
+        token = None  # Resolved once by _call, including every nested token.
         batch = [
             {"methodName": "aria2.tellActive",
              "params": [token, self._EXTERNAL_KEYS]},
@@ -865,11 +964,13 @@ class Aria2RPC:
             # would be the same unproven leap as reading a transport failure
             # as "no child", so it is surfaced as aria2 declining to answer.
             if isinstance(answer, dict):
-                raise Aria2RpcError(
+                error = Aria2RpcError(
                     "system.multicall",
-                    answer.get("faultCode"),
-                    answer.get("faultString", answer),
+                    answer.get("faultCode", answer.get("code")),
+                    answer.get("faultString", answer.get("message", answer)),
                 )
+                error._gid_absent = answer.get("_gid_absent", error.gid_not_found())
+                raise error
             # Each successful sub-call answers with its result wrapped in a
             # one-element array. Anything else is not a listing, and is not
             # read as an empty one.
