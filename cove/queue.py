@@ -241,6 +241,15 @@ MAGNET_CANCELLED = "cancelled"
 MAGNET_DUPLICATE = "duplicate"
 MAGNET_BLOCKED = "blocked"
 
+ENGINE_UNAVAILABLE_TEXT = (
+    "Cove couldn't start the download engine, so this download did not start. "
+    "It is saved and will be tried again the next time Cove starts."
+)
+MAGNET_UNAVAILABLE_TEXT = (
+    "Cove's download engine is not ready, so this magnet link was not added. "
+    "Try again in a moment, or restart Cove if it failed to start."
+)
+
 P2P_ALLOW = "allow"
 P2P_BLOCK_TORRENT_DISABLED = "block_torrent_disabled"
 P2P_BLOCK_FALLBACK_POLICY = "block_fallback_policy"
@@ -793,6 +802,8 @@ class DownloadTask:
     # remain the truth about the transfer.
     shown_bytes: int = 0
     shown_identity: tuple = ()
+    # Memory-only: saved work remains recoverable after an engine-start failure.
+    startup_held: bool = field(default=False, init=False, repr=False)
 
     def reset_display_progress(self) -> None:
         """Forget the byte count already shown for this task.
@@ -911,8 +922,10 @@ class QueueManager(QObject):
     # torrent_consent(tid, accepted). No modal is ever raised from here.
     torrent_consent_needed = Signal(int)  # task id
 
-    def __init__(self, settings: Settings, rpc: Aria2RPC, parent: QObject | None = None):
+    def __init__(self, settings: Settings, rpc: Aria2RPC, parent: QObject | None = None,
+                 *, aria2_admission: str = "open"):
         super().__init__(parent)
+        self._aria2_admission = aria2_admission
         self.settings = settings
         self.rpc = rpc
         self.tasks: dict[int, DownloadTask] = {}
@@ -1379,7 +1392,7 @@ class QueueManager(QObject):
 
         Live in-memory tasks are checked first, then completed rows in
         SQLite (so a warning still fires after a restart). Errored and
-        removed tasks never match.
+        removed tasks never match (an engine-start failure is not an error here).
         """
         cand = dedup.Candidate(
             url=url,
@@ -1396,11 +1409,12 @@ class QueueManager(QObject):
         for t in self.tasks.values():
             if exclude_task_id is not None and t.id == exclude_task_id:
                 continue
-            if t.status not in self._DUP_LIVE_STATUSES and t.status != "completed":
+            status = "queued" if t.status == "error" and t.startup_held else t.status
+            if status not in self._DUP_LIVE_STATUSES and status != "completed":
                 continue
             if dedup.identity(self._dup_candidate_from_task(t)) != ident:
                 continue
-            if t.status == "completed":
+            if status == "completed":
                 # Keep looking: a live task is the more useful answer, and
                 # "Focus Existing" beats "Open Folder" when both apply.
                 if completed_task is None:
@@ -1410,7 +1424,7 @@ class QueueManager(QObject):
                 category=dedup.LIVE,
                 identity=ident[0],
                 task_id=t.id,
-                status=t.status,
+                status=status,
                 name=t.torrent_name or (t.filename or ""),
                 out_dir=t.out_dir,
                 filename=t.filename or "",
@@ -2083,6 +2097,8 @@ class QueueManager(QObject):
             return magnet, MAGNET_DUPLICATE, TORRENT_PREFLIGHT_PENDING
         if self._live_torrent(magnet.info_hash):
             return magnet, MAGNET_DUPLICATE, "That torrent is already in Cove's queue."
+        if self._aria2_admission != "open":
+            return magnet, MAGNET_BLOCKED, MAGNET_UNAVAILABLE_TEXT
         return magnet, "", ""
 
     def resolve_magnet_preflight(
@@ -4547,12 +4563,41 @@ class QueueManager(QObject):
             t.status == "active" or t.id in self._removing or t.id in self._unreconciled
         ))
 
+    @property
+    def aria2_admission(self) -> str:
+        return self._aria2_admission
+
+    @staticmethod
+    def _aria2_bound(t: DownloadTask) -> bool:
+        return t.backend not in ("ffmpeg", "yt-dlp")
+
+    def set_aria2_admission(self, state: str) -> None:
+        """Only leave pending; a failed admission never reopens."""
+        if self._aria2_admission != "pending" or state not in ("open", "failed"):
+            return
+        self._aria2_admission = state
+        if state == "failed":
+            self._fail_queued_aria2()
+
+    def _fail_for_startup(self, t: DownloadTask) -> None:
+        t.status = "error"
+        t.error = ENGINE_UNAVAILABLE_TEXT
+        t.startup_held = True
+        self.task_changed.emit(t.id)
+
+    def _fail_queued_aria2(self) -> None:
+        for t in list(self.tasks.values()):
+            if t.status == "queued" and self._aria2_bound(t):
+                self._fail_for_startup(t)
+
     def _maybe_start_next(self) -> None:
         if self._scheduling:
             self._schedule_rerun = True
             return
 
         def run_pass() -> None:
+            if self._aria2_admission == "failed":
+                self._fail_queued_aria2()
             if not self._running or not self._scheduler_allows:
                 return
             slots = max(0, self.settings.max_concurrent - self._active_count())
@@ -4566,6 +4611,7 @@ class QueueManager(QObject):
                 (
                     t for t in self.tasks.values()
                     if t.status == "queued"
+                    and (self._aria2_admission == "open" or not self._aria2_bound(t))
                     and not t.gid
                     and t.id not in self._pending_launch
                     and t.id not in self._removing
@@ -5025,6 +5071,10 @@ class QueueManager(QObject):
         proc.start(cmd[0], cmd[1:])
 
     def _launch(self, t: DownloadTask) -> None:
+        if self._aria2_admission != "open" and self._aria2_bound(t):
+            if self._aria2_admission == "failed":
+                self._fail_for_startup(t)
+            return
         if self._refuse_unreconciled_torrent_retry(t):
             return
         if (
@@ -5056,7 +5106,13 @@ class QueueManager(QObject):
         # Any previously generated debrid link has expired by now; a fresh
         # one is resolved from t.url below.
         t.clear_debrid()
-        self._persist(t)
+        try:
+            self._persist(t)
+        except Exception:
+            # Nothing was dispatched yet: keep the row queued, without a phantom active slot.
+            t.status = "queued"
+            self.task_changed.emit(t.id)
+            raise
         self.task_changed.emit(t.id)
         self._diag("queue", "task_launched", "INFO", task_id=t.id,
                    backend=t.backend, source_type=t.source_type)

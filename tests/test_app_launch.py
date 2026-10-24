@@ -188,22 +188,42 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication as _RealQApplication
 
 import cove.app as app_mod
-from cove.aria2 import Aria2Error, Aria2RPC as RealAria2RPC
+from cove.aria2 import Aria2Error, Aria2InterfaceError, Aria2RPC as RealAria2RPC
 
-calls = {"constructed": [], "add_url": [], "activated": 0, "forwarded": None}
+calls = {"constructed": [], "add_url": [], "activated": 0, "forwarded": None,
+         "boxes": [], "admission": [], "enabled": [], "drains": 0}
+flags = __A7A_FLAGS__
+choices = list(flags.get("interface_choices", []))
 
 
 class FakeQMessageBox:
+    Warning, ActionRole, RejectRole = 2, 0, 1
+    def __init__(self, parent=None): self.buttons = {}
+    def setIcon(self, v): pass
+    def setWindowTitle(self, v): pass
+    def setDefaultButton(self, v): pass
+    def setEscapeButton(self, v): pass
+    def setText(self, v): calls["boxes"].append(["interface", v])
+    def addButton(self, label, role):
+        self.buttons[label] = label
+        return label
+    def exec(self): self.choice = self.buttons[choices.pop(0) if choices else "Close"]
+    def clickedButton(self): return self.choice
     @staticmethod
     def critical(parent, title, text):
         calls["constructed"].append("QMessageBox.critical")
+        calls["boxes"].append(["critical", text])
+    @staticmethod
+    def warning(parent, title, text):
+        calls["constructed"].append("warning")
+        calls["boxes"].append(["warning", text])
 
 
 class FakeSettings:
     rpc_port, rpc_secret = 16801, "PERSISTED_SECRET_0123456789"
     theme = "dark"
     auto_update_check = False
-    api_enabled = False
+    api_enabled = flags.get("api_enabled", False)
     schedule = None
     overall_speed_limit_kbps = 0
     speed_limiter_enabled = False
@@ -221,6 +241,12 @@ class FakeQueueManager:
         calls["constructed"].append("QueueManager")
         from unittest.mock import MagicMock
         self.error = MagicMock()
+        self.aria2_admission = k.get("aria2_admission", "open")
+
+    def set_aria2_admission(self, state):
+        calls["constructed"].append("admission:" + state)
+        calls["admission"].append(state)
+        if self.aria2_admission == "pending": self.aria2_admission = state
 
     @property
     def legacy_cookie_cleanup(self):
@@ -236,6 +262,7 @@ class FakeQueueManager:
 
     def resume_persisted(self):
         calls["constructed"].append("resume_persisted")
+        if flags.get("resume_raises"): raise RuntimeError("SECRET-CANARY-123")
 
 
 class FakeAria2Daemon:
@@ -248,9 +275,13 @@ class FakeAria2Daemon:
 
     def start(self):
         calls["constructed"].append("daemon_start")
+        if flags.get("interface_errors") and not calls.get("interface_seen"):
+            calls["interface_seen"] = True
+            raise Aria2InterfaceError("Network interface 'x' was not found.")
         if __DAEMON_FAILS__:
             raise Aria2Error("aria2 missing")
-        self.ready = True
+        if flags.get("start_raises"): raise RuntimeError("SECRET-CANARY-123")
+        self.ready = not flags.get("no_secret", False)
 
     def stop(self):
         self.ready = False
@@ -278,6 +309,8 @@ class FakeAria2RPC(RealAria2RPC):
         calls.setdefault("rpc_phases", {})[phase] = self.sends[before:]
 
     def set_overall_speed_limit_kbps(self, v):
+        calls["constructed"].append("speed_limit")
+        if flags.get("speed_raises"): raise RuntimeError("speed")
         self.probe("ready"); FakeAria2Daemon.instance.dead = True; self.probe("dead")
 
     def shutdown(self):
@@ -289,18 +322,45 @@ class FakeScheduler:
         calls["constructed"].append("Scheduler")
 
 
-class FakeMainWindow:
+class FakeMainWindow(QObject):
     def __init__(self, *a, **k):
+        super().__init__()
+        FakeMainWindow.instance = self
         calls["constructed"].append("MainWindow")
         from unittest.mock import MagicMock
         self.titlebar = MagicMock()
         self._queue = a[1] if len(a) > 1 else k.get("queue")
+        self.settings, self.queue = a[0], self._queue
 
     def add_url_interactive(self, url):
         # The real window runs its duplicate check here and then calls the
         # queue; the delivery contract under test is that the magnet still
         # lands in queue.add_url exactly once.
+        calls["constructed"].append("handoff:" + url)
+        if late := flags.pop("during_handoff", None):
+            FakeSingleInstanceServer.instance.open_requested.emit([late])
+        if flags.get("handoff_raises") and url == __BAD_URL__:
+            raise RuntimeError("SECRET-CANARY-123 " + url)
         self._queue.add_url(url)
+
+    def _open_settings(self):
+        calls["constructed"].append("open_settings")
+        if flags.get("settings_raises"): raise OSError("settings")
+        if flags.get("real_queue"):
+            from unittest.mock import MagicMock
+            from cove import main_window as mw
+            class Accepted:
+                Accepted = 1
+                def __init__(self, *a): pass
+                def exec(self): return self.Accepted
+            mw.SettingsDialog, mw.configure_speed_spin = Accepted, lambda *a: None
+            for name in ("concurrent_spin", "speed_unit", "speed_spin", "speed_always_on"):
+                setattr(self, name, MagicMock())
+            self._apply_speed_limit = lambda: self.queue.set_overall_speed_limit(0)
+            self._refresh_schedule_section = self._refresh_folder_chip = lambda: None
+            mw.MainWindow._open_settings(self)
+            settle(self.queue)
+            calls["before_ready"] = [m for m, ready in calls.get("rpc", []) if m in ACTIVATING and not ready]
 
     def note_extension_seen(self):
         calls["constructed"].append("extension_seen")
@@ -324,7 +384,7 @@ class FakeMainWindow:
         calls["activated"] += 1
 
     def setEnabled(self, v):
-        pass
+        calls["enabled"].append(v)
 
     def stop_ui_timers(self):
         pass
@@ -335,7 +395,7 @@ class FakeLocalApiServer:
         calls["constructed"].append("LocalApiServer")
 
     def start(self):
-        pass
+        calls["constructed"].append("api_start")
 
     def stop(self):
         pass
@@ -348,13 +408,14 @@ class FakeSingleInstanceServer(QObject):
 
     def __init__(self, *a, **k):
         super().__init__()
+        FakeSingleInstanceServer.instance = self
         calls["constructed"].append("SingleInstanceServer")
         early = __EARLY_IPC__
         if early:
             QTimer.singleShot(0, lambda: self.open_requested.emit([early]))
         late = __LATE_IPC__
         if late:
-            QTimer.singleShot(200, lambda: self.open_requested.emit([late]))
+            QTimer.singleShot(200, lambda: self.open_requested.emit(late if isinstance(late, list) else [late]))
 
     def try_become_primary(self, name):
         return __IS_PRIMARY__
@@ -374,6 +435,12 @@ class BoundedExecQApplication(_RealQApplication):
         while time.monotonic() < deadline:
             self.processEvents()
             time.sleep(0.01)
+        if flags.get("recovery_actions") and False not in calls["enabled"]:
+            FakeMainWindow.instance._open_settings()
+            FakeMainWindow.instance.queue.remove(1)
+            calls["constructed"].append("remove")
+        if flags.get("recovery_schedule"):
+            FakeMainWindow.instance._open_settings()
         # Simulate normal shutdown so run()'s aboutToQuit-connected cleanup
         # (which shuts down the single-instance server) actually runs.
         self.aboutToQuit.emit()
@@ -385,6 +452,44 @@ app_mod.Settings = FakeSettings
 app_mod.QueueManager = FakeQueueManager
 app_mod.Aria2Daemon = FakeAria2Daemon
 app_mod.Aria2RPC = FakeAria2RPC
+if flags.get("real_queue"):
+    from cove import db, config
+    from cove.config import Settings as RealSettings, CategoryDirs
+    from cove.queue import QueueManager as RealQueue
+    from tests.test_queue_aria2_admission import ACTIVATING, settle, rows
+    from pathlib import Path
+    import requests
+    path = Path.cwd() / "queue.sqlite3"
+    init, connect = db.init, db.connect
+    db.init, db.connect = lambda: init(path), lambda: connect(path)
+    db.init()
+    with db.connect() as conn:
+        conn.execute("INSERT INTO downloads (url,out_dir,connections,speed_limit_kbps,status,created_at,category,backend) VALUES ('https://example.com/f.zip',?,4,0,'queued',1,'Other','aria2')", (str(Path.cwd()),))
+    def no_http(*a, **k): raise AssertionError("unexpected HTTP request")
+    requests.sessions.Session.request = no_http
+    settings = RealSettings(download_dir=str(Path.cwd()), category_dirs=CategoryDirs(), intelligent_segments=False, auto_update_check=False)
+    RealSettings.load, RealSettings.save = classmethod(lambda cls: settings), lambda self: None
+    class StartupQueue(RealQueue):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._poll.stop(); self._ext_poll.stop()
+            StartupQueue.instance = self
+    class StartupRecorder(RealAria2RPC):
+        def _call(self, method, params=(), *, with_token=True):
+            calls.setdefault("rpc", []).append([method, bool(self.secret)])
+            if self.secret is None: return super()._call(method, params, with_token=with_token)
+            return "1234567890abcdef" if method in ACTIVATING else "OK"
+        def shutdown(self): pass
+    app_mod.Settings, app_mod.QueueManager, app_mod.Aria2RPC = RealSettings, StartupQueue, StartupRecorder
+class FakeWatchdog:
+    def __init__(self, *a): calls["constructed"].append("watchdog")
+    def check(self): pass
+    def stop(self): pass
+app_mod.Aria2Watchdog = FakeWatchdog
+FakeMainWindow.note_aria2_unavailable = lambda *a: None
+# The two unrelated registration threads must not reach the host environment.
+from unittest.mock import MagicMock
+app_mod.threading.Thread = MagicMock()
 app_mod.Scheduler = FakeScheduler
 app_mod.MainWindow = FakeMainWindow
 app_mod.LocalApiServer = FakeLocalApiServer
@@ -396,7 +501,17 @@ app_mod.install_native_hosts = lambda: None
 
 sys.argv = ["cove"] + __ARGV__
 
+def profile(frame, event, arg):
+    if event == "call" and frame.f_code.co_name == "_drain_startup_inbox": calls["drains"] += 1
+sys.setprofile(profile)
 rc = app_mod.run()
+sys.setprofile(None)
+if flags.get("real_queue"):
+    settle(StartupQueue.instance)
+    calls["saved"] = rows(path)
+    restarted = StartupQueue(settings, StartupRecorder(settings, secret_provider=lambda: None))
+    calls["restored"] = sorted(restarted.tasks)
+    calls["saved_after_restart"] = rows(path)
 calls["returncode"] = rc
 print(json.dumps(calls))
 '''
@@ -463,9 +578,10 @@ def _isolated_child(script, *, control="", input=None):
 
 def _run_harness(argv, is_primary, daemon_fails=False, early_ipc=None, late_ipc=None,
                   forward_ok=True, bad_url="", return_raw=False,
-                  settings_unreadable=False, cleanup_status="not_needed"):
+                  settings_unreadable=False, cleanup_status="not_needed", **flags):
     script = (
         _HARNESS
+        .replace("__A7A_FLAGS__", repr(flags))
         .replace("__ARGV__", repr(argv))
         .replace("__IS_PRIMARY__", repr(is_primary))
         .replace("__SETTINGS_UNREADABLE__", repr(settings_unreadable))
@@ -682,3 +798,98 @@ def test_unreadable_settings_exits_without_constructing_services():
     for heavy in ("Aria2Daemon", "Aria2RPC", "QueueManager", "MainWindow", "LocalApiServer"):
         assert heavy not in out["constructed"], heavy
     assert "settings_unreadable" in result.stderr
+
+
+def test_settings_recovery_never_activates_aria2_before_ready():
+    out = _run_harness([], True, real_queue=True, interface_errors=True, interface_choices=["Open Settings"])
+    assert out["before_ready"] == []
+    assert [m for m, ready in out["rpc"] if m == "aria2.addUri" and ready] == ["aria2.addUri"]
+    assert out["constructed"].count("daemon_start") == 2
+
+
+def test_failed_start_keeps_settings_remove_and_quit_available():
+    out = _run_harness([], True, daemon_fails=True, real_queue=True, recovery_actions=True)
+    assert out["enabled"] == []
+    assert "open_settings" in out["constructed"] and "remove" in out["constructed"]
+    assert out["saved"] == [] and out["restored"] == [] and "shutdown" in out["constructed"]
+    assert not [m for m, _ in out.get("rpc", []) if m in {"aria2.addUri", "aria2.unpause"}]
+
+
+@pytest.mark.parametrize("phase", ["buffered", "late"])
+@pytest.mark.parametrize("count", [1, 2])
+def test_handoff_exceptions_report_one_sanitized_warning_per_batch(phase, count):
+    batch = [MAGNET_BAD] * count + [MAGNET]
+    out, raw = _run_harness(batch if phase == "buffered" else [], True,
+                           late_ipc=batch if phase == "late" else None, bad_url=MAGNET_BAD,
+                           handoff_raises=True, api_enabled=True, return_raw=True)
+    assert out["add_url"] == [MAGNET]
+    text = f"{count} magnet link{' was' if count == 1 else 's were'} not added. Open the link again; if that fails, restart Cove."
+    assert out["boxes"] == [["warning", text]]
+    assert "SECRET-CANARY-123" not in raw.stderr and MAGNET_BAD not in raw.stderr
+    order = out["constructed"]
+    assert order.index("api_start") < order.index("watchdog") < order.index("warning")
+
+
+def test_modal_handoff_order_is_drain_then_api_then_watchdog():
+    out = _run_harness([MAGNET, MAGNET_2], True, api_enabled=True)
+    assert out["add_url"] == [MAGNET, MAGNET_2] and out["drains"] == 1
+    order = out["constructed"]
+    assert order.index("resume_persisted") < order.index("handoff:" + MAGNET) < order.index("handoff:" + MAGNET_2) < order.index("api_start") < order.index("watchdog")
+
+
+@pytest.mark.parametrize("fault", ["resume_raises", "speed_raises"])
+def test_recovery_exception_still_drains_once_and_keeps_admission_open(fault):
+    out = _run_harness([MAGNET], True, **{fault: True})
+    assert out["add_url"] == [MAGNET]
+    assert out["admission"] == ["open"] and out["drains"] == 1
+    assert out["constructed"].count("resume_persisted") == 1
+    expected = [["warning", "Cove started the download engine but couldn't resume your saved downloads. They are still in your list. Restart Cove to try again."]] if fault == "resume_raises" else []
+    assert out["boxes"] == expected
+
+
+@pytest.mark.parametrize("fault", ["daemon", "start_raises", "no_secret", "interface_close", "settings_raises"])
+def test_startup_failure_reports_buffered_and_late_links_without_draining(fault):
+    flags = {fault: True} if fault in ("start_raises", "no_secret") else {}
+    if fault in ("interface_close", "settings_raises"):
+        flags.update(interface_errors=True, interface_choices=["Open Settings"] if fault == "settings_raises" else ["Close"], settings_raises=fault == "settings_raises")
+    out, raw = _run_harness([MAGNET], True, daemon_fails=fault == "daemon", late_ipc=[MAGNET_2, MAGNET_BAD], return_raw=True, **flags)
+    assert out["add_url"] == []
+    assert out["admission"] == ["failed"] and out["drains"] == 0
+    warnings = [text for kind, text in out["boxes"] if kind == "warning"]
+    assert warnings == ["1 magnet link was not added. Open the link again; if that fails, restart Cove.", "2 magnet links were not added. Open the link again; if that fails, restart Cove."]
+    assert out["enabled"] == [] and "SECRET-CANARY-123" not in raw.stdout + raw.stderr
+    if fault in ("daemon", "no_secret"):
+        assert out["boxes"][0] == ["critical", "aria2 missing" if fault == "daemon" else "aria2 did not report authenticated readiness."]
+    if fault in ("interface_close", "settings_raises"):
+        assert out["boxes"][0] == ["interface", "Network interface 'x' was not found."]
+    if fault in ("start_raises", "settings_raises"):
+        assert out["boxes"][-3] == ["critical", "Cove couldn't start the download engine. Restart Cove and try again."]
+    if fault not in ("interface_close", "settings_raises"):
+        order = out["constructed"]
+        assert order.index("admission:failed") < order.index("QMessageBox.critical")
+
+
+def test_ready_opens_before_continuation_and_successful_batches_have_no_warning():
+    out = _run_harness([MAGNET], True, early_ipc=MAGNET_2, late_ipc=MAGNET_BAD)
+    assert out["add_url"] == [MAGNET, MAGNET_2, MAGNET_BAD] and out["boxes"] == []
+    order = out["constructed"]
+    assert out["admission"] == ["open"] and out["drains"] == 1
+    assert order.index("daemon_start") < order.index("admission:open") < order.index("speed_limit") < order.index("resume_persisted")
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_startup_failure_preserves_saved_row_for_restart(failed):
+    out = _run_harness([], True, real_queue=True, interface_errors=failed, interface_choices=["Close"], recovery_schedule=failed)
+    # A later accepted Settings action is a real scheduling entry, even after Close.
+    if failed:
+        assert out["saved"] == [[1, "queued", None, None]]
+        assert out["restored"] == [1]
+        assert out["saved_after_restart"] == out["saved"]
+    else:
+        assert [m for m, ready in out["rpc"] if m == "aria2.addUri" and ready] == ["aria2.addUri"]
+
+
+def test_reentrant_ipc_during_startup_drain_is_delivered_once():
+    out = _run_harness([MAGNET], True, during_handoff=MAGNET_2)
+    assert out["add_url"] == [MAGNET_2, MAGNET]
+    assert out["drains"] == 1 and out["boxes"] == []

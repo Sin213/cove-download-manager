@@ -40,6 +40,13 @@ from .widgets import find_icon
 
 UPDATE_REPO = "Sin213/cove-download-manager"
 
+ENGINE_START_FAILED_TEXT = "Cove couldn't start the download engine. Restart Cove and try again."
+RESUME_FAILED_TEXT = (
+    "Cove started the download engine but couldn't resume your saved "
+    "downloads. They are still in your list. Restart Cove to try again."
+)
+LINKS_NOT_ADDED_TEXT = "not added. Open the link again; if that fails, restart Cove."
+
 
 def parse_launch_urls(argv: list[str]) -> list[str]:
     """Extract magnet URIs from GUI launch arguments.
@@ -404,6 +411,7 @@ def run() -> int:
     # daemon.start() succeeds and the persisted queue has resumed.
     startup_inbox: list[str] = list(launch_urls)
     queue_ready = False
+    startup_failed = False
 
     def _add_interactive(url: str) -> None:
         """Add one externally-delivered magnet the way the GUI would.
@@ -418,26 +426,34 @@ def run() -> int:
         else:
             queue.add_url(url)
 
-    def _drain_startup_inbox() -> None:
+    def _drain_startup_inbox() -> int:
         nonlocal queue_ready
         queue_ready = True
         # Same moment for the browser path: only now can an add actually be
         # driven to completion, so only now may we tell a browser we took one.
         browser_gate.ready = True
         pending, startup_inbox[:] = list(startup_inbox), []
+        refused = 0
         for url in pending:
             try:
                 _add_interactive(url)
             except Exception:
+                refused += 1
                 logging.getLogger("cove").warning("startup_inbox_add_failed")
+        return refused
 
     def _handle_open(urls: list[str]) -> None:
         if queue_ready and queue is not None:
+            refused = 0
             for url in urls:
                 try:
                     _add_interactive(url)
                 except Exception:
+                    refused += 1
                     logging.getLogger("cove").warning("ipc_add_failed")
+            _links_not_added(refused)
+        elif startup_failed:
+            _links_not_added(len(urls))
         else:
             startup_inbox.extend(urls)
         if window is not None:
@@ -484,7 +500,7 @@ def run() -> int:
 
     daemon = Aria2Daemon(settings)
     rpc = Aria2RPC(settings, secret_provider=daemon.active_rpc_secret)
-    queue = QueueManager(settings, rpc)
+    queue = QueueManager(settings, rpc, aria2_admission="pending")
     browser_gate.queue = queue
     scheduler = Scheduler(settings.schedule)
     app.processEvents()
@@ -540,10 +556,28 @@ def run() -> int:
         target=_heal_magnet_handler, name="magnet-self-heal", daemon=True
     ).start()
 
-    def _boot_daemon() -> None:
+    def _links_not_added(n: int) -> None:
+        if n:
+            QMessageBox.warning(
+                window, f"{APP_NAME} - links not added",
+                f"{n} magnet link{' was' if n == 1 else 's were'} {LINKS_NOT_ADDED_TEXT}",
+            )
+
+    def _mark_startup_failed() -> None:
+        nonlocal startup_failed
+        startup_failed = True
+        queue.set_aria2_admission("failed")
+
+    def _report_buffered_links() -> None:
+        dropped, startup_inbox[:] = len(startup_inbox), []
+        _links_not_added(dropped)
+
+    def _boot_daemon_steps() -> None:
         while True:
             try:
                 daemon.start()
+                if not daemon.active_rpc_secret():
+                    raise Aria2Error("aria2 did not report authenticated readiness.")
                 break
             except Aria2InterfaceError as e:
                 # A bound interface that is gone blocks every download, but
@@ -563,23 +597,32 @@ def run() -> int:
                     continue
                 # Nothing was started, so no traffic leaves over another
                 # interface. Downloads simply stay blocked until aria2 runs.
+                _mark_startup_failed()
+                _report_buffered_links()
                 return
             except Aria2Error as e:
+                _mark_startup_failed()
                 QMessageBox.critical(window, f"{APP_NAME} - aria2 missing", str(e))
-                window.setEnabled(False)
+                _report_buffered_links()
                 return
+        queue.set_aria2_admission("open")
         # Apply the effective speed limit (kbps if the limiter is on, else 0).
         effective = settings.overall_speed_limit_kbps if settings.speed_limiter_enabled else 0
         try:
             rpc.set_overall_speed_limit_kbps(effective)
-        except Aria2Error:
-            pass
+        except Exception as exc:
+            logging.getLogger("cove").warning("startup_speed_limit_failed: %s", type(exc).__name__)
         # Now that aria2 is reachable, drive any persisted-queued tasks.
-        queue.resume_persisted()
+        resume_failed = False
+        try:
+            queue.resume_persisted()
+        except Exception as exc:
+            resume_failed = True
+            logging.getLogger("cove").error("startup_resume_failed: %s", type(exc).__name__)
         # Only now drain command-line/IPC magnets buffered before aria2 was
         # ready. If daemon.start() raised above, we return before this and
         # the startup inbox is never drained into a broken daemon.
-        _drain_startup_inbox()
+        refused_links = _drain_startup_inbox()
         # Accept API downloads only once aria2 is up, so a request that
         # races app startup cannot be persisted straight into "error".
         if settings.api_enabled:
@@ -592,6 +635,20 @@ def run() -> int:
         timer.timeout.connect(watchdog.check)
         timer.start()
         window._aria2_watchdog = watchdog  # keep a strong reference
+        _links_not_added(refused_links)
+        if resume_failed:
+            QMessageBox.warning(window, f"{APP_NAME} - saved downloads", RESUME_FAILED_TEXT)
+
+    def _boot_daemon() -> None:
+        try:
+            _boot_daemon_steps()
+        except Exception as exc:
+            if queue.aria2_admission != "pending":
+                raise
+            logging.getLogger("cove").error("startup_unexpected_failure: %s", type(exc).__name__)
+            _mark_startup_failed()
+            QMessageBox.critical(window, f"{APP_NAME} - startup failed", ENGINE_START_FAILED_TEXT)
+            _report_buffered_links()
 
     QTimer.singleShot(0, _boot_daemon)
 
