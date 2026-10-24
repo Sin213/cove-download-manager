@@ -313,6 +313,18 @@ class FakeAria2Daemon:
         if value == "raise": raise RuntimeError("SECRET-CANARY-123")
         return value
 
+    def begin_start(self):
+        from types import SimpleNamespace
+        self.start(); self.ready = False
+        return SimpleNamespace(proc=None, secret="ACTIVE_SECRET_0123456789", port=FakeSettings.rpc_port)
+
+    @staticmethod
+    def authenticate(ticket, cancel): return None
+
+    def commit_ready(self, ticket, error):
+        if flags.get("no_secret"): raise Aria2Error("aria2 did not report authenticated readiness.")
+        self.ready = True
+
 
 class FakeAria2RPC(RealAria2RPC):
     def __init__(self, *a, **k):
@@ -514,9 +526,10 @@ class FakeWatchdog:
     def stop(self): pass
 app_mod.Aria2Watchdog = FakeWatchdog
 FakeMainWindow.note_aria2_unavailable = lambda *a: None
-# The two unrelated registration threads must not reach the host environment.
+# Registration targets stay harmless; authentication uses a real Python thread.
 from unittest.mock import MagicMock
-app_mod.threading.Thread = MagicMock()
+import cove.magnet_startup
+cove.magnet_startup.migrate_and_repair = lambda *a: None
 app_mod.Scheduler = FakeScheduler
 app_mod.MainWindow = FakeMainWindow
 app_mod.LocalApiServer = FakeLocalApiServer

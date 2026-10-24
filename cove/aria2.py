@@ -22,7 +22,11 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
+from requests.adapters import HTTPAdapter
+from urllib3 import HTTPConnectionPool
+from urllib3.connection import HTTPConnection
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 import requests
 
@@ -39,6 +43,76 @@ from .netiface import interface_exists
 
 class Aria2Error(RuntimeError):
     pass
+
+
+class _AuthCancel:
+    def __init__(self):
+        self.lock, self.sockets, self.event = threading.RLock(), set(), threading.Event()
+    @property
+    def cancelled(self):
+        return self.event.is_set()
+    def wait(self, timeout):
+        return self.event.wait(timeout)
+    def register(self, sock):
+        with self.lock:
+            if self.cancelled: raise OSError("Authentication cancelled")
+            self.sockets.add(sock)
+    def cancel(self):
+        with self.lock:
+            self.event.set()
+            for sock in tuple(self.sockets):
+                try: sock.shutdown(socket.SHUT_RDWR)
+                except OSError: pass
+                if sock.fileno() == -1: self.sockets.discard(sock)
+    def session(self):
+        gate = self
+        class Sock(socket.socket):
+            def close(self):
+                with gate.lock:
+                    super().close()
+                    if self.fileno() == -1: gate.sockets.discard(self)
+        class Connection(HTTPConnection):
+            def _new_conn(self):
+                sock = Sock(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    gate.register(sock)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                    sock.settimeout(self.timeout)
+                    if gate.cancelled: raise OSError("Authentication cancelled")
+                    sock.connect(("127.0.0.1", self.port))
+                except socket.timeout as error:
+                    sock.close(); raise ConnectTimeoutError(self, "connect timeout") from error
+                except OSError as error:
+                    sock.close(); raise NewConnectionError(self, "connect failed") from error
+                return sock
+        class Pool(HTTPConnectionPool):
+            ConnectionCls = Connection
+        class Adapter(HTTPAdapter):
+            def init_poolmanager(self, *args, **kwargs):
+                super().init_poolmanager(*args, **kwargs)
+                self.poolmanager.pool_classes_by_scheme = {"http": Pool}
+        session = requests.Session(); session.trust_env = False
+        session.mount("http://", Adapter(max_retries=0))
+        return session
+
+
+class _LaunchTicket(NamedTuple):
+    proc: object
+    secret: str
+    port: int
+
+
+class _AuthInput(NamedTuple):
+    settings: object
+    secret: str
+    @property
+    def _secret(self): return self.secret
+    def _stale_daemon_error(self): return Aria2Daemon._stale_daemon_error(self)
+
+
+class _RpcSettings(NamedTuple):
+    rpc_port: int
+    rpc_secret: None = None
 
 
 STOP_TERM_TIMEOUT = 5
@@ -345,10 +419,23 @@ class Aria2Daemon:
         return _resolve_aria2c() is not None
 
     def start(self) -> None:
+        if self._unreleased or _owned_pending is not None: raise Aria2Error(_UNRESOLVED)
+        if self.is_running(): return
+        ticket = self.begin_start()
+        try:
+            error = self._await_rpc()
+        except BaseException:
+            try: self.stop()
+            except BaseException: pass
+            raise
+        self.commit_ready(ticket, error)
+
+    def begin_start(self):
         if self._unreleased or _owned_pending is not None:
             raise Aria2Error(_UNRESOLVED)
         if self.is_running():
-            return
+            if self._active_secret is not None: return None
+            raise Aria2Error("aria2 startup already in progress.")
         self._active_secret = self._secret = None
         aria2c = _resolve_aria2c()
         if aria2c is None:
@@ -363,11 +450,12 @@ class Aria2Daemon:
             max(int(self.settings.connections_per_server), 1),
             MAX_CONNECTIONS_PER_SERVER,
         )
+        port = self.settings.rpc_port
         args = [
             aria2c,
             "--enable-rpc",
             f"--max-concurrent-downloads={MAX_CONCURRENT_DOWNLOADS}",
-            f"--rpc-listen-port={self.settings.rpc_port}",
+            f"--rpc-listen-port={port}",
             "--rpc-listen-all=false",
             "--rpc-allow-origin-all=false",
             f"--max-connection-per-server={connections}",
@@ -423,19 +511,28 @@ class Aria2Daemon:
             self._write_rpc_conf(record=True)
             args.insert(1, f"--conf-path={conf_path}")
             self._spawn(args)
-            last_err = self._await_rpc()
-            if last_err is None and self.is_running():
-                self._unlink_launch_conf()
-                self._active_secret = self._secret
-                return
+            return _LaunchTicket(self._proc, self._secret, port)
         except BaseException:
             try:
                 self.stop()
             except BaseException:
                 pass  # Cleanup failure cannot replace the original startup exception.
             raise
+    @staticmethod
+    def authenticate(ticket, cancel):
+        return Aria2Daemon._await_rpc(_AuthInput(_RpcSettings(ticket.port), ticket.secret), cancel=cancel)
+
+    def commit_ready(self, ticket, error):
+        try:
+            if error is None and self._proc is ticket.proc and self._secret == ticket.secret and self.is_running():
+                self._unlink_launch_conf(); self._active_secret = ticket.secret
+                return
+        except BaseException:
+            try: self.stop()
+            except BaseException: pass
+            raise
         self.stop()
-        if last_err is None or str(last_err) == str(self._stale_daemon_error()):
+        if error is None or str(error) == str(self._stale_daemon_error()):
             raise self._stale_daemon_error()
         raise Aria2Error("aria2 RPC did not come up.")
 
@@ -536,27 +633,32 @@ class Aria2Daemon:
             return
         raise Aria2Error("Failed to launch aria2c.")
 
-    def _await_rpc(self, timeout: float = 5.0, secret=None, retry=True) -> Exception | None:
+    def _await_rpc(self, timeout: float = 5.0, secret=None, retry=True, cancel=None) -> Exception | None:
         """Observe acceptance, then one exact rejection (aria2 delays it ~2s)."""
         deadline = time.monotonic() + timeout
         secret = self._secret if secret is None else secret
-        client = Aria2RPC(self.settings, secret_provider=lambda: secret)
+        client = Aria2RPC(self.settings, secret_provider=lambda: secret, session_factory=cancel.session if cancel else None)
         last_err = Aria2Error("aria2 RPC did not come up.")
         try:
             while (remaining := deadline - time.monotonic()) > 0:
+                if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                 try:
                     client.timeout = min(timeout, remaining)
                     version = client.get_version()
+                    if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                     if not isinstance(version, dict) or not isinstance(version.get("version"), str):
                         return last_err
                     break
                 except Aria2RpcError:
+                    if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                     return self._stale_daemon_error()
                 except Aria2Error:
+                    if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                     if not retry:
                         return last_err
-                    time.sleep(0.1)
+                    cancel.wait(0.1) if cancel else time.sleep(0.1)
             else:
+                if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                 return last_err
             wrong = secrets.token_urlsafe(32)
             secret = wrong if wrong != secret else wrong + "_"
@@ -564,10 +666,13 @@ class Aria2Daemon:
             try:
                 client.get_version()
             except Aria2RpcError as error:
+                if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                 if error.http_status == 400 and type(error.code) is int and error.code == 1 and error.rpc_message == "Unauthorized":
                     return None
             except Aria2Error:
+                if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
                 return last_err
+            if cancel and cancel.cancelled: return Aria2Error("aria2 authentication cancelled.")
             return self._stale_daemon_error()
         finally:
             client.close()
@@ -672,6 +777,7 @@ class Aria2Daemon:
                 pass
 
     def active_rpc_secret(self) -> str | None:
+        if self._active_secret is None: return None
         if not self.is_running():
             self._active_secret = None
         return self._active_secret
@@ -680,11 +786,12 @@ class Aria2Daemon:
 class Aria2RPC:
     """Synchronous JSON-RPC client. Call from a worker thread."""
 
-    def __init__(self, settings: Settings, timeout: float = 5.0, secret_provider=None):
+    def __init__(self, settings: Settings, timeout: float = 5.0, secret_provider=None, session_factory=None):
         self.url = f"http://127.0.0.1:{settings.rpc_port}/jsonrpc"
         self.secret = settings.rpc_secret
         self._secret_provider = secret_provider
         self.timeout = timeout
+        self._session_factory = session_factory
         # requests.Session is not thread-safe. Calls fan out across a
         # QThreadPool, so give each thread its own session.
         self._local = threading.local()
@@ -701,7 +808,7 @@ class Aria2RPC:
     def _session(self) -> requests.Session:
         s = getattr(self._local, "session", None)
         if s is None:
-            s = requests.Session()
+            s = (getattr(self, "_session_factory", None) or requests.Session)()
             # The RPC token must never go to an environment proxy.
             s.trust_env = False
             self._local.session = s

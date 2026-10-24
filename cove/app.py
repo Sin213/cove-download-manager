@@ -14,12 +14,12 @@ import sys
 import logging
 import threading
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import APP_NAME, __version__, diagnostics, theme
-from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC
+from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC, _AuthCancel, _AuthInput, _RpcSettings
 from .api_server import LocalApiServer
 from .config import CONFIG_FILE, Settings
 from .main_window import MainWindow
@@ -47,6 +47,77 @@ RESUME_FAILED_TEXT = (
     "downloads. They are still in your list. Restart Cove to try again."
 )
 LINKS_NOT_ADDED_TEXT = "not added. Open the link again; if that fails, restart Cove."
+
+
+def _async_startup_supported():
+    return sys.platform.startswith("linux")
+
+
+class _StartupController(QObject):
+    completed = Signal(int, object)
+    def __init__(self, window, daemon, prepare, ready, failed):
+        super().__init__(window)
+        self.daemon, self.prepare, self.ready, self.failed = daemon, prepare, ready, failed
+        self.state, self.generation, self.closing = "NOT_STARTED", 0, False
+        self.cancel, self.worker, self.ticket = _AuthCancel(), None, None
+        self.completed.connect(self.complete, Qt.QueuedConnection)
+    def begin(self):
+        if self.state != "NOT_STARTED" or self.closing: return
+        self.state = "STARTING"; self.generation += 1
+        generation = self.generation
+        try:
+            ticket = self.prepare()
+            if self.closing or generation != self.generation: return
+            if ticket is False:
+                self.state = "FAILED"
+                return
+            self.ticket, self.state = ticket, "AUTHENTICATING"
+            if ticket is None:
+                self.complete(generation, "ok")
+                return
+            def work(ticket=ticket, cancel=self.cancel, generation=generation, emit=self.completed.emit):
+                try:
+                    error = Aria2Daemon.authenticate(ticket, cancel)
+                    result = "cancelled" if cancel.cancelled else "ok" if error is None else "stale_daemon" if str(error).startswith("Another aria2") else "rpc_down"
+                except BaseException:
+                    result = "unexpected"
+                try: emit(generation, result)
+                except RuntimeError: pass
+            self.worker = threading.Thread(target=work, name="aria2-auth")
+            try: self.worker.start()
+            except BaseException:
+                self.worker = None
+                raise
+        except BaseException as error:
+            self.failure(None, notify=isinstance(error, Exception))
+            if not isinstance(error, Exception): raise
+    def failure(self, error, notify=True):
+        if self.closing: return
+        self.state = "FAILED"
+        self.cancel.cancel()
+        try: self.daemon.stop()
+        except BaseException as exc:
+            logging.getLogger("cove").error("aria2_stop_failed type=%s", type(exc).__name__)
+        finally:
+            if notify: self.failed(error)
+    @Slot(int, object)
+    def complete(self, generation, result):
+        if self.closing or generation != self.generation or self.state != "AUTHENTICATING": return
+        self.state = "READY" if result == "ok" else "FAILED"
+        try:
+            if result != "ok":
+                target = _AuthInput(_RpcSettings(self.ticket.port), self.ticket.secret)
+                raise target._stale_daemon_error() if result == "stale_daemon" else Aria2Error("aria2 RPC did not come up.") if result != "unexpected" else RuntimeError()
+            if self.ticket is not None: self.daemon.commit_ready(self.ticket, None)
+            elif not self.daemon.active_rpc_secret(): raise Aria2Error("aria2 did not report authenticated readiness.")
+            self.ready()
+        except Exception as error:
+            allowed = ("aria2 RPC did not come up.", "aria2 did not report authenticated readiness.")
+            if self.ticket is not None: allowed += (str(_AuthInput(_RpcSettings(self.ticket.port), "")._stale_daemon_error()),)
+            self.failure(error if isinstance(error, Aria2Error) and str(error) in allowed else None)
+    def shutdown(self):
+        self.closing = True; self.generation += 1; self.state = "STOPPED"
+        self.cancel.cancel()
 
 
 def parse_launch_urls(argv: list[str]) -> list[str]:
@@ -397,6 +468,7 @@ def run() -> int:
     # window or touch the queue until those objects actually exist.
     queue = None
     window = None
+    controller = None
 
     # Browser downloads are delivered synchronously to this process and are
     # never buffered: the extension cancels the browser's own transfer on the
@@ -436,6 +508,7 @@ def run() -> int:
         pending, startup_inbox[:] = list(startup_inbox), []
         refused = 0
         for url in pending:
+            if controller and controller.closing: break
             try:
                 _add_interactive(url)
             except Exception:
@@ -444,6 +517,7 @@ def run() -> int:
         return refused
 
     def _handle_open(urls: list[str]) -> None:
+        if controller and controller.closing: return
         if queue_ready and queue is not None:
             refused = 0
             for url in urls:
@@ -452,6 +526,7 @@ def run() -> int:
                 except Exception:
                     refused += 1
                     logging.getLogger("cove").warning("ipc_add_failed")
+                if controller and controller.closing: return
             _links_not_added(refused)
         elif startup_failed:
             _links_not_added(len(urls))
@@ -574,10 +649,11 @@ def run() -> int:
         _links_not_added(dropped)
 
     def _boot_daemon_steps() -> None:
+        generation = controller.generation if controller else None
         while True:
             try:
-                daemon.start()
-                if not daemon.active_rpc_secret():
+                ticket = daemon.begin_start() if controller else daemon.start()
+                if not controller and not daemon.active_rpc_secret():
                     raise Aria2Error("aria2 did not report authenticated readiness.")
                 break
             except Aria2InterfaceError as e:
@@ -593,19 +669,25 @@ def run() -> int:
                 box.setDefaultButton(settings_button)
                 box.setEscapeButton(close_button)
                 box.exec()
+                if controller and (controller.closing or generation != controller.generation): return False
                 if box.clickedButton() is settings_button:
                     window._open_settings()
+                    if controller and (controller.closing or generation != controller.generation): return False
                     continue
                 # Nothing was started, so no traffic leaves over another
                 # interface. Downloads simply stay blocked until aria2 runs.
                 _mark_startup_failed()
                 _report_buffered_links()
-                return
+                return False
             except Aria2Error as e:
                 _mark_startup_failed()
                 QMessageBox.critical(window, f"{APP_NAME} - aria2 missing", str(e))
                 _report_buffered_links()
-                return
+                return False
+        return ticket
+
+    def _continue_startup():
+        if controller and controller.ticket: rpc.url = f"http://127.0.0.1:{controller.ticket.port}/jsonrpc"
         queue.set_aria2_admission("open")
         # Apply the effective speed limit (kbps if the limiter is on, else 0).
         effective = settings.overall_speed_limit_kbps if settings.speed_limiter_enabled else 0
@@ -624,6 +706,7 @@ def run() -> int:
         # ready. If daemon.start() raised above, we return before this and
         # the startup inbox is never drained into a broken daemon.
         refused_links = _drain_startup_inbox()
+        if controller and controller.closing: return
         # Accept API downloads only once aria2 is up, so a request that
         # races app startup cannot be persisted straight into "error".
         if settings.api_enabled:
@@ -637,12 +720,14 @@ def run() -> int:
         timer.start()
         window._aria2_watchdog = watchdog  # keep a strong reference
         _links_not_added(refused_links)
+        if controller and controller.closing: return
         if resume_failed:
             QMessageBox.warning(window, f"{APP_NAME} - saved downloads", RESUME_FAILED_TEXT)
 
     def _boot_daemon() -> None:
         try:
-            _boot_daemon_steps()
+            if controller: controller.begin()
+            elif _boot_daemon_steps() is not False: _continue_startup()
         except Exception as exc:
             if queue.aria2_admission != "pending":
                 raise
@@ -651,6 +736,18 @@ def run() -> int:
             QMessageBox.critical(window, f"{APP_NAME} - startup failed", ENGINE_START_FAILED_TEXT)
             _report_buffered_links()
 
+    def _startup_failure(error):
+        _mark_startup_failed()
+        QMessageBox.critical(window, f"{APP_NAME} - startup failed", str(error) if error else ENGINE_START_FAILED_TEXT)
+        if controller and controller.closing: return
+        _report_buffered_links()
+    def _ready_startup():
+        try: _continue_startup()
+        except Exception as exc:
+            if queue.aria2_admission == "pending": raise
+            logging.getLogger("cove").error("startup_continuation_failed type=%s", type(exc).__name__)
+    if _async_startup_supported():
+        controller = _StartupController(window, daemon, _boot_daemon_steps, _ready_startup, _startup_failure)
     QTimer.singleShot(0, _boot_daemon)
 
     # Update check - opt-in by default, always prompts before installing.
@@ -672,6 +769,7 @@ def run() -> int:
 
     def _cleanup() -> None:
         nonlocal aria2_unresolved
+        if controller: controller.shutdown()
         # Refuse browser downloads from the first instant of shutdown: an add
         # accepted now would never be driven to completion, and the browser
         # would already have cancelled its own copy.
@@ -706,6 +804,11 @@ def run() -> int:
                 logging.getLogger("cove").error("aria2_stop_failed type=%s", type(exc).__name__)
             if not aria2_unresolved:
                 break
+        if controller and controller.worker:
+            controller.worker.join(2)
+            if controller.worker.is_alive():
+                aria2_unresolved = True
+                logging.getLogger("cove").error("aria2_auth_teardown_failed type=Thread")
         instance_server.shutdown()
         shutdown_diagnostics()
 
