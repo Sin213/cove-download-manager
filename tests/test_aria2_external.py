@@ -79,6 +79,7 @@ class ScriptedRPC:
         self.spawns.append((path, path.read_text(), args, kwargs))
         child = SimpleNamespace(dead=False); child.poll = lambda: 1 if child.dead else None
         child.send_signal = lambda signal: setattr(child, "dead", True)
+        child.terminate = lambda: child.send_signal(aria2.signal.SIGTERM)
         child.wait = child.kill = lambda **kw: setattr(child, "dead", True)
         self.children.append(child)
         if self.on_spawn: self.on_spawn()
@@ -106,7 +107,7 @@ def test_p1_scripted_transport_GUARD(startup_wire, case):
 def p1(startup_wire, monkeypatch):
     w = startup_wire; w.daemon = Aria2Daemon(Settings(rpc_port=16801, rpc_secret="P1_PERSISTED_SECRET_0123456789"))
     monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "synthetic-aria2c")
-    monkeypatch.setattr(aria2.subprocess, "Popen", w.spawn)
+    monkeypatch.setattr(aria2, "_OwnedPopen", w.spawn)
     monkeypatch.setattr(Aria2Daemon, "_port_in_use", lambda self: w.busy)
     monkeypatch.setattr(Aria2Daemon, "_wait_for_port_release", lambda self: None)
     w.ticks = ticks = iter(i / 8 for i in range(10000))
@@ -391,7 +392,7 @@ def test_repair1_F5_release_wait_uses_monotonic(startup_wire, monkeypatch):
         wall.append(True); assert len(wall) < 20, "backward wall clock made port-release wait unbounded"
         return -len(wall)
     monkeypatch.setattr(aria2, "time", SimpleNamespace(time=backwards, monotonic=iter(range(100)).__next__, sleep=lambda n: None))
-    monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "synthetic-aria2c"); monkeypatch.setattr(aria2.subprocess, "Popen", w.spawn)
+    monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "synthetic-aria2c"); monkeypatch.setattr(aria2, "_OwnedPopen", w.spawn)
     monkeypatch.setattr(Aria2Daemon, "_port_in_use", lambda self: True); monkeypatch.setattr(aria2.socket, "socket", MagicMock())
     with pytest.raises(Aria2Error, match="Another aria2 process"): daemon.start()
     assert not w.spawns and w.shutdowns() == 1 and len(wall) < 20
@@ -429,15 +430,18 @@ def test_p1_A5_cleanup_injection(p1, monkeypatch, point):
         if point == "unlink" and path.name.startswith(".aria2.launch."): reached.append(True); raise OSError(canary)
         return original_unlink(path, *a, **kw)
     monkeypatch.setattr(os, "open", opened); monkeypatch.setattr(os, "replace", replaced); monkeypatch.setattr(Path, "unlink", unlinked)
-    if point == "spawn": monkeypatch.setattr(aria2.subprocess, "Popen", lambda *a, **kw: (_ for _ in ()).throw(OSError(canary)))
+    if point == "spawn": monkeypatch.setattr(aria2, "_OwnedPopen", lambda *a, **kw: (_ for _ in ()).throw(OSError(canary)))
     if point in ("readiness", "terminate"): w.failure = requests.ConnectionError(canary)
-    if point == "terminate": w.on_spawn = lambda: setattr(w.children[-1], "send_signal", lambda signal: (_ for _ in ()).throw(OSError(canary)))
+    def failed_terminate(signal):
+        reached.append(True)
+        raise OSError(canary)
+    if point == "terminate": w.on_spawn = lambda: setattr(w.children[-1], "send_signal", failed_terminate)
     error = None
     try: w.daemon.start()
     except Exception as exc: error = exc
     if point != "unlink": assert isinstance(error, Aria2Error), f"{point} did not reach sanitized failure"
     if error: assert canary not in str(error) + repr(error) + "".join(traceback.format_exception(error))
-    if point in ("create", "publish", "unlink"): assert reached, f"{point} injection was never reached"
+    if point in ("create", "publish", "unlink", "terminate"): assert reached, f"{point} injection was never reached"
     assert foreign.read_text() == "unrelated bytes"
     assert point == "unlink" or list(w.data.glob(".aria2.launch.*.conf")) == [foreign]
     assert (w.data / "aria2.rpc.auth").exists() == (point not in ("create", "publish")), "crash record state"
@@ -525,7 +529,7 @@ def s04_daemon(monkeypatch, tmp_path, startup_wire):
         return _live_proc()
     popen = MagicMock(side_effect=spawned)
     monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "aria2c")
-    monkeypatch.setattr(aria2.subprocess, "Popen", popen)
+    monkeypatch.setattr(aria2, "_OwnedPopen", popen)
     daemon = Aria2Daemon(settings)
     try:
         yield daemon, popen, aria2.DATA_DIR / "aria2.rpc.auth"
@@ -701,7 +705,7 @@ def test_daemon_lifts_max_concurrent_downloads(startup_wire):
     """aria2 defaults to 5; the daemon must pass an explicit higher cap."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         daemon.start()
 
     args = popen.call_args[0][0]
@@ -713,7 +717,7 @@ def test_daemon_caps_per_server_connections_for_stock_aria2(startup_wire):
     settings = Settings(connections_per_server=32)
     daemon = Aria2Daemon(settings)
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         daemon.start()
 
     args = popen.call_args[0][0]
@@ -725,7 +729,7 @@ def test_daemon_stops_seeding_when_the_download_completes(startup_wire):
     """Local BitTorrent must not keep uploading after Cove says "done"."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         daemon.start()
 
     args = popen.call_args[0][0]
@@ -737,7 +741,7 @@ def test_daemon_binds_to_the_selected_network_interface(startup_wire):
     daemon = Aria2Daemon(settings)
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.interface_exists", return_value=True), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         daemon.start()
 
     assert "--interface=wg0-mullvad" in popen.call_args[0][0]
@@ -746,7 +750,7 @@ def test_daemon_binds_to_the_selected_network_interface(startup_wire):
 def test_daemon_passes_no_interface_flag_for_any_interface(startup_wire):
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         daemon.start()
 
     assert not [a for a in popen.call_args[0][0] if a.startswith("--interface=")]
@@ -758,7 +762,7 @@ def test_daemon_refuses_to_launch_when_the_interface_is_gone(startup_wire):
     daemon = Aria2Daemon(settings)
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
          patch("cove.aria2.interface_exists", return_value=False), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         with pytest.raises(Aria2InterfaceError) as excinfo:
             daemon.start()
 
@@ -786,7 +790,7 @@ def test_daemon_reclaims_the_port_from_a_leftover_aria2(startup_wire):
         startup_wire.accepted = None
         return _live_proc()
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", side_effect=spawned) as popen, \
+         patch("cove.aria2._OwnedPopen", side_effect=spawned) as popen, \
          patch.object(Aria2Daemon, "_port_in_use", side_effect=lambda: next(in_use)), \
          patch.object(Aria2Daemon, "_wait_for_port_release") as wait, \
          patch.object(Aria2RPC, "shutdown") as shutdown:
@@ -804,7 +808,7 @@ def test_daemon_reports_a_port_it_cannot_reclaim(startup_wire):
     daemon = Aria2Daemon(Settings())
     startup_wire.accepted = {daemon.settings.rpc_secret}
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen, \
          patch.object(Aria2Daemon, "_port_in_use", return_value=True), \
          patch.object(Aria2Daemon, "_wait_for_port_release") as wait, \
          patch.object(Aria2RPC, "shutdown"):
@@ -822,7 +826,7 @@ def test_daemon_refuses_a_foreign_aria2_on_our_port(startup_wire):
     daemon = Aria2Daemon(Settings())
     startup_wire.accepted = {"FOREIGN_SECRET_0123456789"}
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()), \
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()), \
          patch.object(Aria2Daemon, "_port_in_use", return_value=True), \
          patch.object(Aria2RPC, "shutdown") as shutdown:
         with pytest.raises(Aria2Error) as excinfo:
@@ -836,7 +840,7 @@ def test_daemon_keeps_a_healthy_child_without_shutting_anything_down(startup_wir
     """The normal path must not gain a stray shutdown call."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen, \
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen, \
          patch.object(Aria2Daemon, "_port_in_use", return_value=False), \
          patch.object(Aria2RPC, "shutdown") as shutdown:
         daemon.start()
@@ -849,7 +853,7 @@ def test_daemon_adds_no_speculative_bittorrent_flags(startup_wire):
     """Only --seed-time=0 is new; DHT/PEX/ports stay on aria2 defaults."""
     daemon = Aria2Daemon(Settings())
     with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
-         patch("cove.aria2.subprocess.Popen", return_value=_live_proc()) as popen:
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
         daemon.start()
 
     args = " ".join(popen.call_args[0][0])
@@ -1067,7 +1071,7 @@ def test_is_running_never_restarts_anything():
     leave Cove holding gids issued by a process that no longer exists."""
     daemon = Aria2Daemon(Settings())
     daemon._proc = _dead_proc()
-    with patch("cove.aria2.subprocess.Popen") as popen:
+    with patch("cove.aria2._OwnedPopen") as popen:
         for _ in range(5):
             assert daemon.is_running() is False
     assert popen.call_count == 0

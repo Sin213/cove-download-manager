@@ -84,7 +84,7 @@ def mock_start(storage, monkeypatch):
         return proc
     popen = MagicMock(side_effect=spawned)
     monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "aria2c")
-    monkeypatch.setattr(aria2.subprocess, "Popen", popen)
+    monkeypatch.setattr(aria2, "_OwnedPopen", popen)
     monkeypatch.setattr(Aria2Daemon, "_port_in_use", lambda self: False)
     storage.wire = ScriptedRPC(monkeypatch, storage.data)
     daemons = []
@@ -341,7 +341,7 @@ try:
     daemon = aria2.Aria2Daemon(settings)
     try:
         with patch.object(aria2, "_resolve_aria2c", return_value="aria2c"), \
-             patch.object(aria2.subprocess, "Popen", return_value=proc), \
+             patch.object(aria2, "_OwnedPopen", return_value=proc), \
              patch.object(aria2.Aria2Daemon, "_port_in_use", return_value=False):
             daemon.start()
     finally:
@@ -587,7 +587,7 @@ def real_proxy(storage, monkeypatch):
         launched.append(proc)
         return proc
 
-    monkeypatch.setattr(aria2.subprocess, "Popen", isolated_popen)
+    monkeypatch.setattr(aria2, "_OwnedPopen", isolated_popen)
     resources = []
 
     def make(username="s04user", password="S04_ARGV_SECRET_9f3c", *, proxy_argv=False):

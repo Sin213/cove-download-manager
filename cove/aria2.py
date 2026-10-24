@@ -41,6 +41,99 @@ class Aria2Error(RuntimeError):
     pass
 
 
+STOP_TERM_TIMEOUT = 5
+STOP_KILL_TIMEOUT = 5
+_owned_pending = None  # Strong, single-slot ownership of incomplete construction.
+_lifecycle_lock = threading.RLock()  # Serialize probes and the unreaped-leader proof.
+_UNRESOLVED = "Aria2 child cleanup is unresolved."
+
+
+def _release_child(proc, graceful=False):
+    """Only positive poll/wait evidence releases ownership; every wait is bounded."""
+    def exited():
+        with _lifecycle_lock:
+            returncode = proc.poll()
+        if returncode is not None:
+            if (sys.platform != "win32" and returncode == 0
+                    and signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN):
+                logging.getLogger("cove").info("aria2_child_status-unavailable")
+            return True
+        return False
+    try:
+        proc._cove_phase = "poll"
+        if exited():
+            return True
+        if graceful:
+            try:
+                with _lifecycle_lock:
+                    proc._cove_phase = "term"
+                    proc.terminate()
+                if proc.wait(timeout=STOP_TERM_TIMEOUT) is not None:
+                    return True
+            except Exception:
+                pass
+        with _lifecycle_lock:
+            if exited():
+                return True
+            group = (sys.platform != "win32" and getattr(proc, "_cove_new_session", False) is True
+                    and os.getpgid(proc.pid) == proc.pid and proc.pid != os.getpgrp()
+                    and getattr(proc, "returncode", None) is None)
+            proc._cove_phase = "kill"
+            if group:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        if proc.wait(timeout=STOP_KILL_TIMEOUT) is not None:
+            return True
+        return exited()
+    except Exception:
+        # A failed signal or wait is not evidence; poll may still prove exit.
+        try:
+            return exited()
+        except Exception:
+            return False
+
+
+def _unresolved_child(proc):
+    if not getattr(proc, "_cove_unresolved_logged", False):
+        try:
+            logging.getLogger("cove").error("aria2_child_unresolved pid=%s platform=%s phase=%s",
+                                          proc.pid, sys.platform, getattr(proc, "_cove_phase", "poll"))
+            proc._cove_unresolved_logged = True
+        except BaseException:
+            pass  # Retain ownership and leave the diagnostic retryable.
+
+
+class _OwnedPopen(subprocess.Popen):
+    def __new__(cls, *args, **kwargs):
+        if _owned_pending is not None:
+            raise Aria2Error(_UNRESOLVED)
+        return super().__new__(cls)
+
+    def __init__(self, *args, **kwargs):
+        global _owned_pending
+        self._cove_new_session = kwargs.get("start_new_session", False) is True
+        try:
+            super().__init__(*args, **kwargs)
+        except BaseException:
+            if (getattr(self, "returncode", None) is None
+                    and ((sys.platform != "win32" and getattr(self, "pid", None) is not None)
+                         or (sys.platform == "win32" and getattr(self, "_handle", None) is not None))):
+                _owned_pending = self
+                try:
+                    released = _release_child(self)
+                except BaseException:
+                    released = self.returncode is not None
+                if released:
+                    _owned_pending = None
+                else:
+                    try:
+                        _unresolved_child(self)
+                    except BaseException:
+                        pass  # Diagnostics must never replace the construction exception.
+            raise
+
+
 def read_rpc_record() -> tuple[str, str | None]:
     """Read only a bounded regular auth record; absence alone permits upgrade."""
     path = DATA_DIR / "aria2.rpc.auth"
@@ -244,6 +337,7 @@ class Aria2Daemon:
     def __init__(self, settings: Settings):
         self.settings = settings
         self._proc: subprocess.Popen | None = None
+        self._unreleased = False
         self._secret = self._active_secret = self._launch_conf = None
 
     @staticmethod
@@ -251,7 +345,9 @@ class Aria2Daemon:
         return _resolve_aria2c() is not None
 
     def start(self) -> None:
-        if self._proc and self._proc.poll() is None:
+        if self._unreleased or _owned_pending is not None:
+            raise Aria2Error(_UNRESOLVED)
+        if self.is_running():
             return
         self._active_secret = self._secret = None
         aria2c = _resolve_aria2c()
@@ -328,12 +424,15 @@ class Aria2Daemon:
             args.insert(1, f"--conf-path={conf_path}")
             self._spawn(args)
             last_err = self._await_rpc()
-            if last_err is None and self._proc.poll() is None:
+            if last_err is None and self.is_running():
                 self._unlink_launch_conf()
                 self._active_secret = self._secret
                 return
         except BaseException:
-            self.stop()
+            try:
+                self.stop()
+            except BaseException:
+                pass  # Cleanup failure cannot replace the original startup exception.
             raise
         self.stop()
         if last_err is None or str(last_err) == str(self._stale_daemon_error()):
@@ -408,7 +507,9 @@ class Aria2Daemon:
         asking this periodically is what stops a dead aria2c lingering as a
         zombie for the rest of the session.
         """
-        return self._proc is not None and self._proc.poll() is None
+        proc = self._proc
+        with _lifecycle_lock:
+            return proc is not None and proc.poll() is None
 
     def _spawn(self, args: list[str]) -> None:
         child_env = None
@@ -422,7 +523,7 @@ class Aria2Daemon:
             if os.name == "nt":
                 child_env.pop("ALL_PROXY", None)
         try:
-            self._proc = subprocess.Popen(
+            self._proc = _OwnedPopen(
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -542,24 +643,25 @@ class Aria2Daemon:
         port = f":{s.proxy_port}" if s.proxy_port else ""
         return f"{scheme}://{auth}{s.proxy_host}{port}"
 
-    def stop(self) -> None:
+    def stop(self, *, kill_only=False) -> bool:
+        global _owned_pending
         self._active_secret = self._secret = None
         self._unlink_launch_conf()
-        if not self._proc:
-            return
-        if self._proc.poll() is None:
-            try:
-                self._proc.send_signal(signal.SIGTERM)
-                self._proc.wait(timeout=5)
-            except (OSError, subprocess.TimeoutExpired):
-                # Reap the killed child so it can't linger as a zombie or
-                # race a later startup.
-                try:
-                    self._proc.kill()
-                    self._proc.wait(timeout=5)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-        self._proc = None
+        procs = [self._proc] + ([_owned_pending] if _owned_pending is not self._proc else [])
+        failed = False
+        for proc in procs:
+            if proc is None:
+                continue
+            if _release_child(proc, graceful=not (kill_only or self._unreleased or proc is _owned_pending)):
+                if self._proc is proc:
+                    self._proc = None
+                if _owned_pending is proc:
+                    _owned_pending = None
+            else:
+                failed = self._unreleased = True
+                _unresolved_child(proc)
+        self._unreleased = failed
+        return not failed
 
     def _unlink_launch_conf(self) -> None:
         if self._launch_conf is not None:

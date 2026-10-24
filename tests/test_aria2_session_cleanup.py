@@ -44,7 +44,7 @@ def s(tmp_path, monkeypatch, caplog):
                                                rpc_secret="SYNTH_TOKEN"))
     proc = MagicMock(); proc.poll.return_value = None
     s.popen = MagicMock(side_effect=lambda *a, **k: s.events.append("spawn") or proc)
-    monkeypatch.setattr(aria2.subprocess, "Popen", s.popen)
+    monkeypatch.setattr(aria2, "_OwnedPopen", s.popen)
     monkeypatch.setattr(aria2, "_resolve_aria2c", lambda: "synthetic-aria2c")
     ScriptedRPC(monkeypatch, data)
     monkeypatch.setattr(aria2, "interface_exists", lambda name: True)

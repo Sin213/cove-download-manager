@@ -39,6 +39,7 @@ from .native_host_install import install_native_hosts
 from .widgets import find_icon
 
 UPDATE_REPO = "Sin213/cove-download-manager"
+ARIA2_UNRESOLVED_EXIT = 70
 
 ENGINE_START_FAILED_TEXT = "Cove couldn't start the download engine. Restart Cove and try again."
 RESUME_FAILED_TEXT = (
@@ -667,7 +668,10 @@ def run() -> int:
         QTimer.singleShot(4000, updater.check)
         window._updater = updater  # keep a reference
 
+    aria2_unresolved = False
+
     def _cleanup() -> None:
+        nonlocal aria2_unresolved
         # Refuse browser downloads from the first instant of shutdown: an add
         # accepted now would never be driven to completion, and the browser
         # would already have cancelled its own copy.
@@ -694,9 +698,17 @@ def run() -> int:
             rpc.shutdown()
         except Exception:
             pass
-        daemon.stop()
+        for attempt in range(3):  # First attempt plus one bounded, kill-only retry round.
+            try:
+                aria2_unresolved = daemon.stop(kill_only=attempt > 0) is not True
+            except Exception as exc:
+                aria2_unresolved = True
+                logging.getLogger("cove").error("aria2_stop_failed type=%s", type(exc).__name__)
+            if not aria2_unresolved:
+                break
         instance_server.shutdown()
         shutdown_diagnostics()
 
     app.aboutToQuit.connect(_cleanup)
-    return app.exec()
+    status = app.exec()
+    return ARIA2_UNRESOLVED_EXIT if aria2_unresolved and status == 0 else status

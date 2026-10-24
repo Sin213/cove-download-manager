@@ -283,8 +283,35 @@ class FakeAria2Daemon:
         if flags.get("start_raises"): raise RuntimeError("SECRET-CANARY-123")
         self.ready = not flags.get("no_secret", False)
 
-    def stop(self):
+    def stop(self, *, kill_only=False):
         self.ready = False
+        attempts = calls.setdefault("stop_attempts", [])
+        attempts.append(kill_only)
+        if flags.get("pending_handles"):
+            import cove.aria2 as lifecycle
+            from unittest.mock import MagicMock
+            if not hasattr(self, "_proc"):
+                self._proc = MagicMock(); self._proc.poll.return_value = 0
+                self._unreleased = False
+                self._secret = self._active_secret = self._launch_conf = None
+                self._unlink_launch_conf = lambda: None
+                pending = MagicMock(pid=424242)
+                pending.poll.return_value = None
+                pending._cove_unresolved_logged = False
+                pending.wait.return_value = 0
+                def kill():
+                    calls["pending_kills"] = calls.get("pending_kills", 0) + 1
+                    if calls["pending_kills"] < 3: raise PermissionError("controlled")
+                    pending.poll.return_value = 0
+                pending.kill.side_effect = kill
+                lifecycle._owned_pending = pending
+            result = lifecycle.Aria2Daemon.stop(self, kill_only=kill_only)
+            calls["pending_cleared"] = lifecycle._owned_pending is None
+            return result
+        sequence = flags.get("stop_sequence", [True])
+        value = sequence[min(len(attempts) - 1, len(sequence) - 1)]
+        if value == "raise": raise RuntimeError("SECRET-CANARY-123")
+        return value
 
 
 class FakeAria2RPC(RealAria2RPC):
@@ -445,7 +472,7 @@ class BoundedExecQApplication(_RealQApplication):
         # (which shuts down the single-instance server) actually runs.
         self.aboutToQuit.emit()
         self.processEvents()
-        return 0
+        return flags.get("exec_status", 0)
 
 
 app_mod.Settings = FakeSettings
@@ -498,6 +525,7 @@ app_mod.send_to_primary = fake_send_to_primary
 app_mod.QApplication = BoundedExecQApplication
 app_mod.QMessageBox = FakeQMessageBox
 app_mod.install_native_hosts = lambda: None
+app_mod.shutdown_diagnostics = lambda: calls["constructed"].append("diagnostics_shutdown")
 
 sys.argv = ["cove"] + __ARGV__
 
@@ -598,6 +626,36 @@ def _run_harness(argv, is_primary, daemon_fails=False, early_ipc=None, late_ipc=
     if return_raw:
         return out, result
     return out
+
+
+@pytest.mark.parametrize("sequence,status,expected,count", [
+    ([False, False, True], 0, 0, 3),  # D1: bounded recovery
+    ([False], 0, 70, 3),             # D2/D5: unresolved and exact bound
+    (["raise"], 0, 70, 3),          # D3: sanitized exception, cleanup continues
+    ([True], 0, 0, 1),              # D4: successful status
+    ([True], 17, 17, 1),            # D4: preserve app failure
+    ([False], 17, 17, 3),           # preserve failure even if unresolved
+    ([False, True], 0, 0, 2),
+])
+def test_lifecycle_cleanup_status(sequence, status, expected, count):
+    out, raw = _run_harness([], True, stop_sequence=sequence,
+                            exec_status=status, return_raw=True)
+    assert out["returncode"] == expected
+    assert len(out["stop_attempts"]) == count, "one retry round, at most two additional calls"
+    assert out["stop_attempts"] == [False] + [True] * (count - 1)
+    assert out["constructed"][-2:] == ["shutdown", "diagnostics_shutdown"]
+    assert "SECRET-CANARY-123" not in raw.stderr
+    if "raise" in sequence:
+        assert "RuntimeError" in raw.stderr
+
+
+def test_lifecycle_cleanup_retries_pending_handle_behind_exited_child():
+    out, raw = _run_harness([], True, pending_handles=True, return_raw=True)
+    assert out["returncode"] == 0 and out["pending_cleared"]
+    assert out["stop_attempts"] == [False, True, True]
+    assert out["pending_kills"] == 3
+    assert raw.stderr.count("aria2_child_unresolved") == 1
+    assert out["constructed"][-2:] == ["shutdown", "diagnostics_shutdown"]
 
 
 def test_p1_OP16_app_rpc_tracks_daemon_readiness():
