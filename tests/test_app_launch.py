@@ -371,6 +371,9 @@ class FakeMainWindow(QObject):
         self._queue = a[1] if len(a) > 1 else k.get("queue")
         self.settings, self.queue = a[0], self._queue
 
+    def set_engine_starting(self, starting):
+        calls.setdefault("engine_starting", []).append(starting)
+
     def add_url_interactive(self, url):
         # The real window runs its duplicate check here and then calls the
         # queue; the delivery contract under test is that the magnet still

@@ -624,6 +624,16 @@ class MainWindow(QMainWindow):
         self._force_quit = False
         self._install_tray_menu()
 
+    def set_engine_starting(self, starting: bool) -> None:
+        """Present startup progress without changing engine or queue state."""
+        message = (
+            "Starting download engine…\n"
+            "Downloads remain queued until the engine is ready."
+        )
+        self._hero_sub.setText(message if starting else self._hero_subtitle)
+        self._hero_sub.setWordWrap(starting)
+        self._hero_sub.setAccessibleName(message if starting else "")
+
     # ---- system tray ------------------------------------------------------
 
     def _system_tray_available(self) -> bool:
@@ -794,6 +804,9 @@ class MainWindow(QMainWindow):
             "Multi-connection downloads with a queue, schedule, and a global speed cap."
         )
         sub.setProperty("role", "hero-sub")
+        sub.setTextFormat(Qt.PlainText)
+        self._hero_sub = sub
+        self._hero_subtitle = sub.text()
         hero.addWidget(sub, 1, Qt.AlignVCenter)
         self.status_pill = StatusPill("Idle")
         hero.addWidget(self.status_pill, 0, Qt.AlignVCenter)

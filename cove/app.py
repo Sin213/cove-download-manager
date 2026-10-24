@@ -55,6 +55,7 @@ def _async_startup_supported():
 
 class _StartupController(QObject):
     completed = Signal(int, object)
+    pending = Signal(bool)
     def __init__(self, window, daemon, prepare, ready, failed):
         super().__init__(window)
         self.daemon, self.prepare, self.ready, self.failed = daemon, prepare, ready, failed
@@ -75,6 +76,7 @@ class _StartupController(QObject):
             if ticket is None:
                 self.complete(generation, "ok")
                 return
+            self.pending.emit(True)
             def work(ticket=ticket, cancel=self.cancel, generation=generation, emit=self.completed.emit):
                 try:
                     error = Aria2Daemon.authenticate(ticket, cancel)
@@ -93,6 +95,7 @@ class _StartupController(QObject):
             if not isinstance(error, Exception): raise
     def failure(self, error, notify=True):
         if self.closing: return
+        self.pending.emit(False)
         self.state = "FAILED"
         self.cancel.cancel()
         try: self.daemon.stop()
@@ -110,6 +113,7 @@ class _StartupController(QObject):
                 raise target._stale_daemon_error() if result == "stale_daemon" else Aria2Error("aria2 RPC did not come up.") if result != "unexpected" else RuntimeError()
             if self.ticket is not None: self.daemon.commit_ready(self.ticket, None)
             elif not self.daemon.active_rpc_secret(): raise Aria2Error("aria2 did not report authenticated readiness.")
+            self.pending.emit(False)
             self.ready()
         except Exception as error:
             allowed = ("aria2 RPC did not come up.", "aria2 did not report authenticated readiness.")
@@ -748,6 +752,7 @@ def run() -> int:
             logging.getLogger("cove").error("startup_continuation_failed type=%s", type(exc).__name__)
     if _async_startup_supported():
         controller = _StartupController(window, daemon, _boot_daemon_steps, _ready_startup, _startup_failure)
+        controller.pending.connect(window.set_engine_starting)
     QTimer.singleShot(0, _boot_daemon)
 
     # Update check - opt-in by default, always prompts before installing.
