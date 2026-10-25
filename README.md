@@ -11,8 +11,6 @@ PySide6 for the UI. Same look as the rest of the Cove suite.
 
 https://github.com/user-attachments/assets/d45ce6fc-dbe1-484f-bc7a-8b77a12eaa5b
 
-![Cove Download Manager](docs/screenshot.png)
-
 ---
 
 ## Features
