@@ -13,13 +13,14 @@ from __future__ import annotations
 import sys
 import logging
 import threading
+import time
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import APP_NAME, __version__, diagnostics, theme
-from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC, _AuthCancel, _AuthInput, _RpcSettings
+from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC, _AuthCancel, _AuthInput, _RpcSettings, _ReclaimRequest, _Preflight
 from .api_server import LocalApiServer
 from .config import CONFIG_FILE, Settings
 from .main_window import MainWindow
@@ -55,16 +56,30 @@ def _async_startup_supported():
 
 class _StartupController(QObject):
     completed = Signal(int, object)
+    reclaimed = Signal(int, int, object)
     pending = Signal(bool)
     def __init__(self, window, daemon, prepare, ready, failed):
         super().__init__(window)
         self.daemon, self.prepare, self.ready, self.failed = daemon, prepare, ready, failed
         self.state, self.generation, self.closing = "NOT_STARTED", 0, False
         self.cancel, self.worker, self.ticket = _AuthCancel(), None, None
+        self.op, self.request, self.retired, self.shown = 0, None, [], False
         self.completed.connect(self.complete, Qt.QueuedConnection)
+        self.reclaimed.connect(self.reclaim, Qt.QueuedConnection)
+    def present(self, on):
+        if on:
+            if self.shown: return
+            self.shown = True
+        else:
+            self.shown = False
+        self.pending.emit(on)
     def begin(self):
         if self.state != "NOT_STARTED" or self.closing: return
-        self.state = "STARTING"; self.generation += 1
+        self.generation += 1
+        self.daemon.preflight = None
+        self.advance()
+    def advance(self):
+        self.state = "STARTING"
         generation = self.generation
         try:
             ticket = self.prepare()
@@ -72,11 +87,16 @@ class _StartupController(QObject):
             if ticket is False:
                 self.state = "FAILED"
                 return
+            if isinstance(ticket, _ReclaimRequest):
+                self.request, self.state = ticket, "RECLAIMING"
+                self.present(True)
+                self.run(generation, Aria2Daemon.reclaim_probe)
+                return
             self.ticket, self.state = ticket, "AUTHENTICATING"
             if ticket is None:
                 self.complete(generation, "ok")
                 return
-            self.pending.emit(True)
+            self.present(True)
             def work(ticket=ticket, cancel=self.cancel, generation=generation, emit=self.completed.emit):
                 try:
                     error = Aria2Daemon.authenticate(ticket, cancel)
@@ -85,17 +105,56 @@ class _StartupController(QObject):
                     result = "unexpected"
                 try: emit(generation, result)
                 except RuntimeError: pass
-            self.worker = threading.Thread(target=work, name="aria2-auth")
-            try: self.worker.start()
-            except BaseException:
-                self.worker = None
-                raise
+            self.start(work, "aria2-auth")
         except BaseException as error:
             self.failure(None, notify=isinstance(error, Exception))
             if not isinstance(error, Exception): raise
+    def start(self, work, name):
+        previous = self.worker
+        self.worker = threading.Thread(target=work, name=name)
+        if previous is not None: self.retired.append(previous)
+        try: self.worker.start()
+        except BaseException:
+            self.worker = None
+            raise
+    def run(self, generation, fn):
+        self.op += 1
+        op, request, cancel, emit = self.op, self.request, self.cancel, self.reclaimed.emit
+        def work():
+            try: result = fn(request, cancel)
+            except BaseException: result = "unexpected"
+            try: emit(generation, op, result)
+            except RuntimeError: pass
+        self.start(work, "aria2-reclaim")
+    @Slot(int, int, object)
+    def reclaim(self, generation, op, result):
+        if (self.closing or generation != self.generation or op != self.op
+                or self.state not in ("RECLAIMING", "RELEASING")): return
+        self.op += 1
+        try:
+            if self.state == "RECLAIMING" and result == "eligible":
+                self.state = "RELEASING"
+                self.run(generation, Aria2Daemon.reclaim_release)
+            elif ((self.state == "RECLAIMING" and result in ("free", "refused", "stale"))
+                  or (self.state == "RELEASING" and result in ("released", "busy"))):
+                self.daemon.preflight = _Preflight(self.request.port, "stale" if result in ("stale", "busy") else result)
+                self.request = None
+                self.advance()
+            else:
+                self.failure(None)
+        except BaseException as error:
+            self.failure(None, notify=isinstance(error, Exception))
+            if not isinstance(error, Exception): raise
+    def join(self, timeout=2):
+        deadline = time.monotonic() + timeout
+        workers = [thread for thread in (*self.retired, self.worker) if thread is not None]
+        for thread in workers:
+            thread.join(max(0, deadline - time.monotonic()))
+        return not any(thread.is_alive() for thread in workers)
     def failure(self, error, notify=True):
         if self.closing: return
-        self.pending.emit(False)
+        self.request = None
+        self.present(False)
         self.state = "FAILED"
         self.cancel.cancel()
         try: self.daemon.stop()
@@ -113,13 +172,14 @@ class _StartupController(QObject):
                 raise target._stale_daemon_error() if result == "stale_daemon" else Aria2Error("aria2 RPC did not come up.") if result != "unexpected" else RuntimeError()
             if self.ticket is not None: self.daemon.commit_ready(self.ticket, None)
             elif not self.daemon.active_rpc_secret(): raise Aria2Error("aria2 did not report authenticated readiness.")
-            self.pending.emit(False)
+            self.present(False)
             self.ready()
         except Exception as error:
             allowed = ("aria2 RPC did not come up.", "aria2 did not report authenticated readiness.")
             if self.ticket is not None: allowed += (str(_AuthInput(_RpcSettings(self.ticket.port), "")._stale_daemon_error()),)
             self.failure(error if isinstance(error, Aria2Error) and str(error) in allowed else None)
     def shutdown(self):
+        self.request = None
         self.closing = True; self.generation += 1; self.state = "STOPPED"
         self.cancel.cancel()
 
@@ -661,6 +721,7 @@ def run() -> int:
                     raise Aria2Error("aria2 did not report authenticated readiness.")
                 break
             except Aria2InterfaceError as e:
+                if controller: controller.present(False)
                 # A bound interface that is gone blocks every download, but
                 # the window stays usable: disabling it would trap the user
                 # with no way to reach the very setting at fault.
@@ -677,6 +738,7 @@ def run() -> int:
                 if box.clickedButton() is settings_button:
                     window._open_settings()
                     if controller and (controller.closing or generation != controller.generation): return False
+                    if controller: daemon.preflight = None
                     continue
                 # Nothing was started, so no traffic leaves over another
                 # interface. Downloads simply stay blocked until aria2 runs.
@@ -684,8 +746,10 @@ def run() -> int:
                 _report_buffered_links()
                 return False
             except Aria2Error as e:
+                if controller: controller.present(False)
                 _mark_startup_failed()
                 QMessageBox.critical(window, f"{APP_NAME} - aria2 missing", str(e))
+                if controller and (controller.closing or generation != controller.generation): return False
                 _report_buffered_links()
                 return False
         return ticket
@@ -809,11 +873,9 @@ def run() -> int:
                 logging.getLogger("cove").error("aria2_stop_failed type=%s", type(exc).__name__)
             if not aria2_unresolved:
                 break
-        if controller and controller.worker:
-            controller.worker.join(2)
-            if controller.worker.is_alive():
-                aria2_unresolved = True
-                logging.getLogger("cove").error("aria2_auth_teardown_failed type=Thread")
+        if controller and not controller.join(2):
+            aria2_unresolved = True
+            logging.getLogger("cove").error("aria2_auth_teardown_failed type=Thread")
         instance_server.shutdown()
         shutdown_diagnostics()
 

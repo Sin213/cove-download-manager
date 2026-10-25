@@ -80,6 +80,7 @@ class _AuthCancel:
                     sock.settimeout(self.timeout)
                     if gate.cancelled: raise OSError("Authentication cancelled")
                     sock.connect(("127.0.0.1", self.port))
+                    if gate.cancelled: raise OSError("Authentication cancelled")
                 except socket.timeout as error:
                     sock.close(); raise ConnectTimeoutError(self, "connect timeout") from error
                 except OSError as error:
@@ -113,6 +114,33 @@ class _AuthInput(NamedTuple):
 class _RpcSettings(NamedTuple):
     rpc_port: int
     rpc_secret: None = None
+
+
+_SYNC_RECLAIM = object()
+_PORT_RELEASE_TIMEOUT = 5.0
+
+
+class _ReclaimRequest(NamedTuple):
+    port: int
+    secret: str | None
+    def __repr__(self): return f"_ReclaimRequest(port={self.port})"
+
+
+class _Preflight(NamedTuple):
+    port: int
+    kind: str
+
+
+def _probe_port(port):
+    with socket.socket() as probe:
+        probe.settimeout(0.2)
+        try:
+            probe.connect(("127.0.0.1", int(port)))
+        except ConnectionRefusedError:
+            return "refused"
+        except OSError:
+            return "free"
+    return "busy"
 
 
 STOP_TERM_TIMEOUT = 5
@@ -407,6 +435,7 @@ class Aria2Daemon:
     """Owns the aria2c process. Idempotent start/stop."""
 
     _rpc_refused = False  # An unprobed daemon has no explicit refusal.
+    preflight = _SYNC_RECLAIM
 
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -498,13 +527,28 @@ class Aria2Daemon:
         # poll() can still read "alive" while the RPC reply is really coming
         # from the leftover daemon.
         self._rpc_refused = False
-        if self._port_in_use():
-            self._reclaim_stale_daemon()
-            logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_busy")
-        elif self._rpc_refused:
-            _remove_legacy_session_file()
+        if self.preflight is _SYNC_RECLAIM:
+            if self._port_in_use():
+                self._reclaim_stale_daemon()
+                logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_busy")
+            elif self._rpc_refused:
+                _remove_legacy_session_file()
+            else:
+                logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
+        elif self.preflight is None or self.preflight.port != port:
+            state, secret = read_rpc_record()
+            return _ReclaimRequest(port, self.settings.rpc_secret if state == "ABSENT" else secret)
         else:
-            logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
+            preflight, self.preflight = self.preflight, None
+            if preflight.kind == "stale":
+                raise self._stale_daemon_error()
+            if preflight.kind == "refused":
+                self._rpc_refused = True
+                _remove_legacy_session_file()
+            elif preflight.kind == "released":
+                logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_busy")
+            else:
+                logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
         try:
             self._secret = secrets.token_urlsafe(32)
             conf_path = self._write_rpc_conf()
@@ -518,6 +562,35 @@ class Aria2Daemon:
             except BaseException:
                 pass  # Cleanup failure cannot replace the original startup exception.
             raise
+    @staticmethod
+    def reclaim_probe(request, cancel):
+        kind = _probe_port(request.port)
+        if kind != "busy": return kind
+        if request.secret is not None:
+            error = Aria2Daemon._await_rpc(
+                _AuthInput(_RpcSettings(request.port), request.secret),
+                secret=request.secret, retry=False, cancel=cancel)
+            if cancel.cancelled: return "cancelled"
+            if error is None: return "eligible"
+        return "stale" if _probe_port(request.port) == "busy" else "free"
+
+    @staticmethod
+    def reclaim_release(request, cancel, timeout=None):
+        client = Aria2RPC(_RpcSettings(request.port), secret_provider=lambda: request.secret,
+                          session_factory=cancel.session)
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+        finally:
+            client.close()
+        deadline = time.monotonic() + (_PORT_RELEASE_TIMEOUT if timeout is None else timeout)
+        while not cancel.cancelled and time.monotonic() < deadline:
+            if _probe_port(request.port) != "busy": break
+            cancel.wait(0.1)
+        if cancel.cancelled: return "cancelled"
+        return "busy" if _probe_port(request.port) == "busy" else "released"
+
     @staticmethod
     def authenticate(ticket, cancel):
         return Aria2Daemon._await_rpc(_AuthInput(_RpcSettings(ticket.port), ticket.secret), cancel=cancel)

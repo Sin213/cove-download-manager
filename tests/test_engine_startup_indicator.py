@@ -70,7 +70,7 @@ class Window(mw.MainWindow):
             assert controllers[-1].state == "AUTHENTICATING" and controllers[-1].ticket is not None
             assert controllers[-1].worker is None, "pending notification arrived after worker creation"
             assert not entered.is_set(), "pending notification arrived after worker start"
-        elif case not in ("commit-fails", "rejected", "wrong-token", "occupied", "failure-modal-close") and controllers and controllers[-1] is controllers[0] and events.count(False) == 1:
+        elif case not in ("missing", "interface-close", "commit-fails", "rejected", "wrong-token", "occupied", "failure-modal-close") and controllers and controllers[-1] is controllers[0] and events.count(False) == (2 if case == "interface-retry" else 1):
             assert controllers[0].state == "READY", "cleared before READY state"
             assert FakeAria2Daemon.instance.ready and "committed" in events, "cleared before READY"
             assert self.queue.aria2_admission == "pending", "admission moved before presentation clear"
@@ -207,7 +207,7 @@ class ProbeApplication(_RealQApplication):
                 return 0
             controller = controllers[0]
             if case in ("missing", "interface-close"):
-                assert not window.pending_seen and events == []
+                assert not window.pending_seen and events == [False], "modal must explicitly clear pending"
                 assert len(calls["boxes"]) == 1
                 check_clear()
                 return 0
@@ -290,7 +290,7 @@ class ProbeApplication(_RealQApplication):
             self.until(lambda: controller.state in ("READY", "FAILED") or controller.closing)
             self.processEvents()
             check_clear()
-            assert events.count(True) == 1 and events.count(False) == 1
+            assert events.count(True) == 1 and events.count(False) == (2 if case == "interface-retry" else 1)
             if case in ("failure-modal-close", "ready-warning"):
                 assert controller.closing and controller.state == "STOPPED"
                 assert calls["admission"] == (["open"] if case == "ready-warning" else ["failed"])

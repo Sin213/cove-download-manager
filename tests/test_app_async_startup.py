@@ -548,7 +548,7 @@ workers, launch_secrets = [], []
 release_auth, auth_done, cleanup_joins = threading.Event(), threading.Event(), []
 class Thread(real_thread):
     def join(self, timeout=None):
-        if flags.get("linger_auth"): cleanup_joins.append(timeout)
+        if flags.get("linger_auth"): cleanup_joins.append([self.name, timeout])
         return super().join(timeout)
     def start(self):
         if self.name in ("native-host-install", "magnet-self-heal"): return
@@ -578,6 +578,10 @@ class Daemon(aria.Aria2Daemon):
         calls["auth_threads"].append(threading.get_ident() == main)
         return super()._await_rpc(*args, **kwargs)
 app_mod.Aria2Daemon = Daemon
+if hostile:
+    # This harness isolates post-spawn auth cancellation. A7b-3's real
+    # occupied-port/reclaim behavior has its own loopback regression tests.
+    Daemon.reclaim_probe = staticmethod(lambda request, cancel: "free")
 if hasattr(aria.Aria2Daemon, "authenticate"):
     authenticate = aria.Aria2Daemon.authenticate
     def auth(ticket, cancel):
@@ -811,7 +815,10 @@ assert all(secret not in json.dumps(calls) for secret in launch_secrets)
 @pytest.mark.parametrize("linger", ["delayed", "blocked"])
 def test_real_cleanup_joins_or_records_failed_worker(linger):
     out = app_case(linger_auth=linger, quit_auth=True)
-    assert out["real_about_to_quit"] and out["join_at_cleanup"] == [2]
+    joins = out["join_at_cleanup"]
+    assert out["real_about_to_quit"]
+    assert [name for name, _ in joins] == ["aria2-reclaim", "aria2-auth"]
+    assert 1.5 < joins[1][1] <= joins[0][1] <= 2  # One deadline, not 2 s per worker.
     assert out["auth_done_at_cleanup"] is (linger == "delayed")
     assert out["returncode"] == (70 if linger == "blocked" else 0)
     assert ("aria2_auth_teardown_failed type=Thread" in out["logs"]) is (linger == "blocked")
