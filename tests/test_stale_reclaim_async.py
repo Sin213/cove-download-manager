@@ -33,6 +33,12 @@ def pump(predicate, timeout=4):
 
 
 @pytest.fixture(autouse=True)
+def eligible_test_peer(monkeypatch):
+    # These legacy protocol responders are Python, not provenance fixtures.
+    monkeypatch.setattr(a, "_peer_identity", lambda *args: (os.getpid(), "0"))
+
+
+@pytest.fixture(autouse=True)
 def worker_exceptions(monkeypatch):
     errors = []
     monkeypatch.setattr(threading, "excepthook", lambda args: errors.append((args.thread.name, args.exc_type.__name__)))
@@ -1176,8 +1182,10 @@ def test_terminal_controller_drops_reclaim_token(method):
 
 
 def test_foreign_replacement_between_probe_and_release_is_rejected(drive, listeners, monkeypatch):
-    """No identity guarantee across this window: the replacement rejects the one RPC."""
+    """A replacement is rejected before any credential/shutdown byte is sent."""
     d, root = drive
+    identity = [(os.getpid(), "old")]
+    monkeypatch.setattr(a, "_peer_identity", lambda *args: identity[0])
     old = listeners()
     stale_record(d, root, old)
     entered, proceed, dialogs = threading.Event(), threading.Event(), []
@@ -1209,9 +1217,10 @@ def test_foreign_replacement_between_probe_and_release_is_rejected(drive, listen
             patch.setattr(socket.socket, "bind", same_port)
             foreign = listeners(mode="foreign")
         foreign.secret = "DIFFERENT_FOREIGN_SECRET_123456789"
+        identity[0] = (os.getpid() + 1, "replacement")
         proceed.set()
         d.finish()
-        assert [method for method, _ in foreign.calls] == ["aria2.shutdown"]
+        assert foreign.calls == [] and foreign.tokens == []
         assert not foreign.shutdown_seen.is_set() and a._probe_port(foreign.port) == "busy"
         assert d.controller.state == "FAILED" and d.spawns == []
         assert any(error.startswith("Another aria2") for error in d.errors)

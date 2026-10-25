@@ -21,6 +21,8 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any, Iterable, NamedTuple
 from requests.adapters import HTTPAdapter
@@ -45,6 +47,99 @@ class Aria2Error(RuntimeError):
     pass
 
 
+_PROC_ROOT = Path("/proc")
+_GATE_ACCEPT_WAIT = 2.0
+_RECLAIM_DEADLINE = 12.0
+
+
+def _peer_identity(sock, port, cancel, deadline):
+    """Bind this connected socket to its visible, same-UID accepted peer."""
+    def check():
+        if cancel.cancelled or time.monotonic() >= deadline: raise OSError("Reclaim interrupted")
+    try:
+        if not sys.platform.startswith("linux"): raise OSError("Peer evidence unavailable")
+        local, remote = f"0100007F:{port:04X}", f"0100007F:{sock.getsockname()[1]:04X}"
+        until = min(deadline, time.monotonic() + _GATE_ACCEPT_WAIT)
+        while True:
+            check()
+            rows = [fields for line in (_PROC_ROOT / "net/tcp").read_text().splitlines()
+                    if len(fields := line.split()) > 9 and fields[1:4] == [local, remote, "01"]]
+            if len(rows) > 1: raise OSError("Ambiguous peer socket")
+            if rows and rows[0][9] != "0": break
+            if time.monotonic() >= until: raise OSError("Peer socket unavailable")
+            cancel.wait(min(.005, max(0, until - time.monotonic())))
+        # Census covers only holders visible to this UID; it is not proof of exclusivity.
+        row, holders = rows[0], []
+        if int(row[7]) != os.geteuid(): raise OSError("Foreign socket owner")
+        target = f"socket:[{int(row[9])}]"
+        for process in _PROC_ROOT.iterdir():
+            check()
+            if not process.name.isdecimal(): continue
+            try:
+                if process.stat().st_uid != os.geteuid(): continue
+                links = []
+                for fd in (process / "fd").iterdir():
+                    check()
+                    try:
+                        if os.readlink(fd) == target: links.append(fd)
+                    except OSError as error:
+                        if error.errno not in (2, 13): raise
+                if links: holders.append((process, links[0]))
+            except OSError as error:
+                if error.errno not in (2, 13): raise
+        if len(holders) != 1: raise OSError("Ambiguous socket holders")
+        process, fd = holders[0]
+        def starttime(): return (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
+        start = starttime()
+        exe = os.path.basename(os.readlink(process / "exe")).removesuffix(" (deleted)")
+        args = (process / "cmdline").read_bytes().split(b"\0")
+        if ("aria2" not in exe.lower() or b"--enable-rpc" not in args
+                or f"--rpc-listen-port={port}".encode() not in args
+                or not any(arg.startswith(b"--conf-path=") and
+                    os.path.realpath(os.path.dirname(os.fsdecode(arg.split(b"=", 1)[1]))) == os.path.realpath(DATA_DIR)
+                    for arg in args)): raise OSError("Peer provenance unavailable")
+        check()
+        if starttime() != start or os.readlink(fd) != target: raise OSError("Peer changed")
+        return int(process.name), start
+    except Exception:
+        raise OSError("Cannot establish reclaim peer") from None
+
+
+class _PeerGate:
+    def __init__(self): self.pin, self.denied = None, False
+    def check(self, sock, port, cancel, deadline):
+        try: identity = _peer_identity(sock, port, cancel, deadline)
+        except OSError:
+            if not cancel.cancelled and time.monotonic() < deadline: self.denied = True
+            raise
+        if self.pin is None: self.pin = identity
+        elif self.pin != identity:
+            self.denied = True
+            raise OSError("Reclaim peer changed")
+
+
+@contextmanager
+def _deadline_guard(cancel, deadline):
+    if deadline == float("inf"):
+        yield; return
+    timer = threading.Timer(max(0, deadline - time.monotonic()), cancel.cancel)
+    timer.daemon = False; timer.start()
+    try: yield
+    finally: timer.cancel(); timer.join()
+
+
+def _bounded_reclaim(fn):
+    @wraps(fn)
+    def run(request, cancel, *args, **kwargs):
+        if time.monotonic() >= request.deadline: return "deadline"
+        if cancel.cancelled: return "cancelled"
+        with _deadline_guard(cancel, request.deadline):
+            result = fn(request, cancel, *args, **kwargs)
+            if time.monotonic() >= request.deadline: return "deadline"
+            return "cancelled" if cancel.cancelled else result
+    return run
+
+
 class _AuthCancel:
     def __init__(self):
         self.lock, self.sockets, self.event = threading.RLock(), set(), threading.Event()
@@ -64,7 +159,7 @@ class _AuthCancel:
                 try: sock.shutdown(socket.SHUT_RDWR)
                 except OSError: pass
                 if sock.fileno() == -1: self.sockets.discard(sock)
-    def session(self):
+    def session(self, verify=None):
         gate = self
         class Sock(socket.socket):
             def close(self):
@@ -81,6 +176,7 @@ class _AuthCancel:
                     if gate.cancelled: raise OSError("Authentication cancelled")
                     sock.connect(("127.0.0.1", self.port))
                     if gate.cancelled: raise OSError("Authentication cancelled")
+                    if verify is not None: verify(sock)
                 except socket.timeout as error:
                     sock.close(); raise ConnectTimeoutError(self, "connect timeout") from error
                 except OSError as error:
@@ -123,6 +219,8 @@ _PORT_RELEASE_TIMEOUT = 5.0
 class _ReclaimRequest(NamedTuple):
     port: int
     secret: str | None
+    deadline: float = float("inf")
+    gate: object = None
     def __repr__(self): return f"_ReclaimRequest(port={self.port})"
 
 
@@ -537,7 +635,7 @@ class Aria2Daemon:
                 logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
         elif self.preflight is None or self.preflight.port != port:
             state, secret = read_rpc_record()
-            return _ReclaimRequest(port, self.settings.rpc_secret if state == "ABSENT" else secret)
+            return _ReclaimRequest(port, self.settings.rpc_secret if state == "ABSENT" else secret, gate=_PeerGate())
         else:
             preflight, self.preflight = self.preflight, None
             if preflight.kind == "stale":
@@ -563,31 +661,42 @@ class Aria2Daemon:
                 pass  # Cleanup failure cannot replace the original startup exception.
             raise
     @staticmethod
+    @_bounded_reclaim
     def reclaim_probe(request, cancel):
+        gate = request.gate or _PeerGate()
+        verify = lambda sock: gate.check(sock, request.port, cancel, request.deadline)
         kind = _probe_port(request.port)
         if kind != "busy": return kind
         if request.secret is not None:
             error = Aria2Daemon._await_rpc(
                 _AuthInput(_RpcSettings(request.port), request.secret),
-                secret=request.secret, retry=False, cancel=cancel)
+                secret=request.secret, retry=False, cancel=cancel, verify=verify, limit=request.deadline)
+            if time.monotonic() >= request.deadline: return "deadline"
             if cancel.cancelled: return "cancelled"
             if error is None: return "eligible"
+        if time.monotonic() >= request.deadline: return "deadline"
+        if cancel.cancelled: return "cancelled"
         return "stale" if _probe_port(request.port) == "busy" else "free"
 
     @staticmethod
+    @_bounded_reclaim
     def reclaim_release(request, cancel, timeout=None):
+        gate = request.gate or _PeerGate()
+        verify = lambda sock: gate.check(sock, request.port, cancel, request.deadline)
         client = Aria2RPC(_RpcSettings(request.port), secret_provider=lambda: request.secret,
-                          session_factory=cancel.session)
+                          session_factory=lambda: cancel.session(verify))
         try:
             client.shutdown()
         except Exception:
             pass
         finally:
             client.close()
-        deadline = time.monotonic() + (_PORT_RELEASE_TIMEOUT if timeout is None else timeout)
+        if gate.denied: return "busy"
+        deadline = min(request.deadline, time.monotonic() + (_PORT_RELEASE_TIMEOUT if timeout is None else timeout))
         while not cancel.cancelled and time.monotonic() < deadline:
             if _probe_port(request.port) != "busy": break
             cancel.wait(0.1)
+        if time.monotonic() >= request.deadline: return "deadline"
         if cancel.cancelled: return "cancelled"
         return "busy" if _probe_port(request.port) == "busy" else "released"
 
@@ -706,11 +815,12 @@ class Aria2Daemon:
             return
         raise Aria2Error("Failed to launch aria2c.")
 
-    def _await_rpc(self, timeout: float = 5.0, secret=None, retry=True, cancel=None) -> Exception | None:
+    def _await_rpc(self, timeout: float = 5.0, secret=None, retry=True, cancel=None, verify=None, limit=None) -> Exception | None:
         """Observe acceptance, then one exact rejection (aria2 delays it ~2s)."""
         deadline = time.monotonic() + timeout
+        if limit is not None: deadline = min(deadline, limit)
         secret = self._secret if secret is None else secret
-        client = Aria2RPC(self.settings, secret_provider=lambda: secret, session_factory=cancel.session if cancel else None)
+        client = Aria2RPC(self.settings, secret_provider=lambda: secret, session_factory=(lambda: cancel.session(verify)) if cancel else None)
         last_err = Aria2Error("aria2 RPC did not come up.")
         try:
             while (remaining := deadline - time.monotonic()) > 0:
@@ -736,6 +846,9 @@ class Aria2Daemon:
             wrong = secrets.token_urlsafe(32)
             secret = wrong if wrong != secret else wrong + "_"
             client.timeout = max(4.0, timeout)
+            if limit is not None:
+                if time.monotonic() >= limit: return last_err
+                client.timeout = min(client.timeout, limit - time.monotonic())
             try:
                 client.get_version()
             except Aria2RpcError as error:

@@ -20,7 +20,7 @@ from PySide6.QtGui import QGuiApplication, QIcon, QPalette, QColor
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import APP_NAME, __version__, diagnostics, theme
-from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC, _AuthCancel, _AuthInput, _RpcSettings, _ReclaimRequest, _Preflight
+from .aria2 import Aria2Daemon, Aria2Error, Aria2InterfaceError, Aria2RPC, _AuthCancel, _AuthInput, _RpcSettings, _ReclaimRequest, _Preflight, _RECLAIM_DEADLINE
 from .api_server import LocalApiServer
 from .config import CONFIG_FILE, Settings
 from .main_window import MainWindow
@@ -43,6 +43,7 @@ UPDATE_REPO = "Sin213/cove-download-manager"
 ARIA2_UNRESOLVED_EXIT = 70
 
 ENGINE_START_FAILED_TEXT = "Cove couldn't start the download engine. Restart Cove and try again."
+RECLAIM_DEADLINE_TEXT = "The download engine did not respond during startup. Cove could not safely reclaim the RPC port. Restart Cove and try again."
 RESUME_FAILED_TEXT = (
     "Cove started the download engine but couldn't resume your saved "
     "downloads. They are still in your list. Restart Cove to try again."
@@ -64,6 +65,9 @@ class _StartupController(QObject):
         self.state, self.generation, self.closing = "NOT_STARTED", 0, False
         self.cancel, self.worker, self.ticket = _AuthCancel(), None, None
         self.op, self.request, self.retired, self.shown = 0, None, [], False
+        self.deadline, self.deadline_generation = None, None
+        self.deadline_timer = QTimer(self); self.deadline_timer.setSingleShot(True)
+        self.deadline_timer.timeout.connect(self.expire)
         self.completed.connect(self.complete, Qt.QueuedConnection)
         self.reclaimed.connect(self.reclaim, Qt.QueuedConnection)
     def present(self, on):
@@ -85,13 +89,19 @@ class _StartupController(QObject):
             ticket = self.prepare()
             if self.closing or generation != self.generation: return
             if ticket is False:
+                self.deadline_timer.stop()
                 self.state = "FAILED"
                 return
             if isinstance(ticket, _ReclaimRequest):
+                if self.deadline is None:
+                    self.deadline, self.deadline_generation = time.monotonic() + _RECLAIM_DEADLINE, generation
+                ticket = ticket._replace(deadline=self.deadline)
                 self.request, self.state = ticket, "RECLAIMING"
+                self.deadline_timer.start(max(1, int((self.deadline - time.monotonic()) * 1000)))
                 self.present(True)
                 self.run(generation, Aria2Daemon.reclaim_probe)
                 return
+            self.deadline_timer.stop()
             self.ticket, self.state = ticket, "AUTHENTICATING"
             if ticket is None:
                 self.complete(generation, "ok")
@@ -131,6 +141,9 @@ class _StartupController(QObject):
         if (self.closing or generation != self.generation or op != self.op
                 or self.state not in ("RECLAIMING", "RELEASING")): return
         self.op += 1
+        if result == "deadline" or (self.deadline is not None and time.monotonic() >= self.deadline):
+            self.failure(Aria2Error(RECLAIM_DEADLINE_TEXT))
+            return
         try:
             if self.state == "RECLAIMING" and result == "eligible":
                 self.state = "RELEASING"
@@ -145,6 +158,14 @@ class _StartupController(QObject):
         except BaseException as error:
             self.failure(None, notify=isinstance(error, Exception))
             if not isinstance(error, Exception): raise
+    @Slot()
+    def expire(self):
+        if (self.closing or self.state not in ("RECLAIMING", "RELEASING")
+                or self.deadline_generation != self.generation): return
+        if time.monotonic() < self.deadline:
+            self.deadline_timer.start(max(1, int((self.deadline - time.monotonic()) * 1000)))
+            return
+        self.failure(Aria2Error(RECLAIM_DEADLINE_TEXT))
     def join(self, timeout=2):
         deadline = time.monotonic() + timeout
         workers = [thread for thread in (*self.retired, self.worker) if thread is not None]
@@ -153,10 +174,11 @@ class _StartupController(QObject):
         return not any(thread.is_alive() for thread in workers)
     def failure(self, error, notify=True):
         if self.closing: return
+        self.deadline_timer.stop()
         self.request = None
-        self.present(False)
         self.state = "FAILED"
         self.cancel.cancel()
+        self.present(False)
         try: self.daemon.stop()
         except BaseException as exc:
             logging.getLogger("cove").error("aria2_stop_failed type=%s", type(exc).__name__)
@@ -179,9 +201,13 @@ class _StartupController(QObject):
             if self.ticket is not None: allowed += (str(_AuthInput(_RpcSettings(self.ticket.port), "")._stale_daemon_error()),)
             self.failure(error if isinstance(error, Aria2Error) and str(error) in allowed else None)
     def shutdown(self):
+        if self.closing: return
+        self.deadline_timer.stop()
+        reclaiming = self.state in ("RECLAIMING", "RELEASING")
         self.request = None
         self.closing = True; self.generation += 1; self.state = "STOPPED"
         self.cancel.cancel()
+        if reclaiming and self.shown: self.present(False)
 
 
 def parse_launch_urls(argv: list[str]) -> list[str]:

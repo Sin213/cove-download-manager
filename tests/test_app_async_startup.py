@@ -3,6 +3,7 @@ Missing APIs are INTERFACE REDs. Discover completion names by contracted Qt
 signature. The unnamed platform gate is called _async_startup_supported here.
 """
 import json
+import os
 import socket
 import sys
 import threading
@@ -80,6 +81,11 @@ def test_startup_baseexception_propagates_after_cleanup(exception, phase, monkey
     assert controller.state == "FAILED" and controller.cancel.cancelled
     assert controller.worker is None
     failed.assert_not_called()
+
+@pytest.fixture(autouse=True)
+def eligible_test_peer(monkeypatch):
+    monkeypatch.setattr(a, "_peer_identity", lambda *args: (os.getpid(), "0"))
+
 
 def until(predicate, timeout=3):
     deadline = time.monotonic() + timeout
@@ -621,7 +627,9 @@ if flags.get("continuation"):
     if flags["continuation"] == "watchdog": FakeWatchdog.__init__ = optional_failure
     if flags["continuation"] == "watchdog_start":
         class Timer(QTimer):
-            def start(self, *args): return optional_failure(self)
+            def start(self, *args):
+                # Only the watchdog uses start(); reclaim's deadline uses start(msec).
+                return super().start(*args) if args else optional_failure(self)
         app_mod.QTimer = Timer
     if flags["continuation"] == "links": FakeQMessageBox.warning = staticmethod(lambda *args: optional_failure(None))
 controllers = []
