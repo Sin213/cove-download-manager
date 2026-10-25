@@ -69,6 +69,8 @@ def test_chrome_bundle_has_no_extractor_module(bundles):
     files = _files(bundles / "chrome")
     assert "media.js" not in files
     assert "media-sites.js" not in files
+    assert "fuckingfast-fetch.js" not in files
+    assert "content/fuckingfast.js" not in files
 
 
 def test_chrome_bundle_content_directory_holds_the_shared_pill_only(bundles):
@@ -365,6 +367,7 @@ def test_firefox_bundle_keeps_the_media_pill(bundles):
     assert "content/media-sites.js" in files
     assert "media-core.js" in files
     assert "media-sites.js" in files
+    assert "fuckingfast-fetch.js" in files and "content/fuckingfast.js" in files
     # Superseded by the core/sites split; nothing may resurrect it.
     assert "media.js" not in files
 
@@ -377,13 +380,17 @@ def test_firefox_bundle_excludes_the_chrome_capability(bundles):
 def test_firefox_manifest_loads_the_extractor_module(bundles):
     manifest = json.loads((bundles / "firefox" / "manifest.json").read_text())
     scripts = manifest["background"]["scripts"]
-    assert scripts == ["media-core.js", "media-sites.js", "background.js"]
+    assert scripts == ["media-core.js", "media-sites.js", "fuckingfast-fetch.js", "background.js"]
     assert manifest["content_scripts"], "the pill content script must stay on Firefox"
     # The site adapter publishes its capability before the shared pill reads it.
-    assert manifest["content_scripts"][0]["js"] == [
+    assert manifest["content_scripts"][1]["js"] == [
         "content/media-sites.js",
         "content/media-tab.js",
     ]
+    fetch = manifest["content_scripts"][0]
+    assert fetch["matches"] == ["https://fuckingfast.co/*", "https://www.fuckingfast.co/*"]
+    assert fetch["js"] == ["content/fuckingfast.js"]
+    assert fetch["all_frames"] is False and fetch["run_at"] == "document_idle"
 
 
 def test_firefox_bundle_still_handles_video_pages(bundles):
@@ -457,6 +464,7 @@ def test_chrome_store_zip_ships_the_same_media_boundary(bundles):
             "content/media-tab.js", "content/media-tab.css"} <= names
     assert "media-sites.js" not in names
     assert "content/media-sites.js" not in names
+    assert "fuckingfast-fetch.js" not in names and "content/fuckingfast.js" not in names
     assert "chrome-key.pem" not in names
 
 
@@ -468,6 +476,7 @@ def test_firefox_zip_ships_its_own_media_boundary(bundles):
     with ZipFile(zips[0]) as zf:
         names = set(zf.namelist())
     assert {"media-core.js", "media-sites.js", "content/media-sites.js",
+            "fuckingfast-fetch.js", "content/fuckingfast.js",
             "content/media-tab.js", "content/media-tab.css"} <= names
     assert "media-chrome.js" not in names
     assert "chrome-key.pem" not in names

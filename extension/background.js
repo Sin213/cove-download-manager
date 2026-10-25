@@ -798,12 +798,13 @@ async function handleCreated(downloadItem) {
   // Size filter: only when the size is known. Small files are left to the
   // browser per the user's minimum-size setting.
   const size = downloadItem.totalBytes;
-  if (typeof size === "number" && size > 0 && size < settings.minSizeBytes) return;
+  const browserFetch = typeof CoveFuckingfast !== "undefined" && CoveFuckingfast.owns(downloadItem);
+  if (!browserFetch && typeof size === "number" && size > 0 && size < settings.minSizeBytes) return;
 
   // Extension allowlist: only grab configured file types. An empty list
   // means "intercept everything".
   const exts = settings.interceptExtensions || [];
-  if (exts.length && !exts.includes(downloadExtension(downloadItem))) return;
+  if (!browserFetch && exts.length && !exts.includes(downloadExtension(downloadItem))) return;
 
   interceptDownload(downloadItem);
 }
@@ -948,6 +949,8 @@ browser.downloads.onErased.addListener(async (id) => {
 
 async function interceptDownload(downloadItem) {
   if (!isNormalContext(downloadItem)) return;
+  const browserFetch = typeof CoveFuckingfast !== "undefined" && CoveFuckingfast.owns(downloadItem)
+    ? CoveFuckingfast.armed : null;
   const ownedIdentity = { url: downloadItem.url, startTime: downloadItem.startTime };
   // Mark synchronously to block concurrent same-URL events before any await.
   markIntercepted(downloadItem.url);
@@ -961,7 +964,8 @@ async function interceptDownload(downloadItem) {
     filename = parts[parts.length - 1] || null;
   }
 
-  console.log("Cove: sending download to native host", downloadItem.url);
+  if (browserFetch && !filename) filename = browserFetch.hint || null;
+  if (!browserFetch) console.log("Cove: sending download to native host", downloadItem.url);
 
   // Send to native host BEFORE cancelling. The browser download continues
   // until we have confirmed acceptance of this specific request.
@@ -973,12 +977,14 @@ async function interceptDownload(downloadItem) {
     // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
     // not know yet, and the primary's schema refuses a negative size outright.
     fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
+    ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
     ...(await userAgentField()),
   });
 
-  console.log("Cove: native host response", JSON.stringify(result));
+  if (!browserFetch) console.log("Cove: native host response", JSON.stringify(result));
 
   if (result && result.status === "ok") {
+    if (browserFetch) CoveFuckingfast.onIntercepted(browserFetch);
     // Confirmed: native host accepted this download. Now cancel the browser copy.
     interceptedIds.add(dlId);
     ownedDownloads.set(dlId, ownedIdentity);
@@ -994,7 +1000,7 @@ async function interceptDownload(downloadItem) {
       // unavailable, which is the worse failure mode.
     }
     browser.downloads.erase({ id: dlId }).catch(() => {});
-    showNotification("Download sent to Cove", filename || downloadItem.url);
+    showNotification("Download sent to Cove", filename || (browserFetch ? "Browser download" : downloadItem.url));
   } else {
     // Native host failed or is unavailable. Clear the dedup mark so the
     // browser's original download proceeds unimpeded and future intercepts
@@ -1002,7 +1008,8 @@ async function interceptDownload(downloadItem) {
     recentIntercepted.delete(downloadItem.url);
     // `result` may be null/undefined if the host replied with malformed JSON,
     // so don't dereference it: an exception here would abort the handler.
-    console.error(
+    if (browserFetch) CoveFuckingfast.onRefused(browserFetch);
+    else console.error(
       "Cove: native host failed, browser download continues",
       (result && result.message) || "no response"
     );

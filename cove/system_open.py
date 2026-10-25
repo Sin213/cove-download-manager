@@ -44,15 +44,18 @@ def child_env() -> dict[str, str] | None:
 
 
 def open_url(url: str) -> None:
-    """Open `url` in the default browser without leaking AppImage env.
+    """Open `url` with detached xdg-open on Linux, or Qt as a fallback.
 
-    QDesktopServices.openUrl spawns xdg-open with the current environment,
-    which inside an AppImage carries LD_LIBRARY_PATH into the browser and
-    crashes it. Spawn xdg-open ourselves with a scrubbed env in that case.
+    Prefer xdg-open whenever available: Qt can silently fail to open URLs
+    on Linux desktops. AppImage children receive a scrubbed environment;
+    source-run children inherit Cove's environment. Other platforms or missing
+    xdg-open use Qt.
     """
     env = child_env()
-    if env is not None and sys.platform.startswith("linux") and shutil.which("xdg-open"):
-        subprocess.Popen(["xdg-open", url], env=env)
+    if sys.platform.startswith("linux") and shutil.which("xdg-open"):
+        subprocess.Popen(["xdg-open", url], env=env, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
         return
     # Imported here so this module stays importable without a Qt GUI stack.
     from PySide6.QtCore import QUrl

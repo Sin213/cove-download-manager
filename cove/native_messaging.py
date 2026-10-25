@@ -231,6 +231,13 @@ def handle_message(
     settings: Settings | None,
 ) -> dict:
     action = msg.get("action", "")
+    if action == "fetch_ticket":
+        from . import fuckingfast
+        from .config import DATA_DIR
+        result = fuckingfast.consume_ticket(DATA_DIR, msg.get("nonce"), msg.get("id"))
+        _log("fetch_ticket", "INFO", status="ok" if result is not None else "error")
+        return ({"status": "ok", "hint": result["hint"], "directory": result["dir"]} if result is not None else
+                {"status": "error", "message": "Cove did not authorize this page."})
     # Optional, additive and backward compatible: an older extension simply
     # omits it, and an older host ignores it.
     request_id = diagnostics.normalize_request_id(msg.get("requestId"))

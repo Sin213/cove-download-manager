@@ -30,11 +30,17 @@
   ],
 
   "background": {
-    "scripts": ["media-core.js", "media-sites.js", "background.js"],
+    "scripts": ["media-core.js", "media-sites.js", "fuckingfast-fetch.js", "background.js"],
     "persistent": true
   },
 
   "content_scripts": [
+    {
+      "matches": ["https://fuckingfast.co/*", "https://www.fuckingfast.co/*"],
+      "js": ["content/fuckingfast.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    },
     {
       "matches": ["http://*/*", "https://*/*"],
       "js": ["content/media-sites.js", "content/media-tab.js"],

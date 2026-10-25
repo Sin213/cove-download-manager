@@ -54,6 +54,7 @@ _EXCLUDE = {"manifest.chrome.json", "chrome-key.pem"}
 # no detector behind it. The section, its styling and its click handler are one
 # Firefox-only module, composed into that bundle's popup below.
 _CHROME_EXCLUDE = {"media-sites.js", "content/media-sites.js",
+                   "fuckingfast-fetch.js", "content/fuckingfast.js",
                    "popup/streams.js", "popup/streams.css"}
 _FIREFOX_EXCLUDE = {"media-chrome.js"}
 

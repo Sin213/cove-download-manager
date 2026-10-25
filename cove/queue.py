@@ -5138,16 +5138,23 @@ class QueueManager(QObject):
             "" if t.source_type == SOURCE_TORRENT_FILE
             else debrid.share_link_reason(t.url, self.settings)
         )
+        from .fuckingfast import share_link_reason as browser_share_reason
+        browser_reason = browser_share_reason(t.url) if t.source_type == SOURCE_PLAIN else ""
+        share_reason = browser_reason or share_reason
         if share_reason:
             facts = diagnostics.url_facts(t.url)
-            self._diag(
-                "debrid", "share_link_rejected", "WARNING", task_id=t.id,
-                host=facts["host"], route=facts["route"],
-                provider=facts["provider"] or "unknown",
-                classification=facts["classification"],
-                resolver="unsupported_share_link",
-                **self._debrid_credential_facts(),
-            )
+            if browser_reason:
+                self._diag("browser_fetch", "share_link_rejected", "WARNING", task_id=t.id,
+                           classification=facts["classification"])
+            else:
+                self._diag(
+                    "debrid", "share_link_rejected", "WARNING", task_id=t.id,
+                    host=facts["host"], route=facts["route"],
+                    provider=facts["provider"] or "unknown",
+                    classification=facts["classification"],
+                    resolver="unsupported_share_link",
+                    **self._debrid_credential_facts(),
+                )
             t.status = "error"
             t.error = share_reason
             t.finished_at = time.time()

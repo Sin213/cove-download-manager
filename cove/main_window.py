@@ -731,6 +731,9 @@ class MainWindow(QMainWindow):
         """
         self._preflights_closed = True
         self.discard_magnet_requests()
+        browser_fetch = getattr(self, "_browser_fetch_coordinator", None)
+        if browser_fetch is not None:
+            browser_fetch.cancel()
         # Queued preflights are dropped *before* the open dialog is rejected:
         # unwinding it returns to the drain loop, which would otherwise take
         # the next one straight out of the queue and put another modal up.
@@ -1844,6 +1847,19 @@ class MainWindow(QMainWindow):
         self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
     ) -> list[int]:
         """Add URLs interactively, warning about anything already present."""
+        from .fuckingfast import parse_share_url
+        browser_links, remaining = [], []
+        for url in urls:
+            link = parse_share_url(url)
+            if link is None:
+                remaining.append(url)
+            else:
+                browser_links.append(link)
+        if browser_links:
+            self._submit_browser_fetch(browser_links, out_dir=out_dir)
+        urls = remaining
+        if not urls:
+            return []
         cands = [self._candidate(u) for u in urls if (u or "").strip()]
         if not cands:
             return []
@@ -1891,6 +1907,20 @@ class MainWindow(QMainWindow):
             return [] if tid is None else [tid]
         chosen = self._confirm_duplicate_batch(checked)
         return self.queue.add_urls(chosen, out_dir, intake=intake) if chosen else []
+
+    def _submit_browser_fetch(self, links, out_dir=None):
+        from . import config
+        from .browser_fetch import BrowserFetchCoordinator
+        if getattr(self, "_browser_fetch_coordinator", None) is None:
+            self._browser_fetch_coordinator = BrowserFetchCoordinator(
+                self.queue, config.DATA_DIR, open_url, self)
+            self._browser_fetch_coordinator.finished.connect(self._browser_fetch_finished)
+        return self._browser_fetch_coordinator.submit(links, out_dir=out_dir)
+
+    def _browser_fetch_finished(self, failures):
+        if failures:
+            QMessageBox.warning(self, "Browser downloads", "\n".join(
+                f"{failure['id']}: {failure['message']}" for failure in failures))
 
     def _add_single_interactive(
         self, cand: dedup.Candidate, out_dir: str | None, intake: str
