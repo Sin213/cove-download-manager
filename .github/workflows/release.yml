@@ -342,18 +342,38 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.6.2
+          ## What's new in 3.7.0
 
-          A maintenance release with two reliability fixes around the aria2 backend.
+          New download sources, a faster and safer startup, and a large round of privacy and security hardening.
+
+          ### New
+
+          - **MEGA folder downloads via AllDebrid.** Paste a public MEGA folder link into **Add Download** and pick which files to grab. Requires AllDebrid to be enabled; folder keys are sent to AllDebrid only to resolve the links. Listings are flat unless AllDebrid supplies folder paths. (#17)
+          - **Fuckingfast.co downloads via Firefox.** Cove hands these pages to Firefox, where the Cove extension starts the download and passes it back to Cove. Needs Firefox with an updated Cove extension; other browsers are not supported for this site. (#18)
+          - **Startup indicator.** While the download engine starts, the main window says so, and anything you add stays queued until the engine is ready.
 
           ### Fixed
 
-          - **Removing a torrent now stops its backend transfer.** Removing a torrent from Cove could leave the underlying transfer running in the background; Cove now keeps ownership of the transfer until the backend confirms the removal. Choosing to keep the files still keeps them.
-          - **Cove now tells you when the aria2 backend stops.** If aria2 exits partway through a session, Cove no longer sits there looking idle while every download fails - it reports the outage once and tells you to restart Cove. The underlying error is also written to the diagnostics log instead of being discarded.
+          - **Startup no longer freezes the window.** aria2 authentication and reclaiming a leftover aria2 process from a previous run now happen off the UI thread, with a hard deadline so a stuck engine cannot hang Cove.
+          - **Downloads added during startup wait their turn.** Items added before the engine is ready are held instead of failing.
+          - **Cleaner aria2 shutdown.** Cove tracks its aria2 process more strictly and cleans it up reliably when it exits.
+          - **Removing a download protects your files.** Cove only deletes files it created for that task, and keeps ownership of a transfer until the backend confirms it is gone.
+          - **Selected network interface is enforced everywhere.** Cove's own Python requests and the external media engines now use the interface you picked in Settings.
+
+          ### Privacy and security
+
+          - **Browser cookies are no longer collected or used.** The extension no longer reads or sends cookies, and Cove discards any that an older extension build still sends. Cove also tries to clear cookies stored by earlier versions from its download history at startup. Downloads that depend on a browser login may no longer work in Cove.
+          - **Private and incognito downloads stay in the browser.** The extension does not take over downloads from private (Firefox) or incognito (Chrome) windows, and the in-page button is not shown there.
+          - **Referrers trimmed to the site origin.** Cove passes only the origin of the referring page, not its full address.
+          - **aria2 RPC locked down.** A fresh RPC secret is generated each launch, and RPC calls ignore system proxies and redirects so the secret cannot leak through them. Stored credentials and aria2 proxy authentication are hardened.
+          - **aria2 session file retired.** Cove no longer writes `aria2.session` and removes a leftover copy when it is safe to do so. Recovery uses the queue database.
+          - **Torrent and magnet checks.** Magnet metadata and torrent payloads are only fetched after the P2P setting allows them, and that setting is checked again right before the transfer starts.
+          - **Media pill trust.** The in-page download button only acts on downloads it can verify came from the page, and gains an "exclude this site" action with a confirmation step.
 
           ### Notes
 
           - The browser extension is published separately, on its own schedule and through the two stores; this desktop release neither contains nor updates it.
+          - On Linux, Cove uses `aria2` from your system (the .deb declares its dependencies). The Windows builds bundle aria2 and yt-dlp.
 
           ## Downloads
 
