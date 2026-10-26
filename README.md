@@ -390,6 +390,10 @@ Configure them in **Settings -> Debrid services**:
 - TorBox hoster downloads and cached torrents are supported. TorBox Usenet
   is not.
 
+Public MEGA folder links need AllDebrid enabled. Add them through **Add Download**
+to choose files; folder keys are sent to AllDebrid only for resolution. Listings
+are flat unless AllDebrid supplies relative folder paths.
+
 When a download starts, Cove checks the URL's host against the provider's
 published host list. If the host is supported, the original link is
 resolved through your account and the resulting direct link is handed to

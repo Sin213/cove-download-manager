@@ -142,7 +142,8 @@ def _engine_output_candidates(work: WorkDirectory) -> list[str]:
 SOURCE_PLAIN = ""
 SOURCE_TORRENT = "torrent"
 SOURCE_TORRENT_FILE = "torrent_file"
-SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE)
+SOURCE_DEBRID_FILE = "debrid_file"
+SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
 
 
 @dataclass(frozen=True)
@@ -793,6 +794,7 @@ class DownloadTask:
     # relaunch because the previous one expires.
     resolved_url: str = ""
     debrid_provider: str = ""
+    debrid_max_chunks: int = 0
     # "metadata" while aria2 is still fetching a magnet's torrent metadata.
     # Transient by design: it is re-derived when the magnet is re-added.
     phase: str = ""
@@ -819,6 +821,7 @@ class DownloadTask:
     def clear_debrid(self) -> None:
         self.resolved_url = ""
         self.debrid_provider = ""
+        self.debrid_max_chunks = 0
 
     @property
     def progress(self) -> float:
@@ -1230,6 +1233,11 @@ class QueueManager(QObject):
                 self._seen_gids.add(gid)
 
                 files = dl.get("files") or []
+                if any(debrid.is_mega_folder_url(uri.get("uri", ""))
+                       for file in files for uri in (file.get("uris") or [])):
+                    # A folder landing page cannot be an ordinary download.
+                    # Check every URI before deriving any persisted metadata.
+                    continue
                 url = ""
                 filename = None
                 out_dir = self.settings.download_dir
@@ -1595,6 +1603,9 @@ class QueueManager(QObject):
         recreate the exact legacy task.
         """
         url = url.strip()
+        if debrid.is_mega_folder_url(url):
+            self.error.emit(debrid.MEGA_FOLDER_INTAKE_MESSAGE)
+            return None
         browser_cookies_seen = bool(_clean_header(cookies))
         referrer = referrer_origin(referrer)
         user_agent = _clean_header(user_agent)
@@ -1773,6 +1784,62 @@ class QueueManager(QObject):
         self.task_added.emit(t.id)
         self._maybe_start_next()
         return t.id
+
+    def add_debrid_files(self, entries, out_dir: str) -> list[int]:
+        """Commit a selected folder manifest atomically, storing virtual links only."""
+        from .config import categorize
+
+        base = os.path.abspath(out_dir)
+        rows = []
+        file_paths, directory_paths = set(), set()
+        for entry in entries:
+            parts = debrid._mega_path(entry.path)
+            if entry.name != parts[-1]:
+                raise debrid._mega_error(debrid._MEGA_BAD_LIST)
+            link = debrid._mega_virtual_link(entry.locked_link)
+            size = debrid._mega_filesize(entry.size)
+            folded = tuple(part.casefold() for part in parts)
+            prefixes = {folded[:i] for i in range(1, len(folded))}
+            if (folded in file_paths or folded in directory_paths
+                    or not prefixes.isdisjoint(file_paths)):
+                raise debrid._mega_error("The selected MEGA files contain conflicting paths.")
+            file_paths.add(folded)
+            directory_paths.update(prefixes)
+            dest = os.path.join(base, *parts[:-1])
+            if not _within(base, dest):
+                raise debrid._mega_error("This MEGA folder contains a path Cove will not write to.")
+            rows.append((dest, parts[-1], size, link))
+        connections = min(max(int(self.settings.connections_per_server), 1), MAX_CONNECTIONS_PER_SERVER)
+        now, created = time.time(), []
+        with db.connect() as conn:
+            for dest, name, size, link in rows:
+                existing = conn.execute(
+                    "SELECT id FROM downloads WHERE url=? "
+                    "AND status NOT IN ('completed','error','removed') LIMIT 1", (link,),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                cur = conn.execute(
+                    """INSERT INTO downloads
+                       (url, out_dir, connections, speed_limit_kbps, status,
+                        created_at, category, backend, filename, total_bytes,
+                        source_type, debrid_route)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (link, dest, connections, 0, "queued", now, categorize(name),
+                     "aria2", name, size, SOURCE_DEBRID_FILE, debrid.ALL_DEBRID),
+                )
+                created.append(DownloadTask(
+                    id=cur.lastrowid, url=link, out_dir=dest, connections=connections,
+                    filename=name, total_bytes=size, created_at=now,
+                    source_type=SOURCE_DEBRID_FILE, debrid_route=debrid.ALL_DEBRID,
+                ))
+        for task in created:
+            self.tasks[task.id] = task
+            self._diag_url_added(task, "manual")
+            self.task_added.emit(task.id)
+        if created:
+            self._maybe_start_next()
+        return [task.id for task in created]
 
     # ---- diagnostics ---------------------------------------------------
     #
@@ -5135,7 +5202,7 @@ class QueueManager(QObject):
         # is keyed on source_type, which only Cove's own materialisation
         # sets — a pasted share link still lands in the branch below.
         share_reason = (
-            "" if t.source_type == SOURCE_TORRENT_FILE
+            "" if t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
             else debrid.share_link_reason(t.url, self.settings)
         )
         from .fuckingfast import share_link_reason as browser_share_reason
@@ -5235,7 +5302,7 @@ class QueueManager(QObject):
         needs_worker = (
             self.settings.intelligent_segments
             or self._debrid_enabled()
-            or t.source_type == SOURCE_TORRENT_FILE
+            or t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
         )
         if is_http and needs_worker:
             self._spawn(
@@ -5296,9 +5363,10 @@ class QueueManager(QObject):
 
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
-        if t.source_type == SOURCE_TORRENT_FILE:
+        if t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE):
             if (
-                t.debrid_route == debrid.TORBOX
+                t.source_type == SOURCE_TORRENT_FILE
+                and t.debrid_route == debrid.TORBOX
                 and t.debrid_item_id
                 and t.debrid_file_id
                 and debrid.TORBOX_FEATURE_AVAILABLE
@@ -5327,14 +5395,25 @@ class QueueManager(QObject):
             # provider-domain exclusion and goes straight to the provider
             # that issued it. t.url is left untouched: the generated node
             # URL expires, this link doesn't.
-            result = debrid.unlock_torrent_file(
-                t.url, t.debrid_route, self.settings,
-                session=self._bound_session(),
-            )
+            try:
+                result = debrid.unlock_torrent_file(
+                    t.url, t.debrid_route, self.settings,
+                    session=self._bound_session(),
+                )
+            except (ValueError, OverflowError):
+                if t.source_type != SOURCE_DEBRID_FILE:
+                    raise
+                raise debrid._mega_error(debrid._MEGA_BAD_LIST) from None
+            # Unlock metadata is independent of the earlier folder listing.
+            # Validate before mutating the task or allowing an aria2 add.
+            filesize = (debrid._mega_filesize(result.filesize)
+                        if t.source_type == SOURCE_DEBRID_FILE else result.filesize)
             t.resolved_url = result.download
             t.debrid_provider = result.provider
-            if result.filesize > 0:
-                t.total_bytes = result.filesize
+            if t.source_type == SOURCE_DEBRID_FILE:
+                t.debrid_max_chunks = result.max_chunks
+            if filesize > 0:
+                t.total_bytes = filesize
             return result.download
         if (
             t.source_type == SOURCE_PLAIN
@@ -5419,6 +5498,8 @@ class QueueManager(QObject):
             segments = self._compute_segments(supports_range, content_length, t.connections)
         else:
             segments = t.connections
+        if t.source_type == SOURCE_DEBRID_FILE and t.debrid_max_chunks > 0:
+            segments = min(segments, t.debrid_max_chunks)
         t.segments = segments
         # Seed the progress denominator so the bar moves before aria2's first
         # status poll. Never overwrite a size the provider or user already set.

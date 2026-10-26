@@ -70,6 +70,7 @@ from .dialogs import (
     ClipboardBatchDialog,
     DownloadFileInfoDialog,
     MagnetMetadataDialog,
+    MegaFolderDialog,
     SchedulerDialog,
     SettingsDialog,
     SourceDetailsDialog,
@@ -730,6 +731,10 @@ class MainWindow(QMainWindow):
         only version of this that does not depend on the order.
         """
         self._preflights_closed = True
+        getattr(self, "_mega_requests", deque()).clear()
+        mega_dialog = getattr(self, "_mega_dialog", None)
+        if mega_dialog is not None:
+            mega_dialog.reject()
         self.discard_magnet_requests()
         browser_fetch = getattr(self, "_browser_fetch_coordinator", None)
         if browser_fetch is not None:
@@ -1843,10 +1848,108 @@ class MainWindow(QMainWindow):
             # rather than dispatched once the inner loop unwinds.
             record.abandon()
 
+    def _mega_folder_preflight(self, url: str, out_dir: str | None) -> list[int]:
+        """Drain folder requests in turn, including arrivals during a modal."""
+        if self._preflights_closed:
+            return []
+        if not hasattr(self, "_mega_requests"):
+            self._mega_requests = deque()
+        self._mega_requests.append((url, out_dir))
+        if getattr(self, "_mega_open", False):
+            return []
+        self._mega_open = True
+        created = []
+        try:
+            while self._mega_requests and not self._preflights_closed:
+                created.extend(self._resolve_mega_folder(*self._mega_requests.popleft()))
+        finally:
+            self._mega_open = False
+            self._mega_requests.clear()
+        return created
+
+    def _resolve_mega_folder(self, url: str, out_dir: str | None) -> list[int]:
+        """List off-thread; cancelled or abandoned requests cannot commit."""
+        loading = MagnetMetadataDialog(self)
+        loading.setWindowTitle("MEGA Folder")
+        loading.heading.setText("Loading MEGA folder...")
+        loading.label.setText("Cove is fetching the file list through AllDebrid so you can choose files.")
+        state = {"settled": False, "result": None, "error": ""}
+
+        def cancel():
+            state["settled"] = True
+            state["result"] = None
+            loading.finish()
+
+        def done(answer):
+            if state["settled"] or self._preflights_closed:
+                return
+            state["settled"] = True
+            state["result"], state["error"] = answer
+            loading.finish()
+
+        def fetch():
+            nonlocal url
+            try:
+                if state["settled"]:
+                    return None, ""
+                return debrid.list_mega_folder(
+                    url, self.settings, session=self.queue._bound_session(),
+                ), ""
+            except debrid.DebridError as exc:
+                return None, exc.user_message
+            except Exception:
+                return None, debrid._MEGA_UNAVAILABLE
+            finally:
+                url = ""
+
+        loading.cancelled.connect(cancel)
+        self._mega_dialog = loading
+        try:
+            self.queue._spawn(fetch, on_done=done,
+                              on_fail=lambda _error: done((None, debrid._MEGA_UNAVAILABLE)))
+            if not state["settled"]:
+                loading.exec()
+        finally:
+            state["settled"] = True
+            self._mega_dialog = None
+        if self._preflights_closed:
+            return []
+        if state["error"]:
+            QMessageBox.warning(self, "MEGA folder unavailable", state["error"])
+            return []
+        if state["result"] is None:
+            return []
+        dialog = MegaFolderDialog(state["result"], out_dir or self.settings.download_dir, self)
+        self._mega_dialog = dialog
+        try:
+            if dialog.exec() != MegaFolderDialog.Accepted or self._preflights_closed:
+                return []
+            try:
+                return self.queue.add_debrid_files(
+                    dialog.result_selection(), out_dir or self.settings.download_dir,
+                )
+            except debrid.DebridError as exc:
+                QMessageBox.warning(self, "MEGA folder unavailable", exc.user_message)
+                return []
+            except Exception:
+                QMessageBox.warning(self, "MEGA folder unavailable", debrid._MEGA_UNAVAILABLE)
+                return []
+        finally:
+            self._mega_dialog = None
+
     def add_urls_checked(
         self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
     ) -> list[int]:
         """Add URLs interactively, warning about anything already present."""
+        folders = [url for url in urls if debrid.is_mega_folder_url(url)]
+        if folders:
+            created = []
+            for url in folders:
+                created.extend(self._mega_folder_preflight(url, out_dir))
+            remaining = [url for url in urls if not debrid.is_mega_folder_url(url)]
+            if remaining and not self._preflights_closed:
+                created.extend(self.add_urls_checked(remaining, out_dir, intake))
+            return created
         from .fuckingfast import parse_share_url
         browser_links, remaining = [], []
         for url in urls:

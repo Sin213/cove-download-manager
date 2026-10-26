@@ -892,6 +892,41 @@ class TorrentContentsDialog(QDialog):
         return torrent.normalize_file_selection(chosen)
 
 
+class MegaFolderDialog(TorrentContentsDialog):
+    """Use the shared manifest tree and selection controls for resolved files."""
+
+    def __init__(self, listing, save_to: str, parent=None):
+        from types import SimpleNamespace
+
+        self._entries = listing.files
+        self._unavailable = listing.unavailable
+        manifest = SimpleNamespace(name="MEGA folder", files=tuple(
+            SimpleNamespace(index=i, path=f.path, size=f.size)
+            for i, f in enumerate(listing.files)
+        ))
+        super().__init__(manifest, save_to, parent)
+        self.setWindowTitle("MEGA Folder")
+        # The base dialog's heading and form are display-only; no folder URL
+        # or key is ever supplied to a widget.
+        self.layout().itemAt(0).widget().setText("MEGA Folder")
+        form = self.layout().itemAt(2)
+        form.labelForField(self.name_edit).setText("Source")
+        self.tree.setHeaderLabels(["Name", "Size"])
+        self._select_none_button.setText("Deselect All")
+        self.download_button().setText("Download Selected")
+
+    def _refresh_summary(self) -> None:
+        super()._refresh_summary()
+        if self._unavailable:
+            self.summary.setText(self.summary.text() + f" · {self._unavailable} unavailable")
+
+    def result_selection(self) -> tuple:
+        if self.result() != QDialog.Accepted:
+            return ()
+        return tuple(self._entries[index] for item, index, _size in self._leaves
+                     if item.checkState(0) == Qt.Checked)
+
+
 class SourceDetailsDialog(QDialog):
     """Read-only "View source" sheet for one task.
 
