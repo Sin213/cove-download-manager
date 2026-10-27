@@ -588,6 +588,13 @@ def _safe_torrent_name(value) -> str:
         return ""
 
 
+def _cached_file_link(f) -> str:
+    """The stable URL a cached provider file is persisted under."""
+    if f.locked_link:
+        return f.locked_link
+    return f"https://torbox.app/torrent/{f.item_id}/{f.file_id}"
+
+
 def _selected_provider_files(meta, selection, cached):
     """The provider's files for `selection`, or None if that is unprovable.
 
@@ -1841,6 +1848,102 @@ class QueueManager(QObject):
             self._maybe_start_next()
         return [task.id for task in created]
 
+    def add_cached_torrent_files(
+        self, cached, selection, out_dir: str | None = None, *,
+        url: str = "", intake: str = "unknown",
+    ) -> list[int]:
+        """Queue the chosen files of a torrent a provider already holds.
+
+        For a magnet the user picked files from the *provider's* listing:
+        no `.torrent` exists, so `selection` names `cached.files` by their
+        `index` (None means every file) and is never an aria2 selection.
+        Nothing here touches aria2's BitTorrent engine or the swarm, so none
+        of the local-P2P policy applies; the rows are ordinary provider
+        downloads, exactly what `_materialize_cached_torrent` makes, just
+        created in one step because there is no source row to reuse.
+
+        Either every row is created or none is. A selection that does not
+        match the listing creates nothing.
+        """
+        from .config import categorize
+
+        if self._live_torrent(cached.info_hash):
+            self.error.emit("That torrent is already in Cove's queue.")
+            return []
+        by_index = {f.index: f for f in cached.files}
+        if selection is None:
+            files = list(cached.files)
+        else:
+            try:
+                chosen = torrent.normalize_file_selection(selection)
+            except TorrentError as exc:
+                self.error.emit(str(exc))
+                return []
+            files = [by_index.get(i) for i in chosen]
+            if any(f is None for f in files):
+                self.error.emit(TORRENT_PREFLIGHT_FAILED)
+                return []
+        if not files:
+            return []
+        base = out_dir or self._resolve_category_dir(url)
+        rows = []
+        file_paths, directory_paths = set(), set()
+        for f in files:
+            parts = cached.destination_parts(f)
+            dest_dir = os.path.join(base, *parts[:-1]) if len(parts) > 1 else base
+            if not _within(base, dest_dir):
+                self.error.emit("This torrent contains a file path Cove will not write to.")
+                return []
+            # One path can be neither two files nor a file and a folder; the
+            # provider validated each component, not the set of them.
+            folded = tuple(part.casefold() for part in parts)
+            prefixes = {folded[:i] for i in range(1, len(folded))}
+            if (folded in file_paths or folded in directory_paths
+                    or not prefixes.isdisjoint(file_paths)):
+                self.error.emit("This torrent contains conflicting file paths.")
+                return []
+            file_paths.add(folded)
+            directory_paths.update(prefixes)
+            rows.append((dest_dir, parts[-1], f))
+        connections = min(
+            max(int(self.settings.connections_per_server), 1), MAX_CONNECTIONS_PER_SERVER
+        )
+        now, created = time.time(), []
+        with db.connect() as conn:
+            for dest_dir, name, f in rows:
+                link = _cached_file_link(f)
+                cur = conn.execute(
+                    """
+                    INSERT INTO downloads
+                        (url, out_dir, connections, speed_limit_kbps,
+                         status, created_at, category, backend, filename,
+                         total_bytes, source_type, info_hash,
+                         torrent_name, debrid_route,
+                         debrid_item_id, debrid_file_id)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        link, dest_dir, connections, 0, "queued", now,
+                        categorize(name), "aria2", name, f.size,
+                        SOURCE_TORRENT_FILE, cached.info_hash, cached.name,
+                        cached.provider, f.item_id, f.file_id,
+                    ),
+                )
+                created.append(DownloadTask(
+                    id=cur.lastrowid, url=link, out_dir=dest_dir,
+                    connections=connections, filename=name, total_bytes=f.size,
+                    created_at=now, source_type=SOURCE_TORRENT_FILE,
+                    info_hash=cached.info_hash, torrent_name=cached.name,
+                    debrid_route=cached.provider,
+                    debrid_item_id=f.item_id, debrid_file_id=f.file_id,
+                ))
+        for task in created:
+            self.tasks[task.id] = task
+            self._diag_url_added(task, intake)
+            self.task_added.emit(task.id)
+        self._maybe_start_next()
+        return [task.id for task in created]
+
     # ---- diagnostics ---------------------------------------------------
     #
     # Observation only. Every helper below is best effort: it records what
@@ -2146,11 +2249,13 @@ class QueueManager(QObject):
     # hash, commit and discard as a local `.torrent`. There is no second
     # preflight model, and nothing here chooses files.
 
-    def magnet_preflight_check(self, url: str):
-        """Read-only eligibility, shared by the UI and resolver intake.
+    def magnet_intake_check(self, url: str):
+        """Eligibility that does not depend on the local download engine.
 
         Keep the existing refusal order: support, parsing, resolving, held,
-        then live. This takes no hold and grants no network permission.
+        then live. This takes no hold and grants no network permission. A
+        provider-served magnet needs only this much: no aria2 BitTorrent
+        job is ever created for it.
         """
         if not self._torrent_enabled():
             return None, MAGNET_ERROR, TORRENT_SUPPORT_DISABLED
@@ -2164,9 +2269,27 @@ class QueueManager(QObject):
             return magnet, MAGNET_DUPLICATE, TORRENT_PREFLIGHT_PENDING
         if self._live_torrent(magnet.info_hash):
             return magnet, MAGNET_DUPLICATE, "That torrent is already in Cove's queue."
+        return magnet, "", ""
+
+    def magnet_preflight_check(self, url: str):
+        """Read-only eligibility for the local metadata fetch.
+
+        `magnet_intake_check`, then whether the engine can take the work.
+        """
+        magnet, state, message = self.magnet_intake_check(url)
+        if state:
+            return magnet, state, message
         if self._aria2_admission != "open":
             return magnet, MAGNET_BLOCKED, MAGNET_UNAVAILABLE_TEXT
         return magnet, "", ""
+
+    def hold_info_hash(self, info_hash: str) -> None:
+        """Mark a torrent as spoken for while a dialog about it is open."""
+        if info_hash:
+            self._preflight_hashes.add(info_hash)
+
+    def release_info_hash(self, info_hash: str) -> None:
+        self._preflight_hashes.discard(info_hash)
 
     def resolve_magnet_preflight(
         self,
@@ -2797,10 +2920,7 @@ class QueueManager(QObject):
         self._void_torrent_attempt(t.id)
         from .config import categorize
 
-        def link_for(f) -> str:
-            if f.locked_link:
-                return f.locked_link
-            return f"https://torbox.app/torrent/{f.item_id}/{f.file_id}"
+        link_for = _cached_file_link
 
         base = t.out_dir
         rows = []

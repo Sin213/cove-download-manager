@@ -582,6 +582,24 @@ class MagnetMetadataDialog(QDialog):
         QDialog.done(self, QDialog.Accepted)
 
 
+class CachedTorrentCheckDialog(MagnetMetadataDialog):
+    """"Checking your debrid provider..." while a magnet's cache is looked up.
+
+    The same cancel-is-a-request contract as its parent, with wording that
+    is true of this step: only the provider is asked, so no peer is
+    contacted and no swarm metadata is fetched.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Torrent Cache Check")
+        self.heading.setText("Checking your debrid provider...")
+        self.label.setText(
+            "Cove is asking your debrid provider whether it already has this "
+            "torrent. No peers are contacted."
+        )
+
+
 class TorrentContentsDialog(QDialog):
     """Pre-download "Torrent Contents" preflight for one local `.torrent`.
 

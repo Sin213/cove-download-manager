@@ -16,7 +16,7 @@ from tests.test_queue import (  # noqa: F401
 )
 from tests.test_magnet_metadata import _fixture_bytes, _magnet, _other_bytes
 from tests.test_manual_magnet_contents import (
-    _REJECT, _env, _errors, _fixture_cached, _inline, _plan, _running,
+    _REJECT, _accept, _env, _errors, _fixture_cached, _inline, _plan, _running,
 )
 from tests.test_search_magnet_contents import _result
 from tests.test_queue_output_ownership import release
@@ -175,6 +175,387 @@ def test_p1_p2_p7_hard_blocks_before_metadata(
     _empty(queue, rpc, db_path)
     assert errors == [message]
     assert len(notices) == 1 and notices[0][1] == message
+
+
+CACHED_ENV = {"all_debrid_enabled": True, "all_debrid_api_key": "ad-key-value"}
+_PATHS = [("A.bin",), ("B.bin",), ("Folder", "C.bin")]
+
+
+def _provider(monkeypatch, result):
+    probes = []
+
+    def resolve(*args, **kwargs):
+        probes.append(args)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(mw.debrid, "resolve_torrent", resolve)
+    return probes
+
+
+@pytest.mark.parametrize("route", ["manual", "search", "forwarded"])
+@pytest.mark.parametrize("settings", [
+    pytest.param({"torrent_fallback_mode": "never"}, id="fallback"),
+    pytest.param(
+        {"proxy_type": "http", "proxy_host": "127.0.0.1",
+         "torrent_allow_with_proxy": False}, id="proxy"),
+    pytest.param({}, id="no-consent"),
+])
+def test_cached_magnet_ignores_local_p2p_restrictions_and_keeps_selection(
+    queue_env, monkeypatch, tmp_path, notices, route, settings,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=lambda m: (True, (0, 2)),
+        torrent_ip_disclosure_shown=False, **CACHED_ENV, **settings,
+    )
+    consent = _Consent(monkeypatch)
+    errors = _errors(queue)
+    meta = _plan(rpc)
+    cached = _fixture_cached(meta, _PATHS)
+    probes = _provider(monkeypatch, cached)
+
+    _admit(host, meta, route)
+
+    rows = _rows(db_path)
+    assert sorted(r["filename"] for r in rows) == ["A.bin", "C.bin"]
+    assert {r["source_type"] for r in rows} == {qm.SOURCE_TORRENT_FILE}
+    assert {r["debrid_route"] for r in rows} == {cached.provider}
+    assert contents.calls[0].metadata is cached and len(probes) == 1
+    assert rpc.metadata_added == [] and rpc.magnets == [] and rpc.torrents == []
+    assert loading.calls == [] and consent.calls == []
+    assert errors == [] and notices == []
+    assert not queue.settings.torrent_ip_disclosure_shown
+
+
+@pytest.mark.parametrize("settings,message", BLOCKS)
+def test_uncached_magnet_with_provider_still_obeys_privacy_settings(
+    queue_env, monkeypatch, tmp_path, notices, settings, message,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, torrent_ip_disclosure_shown=False,
+        **CACHED_ENV, **settings,
+    )
+    consent = _Consent(monkeypatch)
+    errors = _errors(queue)
+    meta = _plan(rpc)
+    probes = _provider(monkeypatch, None)
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert len(probes) == 1 and errors == [message]
+    assert len(notices) == 1 and notices[0][1] == message
+    assert rpc.metadata_added == [] and consent.calls == []
+    assert contents.calls == [] and loading.calls == []
+    _empty(queue, rpc, db_path)
+
+
+def test_uncached_magnet_with_provider_still_asks_for_consent(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_REJECT,
+        torrent_ip_disclosure_shown=False, **CACHED_ENV,
+    )
+    consent = _Consent(monkeypatch, ["cancel"])
+    meta = _plan(rpc)
+    _provider(monkeypatch, None)
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert len(consent.calls) == 1 and rpc.metadata_added == []
+    _empty(queue, rpc, db_path)
+
+
+@pytest.mark.parametrize("route", ["manual", "search", "forwarded"])
+def test_provider_failure_never_authorizes_local_p2p(
+    queue_env, monkeypatch, tmp_path, notices, route,
+):
+    # Every local-P2P gate is open: only the failure is in the way.
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, torrent_ip_disclosure_shown=True,
+        **CACHED_ENV,
+    )
+    consent = _Consent(monkeypatch)
+    errors = _errors(queue)
+    meta = _plan(rpc)
+    failure = mw.debrid.DebridError(
+        mw.debrid.ALL_DEBRID, "auth", "the API token was rejected.", False, False,
+    )
+    _provider(monkeypatch, failure)
+
+    _admit(host, meta, route)
+
+    assert errors == [failure.user_message]
+    assert len(notices) == 1 and notices[0][1] == failure.user_message
+    assert rpc.metadata_added == [] and consent.calls == []
+    assert contents.calls == [] and loading.calls == []
+    _empty(queue, rpc, db_path)
+
+
+def test_unexpected_provider_error_is_a_fixed_sentence_not_a_fallback(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, torrent_ip_disclosure_shown=True,
+        **CACHED_ENV,
+    )
+    errors = _errors(queue)
+    meta = _plan(rpc)
+    _provider(monkeypatch, RuntimeError("PRIVATE_DETAIL"))
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert errors == [mw.CACHE_CHECK_FAILED] and "PRIVATE_DETAIL" not in notices[0][1]
+    assert rpc.metadata_added == [] and contents.calls == []
+    _empty(queue, rpc, db_path)
+
+
+def test_declining_the_cached_listing_adds_nothing_and_stays_off_the_swarm(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_REJECT,
+        torrent_ip_disclosure_shown=True, **CACHED_ENV,
+    )
+    meta = _plan(rpc)
+    _provider(monkeypatch, _fixture_cached(meta, _PATHS))
+
+    assert host.add_urls_checked([_magnet(meta.info_hash)]) == []
+
+    assert len(contents.calls) == 1 and rpc.metadata_added == []
+    _empty(queue, rpc, db_path)
+
+
+def test_cancelling_the_cache_check_adds_nothing_and_does_not_fall_back(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, torrent_ip_disclosure_shown=True,
+        **CACHED_ENV,
+    )
+    meta = _plan(rpc)
+    probes = _provider(monkeypatch, None)
+
+    class _Cancelling:
+        def __init__(self, parent=None):
+            self.cancelled = deque()
+            self.hooks = []
+            self.finished = False
+
+        def exec(self):
+            for hook in self.hooks:
+                hook()
+            return 0
+
+        def finish(self):
+            self.finished = True
+
+    holder = []
+
+    class _Dlg(_Cancelling):
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            holder.append(self)
+            outer = self
+
+            class _Sig:
+                def connect(self, fn):
+                    outer.hooks.append(fn)
+
+            self.cancelled = _Sig()
+
+    monkeypatch.setattr(mw, "CachedTorrentCheckDialog", _Dlg)
+
+    assert host.add_urls_checked([_magnet(meta.info_hash)]) == []
+
+    assert holder[0].finished and probes == []  # the fetch never ran
+    assert rpc.metadata_added == [] and contents.calls == [] and loading.calls == []
+    _empty(queue, rpc, db_path)
+
+
+def test_add_cached_torrent_files_is_all_or_nothing_and_refuses_duplicates(
+    queue_env, monkeypatch, tmp_path,
+):
+    _host, queue, rpc, db_path, *_ = _env(queue_env, monkeypatch, tmp_path, **CACHED_ENV)
+    errors = _errors(queue)
+    meta = _plan(rpc)
+    cached = _fixture_cached(meta, _PATHS)
+
+    assert queue.add_cached_torrent_files(cached, (0, 99), str(tmp_path)) == []
+    assert errors == [qm.TORRENT_PREFLIGHT_FAILED] and _rows(db_path) == []
+
+    ids = queue.add_cached_torrent_files(cached, None, str(tmp_path))
+    assert len(ids) == 3 and len(_rows(db_path)) == 3
+    assert {r["info_hash"] for r in _rows(db_path)} == {cached.info_hash}
+
+    assert queue.add_cached_torrent_files(cached, (1,), str(tmp_path)) == []
+    assert errors[-1] == "That torrent is already in Cove's queue."
+    assert len(_rows(db_path)) == 3
+    assert rpc.magnets == [] and rpc.torrents == []
+
+
+def test_cached_magnet_is_served_while_the_engine_is_not_admitting(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_accept((1,)),
+        torrent_ip_disclosure_shown=False, torrent_fallback_mode="never",
+        **CACHED_ENV,
+    )
+    queue._aria2_admission = "pending"
+    meta = _plan(rpc)
+    _provider(monkeypatch, _fixture_cached(meta, _PATHS))
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert [r["filename"] for r in _rows(db_path)] == ["B.bin"]
+    assert rpc.metadata_added == []
+
+
+def test_cancel_after_the_provider_lookup_started_adds_nothing(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, deliver = _env(
+        queue_env, monkeypatch, tmp_path, torrent_ip_disclosure_shown=True,
+        **CACHED_ENV,
+    )
+    meta = _plan(rpc)
+    cached = _fixture_cached(meta, _PATHS)
+    dialogs, probes = [], []
+
+    class _Dlg:
+        def __init__(self, parent=None):
+            self.hooks, self.finished = [], False
+            dialogs.append(self)
+            outer = self
+
+            class _Sig:
+                def connect(self, fn):
+                    outer.hooks.append(fn)
+
+            self.cancelled = _Sig()
+
+        def exec(self):
+            deliver(self)
+            return 0
+
+        def finish(self):
+            self.finished = True
+
+    def resolve(*args, **kwargs):
+        probes.append(args)
+        for hook in dialogs[0].hooks:  # Cancel lands while the lookup runs
+            hook()
+        return cached
+
+    monkeypatch.setattr(mw, "CachedTorrentCheckDialog", _Dlg)
+    monkeypatch.setattr(mw.debrid, "resolve_torrent", resolve)
+
+    assert host.add_urls_checked([_magnet(meta.info_hash)]) == []
+
+    assert len(probes) == 1 and dialogs[0].finished
+    assert rpc.metadata_added == [] and contents.calls == []
+    _empty(queue, rpc, db_path)
+
+
+def test_an_api_add_cannot_take_the_torrent_while_the_listing_is_open(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_accept((0,)),
+        torrent_ip_disclosure_shown=True, **CACHED_ENV,
+    )
+    meta = _plan(rpc)
+    _provider(monkeypatch, _fixture_cached(meta, _PATHS))
+    errors = _errors(queue)
+    raced = []
+    contents.during_exec = lambda dlg: raced.append(
+        queue.add_url(_magnet(meta.info_hash)))
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert raced == [None] and errors  # refused while the dialog was up
+    assert [r["filename"] for r in _rows(db_path)] == ["A.bin"]
+    assert queue._preflight_hashes == set()
+
+
+def test_the_hold_is_released_when_the_provider_does_not_have_it(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_REJECT,
+        torrent_ip_disclosure_shown=True, **CACHED_ENV,
+    )
+    meta = _plan(rpc)
+    _provider(monkeypatch, None)
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert len(rpc.metadata_added) == 1  # the ordinary route was not blocked
+    assert queue._preflight_hashes == set()
+
+
+@pytest.mark.parametrize("paths", [
+    [("A.bin",), ("a.BIN",)],
+    [("A",), ("A", "B.bin")],
+], ids=["same-path", "file-and-folder"])
+def test_conflicting_provider_paths_create_nothing(
+    queue_env, monkeypatch, tmp_path, paths,
+):
+    _host, queue, rpc, db_path, *_ = _env(queue_env, monkeypatch, tmp_path, **CACHED_ENV)
+    errors = _errors(queue)
+    meta = _plan(rpc)
+
+    assert queue.add_cached_torrent_files(
+        _fixture_cached(meta, paths), None, str(tmp_path)) == []
+
+    assert errors == ["This torrent contains conflicting file paths."]
+    assert _rows(db_path) == []
+
+
+def test_the_provider_sees_only_the_info_hash_never_the_magnet(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_accept(None),
+        torrent_ip_disclosure_shown=True, **CACHED_ENV,
+    )
+    errors = _errors(queue)
+    meta = _plan(rpc)
+    uri = _magnet(meta.info_hash, dn="PRIVATE_NAME", trackers=(
+        "https://tracker.invalid/announce?passkey=PRIVATE_KEY",))
+    probes = []
+
+    def resolve(*args, **kwargs):
+        probes.append((args, kwargs))
+        raise mw.debrid.DebridError(
+            mw.debrid.ALL_DEBRID, "auth", "the API token was rejected.", False, False)
+
+    monkeypatch.setattr(mw.debrid, "resolve_torrent", resolve)
+
+    host.add_urls_checked([uri])
+
+    (args, kwargs), = probes
+    assert args[0] == meta.info_hash and kwargs.get("torrent_bytes") is None
+    seen = repr((args[0], kwargs.get("torrent_bytes"), errors, notices))
+    assert "PRIVATE" not in seen and "tracker.invalid" not in seen
+
+
+def test_no_provider_enabled_skips_the_cache_check_entirely(
+    queue_env, monkeypatch, tmp_path, notices,
+):
+    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
+        queue_env, monkeypatch, tmp_path, decide=_REJECT,
+        torrent_ip_disclosure_shown=True, all_debrid_enabled=False,
+    )
+    meta = _plan(rpc)
+    probes = _provider(monkeypatch, None)
+
+    host.add_urls_checked([_magnet(meta.info_hash)])
+
+    assert probes == [] and host.cache_checks == []
+    assert len(rpc.metadata_added) == 1
 
 
 @pytest.mark.parametrize("route", ["manual", "search", "forwarded"])

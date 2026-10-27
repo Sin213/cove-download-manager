@@ -252,11 +252,36 @@ def _env(queue_env, monkeypatch, tmp_path, decide=None, hooks=None, **settings):
     pending, deliver = _deferred(queue)
     host = Host(queue, queue.settings)
     contents = _Contents(monkeypatch, decide or _accept(None))
+    host.cache_checks = _cache_check(monkeypatch, deliver)
     loading = _Loading(
         monkeypatch, () if hooks is None else hooks,
         default=deliver if hooks is None else None,
     )
     return host, queue, rpc, db_path, contents, loading, pending, deliver
+
+
+def _cache_check(monkeypatch, deliver):
+    """Stands in for CachedTorrentCheckDialog: its worker answers on exec."""
+    calls = []
+
+    class _Fake:
+        def __init__(self, parent=None):
+            self.cancelled = _Signal()
+            self.finished = False
+            calls.append(self)
+
+        def exec(self):
+            deliver(self)
+            return 0
+
+        def finish(self):
+            self.finished = True
+
+        def reject(self):
+            self.cancelled.emit()
+
+    monkeypatch.setattr(mw, "CachedTorrentCheckDialog", _Fake)
+    return calls
 
 
 def _inline(queue):
@@ -1724,7 +1749,7 @@ def _fixture_cached(meta, paths):
     )
 
 
-def test_a_subset_reaches_the_reviewed_cached_provider_route(
+def test_a_cached_magnet_subset_is_chosen_from_the_provider_listing(
     queue_env, monkeypatch, tmp_path
 ):
     host, queue, rpc, db_path, contents, loading, pending, _d = _env(
@@ -1733,52 +1758,20 @@ def test_a_subset_reaches_the_reviewed_cached_provider_route(
     )
     meta = _plan(rpc)
     cached = _fixture_cached(meta, [("A.bin",), ("B.bin",), ("Folder", "C.bin")])
-    unlocked = []
     monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: cached)
-    monkeypatch.setattr(
-        debrid, "unlock_torrent_file",
-        lambda link, provider, _s, **kw: (
-            unlocked.append(link),
-            Unrestricted("https://cdn.test/B.bin", "B.bin", 20, provider),
-        )[1],
-    )
-    _running(queue)
 
-    host.add_urls_checked([_magnet(meta.info_hash)], out_dir=str(tmp_path))
-    tid = _rows(db_path)[0]["id"]
-    _inline(queue)
-    queue._launch(queue.tasks[tid])
+    ids = host.add_urls_checked([_magnet(meta.info_hash)], out_dir=str(tmp_path))
 
-    children = [r for r in _rows(db_path) if r["source_type"] == SOURCE_TORRENT_FILE]
-    assert unlocked == ["https://alldebrid.test/f/1"]
-    assert [r["filename"] for r in children] == ["B.bin"]
-    assert [r["url"] for r in children] == ["https://alldebrid.test/f/1"]
-    assert rpc.torrents == []  # no local payload when the provider served it
+    rows = _rows(db_path)
+    assert [r["filename"] for r in rows] == ["B.bin"] and ids == [rows[0]["id"]]
+    assert rows[0]["source_type"] == SOURCE_TORRENT_FILE
+    assert rows[0]["url"] == "https://alldebrid.test/f/1"
+    assert contents.calls[0].metadata is cached  # the provider's own listing
+    assert loading.calls == [] and rpc.metadata_added == []
+    assert rpc.magnets == [] and rpc.torrents == []  # no swarm, no payload
 
 
-def test_an_unmappable_cached_result_falls_back_with_the_subset_intact(
-    queue_env, monkeypatch, tmp_path
-):
-    host, queue, rpc, db_path, contents, loading, pending, _d = _env(
-        queue_env, monkeypatch, tmp_path, decide=_accept((0, 2)),
-        all_debrid_enabled=True, all_debrid_api_key="ad-key-value",
-    )
-    meta = _plan(rpc)
-    # A manifest the provider reports under names that map to nothing.
-    cached = _fixture_cached(meta, [("X.bin",), ("Y.bin",), ("Z.bin",)])
-    monkeypatch.setattr(debrid, "resolve_torrent", lambda *a, **k: cached)
-    _running(queue)
-
-    host.add_urls_checked([_magnet(meta.info_hash)], out_dir=str(tmp_path))
-    tid = _rows(db_path)[0]["id"]
-    _inline(queue)
-    queue._launch(queue.tasks[tid])
-
-    assert [r for r in _rows(db_path) if r["source_type"] == SOURCE_TORRENT_FILE] == []
-    assert rpc.torrents[0]["select_file"] == "1,3"
-
-
-def test_no_provider_is_asked_before_the_user_presses_download(
+def test_the_provider_is_asked_before_any_metadata_fetch(
     queue_env, monkeypatch, tmp_path
 ):
     probes = []
@@ -1787,13 +1780,16 @@ def test_no_provider_is_asked_before_the_user_presses_download(
         all_debrid_enabled=True, all_debrid_api_key="ad-key-value",
     )
     monkeypatch.setattr(
-        debrid, "resolve_torrent", lambda *a, **k: probes.append(a) or None
+        debrid, "resolve_torrent",
+        lambda *a, **k: probes.append(list(rpc.metadata_added)) or None,
     )
     meta = _plan(rpc)
 
     host.add_urls_checked([_magnet(meta.info_hash)], out_dir=str(tmp_path))
 
-    assert probes == []
+    assert probes == [[]]  # asked once, before the swarm was
+    assert len(host.cache_checks) == 1 and len(contents.calls) == 1
+    assert _rows(db_path) == []
 
 
 def test_a_manual_magnet_never_reaches_the_download_file_info_dialog(

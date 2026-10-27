@@ -67,6 +67,7 @@ from .clipboard import extract_urls
 from .config import Settings
 from .dialogs import (
     AddDownloadDialog,
+    CachedTorrentCheckDialog,
     ClipboardBatchDialog,
     DownloadFileInfoDialog,
     MagnetMetadataDialog,
@@ -520,6 +521,13 @@ def _ask_magnet_offer(parent) -> bool:
     return answer == QMessageBox.Yes
 
 
+# Fixed text for a cache lookup that failed for a reason with no sentence of
+# its own. Local BitTorrent is never tried instead.
+CACHE_CHECK_FAILED = (
+    "Cove could not check your debrid provider for this torrent. "
+    "Try again shortly."
+)
+
 LEGACY_COOKIE_CLEANUP_NOTICE = (
     "Cove could not finish clearing old browser cookie data from its download history, "
     "or could not confirm that it did, so some of that data may still be stored. "
@@ -735,6 +743,9 @@ class MainWindow(QMainWindow):
         mega_dialog = getattr(self, "_mega_dialog", None)
         if mega_dialog is not None:
             mega_dialog.reject()
+        cache_check = getattr(self, "_cached_check_dialog", None)
+        if cache_check is not None:
+            cache_check.reject()
         self.discard_magnet_requests()
         browser_fetch = getattr(self, "_browser_fetch_coordinator", None)
         if browser_fetch is not None:
@@ -1703,12 +1714,127 @@ class MainWindow(QMainWindow):
         committed: list[int] = []
         try:
             while self._magnet_requests:
-                tid = self._resolve_magnet_request(*self._magnet_requests.popleft())
+                request = self._magnet_requests.popleft()
+                served = self._provider_served_magnet(*request)
+                if served is not None:
+                    committed.extend(served)
+                    continue
+                tid = self._resolve_magnet_request(*request)
                 if tid is not None:
                     committed.append(tid)
         finally:
             self._magnet_preflight_open = False
         return committed
+
+    def _provider_served_magnet(
+        self, url: str, out_dir: str | None, intake: str
+    ) -> "list[int] | None":
+        """Serve a magnet from an enabled debrid provider's cache, if held.
+
+        Runs before every local-BitTorrent gate. Those gates (fallback
+        preference, proxy honesty, IP disclosure) exist to protect the
+        user from peer traffic, and a provider-served torrent has none:
+        only the provider is asked, by info hash, and nothing is fetched
+        from the swarm. The file list the user chooses from is the
+        provider's, so the choice is kept without any metadata fetch.
+
+        Returns None when the ordinary route should continue: no provider
+        is enabled, the request is one the resolver already refuses, or the
+        provider confirmed it does not hold the torrent. Otherwise the
+        request is finished here and the committed task ids are returned
+        (empty for Cancel and for every failure). A provider failure is a
+        failure, never permission: it ends the request and does not fall
+        through to local BitTorrent.
+        """
+        if self._preflights_closed or not debrid.is_enabled(self.settings):
+            return None
+        magnet, state, _message = self.queue.magnet_intake_check(url)
+        if state or magnet is None:
+            # Network-free refusals keep their existing sentence and owner.
+            return None
+        info_hash = magnet.info_hash
+        # Spoken for from here until the rows exist or the request ends, so
+        # an API or extension add of the same torrent cannot slip in while a
+        # dialog is open. Released before returning None, because the
+        # ordinary route claims the hash for itself.
+        self.queue.hold_info_hash(info_hash)
+        try:
+            return self._serve_magnet_from_provider(
+                url, out_dir, intake, info_hash,
+            )
+        finally:
+            self.queue.release_info_hash(info_hash)
+
+    def _serve_magnet_from_provider(
+        self, url: str, out_dir: str | None, intake: str, info_hash: str,
+    ) -> "list[int] | None":
+        loading = CachedTorrentCheckDialog(self)
+        answer = {"settled": False, "cancelled": False, "cached": None, "error": ""}
+
+        def cancel():
+            answer["settled"] = answer["cancelled"] = True
+            loading.finish()
+
+        def done(result):
+            if answer["settled"] or self._preflights_closed:
+                return
+            answer["settled"] = True
+            answer["cached"], answer["error"] = result
+            loading.finish()
+
+        def fetch():
+            if answer["settled"]:
+                return None, ""
+            try:
+                return debrid.resolve_torrent(
+                    info_hash, self.settings, session=self.queue._bound_session(),
+                ), ""
+            except debrid.DebridError as exc:
+                return None, exc.user_message
+            except Exception:
+                return None, CACHE_CHECK_FAILED
+
+        loading.cancelled.connect(cancel)
+        self._cached_check_dialog = loading
+        try:
+            self.queue._spawn(
+                fetch, on_done=done,
+                on_fail=lambda _error: done((None, CACHE_CHECK_FAILED)),
+            )
+            if not answer["settled"]:
+                loading.exec()
+        finally:
+            answer["settled"] = True
+            self._cached_check_dialog = None
+        if self._preflights_closed or answer["cancelled"]:
+            return []
+        if answer["error"]:
+            self.queue.error.emit(answer["error"])
+            QMessageBox.warning(self, "Torrent cache check failed", answer["error"])
+            return []
+        cached = answer["cached"]
+        if cached is None:
+            return None
+        save_to = out_dir or self.queue._resolve_category_dir(url)
+        try:
+            dlg = TorrentContentsDialog(cached, save_to, self)
+            self._torrent_contents_dialog = dlg
+            try:
+                accepted = dlg.exec() == TorrentContentsDialog.Accepted
+            finally:
+                self._torrent_contents_dialog = None
+            if not accepted or self._preflights_closed:
+                return []
+            # Same thread as every other add, so nothing can claim the
+            # torrent between this release and the rows existing.
+            self.queue.release_info_hash(info_hash)
+            return self.queue.add_cached_torrent_files(
+                cached, dlg.result_selection(), save_to, url=url, intake=intake,
+            )
+        except Exception:
+            logging.getLogger("cove").exception("cached_magnet_failed")
+            self.queue.error.emit(TORRENT_PREFLIGHT_FAILED)
+            return []
 
     def _resolve_magnet_request(
         self, url: str, out_dir: str | None, intake: str
