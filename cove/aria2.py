@@ -589,6 +589,11 @@ class Aria2Daemon:
             f"--split={connections}",
             "--min-split-size=1M",
             "--continue=true",
+            # aria2's default "prealloc" writes zeros for the whole file
+            # before downloading. On a multi-GB file that pegs the disk,
+            # blocks aria2's single-threaded RPC loop and lags the machine.
+            # falloc reserves the space without writing it (NTFS/ext4/xfs).
+            "--file-allocation=falloc",
             "--allow-overwrite=false",
             "--auto-file-renaming=true",
             f"--dir={self.settings.download_dir}",

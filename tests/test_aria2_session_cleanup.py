@@ -111,6 +111,15 @@ def fail(exc):
     return raised
 
 
+def unlink_dir_errno(root):
+    # Unlinking a directory is EISDIR on Linux, EPERM on macOS, EACCES on Windows.
+    probe = root / "unlink-dir-probe"; probe.mkdir()
+    try: os.unlink(probe)
+    except OSError as exc: return exc.errno
+    finally: os.rmdir(probe) if probe.is_dir() else None
+    raise AssertionError("unlink on a directory unexpectedly succeeded")
+
+
 @pytest.mark.parametrize("case", ["A1", "A2", "A3", "A4"], ids=str)
 def test_A1_A2_A3_A4_no_creation(s, monkeypatch, case):
     if case == "A2": s.popen.side_effect = OSError(errno.EACCES, "synthetic")
@@ -246,7 +255,7 @@ def test_F2_H1_H2_H3_H4_H5_J2_J3_errors_and_races(s, caplog, case):
         s.daemon._proc = None; s.daemon.start()
         assert s.lstats == 2, "F2: each eligible start must attempt lstat"
     if case in ("H2", "H3", "J3"):
-        number = errno.EISDIR if case == "J3" else errno.EACCES
+        number = unlink_dir_errno(s.root) if case == "J3" else errno.EACCES
         assert records(caplog) == [("WARNING", f"legacy_aria2_session_cleanup_failed: errno={number}")]
         if case == "J3": assert data(s.path / "child") == PAYLOAD, "J3: raced directory child changed"
         else: assert data(s.path) == PAYLOAD, f"{case}: failed cleanup changed session"
