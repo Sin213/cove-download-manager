@@ -967,19 +967,32 @@ async function interceptDownload(downloadItem) {
   if (browserFetch && !filename) filename = browserFetch.hint || null;
   if (!browserFetch) console.log("Cove: sending download to native host", downloadItem.url);
 
-  // Send to native host BEFORE cancelling. The browser download continues
-  // until we have confirmed acceptance of this specific request.
-  const result = await sendNativeMessage({
-    action: "download",
-    url: downloadItem.url,
-    filename: filename,
-    referrer: downloadItem.referrer || "",
-    // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
-    // not know yet, and the primary's schema refuses a negative size outright.
-    fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
-    ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
-    ...(await userAgentField()),
-  });
+  // Pause the browser copy while Cove is asked. Starting the native host can
+  // take over a second, long enough for a small file to finish in the browser
+  // so both the browser and Cove end up with it. A rejected pause (the
+  // download already finished or failed) just leaves the old behaviour.
+  let paused = false;
+  try {
+    await browser.downloads.pause(dlId);
+    paused = true;
+  } catch {}
+
+  // Send to native host BEFORE cancelling. The browser copy is only paused,
+  // and is resumed below unless Cove confirms acceptance of this request.
+  let result = null;
+  try {
+    result = await sendNativeMessage({
+      action: "download",
+      url: downloadItem.url,
+      filename: filename,
+      referrer: downloadItem.referrer || "",
+      // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
+      // not know yet, and the primary's schema refuses a negative size outright.
+      fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
+      ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
+      ...(await userAgentField()),
+    });
+  } catch {}
 
   if (!browserFetch) console.log("Cove: native host response", JSON.stringify(result));
 
@@ -992,19 +1005,25 @@ async function interceptDownload(downloadItem) {
     try {
       await browser.downloads.cancel(dlId);
     } catch {
-      // The browser download completed before cancel() ran. Both the browser
-      // and Cove will have the file. This is an inherent limitation of the
-      // WebExtension API: there is no pause/reservation primitive that would
-      // let us hold the browser transfer while confirming with the native host.
-      // The alternative (cancel-first) silently loses downloads when Cove is
-      // unavailable, which is the worse failure mode.
+      // The browser download completed before pause() could hold it, so both
+      // the browser and Cove will have the file. Cancel-first is not an
+      // option: it silently loses downloads when Cove is unavailable.
     }
     browser.downloads.erase({ id: dlId }).catch(() => {});
     showNotification("Download sent to Cove", filename || (browserFetch ? "Browser download" : downloadItem.url));
   } else {
-    // Native host failed or is unavailable. Clear the dedup mark so the
-    // browser's original download proceeds unimpeded and future intercepts
-    // of the same URL are not blocked.
+    // Native host failed or is unavailable. Resume the browser's original
+    // download and clear the dedup mark so future intercepts of the same URL
+    // are not blocked.
+    if (paused) {
+      try {
+        await browser.downloads.resume(dlId);
+      } catch {
+        // A server without range support can leave the item unresumable.
+        // It stays in the browser's list, where the user can retry it.
+        console.error("Cove: could not resume the browser download", downloadItem.url);
+      }
+    }
     recentIntercepted.delete(downloadItem.url);
     // `result` may be null/undefined if the host replied with malformed JSON,
     // so don't dereference it: an exception here would abort the handler.

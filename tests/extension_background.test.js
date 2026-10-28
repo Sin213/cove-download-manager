@@ -37,6 +37,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          tabs = [], tabsById = new Map(), timers = false,
                          downloadSearch = () => [], downloadState = null, searchHook = null,
                          storedIntercepted = null, eraseThrows = false, eraseFailures = 0,
+                         pauseThrows = false, resumeThrows = false,
                          slowInterceptedIds = false, hydrationGate = null,
                          cookieHook = null, nativeHook = null, settingsReadHook = null,
                          settingsWriteHook = null, permissionsHook = null,
@@ -52,7 +53,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
                          dataConsent,
                          permissionsApi = "present" } = {}) {
   let confirmationTokenSequence = 0;
-  const calls = { native: [], cancel: [], erase: [], menus: [], menuOps: [], imported: [],
+  const calls = { native: [], cancel: [], erase: [], pause: [], resume: [], menus: [], menuOps: [], imported: [],
                   notifications: [], cookies: [], settingsWrites: [], tabsCreated: [],
                   console: [], order: [], tabsGet: [], searches: [], eraseAttempts: [], settingsReads: 0,
                   // One entry per permissions.getAll(). Counted so a test can
@@ -225,6 +226,14 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onCreated: events.downloadCreated,
       onChanged: events.downloadChanged,
       onErased: events.downloadErased,
+      async pause(id) {
+        calls.order.push("pause"); calls.pause.push(id);
+        if (pauseThrows) throw new Error("Download is not in progress");
+      },
+      async resume(id) {
+        calls.order.push("resume"); calls.resume.push(id);
+        if (resumeThrows) throw new Error("Download cannot be resumed");
+      },
       async cancel(id) {
         calls.order.push("cancel"); calls.cancel.push(id);
         if (records && records.has(id)) {
@@ -691,7 +700,7 @@ async function e2Created(worker, item, direct = false) {
 
 function e2NormalCreated(loaded, id) {
   assert.equal(downloadsOf(loaded.calls).length, 1, `${id} PC: normal download reaches Cove`);
-  assert.deepEqual(loaded.calls.order.slice(0, 4), ["native:sent", "native:ok", "cancel", "erase"],
+  assert.deepEqual(loaded.calls.order.slice(0, 5), ["pause", "native:sent", "native:ok", "cancel", "erase"],
     `${id} PC: acknowledgement precedes cancel and erase`);
 }
 
@@ -1550,6 +1559,81 @@ test("native rejection leaves the browser download running", async () => {
   assert.equal(calls.native.filter((message) => message.action === "download").length, 1);
   assert.deepEqual(calls.cancel, []);
 });
+
+// A small file can finish in the browser while the native host is still
+// starting, leaving one copy in the browser and one in Cove. The browser copy
+// is paused before Cove is asked, and resumed only if Cove does not take it.
+function pauseFirstItem(id) {
+  return {
+    incognito: false,
+    id,
+    url: `https://example.test/clip-${id}.mp4`,
+    filename: `clip-${id}.mp4`,
+    state: "in_progress",
+    startTime: new Date().toISOString(),
+    totalBytes: 3_800_000,
+  };
+}
+
+for (const worker of [false, true]) {
+  const mode = worker ? "Chrome" : "Firefox";
+
+  test(`PF1 ${mode}: browser copy is paused before Cove is asked, then cancelled`, async () => {
+    const { calls, events } = loadBackground({ worker });
+    await settle();
+    calls.native.length = 0; calls.order.length = 0;
+    events.downloadCreated.emit(pauseFirstItem(41));
+    await settle();
+    assert.deepEqual(calls.pause, [41]);
+    assert.deepEqual(calls.order.slice(0, 5), ["pause", "native:sent", "native:ok", "cancel", "erase"]);
+    assert.deepEqual(calls.resume, [], "an accepted download is never resumed in the browser");
+  });
+
+  test(`PF2 ${mode}: refused handoff resumes the paused browser copy`, async () => {
+    const { calls, events } = loadBackground({ worker, nativeResult: { status: "error", message: "offline" } });
+    await settle();
+    calls.native.length = 0; calls.order.length = 0;
+    events.downloadCreated.emit(pauseFirstItem(42));
+    await settle();
+    assert.deepEqual(calls.pause, [42]);
+    assert.deepEqual(calls.resume, [42], "the browser keeps the download when Cove refuses");
+    assert.deepEqual(calls.cancel, []);
+    assert.deepEqual(calls.order.filter((step) => step === "pause" || step === "resume"), ["pause", "resume"]);
+  });
+
+  test(`PF3 ${mode}: missing native reply resumes the paused browser copy`, async () => {
+    const { calls, events } = loadBackground({ worker, nativeResult: null });
+    await settle();
+    calls.native.length = 0;
+    events.downloadCreated.emit(pauseFirstItem(43));
+    await settle();
+    assert.deepEqual(calls.resume, [43]);
+    assert.deepEqual(calls.cancel, []);
+  });
+
+  test(`PF4 ${mode}: a pause the browser rejects is not resumed and the handoff still runs`, async () => {
+    const { calls, events } = loadBackground({ worker, pauseThrows: true,
+      nativeResult: { status: "error", message: "offline" } });
+    await settle();
+    calls.native.length = 0;
+    events.downloadCreated.emit(pauseFirstItem(44));
+    await settle();
+    assert.equal(downloadsOf(calls).length, 1, "Cove is still asked");
+    assert.deepEqual(calls.resume, [], "nothing was paused, so nothing is resumed");
+  });
+
+  test(`PF5 ${mode}: a failed resume does not throw out of the handler`, async () => {
+    const { calls, events } = loadBackground({ worker, resumeThrows: true,
+      nativeResult: { status: "error", message: "offline" } });
+    await settle();
+    calls.native.length = 0;
+    events.downloadCreated.emit(pauseFirstItem(45));
+    await settle();
+    assert.deepEqual(calls.resume, [45]);
+    assert.ok(calls.console.some((entry) => JSON.stringify(entry).includes("could not resume")),
+      "the stuck browser download is reported in the console");
+  });
+}
 
 test("detected stream reports native-host failure instead of false success", async () => {
   const { events } = popupStreamFixture({ nativeResult: { status: "error", message: "offline" } });
@@ -2833,11 +2917,12 @@ test("S08E D1 GUARD: native ok strictly precedes cancel then erase then notifica
   loaded.events.downloadCreated.emit(freshItem());
   await settle();
   assert.equal(entered, 1, "D1: native reply suspension reached");
-  assert.deepEqual(loaded.calls.order, ["native:sent"], "D1: browser untouched before acknowledgement");
+  assert.deepEqual(loaded.calls.order, ["pause", "native:sent"],
+    "D1: browser copy is only paused, never cancelled, before acknowledgement");
   release();
   await settle();
   assert.equal(downloadsOf(loaded.calls).length, 1);
-  assert.deepEqual(loaded.calls.order, ["native:sent", "native:ok", "cancel", "erase", "notification"]);
+  assert.deepEqual(loaded.calls.order, ["pause", "native:sent", "native:ok", "cancel", "erase", "notification"]);
 });
 
 for (const [name, settings, item] of [

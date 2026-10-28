@@ -1,9 +1,9 @@
-# AMO listing - Cove Download Manager (Firefox) 1.4.10
+# AMO listing - Cove Download Manager (Firefox) 1.4.12
 
 Lives in `docs/` rather than `dist/`, which `scripts/build_extension.py`
 deletes on every build.
 
-Upload `dist/cove-firefox-1.4.10.zip` at
+Upload `dist/cove-firefox-1.4.12.zip` at
 <https://addons.mozilla.org/developers/>.
 
 That ZIP is the **submission input**, not a distributable add-on. AMO signs an
@@ -12,9 +12,9 @@ produces a signed XPI. Source: the submission flow at
 <https://extensionworkshop.com/documentation/publish/submitting-an-add-on/>,
 read 2026-09-12, which takes a `.zip`, `.xpi`, or `.crx` and signs it.
 
-1.4.10 is the next patch above 1.4.9, which the public AMO API reported as the
-add-on's `current_version` with status `public` on 2026-09-12 (see
-[Before submitting](#before-submitting)).
+1.4.12 is the next patch above 1.4.11, which the public AMO API reported as the
+add-on's `current_version` with status `public` on 2026-10-28 (last updated
+2026-10-26). The history below for 1.4.9 and 1.4.10 is kept as it was written.
 
 The three blocks below map to the three AMO fields. They are plain text, not
 markdown - AMO renders the description literally, so the bullets are real `•`
@@ -66,9 +66,9 @@ About that minimum: it can only be applied when Firefox gives a usable size at t
 
 Nothing is downloaded without an action you took, and the extension never collects or transmits your browsing history.
 
-What's new in version 1.4.10:
+What's new in version 1.4.12:
 
-You can now exclude a site from the in-page button without opening the options page. Use the menu beside "Download with Cove" and choose "Exclude <this site>". Cove opens its own confirmation page, names the site, and changes no setting until you choose "Exclude site" there. Cancelling leaves your settings unchanged. A confirmed exclusion hides the button on pages that are already open, without a reload, and you can undo it by removing the entry under Excluded Domains.
+Small files are no longer downloaded twice. Firefox's own copy of a download is now paused while Cove is asked to take it over. If Cove accepts, Firefox's copy is cancelled; if Cove is closed or refuses, Firefox's copy is resumed and finishes as normal. Before this, a small file could finish in Firefox while Cove was still starting up, leaving one copy from Firefox and a second from Cove.
 
 The free Cove Download Manager desktop app is required because it provides the download engine. Install Cove, launch it once, and then click "Test Connection to Cove" in the extension to link them.
 
@@ -79,30 +79,22 @@ https://github.com/Sin213/cove-download-manager
 ## Version -> Release Notes
 
 Shown on the add-on's detail page under this version. Keep it to what changed
-in 1.4.10 only.
+in 1.4.12 only.
 
 ```text
-New: exclude a site straight from the in-page button.
+Fix: small files are no longer downloaded twice.
 
-Use the menu beside "Download with Cove" and choose "Exclude <this site>". Cove opens its own confirmation page before the exclusion is saved. That page names the site it is about to exclude, and the exclusion is only written when you choose "Exclude site" there. Choosing "Cancel", or simply closing the page, leaves your settings exactly as they were.
+When Cove takes over a download, Firefox's own copy is now paused while the add-on asks the Cove desktop app to accept it. If Cove accepts, Firefox's copy is cancelled. If Cove is closed or refuses, Firefox's copy is resumed and finishes as normal, so no download is lost.
 
-A confirmed exclusion takes effect on pages that are already open, without a reload: the in-page button disappears from that site. To undo it, remove the entry under Excluded Domains in the add-on's options.
+Before this, a small file could finish in Firefox during the second or so that Cove takes to start, leaving one copy from Firefox and a second from Cove.
 
-The site that gets excluded is the one in the address bar. A video player embedded from another site, and the server the video itself comes from, cannot put their own name on the exclusion.
+If a server does not support resuming, a resumed Firefox download may restart from the beginning, or stay paused in Firefox's download list where you can retry it.
 
-Saving the options page keeps an exclusion that was confirmed from another tab while the options page was open, and still saves the unrelated change you made there.
-
-No new Firefox API or host permissions are requested.
-
-The Firefox data-collection declaration is updated to describe the information Cove transmits to the locally installed Cove application. Earlier versions declared none, which was not accurate for an add-on that hands downloads to a local application, so Firefox may ask you to confirm this on update.
-
-Browser and device technical information is optional. The browser user-agent is only included in a handoff when Firefox reports that you currently grant the technical-data permission, and you can turn it off at any time in about:addons. When it is not granted, Cove does not transmit it, and your downloads keep working either way.
-
-Nothing is sent to the developer, there is no analytics or tracking, and nothing is sold or shared.
+No new Firefox API or host permissions are requested. Nothing is sent to the developer, there is no analytics or tracking, and nothing is sold or shared.
 ```
 
-1.4.9, already published, is where the in-page button began respecting
-Excluded Domains. That change is not re-announced here.
+1.4.10 and 1.4.11, already published, added the exclude-site action and the
+Fuckingfast.co handoff. Those changes are not re-announced here.
 
 ## Version -> Notes to Reviewer
 
@@ -115,9 +107,9 @@ The packaging step is a file copy, one deterministic edit to a single HTML file,
 
 The one edit: popup/popup.html carries two HTML comment markers, "<!-- cove:popup-styles -->" and "<!-- cove:popup-modules -->", each on its own line. The Firefox build replaces them with a stylesheet link for popup/streams.css and a script tag for popup/streams.js, which are the Firefox-only detected-stream section of the popup. The Chrome build removes both marker lines instead, because that bundle does not ship stream detection. Nothing else in any file is rewritten, and no JavaScript is transformed. The build fails loudly if either marker is missing or appears more than once.
 
-The uploaded ZIP holds 23 files. Twenty-two of them are byte-for-byte identical to their counterpart in the extension/ directory of the public repository. The twenty-third, popup/popup.html, differs only by that marker substitution. You can verify this by diffing the ZIP contents against that directory: popup/popup.html should be the only file that differs, and the difference should be exactly the two lines described above.
+The uploaded ZIP holds 25 files. Twenty-four of them are byte-for-byte identical to their counterpart in the extension/ directory of the public repository. The twenty-fifth, popup/popup.html, differs only by that marker substitution. You can verify this by diffing the ZIP contents against that directory: popup/popup.html should be the only file that differs, and the difference should be exactly the two lines described above.
 
-Two of the 23 are new in this version: confirm-exclude.html and confirm-exclude.js, the confirmation page described under "What changed in 1.4.10" below. Both are hand-written source and both are byte-identical to the repository.
+No files are added or removed in this version. Only background.js and manifest.json change, as described under "What changed in 1.4.12" below.
 
 To reproduce the uploaded file:
 
@@ -125,11 +117,23 @@ To reproduce the uploaded file:
   cd cove-download-manager
   python scripts/build_extension.py
 
-This writes dist/cove-firefox-1.4.10.zip. Requires Python 3.9 or later, no other tooling. Three things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3); the browser-specific modules, which are media-sites.js, content/media-sites.js, popup/streams.js and popup/streams.css in the Firefox bundle only, and media-chrome.js in the Chrome bundle only; and the popup composition described above. That is why the Firefox bundle holds 23 files and the Chrome bundle holds 20. Chrome is not without video handling: it ships the same shared in-page button and the same video and audio context-menu entries for a media element whose own address is an ordinary HTTP(S) file. What the Chrome build excludes is the site-specific part, meaning page extractors, HLS stream detection, and the detected-stream popup section.
+This writes dist/cove-firefox-1.4.12.zip. Requires Python 3.9 or later, no other tooling. Three things differ from the Chrome bundle produced by the same script: manifest.json (MV2 vs MV3); the browser-specific modules, which are media-sites.js, content/media-sites.js, popup/streams.js, popup/streams.css, fuckingfast-fetch.js and content/fuckingfast.js in the Firefox bundle only, and media-chrome.js in the Chrome bundle only; and the popup composition described above. That is why the Firefox bundle holds 25 files and the Chrome bundle holds 20. Chrome is not without video handling: it ships the same shared in-page button and the same video and audio context-menu entries for a media element whose own address is an ordinary HTTP(S) file. What the Chrome build excludes is the site-specific part, meaning page extractors, HLS stream detection, and the detected-stream popup section.
 
 Public source: https://github.com/Sin213/cove-download-manager
 
-What changed in 1.4.10
+What changed in 1.4.12
+
+No new API permissions, no new hosts, no new content scripts, and no new files. The manifest changes only its version.
+
+Changed file:
+
+• extension/background.js - when the add-on takes over a download, it now calls downloads.pause() on the browser's copy before asking the Cove desktop app over native messaging. If Cove accepts, the browser copy is cancelled and erased from the list, as before. If Cove refuses or does not answer, downloads.resume() lets the browser copy continue. If the browser rejects the pause (for example the download already finished), behaviour is unchanged from 1.4.11. The downloads permission was already requested and covers pause and resume.
+
+Why: starting the native host can take over a second. A small file could finish in the browser during that time, so cancel() had nothing to stop and the user ended up with two copies. Pausing first closes that window without the risk of cancelling before Cove has accepted, which would lose the download if Cove is unavailable.
+
+This is covered by tests/extension_background.test.js, which runs under node --test with no third-party dependencies.
+
+Earlier change, published in 1.4.10
 
 No new API permissions, no new hosts, and no new content scripts. The "permissions" array in manifest.json differs from 1.4.9 only by the removal of "cookies". One other thing changes in the manifest besides the version: the data-collection declaration, which is corrected as described under "Data collection declaration" below, and which Firefox presents to users as a consent change. Two new files are added to the package, and four existing files change, background.js among them - it now withholds the user-agent unless the optional technical-data permission is currently granted.
 
@@ -168,7 +172,7 @@ Permission justifications (the cookies permission is no longer requested and its
 
 • nativeMessaging - the entire purpose of the add-on. It passes download requests to the Cove desktop app via the native host cove_dm_host. Without this the add-on does nothing.
 
-• downloads - to observe downloads the user starts and cancel the browser's copy after Cove has taken it over, so the file is not downloaded twice.
+• downloads - to observe downloads the user starts, pause the browser's copy while Cove is asked to take it over, and then cancel it once Cove has accepted (or resume it if Cove refuses), so the file is not downloaded twice.
 
 • webRequest and <all_urls> - downloads and media can originate from any site, so the add-on cannot enumerate hosts ahead of time. Used to observe request headers for the download being handed off, and to detect media on the page for the in-page pill.
 

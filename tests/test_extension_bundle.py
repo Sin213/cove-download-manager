@@ -193,7 +193,7 @@ def test_firefox_manifest_permissions_and_version_are_untouched(bundles):
     source = json.loads((ROOT / "extension" / "manifest.json").read_text())
     built = json.loads((bundles / "firefox" / "manifest.json").read_text())
     assert built["permissions"] == source["permissions"]
-    assert built["version"] == source["version"] == "1.4.10"
+    assert built["version"] == source["version"] == "1.4.12"
     assert built["manifest_version"] == 2
     assert (built["browser_specific_settings"]["gecko"]["id"]
             == source["browser_specific_settings"]["gecko"]["id"]
@@ -733,9 +733,11 @@ _LISTINGS = {
 # reported version 1.3.10, and the public AMO API reported current_version
 # 1.4.9 with status public. Chrome requires each update to carry a strictly
 # larger version and forbids reusing a published number.
+# On 2026-10-28 the public AMO API reported current_version 1.4.11 with status
+# public (last_updated 2026-10-26), so Firefox 1.4.10 and 1.4.11 are shipped.
 _SHIPPED = {
     "chrome": ("1.3.9", "1.3.10"),
-    "firefox": ("1.4.8", "1.4.9"),
+    "firefox": ("1.4.8", "1.4.9", "1.4.10", "1.4.11"),
 }
 
 # The latest version confirmed published per store, on the evidence above. A
@@ -743,7 +745,7 @@ _SHIPPED = {
 # is not enough: it is an exhaustive blocklist, so a rollback to a number that
 # predates the list - Chrome 1.3.8, Firefox 1.4.7 - would pass it while still
 # being unuploadable.
-_PUBLISHED = {"chrome": "1.3.10", "firefox": "1.4.9"}
+_PUBLISHED = {"chrome": "1.3.10", "firefox": "1.4.11"}
 
 
 def _version_tuple(version):
