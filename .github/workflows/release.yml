@@ -342,17 +342,13 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.7.1
+          ## What's new in 3.7.2
 
-          A fix release for magnets and torrents when a debrid provider is enabled.
+          A fix release for large downloads.
 
           ### Fixed
 
-          - **Cached debrid magnets download without local P2P.** With a debrid provider enabled, Cove now asks the provider first, by info hash, whether it already holds a magnet. If it does, the download is served from the provider and the local BitTorrent settings (P2P fallback, proxy, and IP disclosure checks) no longer block it, because no peer traffic happens.
-          - **Pick files from a cached torrent.** For a torrent the provider already holds, Cove shows the provider's file list so you can choose which files to download, with no metadata fetch from the swarm.
-          - **Clear progress while checking the provider.** A "Checking your debrid provider..." dialog appears during the lookup and can be cancelled.
-          - **Provider errors never fall back to local BitTorrent.** If the cache check fails, Cove stops and tells you, instead of silently trying the swarm.
-          - **No duplicate adds during the check.** The same torrent added again from the API or the browser extension while the dialog is open is held off until the first request finishes.
+          - **Large downloads start instantly and no longer lag your PC.** aria2 used to reserve space for a new download by writing zeros for the whole file before transferring anything. On a multi-GB file (for example a SwissTransfer link) that kept the disk busy for minutes, slowed the whole system, and left the download stuck at 0 bytes until aria2 stopped responding. Cove now tells aria2 to reserve the space without writing it, so the download begins right away. This applies to Windows and Linux (ext4, btrfs, xfs, NTFS).
 
           ### Notes
 
