@@ -1273,3 +1273,21 @@ def test_i2r1_i_unrelated_exceptions_are_not_suppressed(i2r1_wire, error):
         assert type(caught.value) is expected and len(i2r1_wire.sends) == (1 if injected is error else 2)
         assert (caught.value is error and not isinstance(caught.value, Aria2Error) if injected is error
                 else str(caught.value) == "RPC message could not be processed")
+
+
+def test_daemon_file_allocation_never_zero_fills_on_windows(startup_wire):
+    """falloc needs admin on Windows and silently falls back to zero-filling
+    the whole file, which freezes aria2; Windows uses "none" plus a sparse
+    file Cove creates. Elsewhere falloc reserves space without writing."""
+    from cove.aria2 import _file_allocation
+    with patch("cove.aria2.sys.platform", "win32"):
+        assert _file_allocation() == "none"
+    with patch("cove.aria2.sys.platform", "linux"):
+        assert _file_allocation() == "falloc"
+
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
+        daemon.start()
+
+    assert f"--file-allocation={_file_allocation()}" in popen.call_args[0][0]

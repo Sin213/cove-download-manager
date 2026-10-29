@@ -12252,3 +12252,45 @@ def test_s08c_N3_claims(filename, new):
     assert not _s08c_claim_violation(doc, filename, new)
     end = doc.index(".", doc.index(new.split(". ")[0])) + 1
     assert _s08c_claim_violation(doc[:end] + " Every request sends an origin-only referrer." + doc[end:], filename, new)
+
+
+# ---- Sparse pre-creation before aria2 (Windows zero-fill avoidance) --------
+
+
+def _record_sparse_and_add(queue, rpc, monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        "requests.Session.head",
+        lambda self, url, **kw: (_ for _ in ()).throw(OSError("offline")),
+    )
+    monkeypatch.setattr(
+        queue_module, "precreate_sparse_output",
+        lambda work, name: events.append(("sparse", str(work.path), name)) or True,
+    )
+    add = rpc.add_uri
+    monkeypatch.setattr(
+        rpc, "add_uri",
+        lambda uris, out_dir, *a, **kw: events.append(("add", out_dir)) or add(uris, out_dir, *a, **kw),
+    )
+    return events
+
+
+def test_a_known_filename_is_precreated_sparse_before_aria2_adds_it(queue_env, monkeypatch):
+    queue, rpc, _db = queue_env()
+    events = _record_sparse_and_add(queue, rpc, monkeypatch)
+    tid = queue.add_url("https://example.com/big.zip", filename="big.zip")
+
+    _probe_prepared(queue, queue.tasks[tid])
+
+    work = queue.tasks[tid].work_dir
+    assert events == [("sparse", work, "big.zip"), ("add", work)]
+
+
+def test_an_unknown_filename_is_not_precreated(queue_env, monkeypatch):
+    queue, rpc, _db = queue_env()
+    events = _record_sparse_and_add(queue, rpc, monkeypatch)
+    tid = queue.add_url("https://example.com/download")
+
+    _probe_prepared(queue, queue.tasks[tid])
+
+    assert [e[0] for e in events] == ["add"]

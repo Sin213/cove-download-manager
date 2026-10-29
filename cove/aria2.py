@@ -481,6 +481,14 @@ def _bundled_aria2c() -> str | None:
     return None
 
 
+def _file_allocation() -> str:
+    """falloc reserves space without writing it on ext4/xfs/APFS. On Windows
+    it needs SeManageVolumePrivilege (admin) and otherwise falls back to
+    zero-filling the whole file, so Windows uses "none" and the queue
+    pre-creates the output as a sparse file instead."""
+    return "none" if sys.platform == "win32" else "falloc"
+
+
 def _resolve_aria2c() -> str | None:
     return _bundled_aria2c() or shutil.which("aria2c")
 
@@ -592,8 +600,7 @@ class Aria2Daemon:
             # aria2's default "prealloc" writes zeros for the whole file
             # before downloading. On a multi-GB file that pegs the disk,
             # blocks aria2's single-threaded RPC loop and lags the machine.
-            # falloc reserves the space without writing it (NTFS/ext4/xfs).
-            "--file-allocation=falloc",
+            f"--file-allocation={_file_allocation()}",
             "--allow-overwrite=false",
             "--auto-file-renaming=true",
             f"--dir={self.settings.download_dir}",

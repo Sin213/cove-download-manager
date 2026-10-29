@@ -35,6 +35,7 @@ from .output_paths import (
     adopt_work_directory,
     cleanup_work_directory,
     create_work_directory,
+    precreate_sparse_output,
     publish_output,
     validate_engine_output,
     validate_public_filename,
@@ -5625,6 +5626,11 @@ class QueueManager(QObject):
         # status poll. Never overwrite a size the provider or user already set.
         if content_length > 0 and t.total_bytes <= 0:
             t.total_bytes = content_length
+        if requested:
+            # Windows only: a sparse file stops NTFS zero-filling a multi-GB
+            # segmented download, which would block aria2. An existing file
+            # (a resume) is left alone.
+            precreate_sparse_output(work, requested)
         gid = self.rpc.add_uri(
             [target], str(work.path), segments,
             t.speed_limit_kbps, requested,
