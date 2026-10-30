@@ -342,16 +342,24 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.7.2
+          ## What's new in 3.7.3
 
-          A fix release for large downloads.
+          A Windows reliability release for downloads. Several aria2 problems only showed up on Windows: large downloads that froze the PC, aria2 left running after Cove closed, and removed downloads that left files behind. This release fixes all of them. Linux behavior is unchanged.
 
           ### Fixed
 
-          - **Large downloads start instantly and no longer lag your PC.** aria2 used to reserve space for a new download by writing zeros for the whole file before transferring anything. On a multi-GB file (for example a SwissTransfer link) that kept the disk busy for minutes, slowed the whole system, and left the download stuck at 0 bytes until aria2 stopped responding. Cove now tells aria2 to reserve the space without writing it, so the download begins right away. This applies to Windows and Linux (ext4, btrfs, xfs, NTFS).
+          - **Large downloads on Windows no longer freeze your PC.** The 3.7.2 fix only worked when Cove ran as administrator. Without admin rights, Windows refused aria2's request to reserve space, so aria2 fell back to writing zeros for the whole file first. On a multi-GB download that kept the disk at 100% for minutes, lagged the whole system, and stalled both the download and the Remove button. Cove now creates the file as a sparse file before aria2 starts, so even very large downloads begin writing immediately.
+          - **aria2 no longer keeps running after Cove closes unexpectedly.** If Cove crashed or was ended from Task Manager, aria2 kept going in the background, still downloading or writing to disk with nothing on screen to show it. aria2 now shuts itself down cleanly, saving its progress, as soon as Cove is gone.
+          - **Removing a download no longer shows "Could not clean private output directory".** Cove deleted a removed download's files before aria2 had finished closing them. On Windows that delete could not complete, so Cove showed an error and left a hidden `.cove-work-...` folder in your download folder. Cove now waits for aria2 to confirm the transfer has stopped before cleaning up.
+          - **Removing a torrent and its files now cleans up fully.** The same wait applies when you remove a torrent and choose to delete its files, so no stray files or progress files are left behind.
+
+          ### Known issue
+
+          - On Windows, a download whose full file path would be 260 characters or longer still fails with "Download aborted." In a typical Downloads folder that means filenames longer than about 200 characters. Renaming the download to something shorter works around it.
 
           ### Notes
 
+          - Hidden `.cove-work-...` folders left in your download folder by earlier versions can be deleted once Cove is closed. Newer ones are cleaned up automatically.
           - The browser extension is published separately, on its own schedule and through the two stores; this desktop release neither contains nor updates it.
           - On Linux, Cove uses `aria2` from your system (the .deb declares its dependencies). The Windows builds bundle aria2 and yt-dlp.
 
