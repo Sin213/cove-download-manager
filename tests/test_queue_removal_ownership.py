@@ -661,7 +661,9 @@ def test_ambiguous_absent_metadata_parent_still_owns_payload_child(queue_env, mo
     queue.remove(t.id, delete_file=True)
     add[4]("add reply lost")
     drain(calls)
-    assert probes == [identity, identity]
+    # Two absence probes of the parent; a removed child is then asked once
+    # more, to wait for aria2 to let go of the files before they are deleted.
+    assert probes == ([identity, identity] if refused else [identity, identity, CHILD])
     if refused:
         assert t.id in queue.tasks and payload.exists() and t.gid == CHILD and t.phase == ""
         assert _persisted_row(path, t.id)["gid"] == CHILD
@@ -1019,3 +1021,32 @@ def test_removal_still_completes_when_aria2_never_reports_stopped(queue_env, mon
     assert rpc.removed == [EXPECTED]
     assert not payload.exists() and t.id not in queue.tasks
     assert _persisted_row(path, t.id) is None
+
+
+def test_torrent_removal_deletes_files_only_after_aria2_reports_stopped(queue_env, monkeypatch, tmp_path):
+    queue, rpc, path, t, calls, add = dispatched(queue_env, torrent=True)
+    add[3](EXPECTED)
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"owned torrent bytes")
+    rpc.files_result = [{"path": str(payload)}]
+    monkeypatch.setattr(queue, "_REMOVAL_POLL_S", 0)
+    events = []
+    remove = rpc.remove
+    rpc.remove = lambda gid, force=True: events.append("remove") or remove(gid, force)
+    def status(gid):
+        # Still stopping on the first look after the removal, gone after that.
+        answer = "removed" if events.count("active-after-remove") else "active"
+        if "remove" in events and answer == "active":
+            events.append("active-after-remove")
+        events.append(answer)
+        return {"gid": gid, "status": answer, "followedBy": []}
+    rpc.tell_status = status
+    delete = queue._delete_torrent_files
+    monkeypatch.setattr(queue, "_delete_torrent_files",
+                        lambda paths, base: events.append("delete") or delete(paths, base))
+
+    queue.remove(t.id, delete_file=True)
+    drain(calls)
+
+    assert "removed" in events[:events.index("delete")], "files deleted before aria2 reported the transfer stopped"
+    assert not payload.exists() and t.id not in queue.tasks

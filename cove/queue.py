@@ -4348,6 +4348,8 @@ class QueueManager(QObject):
         """
         parent = entry["gid"]
         parent_absent = bool(entry.get("absent"))
+        # Only a removal that deletes files has to wait for aria2 to close them.
+        remove = self._remove_settled if delete_file else self.rpc.remove
         children = self._torrent_children(parent, parent_absent) if follow_children else []
         paths: tuple[str, ...] = ()
         if delete_file:
@@ -4362,7 +4364,7 @@ class QueueManager(QObject):
         # them for the retry. Stopping the children first left the opposite -
         # a task restored in the metadata phase whose payload was already gone.
         if not parent_absent:
-            self._confirm_removal(self.rpc.remove(parent))
+            self._confirm_removal(remove(parent))
         if not follow_children:
             return paths
         # aria2 can finish the metadata and create the payload child in the
@@ -4387,7 +4389,7 @@ class QueueManager(QObject):
             if delete_file and child not in children:
                 # The children known before the removal were inventoried above.
                 paths += self._owned_file_paths(child)
-            self._confirm_removal(self.rpc.remove(child))
+            self._confirm_removal(remove(child))
         return paths
 
     def _torrent_children(self, parent: str, known_absent: bool = False) -> list[str]:
