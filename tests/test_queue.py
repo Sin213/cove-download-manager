@@ -7088,7 +7088,7 @@ def test_aria2_partial_data_is_unlinked_only_after_aria2_forgets_the_gid(
     deferred = []
 
     def spawn(fn, *args, on_done=None, on_fail=None, **kwargs):
-        if getattr(fn, "__name__", "") == "remove":
+        if getattr(fn, "__name__", "") == "_remove_settled":
             deferred.append((fn, args, on_done))
             return
         result = fn(*args, **kwargs)
@@ -7759,7 +7759,7 @@ def test_remove_keeps_the_task_until_aria2_confirms(queue_env, tmp_path):
     # A task Cove has not actually let go of still occupies a slot.
     assert queue._active_count() == 1
 
-    spawn.fail(spawn.take("remove"))
+    spawn.fail(spawn.take("_remove_settled"))
 
     # aria2 refused, so the download is still real: keep showing it.
     assert tid in queue.tasks
@@ -7776,7 +7776,7 @@ def test_remove_completes_once_aria2_confirms(queue_env, tmp_path):
     spawn = _DeferredSpawn(queue)
 
     queue.remove(tid, delete_file=True)
-    spawn.run(spawn.take("remove"))
+    spawn.run(spawn.take("_remove_settled"))
 
     assert rpc.removed == ["gid-1"]
     assert tid not in queue.tasks
@@ -7798,7 +7798,7 @@ def test_status_arriving_during_removal_cannot_complete_the_task(
                               "completedLength": "10"})
 
     assert queue.tasks[tid].status == "active"
-    spawn.run(spawn.take("remove"))
+    spawn.run(spawn.take("_remove_settled"))
     assert tid not in queue.tasks
 
 
@@ -8054,7 +8054,7 @@ def test_a_refused_removal_reasserts_the_tasks_intent_to_aria2(queue_env, tmp_pa
     queue.remove(tid)                      # user removes while it is pending
     spawn.run(pause)                       # lands during removal: not reconciled
 
-    spawn.fail(spawn.take("remove"))       # aria2 refuses the removal
+    spawn.fail(spawn.take("_remove_settled"))       # aria2 refuses the removal
     spawn.drain()
 
     assert tid in queue.tasks
@@ -8096,7 +8096,7 @@ def test_a_refused_removal_asserts_state_even_without_a_per_task_intent(
     spawn.run(spawn.take("pause_all"))    # aria2 paused everything, incl. this
     queue.start_queue()
 
-    spawn.fail(spawn.take("remove"))      # aria2 refuses the removal
+    spawn.fail(spawn.take("_remove_settled"))      # aria2 refuses the removal
     spawn.drain()
 
     assert tid in queue.tasks
@@ -8354,7 +8354,7 @@ def test_a_refused_removal_clears_the_durable_removal_marker(queue_env, tmp_path
     spawn = _DeferredSpawn(queue)
 
     queue.remove(tid, delete_file=True)
-    spawn.fail(spawn.take("remove"))       # aria2 refuses
+    spawn.fail(spawn.take("_remove_settled"))       # aria2 refuses
 
     assert _persisted_row(db_path, tid)["status"] == "active"
 
@@ -8413,7 +8413,7 @@ def test_a_removal_refused_while_stopped_still_restarts_with_the_queue(
     spawn = _DeferredSpawn(queue)
 
     queue.remove(tid)
-    remove = spawn.take("remove")          # held in flight
+    remove = spawn.take("_remove_settled")          # held in flight
     queue.stop_queue()
     spawn.run(spawn.take("pause_all"))
 
@@ -8478,7 +8478,7 @@ def test_activity_during_a_pending_removal_cannot_clear_the_marker(
     queue.pause(tid)
     pause = spawn.take("pause")            # in flight when the removal starts
     queue.remove(tid, delete_file=True)
-    spawn.take("remove")                   # aria2 never answers
+    spawn.take("_remove_settled")                   # aria2 never answers
 
     spawn.run(pause)                       # lands inside the removal window
     assert _persisted_row(db_path, tid)["status"] == "removing"

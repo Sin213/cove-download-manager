@@ -973,3 +973,49 @@ def test_repair3_cached_retry_after_plain_add_failure_settles_without_losing_ide
     drain(calls)
     assert rpc.removed == [identity, CHILD] and not payload.exists()
     assert t.id not in queue.tasks and _persisted_row(path, t.id) is None
+
+
+# ---- Cleanup waits for aria2 to let go (Windows delete-pending race) -------
+# aria2.forceRemove answers before aria2 has closed the file. On Windows a
+# file deleted while aria2 still holds it stays "delete pending", so cleanup's
+# emptiness check fails with error 5 and the work directory is left behind.
+
+
+def test_removal_cleans_up_only_after_aria2_reports_the_transfer_stopped(queue_env, monkeypatch):
+    queue, rpc, path, t, calls, add = dispatched(queue_env)
+    add[3](EXPECTED)
+    payload = private_payload(t)
+    monkeypatch.setattr(queue, "_REMOVAL_POLL_S", 0)
+    statuses = iter(["active", "active", "removed"])
+    seen = []
+    rpc.tell_status = lambda gid: seen.append(payload.exists()) or {"gid": gid, "status": next(statuses)}
+
+    queue.remove(t.id, delete_file=True)
+    drain(calls)
+
+    assert rpc.removed == [EXPECTED]
+    assert seen == [True, True, True], "cleanup ran before aria2 reported the transfer stopped"
+    assert not payload.exists() and t.id not in queue.tasks
+
+
+@pytest.mark.parametrize("answer", ["stuck", "error", "gone"])
+def test_removal_still_completes_when_aria2_never_reports_stopped(queue_env, monkeypatch, answer):
+    queue, rpc, path, t, calls, add = dispatched(queue_env)
+    add[3](EXPECTED)
+    payload = private_payload(t)
+    monkeypatch.setattr(queue, "_REMOVAL_SETTLE_S", 0.05)
+    monkeypatch.setattr(queue, "_REMOVAL_POLL_S", 0.01)
+    def status(gid):
+        if answer == "error":
+            raise Aria2Error("transport lost")
+        if answer == "gone":
+            raise absent(gid)
+        return {"gid": gid, "status": "active"}
+    rpc.tell_status = status
+
+    queue.remove(t.id, delete_file=True)
+    drain(calls)
+
+    assert rpc.removed == [EXPECTED]
+    assert not payload.exists() and t.id not in queue.tasks
+    assert _persisted_row(path, t.id) is None

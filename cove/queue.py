@@ -922,6 +922,10 @@ class _RpcCall(QRunnable):
 
 class QueueManager(QObject):
     _ABSENCE_SETTLE_S = 0.25
+    # How long a removal waits for aria2 to let go of the files after
+    # aria2.remove answers, and how often it asks.
+    _REMOVAL_SETTLE_S = 10.0
+    _REMOVAL_POLL_S = 0.05
     _UNRECONCILED_TORRENT_ERROR = "Remove this download first; Cove could not confirm the previous attempt stopped."
     task_added = Signal(int)            # task id
     task_changed = Signal(int)          # task id
@@ -4096,7 +4100,29 @@ class QueueManager(QObject):
                 on_done=confirmed, on_fail=refused,
             )
         else:
-            self._spawn(self.rpc.remove, entry["gid"], on_done=confirmed, on_fail=refused)
+            self._spawn(self._remove_settled, entry["gid"], on_done=confirmed, on_fail=refused)
+
+    def _remove_settled(self, gid: str) -> str:
+        """Remove ``gid``, then wait (on the worker) for aria2 to let go.
+
+        aria2.remove answers before aria2 has closed the file and written its
+        control file. On Windows a file deleted while aria2 still holds it is
+        left "delete pending", so cleanup's emptiness check fails and the
+        work directory stays behind. The wait is best effort: an answer that
+        is not a live status, or no answer at all, ends it and cleanup goes
+        ahead as before.
+        """
+        result = self.rpc.remove(gid)
+        deadline = time.monotonic() + self._REMOVAL_SETTLE_S
+        while time.monotonic() < deadline:
+            try:
+                status = self.rpc.tell_status(gid)
+            except Exception:
+                break
+            if not isinstance(status, dict) or status.get("status") not in {"active", "waiting", "paused"}:
+                break
+            time.sleep(self._REMOVAL_POLL_S)
+        return result
 
     def _cancel_ambiguous_transfer(
         self, entry: dict, is_torrent: bool, follow_children: bool
@@ -4132,7 +4158,7 @@ class QueueManager(QObject):
                 entry, follow_children, bool(entry.get("delete_file"))
             )
         if not entry.get("absent"):
-            self._confirm_removal(self.rpc.remove(gid))
+            self._confirm_removal(self._remove_settled(gid))
         return ()
 
     def _finish_removal(self, tid: int, cleanup) -> None:
