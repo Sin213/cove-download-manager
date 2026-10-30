@@ -593,6 +593,10 @@ class Aria2Daemon:
             f"--rpc-listen-port={port}",
             "--rpc-listen-all=false",
             "--rpc-allow-origin-all=false",
+            # aria2c is detached from Cove, so a crashed or killed Cove would
+            # otherwise leave it downloading (or zero-filling) unseen. aria2
+            # watches this PID and shuts down cleanly once it is gone.
+            f"--stop-with-process={os.getpid()}",
             f"--max-connection-per-server={connections}",
             f"--split={connections}",
             "--min-split-size=1M",

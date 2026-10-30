@@ -1291,3 +1291,15 @@ def test_daemon_file_allocation_never_zero_fills_on_windows(startup_wire):
         daemon.start()
 
     assert f"--file-allocation={_file_allocation()}" in popen.call_args[0][0]
+
+
+def test_daemon_stops_when_cove_dies(startup_wire):
+    """A crashed or killed Cove must not leave aria2 downloading (or
+    zero-filling) in the background: aria2 watches Cove's PID and shuts
+    down cleanly once it is gone."""
+    daemon = Aria2Daemon(Settings())
+    with patch("cove.aria2._resolve_aria2c", return_value="aria2c"), \
+         patch("cove.aria2._OwnedPopen", return_value=_live_proc()) as popen:
+        daemon.start()
+
+    assert f"--stop-with-process={os.getpid()}" in popen.call_args[0][0]
