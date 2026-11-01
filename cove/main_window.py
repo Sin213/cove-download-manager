@@ -62,7 +62,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import APP_NAME, __version__, debrid, dedup, magnet_handler, theme
+from . import APP_NAME, __version__, debrid, dedup, gofile, magnet_handler, theme
 from .clipboard import extract_urls
 from .config import Settings
 from .dialogs import (
@@ -70,6 +70,7 @@ from .dialogs import (
     CachedTorrentCheckDialog,
     ClipboardBatchDialog,
     DownloadFileInfoDialog,
+    GofileFilesDialog,
     MagnetMetadataDialog,
     MegaFolderDialog,
     SchedulerDialog,
@@ -743,6 +744,10 @@ class MainWindow(QMainWindow):
         mega_dialog = getattr(self, "_mega_dialog", None)
         if mega_dialog is not None:
             mega_dialog.reject()
+        getattr(self, "_gofile_requests", deque()).clear()
+        gofile_dialog = getattr(self, "_gofile_dialog", None)
+        if gofile_dialog is not None:
+            gofile_dialog.reject()
         cache_check = getattr(self, "_cached_check_dialog", None)
         if cache_check is not None:
             cache_check.reject()
@@ -1976,30 +1981,68 @@ class MainWindow(QMainWindow):
 
     def _mega_folder_preflight(self, url: str, out_dir: str | None) -> list[int]:
         """Drain folder requests in turn, including arrivals during a modal."""
+        return MainWindow._drain_listings(
+            self, "_mega_requests", "_mega_open", self._resolve_mega_folder, url, out_dir)
+
+    def _gofile_share_preflight(self, url: str, out_dir: str | None) -> list[int]:
+        """The same turn-taking for Gofile shares."""
+        return MainWindow._drain_listings(
+            self, "_gofile_requests", "_gofile_open", self._resolve_gofile_share, url, out_dir)
+
+    def _drain_listings(self, requests_attr, open_attr, resolve, url, out_dir) -> list[int]:
         if self._preflights_closed:
             return []
-        if not hasattr(self, "_mega_requests"):
-            self._mega_requests = deque()
-        self._mega_requests.append((url, out_dir))
-        if getattr(self, "_mega_open", False):
+        if not hasattr(self, requests_attr):
+            setattr(self, requests_attr, deque())
+        pending = getattr(self, requests_attr)
+        pending.append((url, out_dir))
+        if getattr(self, open_attr, False):
             return []
-        self._mega_open = True
+        setattr(self, open_attr, True)
         created = []
         try:
-            while self._mega_requests and not self._preflights_closed:
-                created.extend(self._resolve_mega_folder(*self._mega_requests.popleft()))
+            while pending and not self._preflights_closed:
+                created.extend(resolve(*pending.popleft()))
         finally:
-            self._mega_open = False
-            self._mega_requests.clear()
+            setattr(self, open_attr, False)
+            pending.clear()
         return created
 
     def _resolve_mega_folder(self, url: str, out_dir: str | None) -> list[int]:
         """List off-thread; cancelled or abandoned requests cannot commit."""
+        return MainWindow._resolve_listing(self, url, out_dir, dict(
+            title="MEGA Folder", loading="Loading MEGA folder...",
+            detail="Cove is fetching the file list through AllDebrid so you can choose files.",
+            dialog_attr="_mega_dialog", warning="MEGA folder unavailable",
+            unavailable=debrid._MEGA_UNAVAILABLE, errors=(debrid.DebridError,),
+            fetch=lambda target: debrid.list_mega_folder(
+                target, self.settings, session=self.queue._bound_session()),
+            dialog=lambda listing, dest: MegaFolderDialog(listing, dest, self),
+            commit=lambda selection, dest: self.queue.add_debrid_files(selection, dest),
+        ))
+
+    def _resolve_gofile_share(self, url: str, out_dir: str | None) -> list[int]:
+        """List a Gofile share off-thread, then queue only the chosen files."""
+        return MainWindow._resolve_listing(self, url, out_dir, dict(
+            title="Gofile Files", loading="Loading Gofile share...",
+            detail="Cove is fetching the file list from Gofile so you can choose files.",
+            dialog_attr="_gofile_dialog", warning="Gofile share unavailable",
+            unavailable=gofile.UNAVAILABLE, errors=(gofile.GofileError,),
+            fetch=lambda target: gofile.list_share(
+                target, self.settings, session=self.queue._bound_session()),
+            dialog=lambda listing, dest: GofileFilesDialog(listing, dest, self),
+            commit=lambda selection, dest: self.queue.add_gofile_files(selection, dest),
+        ))
+
+    def _resolve_listing(self, url: str, out_dir: str | None, flow: dict) -> list[int]:
+        """Shared listing flow: fetch off-thread, choose files, commit atomically."""
         loading = MagnetMetadataDialog(self)
-        loading.setWindowTitle("MEGA Folder")
-        loading.heading.setText("Loading MEGA folder...")
-        loading.label.setText("Cove is fetching the file list through AllDebrid so you can choose files.")
+        loading.setWindowTitle(flow["title"])
+        loading.heading.setText(flow["loading"])
+        loading.label.setText(flow["detail"])
         state = {"settled": False, "result": None, "error": ""}
+        target = [url]
+        errors = flow["errors"]
 
         def cancel():
             state["settled"] = True
@@ -2014,59 +2057,64 @@ class MainWindow(QMainWindow):
             loading.finish()
 
         def fetch():
-            nonlocal url
             try:
                 if state["settled"]:
                     return None, ""
-                return debrid.list_mega_folder(
-                    url, self.settings, session=self.queue._bound_session(),
-                ), ""
-            except debrid.DebridError as exc:
+                return flow["fetch"](target[0]), ""
+            except errors as exc:
                 return None, exc.user_message
             except Exception:
-                return None, debrid._MEGA_UNAVAILABLE
+                return None, flow["unavailable"]
             finally:
-                url = ""
+                target[0] = ""
 
         loading.cancelled.connect(cancel)
-        self._mega_dialog = loading
+        setattr(self, flow["dialog_attr"], loading)
         try:
             self.queue._spawn(fetch, on_done=done,
-                              on_fail=lambda _error: done((None, debrid._MEGA_UNAVAILABLE)))
+                              on_fail=lambda _error: done((None, flow["unavailable"])))
             if not state["settled"]:
                 loading.exec()
         finally:
             state["settled"] = True
-            self._mega_dialog = None
+            setattr(self, flow["dialog_attr"], None)
         if self._preflights_closed:
             return []
         if state["error"]:
-            QMessageBox.warning(self, "MEGA folder unavailable", state["error"])
+            QMessageBox.warning(self, flow["warning"], state["error"])
             return []
         if state["result"] is None:
             return []
-        dialog = MegaFolderDialog(state["result"], out_dir or self.settings.download_dir, self)
-        self._mega_dialog = dialog
+        dest = out_dir or self.settings.download_dir
+        dialog = flow["dialog"](state["result"], dest)
+        setattr(self, flow["dialog_attr"], dialog)
         try:
-            if dialog.exec() != MegaFolderDialog.Accepted or self._preflights_closed:
+            if dialog.exec() != dialog.Accepted or self._preflights_closed:
                 return []
             try:
-                return self.queue.add_debrid_files(
-                    dialog.result_selection(), out_dir or self.settings.download_dir,
-                )
-            except debrid.DebridError as exc:
-                QMessageBox.warning(self, "MEGA folder unavailable", exc.user_message)
+                return flow["commit"](dialog.result_selection(), dest)
+            except errors as exc:
+                QMessageBox.warning(self, flow["warning"], exc.user_message)
                 return []
             except Exception:
-                QMessageBox.warning(self, "MEGA folder unavailable", debrid._MEGA_UNAVAILABLE)
+                QMessageBox.warning(self, flow["warning"], flow["unavailable"])
                 return []
         finally:
-            self._mega_dialog = None
+            setattr(self, flow["dialog_attr"], None)
 
     def add_urls_checked(
         self, urls: list[str], out_dir: str | None = None, intake: str = "manual"
     ) -> list[int]:
         """Add URLs interactively, warning about anything already present."""
+        shares = [url for url in urls if gofile.is_share_url(url)]
+        if shares:
+            created = []
+            for url in shares:
+                created.extend(self._gofile_share_preflight(url, out_dir))
+            remaining = [url for url in urls if not gofile.is_share_url(url)]
+            if remaining and not self._preflights_closed:
+                created.extend(self.add_urls_checked(remaining, out_dir, intake))
+            return created
         folders = [url for url in urls if debrid.is_mega_folder_url(url)]
         if folders:
             created = []

@@ -540,6 +540,11 @@ class Aria2Daemon:
         self._proc: subprocess.Popen | None = None
         self._unreleased = False
         self._secret = self._active_secret = self._launch_conf = None
+        # Gofile cookie jar: the file exists only until the engine is ready,
+        # and `_gofile_fingerprint` records which token this process loaded
+        # ("" = started with no usable token, None = not our running engine).
+        self._launch_jar = None
+        self._gofile_fingerprint = None
 
     @staticmethod
     def is_installed() -> bool:
@@ -564,6 +569,7 @@ class Aria2Daemon:
             if self._active_secret is not None: return None
             raise Aria2Error("aria2 startup already in progress.")
         self._active_secret = self._secret = None
+        self._gofile_fingerprint = None
         aria2c = _resolve_aria2c()
         if aria2c is None:
             if sys.platform == "win32":
@@ -649,7 +655,8 @@ class Aria2Daemon:
                 logging.getLogger("cove").info("legacy_aria2_session_cleanup_skipped: reason=rpc_port_not_refused")
         try:
             self._secret = secrets.token_urlsafe(32)
-            conf_path = self._write_rpc_conf()
+            jar = self._write_gofile_jar()
+            conf_path = self._write_rpc_conf(cookie_jar=jar)
             self._write_rpc_conf(record=True)
             args.insert(1, f"--conf-path={conf_path}")
             self._spawn(args)
@@ -718,13 +725,66 @@ class Aria2Daemon:
             raise self._stale_daemon_error()
         raise Aria2Error("aria2 RPC did not come up.")
 
-    def _write_rpc_conf(self, record: bool = False) -> Path:
+    def _write_gofile_jar(self) -> Path | None:
+        """Publish the private cookie jar for the Gofile token, if one is usable.
+
+        The token lives in this 0600 file and nowhere on argv. aria2 reads it
+        once at startup; it is unlinked with the launch conf as soon as the
+        engine is ready (or on any failure). Returns None without a valid token.
+        """
+        from . import gofile  # lazy: keeps aria2 import-light
+
+        token = getattr(self.settings, "gofile_api_token", "")
+        token = token.strip() if isinstance(token, str) else ""
+        self._gofile_fingerprint = ""
+        try:
+            text = gofile.cookie_jar_text(token)
+        except gofile.GofileError:
+            return None
+        path = DATA_DIR / f".aria2.cookies.{secrets.token_hex(12)}.txt"
+        fd = None
+        try:
+            prepare_private_directory(DATA_DIR)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            self._launch_jar = path  # from here on, stop() removes it
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as jar:
+                fd = None
+                jar.write(text)
+                jar.flush()
+                os.fsync(jar.fileno())
+            if os.name != "nt":
+                os.chmod(path, 0o600, follow_symlinks=False)
+                info = path.lstat()
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+                    raise OSError("cookie file is not private")
+        except (OSError, ValueError):
+            if fd is not None:
+                os.close(fd)
+            self._unlink_launch_conf()
+            raise Aria2Error("Unable to prepare the private Gofile cookie file.") from None
+        self._gofile_fingerprint = gofile.token_fingerprint(token)
+        return path
+
+    def gofile_cookie_fingerprint(self) -> str | None:
+        """Which Gofile token the running engine loaded, or None if it is not ours.
+
+        Only a daemon this process started, committed and still running answers;
+        "" means it started without a usable token. Never the token itself.
+        """
+        if self._active_secret is None or self._gofile_fingerprint is None or not self.is_running():
+            return None
+        return self._gofile_fingerprint
+
+    def _write_rpc_conf(self, record: bool = False, cookie_jar: Path | None = None) -> Path:
         """Publish a complete private conf; no credential belongs in argv."""
         s = self.settings
         for value in (s.proxy_host, s.proxy_type, s.proxy_port):
             if any(ord(char) < 0x20 or 0x7f <= ord(char) <= 0x9f for char in str(value)):
                 raise Aria2Error("Invalid control character in aria2 configuration.")
         text = f"rpc-secret={self._secret}\n"
+        if cookie_jar is not None and not record:
+            text += f"load-cookies={cookie_jar}\n"
         if not record and s.proxy_type != "none" and s.proxy_host:
             text += f"all-proxy={self._build_proxy_url()}\n"
         conf_path = DATA_DIR / ("aria2.rpc.auth" if record else f".aria2.launch.{secrets.token_hex(12)}.conf")
@@ -937,6 +997,7 @@ class Aria2Daemon:
     def stop(self, *, kill_only=False) -> bool:
         global _owned_pending
         self._active_secret = self._secret = None
+        self._gofile_fingerprint = None
         self._unlink_launch_conf()
         procs = [self._proc] + ([_owned_pending] if _owned_pending is not self._proc else [])
         failed = False
@@ -961,6 +1022,12 @@ class Aria2Daemon:
                 self._launch_conf = None
             except OSError:
                 pass
+        if self._launch_jar is not None:
+            try:
+                self._launch_jar.unlink()
+                self._launch_jar = None
+            except OSError:
+                pass
 
     def active_rpc_secret(self) -> str | None:
         if self._active_secret is None: return None
@@ -972,8 +1039,10 @@ class Aria2Daemon:
 class Aria2RPC:
     """Synchronous JSON-RPC client. Call from a worker thread."""
 
-    def __init__(self, settings: Settings, timeout: float = 5.0, secret_provider=None, session_factory=None):
+    def __init__(self, settings: Settings, timeout: float = 5.0, secret_provider=None, session_factory=None,
+                 cookie_fingerprint_provider=None):
         self.url = f"http://127.0.0.1:{settings.rpc_port}/jsonrpc"
+        self._cookie_fingerprint_provider = cookie_fingerprint_provider
         self.secret = settings.rpc_secret
         self._secret_provider = secret_provider
         self.timeout = timeout
@@ -981,6 +1050,15 @@ class Aria2RPC:
         # requests.Session is not thread-safe. Calls fan out across a
         # QThreadPool, so give each thread its own session.
         self._local = threading.local()
+
+    def gofile_cookie_fingerprint(self) -> str | None:
+        """The Gofile-token identity the engine behind this client holds.
+
+        None when the engine is not one Cove started with its own cookie jar
+        (an external aria2, or no provider), which Gofile transfers refuse.
+        """
+        provider = getattr(self, "_cookie_fingerprint_provider", None)
+        return provider() if provider is not None else None
 
     @property
     def secret(self):

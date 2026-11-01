@@ -665,7 +665,10 @@ def run() -> int:
     app.setStyleSheet(theme.QSS)
 
     daemon = Aria2Daemon(settings)
-    rpc = Aria2RPC(settings, secret_provider=daemon.active_rpc_secret)
+    # A daemon that cannot vouch for its Gofile cookie jar reads as "not ours",
+    # which makes Gofile transfers refuse rather than run unprotected.
+    rpc = Aria2RPC(settings, secret_provider=daemon.active_rpc_secret,
+                   cookie_fingerprint_provider=lambda: getattr(daemon, "gofile_cookie_fingerprint", lambda: None)())
     queue = QueueManager(settings, rpc, aria2_admission="pending")
     browser_gate.queue = queue
     scheduler = Scheduler(settings.schedule)

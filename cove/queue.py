@@ -23,7 +23,7 @@ from urllib.parse import urlsplit
 
 from PySide6.QtCore import QCoreApplication, QObject, QProcess, QRunnable, QThreadPool, QTimer, Signal, Slot
 
-from . import db, debrid, dedup, diagnostics, netiface, torrent
+from . import db, debrid, dedup, diagnostics, gofile, netiface, torrent
 from .aria2 import Aria2Error, Aria2RPC, Aria2RpcError, bittorrent_enabled, generate_gid
 from .config import MAX_CONNECTIONS_PER_SERVER, Settings
 from .debrid import DebridError
@@ -143,7 +143,9 @@ SOURCE_PLAIN = ""
 SOURCE_TORRENT = "torrent"
 SOURCE_TORRENT_FILE = "torrent_file"
 SOURCE_DEBRID_FILE = "debrid_file"
-SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
+SOURCE_GOFILE_FILE = "gofile_file"
+SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE,
+                SOURCE_GOFILE_FILE)
 
 
 @dataclass(frozen=True)
@@ -802,6 +804,10 @@ class DownloadTask:
     resolved_url: str = ""
     debrid_provider: str = ""
     debrid_max_chunks: int = 0
+    # Gofile only, and equally transient: the size Gofile reported, which the
+    # finished file must match. None means no size was learned; 0 is a size.
+    # The account cookie is never held here: aria2 gets it from its own jar.
+    expected_size: int | None = None
     # "metadata" while aria2 is still fetching a magnet's torrent metadata.
     # Transient by design: it is re-derived when the magnet is re-added.
     phase: str = ""
@@ -829,6 +835,7 @@ class DownloadTask:
         self.resolved_url = ""
         self.debrid_provider = ""
         self.debrid_max_chunks = 0
+        self.expected_size = None
 
     @property
     def progress(self) -> float:
@@ -907,8 +914,8 @@ class _RpcCall(QRunnable):
     def run(self):
         try:
             result = self._fn(*self._args, **self._kwargs)
-        except (Aria2Error, DebridError, TorrentError) as e:
-            # Both already carry a message written for the user; prefixing
+        except (Aria2Error, DebridError, TorrentError, gofile.GofileError) as e:
+            # Each already carries a message written for the user; prefixing
             # the class name would only leak implementation detail into the
             # task row.
             self.signals.failed.emit(str(e))
@@ -1241,6 +1248,7 @@ class QueueManager(QObject):
 
                 files = dl.get("files") or []
                 if any(debrid.is_mega_folder_url(uri.get("uri", ""))
+                       or gofile.is_share_url(uri.get("uri", ""))
                        for file in files for uri in (file.get("uris") or [])):
                     # A folder landing page cannot be an ordinary download.
                     # Check every URI before deriving any persisted metadata.
@@ -1613,6 +1621,11 @@ class QueueManager(QObject):
         if debrid.is_mega_folder_url(url):
             self.error.emit(debrid.MEGA_FOLDER_INTAKE_MESSAGE)
             return None
+        if gofile.is_share_url(url):
+            # A share page is a web app, not a file. Only the listing flow
+            # (add_gofile_files) may create Gofile rows.
+            self.error.emit(gofile.INTAKE_MESSAGE)
+            return None
         browser_cookies_seen = bool(_clean_header(cookies))
         referrer = referrer_origin(referrer)
         user_agent = _clean_header(user_agent)
@@ -1839,6 +1852,68 @@ class QueueManager(QObject):
                     id=cur.lastrowid, url=link, out_dir=dest, connections=connections,
                     filename=name, total_bytes=size, created_at=now,
                     source_type=SOURCE_DEBRID_FILE, debrid_route=debrid.ALL_DEBRID,
+                ))
+        for task in created:
+            self.tasks[task.id] = task
+            self._diag_url_added(task, "manual")
+            self.task_added.emit(task.id)
+        if created:
+            self._maybe_start_next()
+        return [task.id for task in created]
+
+    def add_gofile_files(self, entries, out_dir: str) -> list[int]:
+        """Commit a selected Gofile manifest atomically.
+
+        Rows store only a stable file reference. The download link and the
+        account cookie are resolved again at every launch.
+        """
+        from .config import categorize
+
+        base = os.path.abspath(out_dir)
+        rows = []
+        file_paths, directory_paths = set(), set()
+        for entry in entries:
+            parts = gofile._path(entry.path)
+            if entry.name != parts[-1]:
+                raise gofile.GofileError("unsafe_path", gofile.BAD_LISTING)
+            ref = gofile.file_ref(entry.share, entry.file_id)
+            size = gofile._size(entry.size)
+            folded = tuple(part.casefold() for part in parts)
+            prefixes = {folded[:i] for i in range(1, len(folded))}
+            if (folded in file_paths or folded in directory_paths
+                    or not prefixes.isdisjoint(file_paths)):
+                raise gofile.GofileError(
+                    "conflict", "The selected Gofile files contain conflicting paths.")
+            file_paths.add(folded)
+            directory_paths.update(prefixes)
+            dest = os.path.join(base, *parts[:-1])
+            if not _within(base, dest):
+                raise gofile.GofileError(
+                    "unsafe_path", "This Gofile share contains a path Cove will not write to.")
+            rows.append((dest, parts[-1], size, ref))
+        connections = min(max(int(self.settings.connections_per_server), 1), MAX_CONNECTIONS_PER_SERVER)
+        now, created = time.time(), []
+        with db.connect() as conn:
+            for dest, name, size, ref in rows:
+                existing = conn.execute(
+                    "SELECT id FROM downloads WHERE url=? "
+                    "AND status NOT IN ('completed','error','removed') LIMIT 1", (ref,),
+                ).fetchone()
+                if existing is not None:
+                    continue
+                cur = conn.execute(
+                    """INSERT INTO downloads
+                       (url, out_dir, connections, speed_limit_kbps, status,
+                        created_at, category, backend, filename, total_bytes,
+                        source_type)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (ref, dest, connections, 0, "queued", now, categorize(name),
+                     "aria2", name, size, SOURCE_GOFILE_FILE),
+                )
+                created.append(DownloadTask(
+                    id=cur.lastrowid, url=ref, out_dir=dest, connections=connections,
+                    filename=name, total_bytes=size, created_at=now,
+                    source_type=SOURCE_GOFILE_FILE,
                 ))
         for task in created:
             self.tasks[task.id] = task
@@ -5327,10 +5402,15 @@ class QueueManager(QObject):
         )
         from .fuckingfast import share_link_reason as browser_share_reason
         browser_reason = browser_share_reason(t.url) if t.source_type == SOURCE_PLAIN else ""
-        share_reason = browser_reason or share_reason
+        gofile_reason = (gofile.INTAKE_MESSAGE
+                         if t.source_type == SOURCE_PLAIN and gofile.is_share_url(t.url) else "")
+        share_reason = browser_reason or gofile_reason or share_reason
         if share_reason:
             facts = diagnostics.url_facts(t.url)
-            if browser_reason:
+            if gofile_reason:
+                self._diag("gofile", "share_link_rejected", "WARNING", task_id=t.id,
+                           classification=facts["classification"])
+            elif browser_reason:
                 self._diag("browser_fetch", "share_link_rejected", "WARNING", task_id=t.id,
                            classification=facts["classification"])
             else:
@@ -5422,7 +5502,7 @@ class QueueManager(QObject):
         needs_worker = (
             self.settings.intelligent_segments
             or self._debrid_enabled()
-            or t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
+            or t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE, SOURCE_GOFILE_FILE)
         )
         if is_http and needs_worker:
             self._spawn(
@@ -5473,6 +5553,23 @@ class QueueManager(QObject):
             )
         return self._debrid_session
 
+    def _require_gofile_cookie(self) -> None:
+        """Fail closed unless aria2 provably holds the current Gofile token.
+
+        The token reaches aria2 only through a cookie jar the daemon loaded at
+        its own startup, where aria2 scopes it to HTTPS Gofile hosts. An
+        engine Cove did not start cannot be shown to do that, and one that
+        started with a different token would send the wrong cookie. Neither
+        is repaired here: restarting aria2 would disturb running transfers.
+        """
+        token = gofile._token(self.settings)
+        provider = getattr(self.rpc, "gofile_cookie_fingerprint", None)
+        held = provider() if callable(provider) else None
+        if held is None:
+            raise gofile.GofileError("cookie_external", gofile.COOKIE_EXTERNAL)
+        if held != gofile.token_fingerprint(token):
+            raise gofile.GofileError("cookie_stale", gofile.COOKIE_RESTART)
+
     def _resolve_debrid(self, t: DownloadTask) -> str:
         """Swap the original hoster URL for a provider node URL, if any.
 
@@ -5483,6 +5580,23 @@ class QueueManager(QObject):
 
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
+        if t.source_type == SOURCE_GOFILE_FILE:
+            # The stored URL only names the file. Its download link is
+            # fetched, proven to serve file bytes, and used for this launch.
+            ref = gofile.parse_file_ref(t.url)
+            if ref is None:
+                raise gofile.GofileError("bad_identity", gofile.BAD_LISTING)
+            self._require_gofile_cookie()
+            result = gofile.resolve_file(
+                ref[0], ref[1], t.filename or "", self.settings,
+                session=self._bound_session(),
+            )
+            t.resolved_url = result.url
+            t.debrid_provider = "gofile"
+            t.expected_size = result.size
+            if result.size > 0:
+                t.total_bytes = result.size
+            return result.url
         if t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE):
             if (
                 t.source_type == SOURCE_TORRENT_FILE
@@ -5602,7 +5716,7 @@ class QueueManager(QObject):
         content_length = 0
         # A provider that reported a size has already told us everything the
         # probe would; skip it rather than send the node URL a second time.
-        if not (t.resolved_url and t.total_bytes > 0):
+        if not (t.resolved_url and t.total_bytes > 0) and t.source_type != SOURCE_GOFILE_FILE:
             try:
                 resp = self._bound_session().head(target, timeout=5, allow_redirects=True)
                 if resp.ok:
@@ -5898,17 +6012,32 @@ class QueueManager(QObject):
         self._publishing[tid] = flight
         destination, work_path = t.out_dir, t.work_dir
         requested = t.aria2_filename
+        # Gofile rows only: other sources keep exactly the behaviour they had,
+        # including legitimately downloading an HTML file.
+        verify = (t.expected_size, t.filename or requested or "") if t.source_type == SOURCE_GOFILE_FILE else None
 
         def publish():
             # Filesystem work only. No task state or Qt objects on this worker.
             try:
                 work = adopt_work_directory(destination, work_path)
                 source = validate_engine_output(work, reported)
+                if verify is not None:
+                    try:
+                        gofile.verify_download(source, verify[0], verify[1])
+                    except gofile.GofileError:
+                        # Never leave the bad bytes for a retry to "resume".
+                        for stray in (str(source), f"{source}.aria2"):
+                            try:
+                                os.unlink(stray)
+                            except OSError:
+                                pass
+                        raise
                 flight["result"] = publish_output(work, source, requested or source.name,
                                                  allow_copy=True, return_identity=True)
                 return flight["result"]
             except Exception as exc:
-                flight["error"] = f"{type(exc).__name__}: {exc}"
+                flight["error"] = (getattr(exc, "user_message", None)
+                                   or f"{type(exc).__name__}: {exc}")
                 raise
             finally:
                 flight["done"].set()

@@ -70,6 +70,7 @@ from .speed_limit import (
 )
 
 ALL_DEBRID_KEY_URL = "https://alldebrid.com/apikeys/"
+GOFILE_PROFILE_URL = "https://gofile.io/myprofile"
 REAL_DEBRID_TOKEN_URL = "https://real-debrid.com/apitoken"
 TORBOX_TOKEN_URL = "https://torbox.app/settings"
 
@@ -913,20 +914,23 @@ class TorrentContentsDialog(QDialog):
 class MegaFolderDialog(TorrentContentsDialog):
     """Use the shared manifest tree and selection controls for resolved files."""
 
+    _TITLE = "MEGA Folder"
+    _SOURCE = "MEGA folder"
+
     def __init__(self, listing, save_to: str, parent=None):
         from types import SimpleNamespace
 
         self._entries = listing.files
         self._unavailable = listing.unavailable
-        manifest = SimpleNamespace(name="MEGA folder", files=tuple(
+        manifest = SimpleNamespace(name=self._SOURCE, files=tuple(
             SimpleNamespace(index=i, path=f.path, size=f.size)
             for i, f in enumerate(listing.files)
         ))
         super().__init__(manifest, save_to, parent)
-        self.setWindowTitle("MEGA Folder")
+        self.setWindowTitle(self._TITLE)
         # The base dialog's heading and form are display-only; no folder URL
         # or key is ever supplied to a widget.
-        self.layout().itemAt(0).widget().setText("MEGA Folder")
+        self.layout().itemAt(0).widget().setText(self._TITLE)
         form = self.layout().itemAt(2)
         form.labelForField(self.name_edit).setText("Source")
         self.tree.setHeaderLabels(["Name", "Size"])
@@ -943,6 +947,13 @@ class MegaFolderDialog(TorrentContentsDialog):
             return ()
         return tuple(self._entries[index] for item, index, _size in self._leaves
                      if item.checkState(0) == Qt.Checked)
+
+
+class GofileFilesDialog(MegaFolderDialog):
+    """The same selection tree for a Gofile share's real files and sizes."""
+
+    _TITLE = "Gofile Files"
+    _SOURCE = "Gofile share"
 
 
 class SourceDetailsDialog(QDialog):
@@ -1482,6 +1493,26 @@ class SettingsDialog(QDialog):
         debrid_lay.addRow(debrid_note)
         scroll_layout.addWidget(debrid_group)
         self._on_debrid_toggled()
+
+        # Gofile lists a share's files only for Premium accounts, so reading
+        # one needs the user's own API token. Nothing else is configurable.
+        gofile_group = QGroupBox("Gofile")
+        gofile_lay = QFormLayout(gofile_group)
+        gofile_lay.setSpacing(8)
+        self.gofile_token = QLineEdit(getattr(settings, "gofile_api_token", ""))
+        self.gofile_token.setEchoMode(QLineEdit.Password)
+        self.gofile_token.setPlaceholderText("Premium API token")
+        gofile_lay.addRow("Gofile API token", self.gofile_token)
+        gofile_note = QLabel(
+            "Gofile only lets Premium accounts list shared files. Add your "
+            "token to choose and download files from Gofile share links. "
+            "Restart Cove to apply a changed token; running downloads are not affected."
+        )
+        gofile_note.setProperty("role", "muted")
+        gofile_note.setWordWrap(True)
+        gofile_lay.addRow(gofile_note)
+        gofile_lay.addRow("", _link_label("Find your Gofile API token", GOFILE_PROFILE_URL))
+        scroll_layout.addWidget(gofile_group)
 
         # BitTorrent — deliberately its own group, not part of Debrid
         # services: a cached debrid torrent is an ordinary HTTPS download,
@@ -2045,6 +2076,7 @@ class SettingsDialog(QDialog):
         self.settings.real_debrid_api_token = self.rd_token.text().strip()
         self.settings.torbox_enabled = self.torbox_enabled_cb.isChecked()
         self.settings.torbox_api_token = self.torbox_token.text().strip()
+        self.settings.gofile_api_token = self.gofile_token.text().strip()
         # The combo has no "TorBox first" entry while the feature gate is
         # off, so its currentData() can never be "torbox" in that state.
         # Saving it unconditionally would then silently reset a previously

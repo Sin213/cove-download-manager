@@ -394,6 +394,17 @@ Public MEGA folder links need AllDebrid enabled. Add them through **Add Download
 to choose files; folder keys are sent to AllDebrid only for resolution. Listings
 are flat unless AllDebrid supplies relative folder paths.
 
+Gofile share links (`https://gofile.io/d/...`) list their files through Gofile's
+API, which only serves Premium accounts. Paste your Gofile API token in
+**Settings -> Gofile**, then add the link through **Add Download** to choose
+files; AllDebrid is not needed. Without a token Cove says so rather than
+saving Gofile's web page as a download. The token is sent only to Gofile over
+HTTPS: Cove gives its own download engine a private, Secure cookie for
+`gofile.io` at startup (removed from disk once the engine is ready), so the
+token cannot follow a redirect to another site. Restart Cove after changing
+the token; downloads already running keep going, and new Gofile downloads
+explain that a restart is needed until then.
+
 When a download starts, Cove checks the URL's host against the provider's
 published host list. If the host is supported, the original link is
 resolved through your account and the resulting direct link is handed to

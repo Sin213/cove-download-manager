@@ -357,6 +357,10 @@ class Settings:
     torbox_enabled: bool = False
     torbox_api_token: str = ""
     debrid_preferred_provider: str = "alldebrid"  # "alldebrid" | "real_debrid" | "torbox"
+    # Gofile lists shared files only for Premium accounts, so reading a
+    # share needs the user's own Gofile API token. Stored with the other
+    # secrets and never serialized by the local API.
+    gofile_api_token: str = ""
     # Torrent support. Magnets and .torrent files are checked against the
     # enabled debrid providers first; anything they don't have cached falls
     # back to Cove's own aria2 BitTorrent engine (see torrent_fallback_mode).
@@ -522,7 +526,8 @@ class Settings:
             if not isinstance(getattr(s, flag), bool):
                 setattr(s, flag, False)
                 changed = True
-        for credential in ("all_debrid_api_key", "real_debrid_api_token", "torbox_api_token"):
+        for credential in ("all_debrid_api_key", "real_debrid_api_token", "torbox_api_token",
+                           "gofile_api_token"):
             if not isinstance(getattr(s, credential), str):
                 setattr(s, credential, "")
                 changed = True
