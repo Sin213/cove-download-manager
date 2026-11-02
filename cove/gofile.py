@@ -213,6 +213,13 @@ def is_delivery_url(url) -> bool:
         return False
 
 
+def is_relay_delivery_url(url) -> bool:
+    """Relay admission additionally requires the browser's canonical spelling."""
+    return (is_delivery_url(url) and url.startswith("https://")
+            and urlsplit(url).netloc.isascii()
+            and urlsplit(url).netloc == urlsplit(url).netloc.lower())
+
+
 def _canonical_parts(url):
     try:
         parts = urlsplit(url.strip())
@@ -515,7 +522,12 @@ def looks_like_web_page(head: bytes, name: str = "") -> bool:
         (b"<!doctype html", b"<html", b"<head", b"<body", b"<script"))
 
 
-def verify_download(path, expected_size: int | None, name: str) -> None:
+def browser_error_body(head):
+    return (not head or looks_like_web_page(head)
+            or bool(re.search(rb'"error"\s*:|"status"\s*:\s*"error', head)))
+
+
+def verify_download(path, expected_size: int | None, name: str, *, browser=False) -> None:
     """Refuse a finished file that is not the one Gofile described.
 
     Bounded: reads the first few KB, never the whole file. `None` means no size
@@ -524,14 +536,14 @@ def verify_download(path, expected_size: int | None, name: str) -> None:
     with open(path, "rb") as handle:
         head = handle.read(PROBE_BYTES)
         size = os.fstat(handle.fileno()).st_size
-    if looks_like_web_page(head, name):
+    if looks_like_web_page(head, name) or (browser and browser_error_body(head)):
         raise GofileError("landing_page", LANDING_PAGE)
     if expected_size is not None and size != expected_size:
         raise GofileError("size_mismatch", SIZE_MISMATCH)
 
 
 def _probe(session, link: str, token: str, name: str, size: int | None = None,
-           *, deadline=None, advertised=None) -> str:
+           *, deadline=None, advertised=None, browser=False) -> str:
     """Prove `link` serves file bytes before aria2 is involved.
 
     Follows redirects by hand so the token can only ever travel to Gofile
@@ -555,6 +567,8 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None,
         try:
             status = int(resp.status_code)
             if status in (301, 302, 303, 307, 308):
+                if browser:  # Only the new browser-token relay forbids safe redirects.
+                    raise GofileError("denied", FILE_DENIED)
                 location = resp.headers.get("Location")
                 if not isinstance(location, str) or not location:
                     raise GofileError("denied", FILE_DENIED)
@@ -585,19 +599,35 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None,
             except Exception:
                 raise GofileError("transport", UNAVAILABLE) from None
             content_type = str(resp.headers.get("Content-Type", "")).lower()
-            if looks_like_web_page(head, name) or (
+            if (looks_like_web_page(head, name)
+                or (browser and head and browser_error_body(head))) or (
                 content_type.startswith("text/html")
                 and os.path.splitext(name)[1].lower() not in _HTML_NAMES
             ):
                 raise GofileError("landing_page", LANDING_PAGE)
             if deadline is not None and time.monotonic() >= deadline:
                 raise GofileError("transport", UNAVAILABLE)
+            if browser:
+                length = str(resp.headers.get("Content-Length", ""))
+                if not head or length == "0":
+                    raise browser_error("gofile_empty")
+                if (not re.fullmatch(r"[0-9]{1,19}", length) or not 0 < int(length) <= 2**62
+                        or len(head) != min(PROBE_BYTES, int(length))
+                        or str(resp.headers.get("Content-Encoding", "identity")).lower() != "identity"):
+                    raise GofileError("unavailable", UNAVAILABLE)
+                for key in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
+                    value = str(resp.headers.get(key, ""))
+                    if len(value) > 1024 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                        raise GofileError("unavailable", UNAVAILABLE)
             if advertised is not None:
                 total = None
                 if status == 206:
                     match = re.fullmatch(r"bytes ([0-9]{1,19})-([0-9]{1,19})/([0-9]{1,19})", str(resp.headers.get("Content-Range", "")))
                     first, last, total = map(int, match.groups()) if match else (-1, -1, 0)
                     if first != 0 or not 0 <= last < total <= 2**62:
+                        raise GofileError("unavailable", UNAVAILABLE)
+                    if browser and (last != min(PROBE_BYTES, total) - 1
+                                    or int(length) != last + 1 or len(head) != last + 1):
                         raise GofileError("unavailable", UNAVAILABLE)
                 elif str(resp.headers.get("Content-Encoding", "")).strip().lower() in ("", "identity"):
                     value = resp.headers.get("Content-Length", "")
@@ -615,7 +645,35 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None,
     raise GofileError("denied", FILE_DENIED)
 
 
-def verify_browser_download(url, filename, settings, *, session=None, deadline):
+def upstream_session(settings):
+    """Use Cove's selected interface and explicit proxy for browser transfers."""
+    from . import netiface
+    from urllib.parse import quote
+
+    kind = settings.proxy_type
+    if kind == "socks5":
+        try:
+            import socks  # noqa: F401
+        except ImportError:
+            raise browser_error("gofile_unavailable") from None
+    session = netiface.bound_requests_session(settings.torrent_network_interface or "")
+    if kind != "none":
+        # Match Aria2RPC._build_proxy_url; credentials never enter errors/logs.
+        scheme = kind if kind in ("http", "https", "socks5") else "http"
+        auth = ""
+        if settings.proxy_username:
+            auth = quote(settings.proxy_username, safe="")
+            if settings.proxy_password:
+                auth += ":" + quote(settings.proxy_password, safe="")
+            auth += "@"
+        port = f":{settings.proxy_port}" if settings.proxy_port else ""
+        proxy = f"{scheme}://{auth}{settings.proxy_host}{port}"
+        session.trust_env = False
+        session.proxies = {"http": proxy, "https": proxy}
+    return session
+
+
+def verify_browser_download(url, filename, settings, *, session=None, deadline, browser_token=None):
     """Prove file access within an absolute monotonic deadline (at most 15s).
 
     Requests' read timeout limits idle time, not a trickling body or DNS. A
@@ -624,7 +682,9 @@ def verify_browser_download(url, filename, settings, *, session=None, deadline):
     The short-lived native host owns this worker and its HTTP session.
     """
     try:
-        token = _token(settings)
+        token = _token(settings) if browser_token is None else browser_token
+        if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+            raise browser_error("gofile_denied")
     except GofileError as exc:
         raise browser_error("gofile_needs_token" if exc.code == "missing_token" else "gofile_denied") from None
     if not is_delivery_url(url):
@@ -637,7 +697,7 @@ def verify_browser_download(url, filename, settings, *, session=None, deadline):
         try:
             owned = requests.Session() if session is None else None
             _probe(session if session is not None else owned, url, token, "",
-                   deadline=deadline, advertised=advertised)
+                   deadline=deadline, advertised=advertised, browser=browser_token is not None)
             outcome.append(None)
         except GofileError as exc:
             reason = {"denied": "gofile_denied", "unsafe_url": "gofile_denied",

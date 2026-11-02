@@ -174,7 +174,8 @@ def _send_to_primary(request: dict, on_reason) -> bool:
     def report(reason):
         on_reason("gofile_restart" if delivery and reason == "unknown_action" else reason)
     accepted = send_browser_download(server_name(DATA_DIR), request, on_reason=report, **observer)
-    if accepted and delivery and not (responses and responses[-1].get("gofile_verified") is True):
+    proof_key = "gofile_relay_ready" if "gofileToken" in request else "gofile_verified"
+    if accepted and delivery and not (responses and responses[-1].get(proof_key) is True):
         on_reason("gofile_restart")
         return False
     return accepted
@@ -240,6 +241,7 @@ def handle_message(
     rpc: Aria2RPC | None,
     settings: Settings | None,
 ) -> dict:
+    global _LAST_HANDOFF_REASON
     action = msg.get("action", "")
     if action == "fetch_ticket":
         from . import fuckingfast
@@ -268,6 +270,39 @@ def handle_message(
         except Exception as exc:
             _log("ping_notify_failed", "WARNING", request_id=request_id, exc=exc)
         return reply({"status": "ok", "version": __version__})
+
+    if action == "download_gofile_relay":
+        session = None
+        try:
+            url, token = msg.get("url"), msg.get("gofileToken")
+            if not gofile.is_relay_delivery_url(url):
+                raise gofile.browser_error("gofile_page")
+            if not isinstance(token, str) or not gofile._TOKEN_RE.fullmatch(token):
+                raise gofile.browser_error("gofile_denied")
+            if settings is None:
+                raise gofile.browser_error("gofile_unavailable")
+            session = gofile.upstream_session(settings)
+            size = gofile.verify_browser_download(url, "", settings, session=session,
+                deadline=time.monotonic() + 15, browser_token=token)
+            request = {"url": url, "gofileToken": token, "file_size": size or 0,
+                       "filename": msg.get("filename"), "directory": msg.get("directory"),
+                       "request_id": request_id}
+            _LAST_HANDOFF_REASON = None
+            if not deliver_to_primary(request):
+                raise gofile.browser_error(_LAST_HANDOFF_REASON if _LAST_HANDOFF_REASON
+                    in gofile.BROWSER_MESSAGES else "gofile_unavailable")
+            return reply({"status": "ok", "proof": "gofile-relay-v1"})
+        except Exception as exc:
+            reason = getattr(exc, "code", "gofile_unavailable")
+            if reason not in gofile.BROWSER_MESSAGES:
+                reason = "gofile_unavailable"
+            message = {"gofile_page": "Gofile did not return the file. Firefox is keeping the download.",
+                       "gofile_restart": "Update Cove before handing this Gofile download over. Firefox is keeping the download."}
+            return reply({"status": "error", "reason": reason,
+                          "message": message.get(reason, gofile.BROWSER_MESSAGES[reason])})
+        finally:
+            if session is not None:
+                session.close()
 
     if action in ("download", "download_gofile"):
         url = msg.get("url", "")
@@ -343,7 +378,6 @@ def handle_message(
         # or not any Cove process existed; the file was then consumed at the
         # next launch, which is what made a download intercepted while Cove
         # was closed reappear later.
-        global _LAST_HANDOFF_REASON
         _LAST_HANDOFF_REASON = None
         try:
             accepted = deliver_to_primary(request)
@@ -447,10 +481,12 @@ def main() -> None:
         except Exception as exc:
             # A crash here kills the host and the browser respawns it,
             # silently dropping the message (and risking a crash loop).
-            _log("handler_crashed", "ERROR", exc=exc)
+            _log("handler_crashed", "ERROR", **({} if isinstance(msg, dict) and msg.get("action") == "download_gofile_relay"
+                                               else {"exc": exc}))
             response = {"status": "error", "message": "Internal error handling message"}
         stdout.write(encode_message(response))
         stdout.flush()
+        del msg, response  # Do not retain the previous browser credential between messages.
 
     _log("host_stop", "INFO")
 

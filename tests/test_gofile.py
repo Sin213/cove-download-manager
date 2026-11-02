@@ -1003,7 +1003,7 @@ def real_gofile_factory(tmp_path, monkeypatch, queue_env):
     executable = shutil.which("aria2c")
     if executable is None:
         pytest.skip("real aria2c is not installed")
-    payload = bytes(range(256)) * 2048
+    payload = bytes(range(256)) * 128  # Small fake, bounded below as well.
     state = SimpleNamespace(payload=payload, sha256=hashlib.sha256(payload).hexdigest(), mode="good",
                             requests=[], hits=0, lock=threading.Lock(),
                             started=threading.Event(), release=threading.Event())
@@ -1053,6 +1053,7 @@ def real_gofile_factory(tmp_path, monkeypatch, queue_env):
             if ranged.startswith("bytes=") and status == 200 and ctype != "text/html" and content:
                 first, _, last = ranged[6:].partition("-")
                 start, end = int(first or 0), min(int(last), end) if last else end
+            end = min(end, start + 256 * 1024 - 1)
             try:
                 self.send_response(206 if end - start + 1 != len(content) else status)
                 self.send_header("Content-Type", ctype)
@@ -1064,13 +1065,13 @@ def real_gofile_factory(tmp_path, monkeypatch, queue_env):
                 self.end_headers()
                 if body and state.mode == "slow" and self.path == "/file" and hit > 1:
                     half = start + (end - start + 1) // 2
-                    self.wfile.write(content[start:half])
+                    self.wfile.write(content[start:half][:256 * 1024])
                     self.wfile.flush()
                     state.started.set()
                     state.release.wait(8)
-                    self.wfile.write(content[half:end + 1])
+                    self.wfile.write(content[half:end + 1][:256 * 1024])
                 elif body:
-                    self.wfile.write(content[start:end + 1])
+                    self.wfile.write(content[start:end + 1][:256 * 1024])
             except (BrokenPipeError, ConnectionResetError):
                 pass
 

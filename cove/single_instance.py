@@ -288,6 +288,7 @@ def validate_message(obj) -> tuple[str, list[str]]:
 
 BROWSER_DOWNLOAD_ACTION = "browser_download"
 GOFILE_DOWNLOAD_ACTION = "browser_download_gofile"
+GOFILE_RELAY_ACTION = "browser_download_gofile_relay"
 
 # A "the extension just talked to me" heartbeat from the native host. It
 # carries no payload and never activates the window: the browser sends it on
@@ -350,6 +351,14 @@ def validate_browser_download(obj: dict) -> dict:
         raise MessageError("invalid_schema")
 
     fingerprint = {}
+    if obj.get("action") == GOFILE_RELAY_ACTION:
+        token = obj.get("gofileToken")
+        if (not isinstance(token, str) or not gofile._TOKEN_RE.fullmatch(token)
+                or type(obj.get("file_size")) is not int or "gofile_fp" in obj):
+            raise MessageError("invalid_schema")
+        fingerprint["gofileToken"] = token
+    elif "gofileToken" in obj:
+        raise MessageError("invalid_schema")
     if "gofile_fp" in obj:
         value = obj["gofile_fp"]
         if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
@@ -388,12 +397,16 @@ def validate_request(obj) -> tuple[str, dict]:
     """
     if not isinstance(obj, dict):
         raise MessageError("invalid_schema")
-    if obj.get("action") in (BROWSER_DOWNLOAD_ACTION, GOFILE_DOWNLOAD_ACTION):
+    if "gofileToken" in obj and obj.get("action") != GOFILE_RELAY_ACTION:
+        raise MessageError("invalid_schema")
+    if obj.get("action") in (BROWSER_DOWNLOAD_ACTION, GOFILE_DOWNLOAD_ACTION, GOFILE_RELAY_ACTION):
         if obj.get("version") != PROTOCOL_VERSION:
             raise MessageError("unsupported_version")
         request = validate_browser_download(obj)
         delivery = gofile.is_delivery_url(request["url"])
-        if obj["action"] == GOFILE_DOWNLOAD_ACTION and not delivery:
+        if (obj["action"] == GOFILE_DOWNLOAD_ACTION and not delivery
+                or obj["action"] == GOFILE_RELAY_ACTION
+                and not gofile.is_relay_delivery_url(request["url"])):
             raise MessageError("gofile_page")
         if obj["action"] == BROWSER_DOWNLOAD_ACTION and delivery:
             raise MessageError("gofile_restart")
@@ -521,7 +534,7 @@ class _PendingConnection(QObject):
             self._respond_error(exc.category)
             return
 
-        if action in (BROWSER_DOWNLOAD_ACTION, GOFILE_DOWNLOAD_ACTION):
+        if action in (BROWSER_DOWNLOAD_ACTION, GOFILE_DOWNLOAD_ACTION, GOFILE_RELAY_ACTION):
             self._handle_browser_download(request)
             return
 
@@ -567,7 +580,9 @@ class _PendingConnection(QObject):
         logger.info("ipc_browser_download accepted=%s", accepted)
         if accepted:
             self._server.extension_seen.emit()
-            if getattr(getattr(handler, "__self__", None), "last_gofile_verified", False) is True:
+            if getattr(getattr(handler, "__self__", None), "last_gofile_relay_ready", False) is True:
+                self._respond_ok(1, gofile_relay_ready=True)
+            elif getattr(getattr(handler, "__self__", None), "last_gofile_verified", False) is True:
                 self._respond_ok(1, gofile_verified=True)
             else:
                 self._respond_ok(1)
@@ -575,9 +590,10 @@ class _PendingConnection(QObject):
             reason = getattr(getattr(handler, "__self__", None), "last_reason", "rejected")
             self._respond_error(reason if reason in _ERROR_SENTENCES else "rejected")
 
-    def _respond_ok(self, accepted: int, *, gofile_verified=False) -> None:
+    def _respond_ok(self, accepted: int, *, gofile_verified=False, gofile_relay_ready=False) -> None:
         self._write({"version": PROTOCOL_VERSION, "ok": True, "accepted": accepted,
-                     **({"gofile_verified": True} if gofile_verified else {})})
+                     **({"gofile_verified": True} if gofile_verified else {}),
+                     **({"gofile_relay_ready": True} if gofile_relay_ready else {})})
 
     def _respond_error(self, category: str) -> None:
         self._done = True
@@ -811,6 +827,8 @@ def send_browser_download(
     Cove launch can never inherit this request.
     """
     action = GOFILE_DOWNLOAD_ACTION if gofile.is_delivery_url(request.get("url")) else BROWSER_DOWNLOAD_ACTION
+    if "gofileToken" in request:
+        action = GOFILE_RELAY_ACTION
     message = {"version": PROTOCOL_VERSION, "action": action}
     for key in (
         "url",
@@ -820,6 +838,7 @@ def send_browser_download(
         "user_agent",
         "file_size",
         "gofile_fp",
+        "gofileToken",
     ):
         if request.get(key) not in (None, ""):
             message[key] = request[key]

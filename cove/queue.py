@@ -144,8 +144,9 @@ SOURCE_TORRENT = "torrent"
 SOURCE_TORRENT_FILE = "torrent_file"
 SOURCE_DEBRID_FILE = "debrid_file"
 SOURCE_GOFILE_FILE = "gofile_file"
+SOURCE_GOFILE_BROWSER = "gofile_browser"
 SOURCE_TYPES = (SOURCE_PLAIN, SOURCE_TORRENT, SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE,
-                SOURCE_GOFILE_FILE)
+                SOURCE_GOFILE_FILE, SOURCE_GOFILE_BROWSER)
 
 
 @dataclass(frozen=True)
@@ -709,8 +710,9 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         # Delivery totals are admission proofs or the engine's last observation.
         # Zero stays unknown; positive restored totals still get size/HTML guards.
         expected_size=(row["total_bytes"] if row["total_bytes"] > 0
-                       and not (_row_get(row, "source_type", "") or "")
-                       and gofile.is_delivery_url(row["url"]) else None),
+                       and ((_row_get(row, "source_type", "") or "") == SOURCE_GOFILE_BROWSER
+                            or (not (_row_get(row, "source_type", "") or "")
+                                and gofile.is_delivery_url(row["url"]))) else None),
         completed_bytes=row["completed_bytes"],
         created_at=row["created_at"],
         segments=row["segments"],
@@ -806,7 +808,7 @@ class DownloadTask:
     # short-lived secret on the provider's delivery node: it is handed to
     # aria2 and nowhere else, and is re-derived from `url` on every
     # relaunch because the previous one expires.
-    resolved_url: str = ""
+    resolved_url: str = field(default="", repr=False)
     debrid_provider: str = ""
     debrid_max_chunks: int = 0
     # Gofile only, and equally transient: the size Gofile reported, which the
@@ -840,7 +842,8 @@ class DownloadTask:
         self.resolved_url = ""
         self.debrid_provider = ""
         self.debrid_max_chunks = 0
-        if not (self.source_type == SOURCE_PLAIN and gofile.is_delivery_url(self.url)):
+        if not (self.source_type == SOURCE_GOFILE_BROWSER
+                or (self.source_type == SOURCE_PLAIN and gofile.is_delivery_url(self.url))):
             self.expected_size = None
 
     @property
@@ -951,6 +954,9 @@ class QueueManager(QObject):
         self._aria2_admission = aria2_admission
         self.settings = settings
         self.rpc = rpc
+        from .gofile_relay import GofileRelay
+        self.gofile_relay = GofileRelay(settings)
+        self._gofile_caps = {}  # Capabilities are runtime-only, never task fields or DB state.
         self.tasks: dict[int, DownloadTask] = {}
         self._running = True
         self._scheduler_allows = True
@@ -1253,7 +1259,10 @@ class QueueManager(QObject):
                 self._seen_gids.add(gid)
 
                 files = dl.get("files") or []
-                if any(debrid.is_mega_folder_url(uri.get("uri", ""))
+                from .gofile_relay import is_relay_url
+                server = self.gofile_relay._server
+                if any(is_relay_url(uri.get("uri", ""), server.server_port if server else None)
+                       or debrid.is_mega_folder_url(uri.get("uri", ""))
                        or gofile.is_share_url(uri.get("uri", ""))
                        for file in files for uri in (file.get("uris") or [])):
                     # A folder landing page cannot be an ordinary download.
@@ -1315,6 +1324,8 @@ class QueueManager(QObject):
         )
 
     def _persist(self, t: DownloadTask) -> None:
+        if t.source_type == SOURCE_GOFILE_BROWSER and t.status in ("error", "completed"):
+            self._release_gofile(t)
         # A task waiting on aria2 to confirm its removal stays visible and
         # interactive, so pause/resume and a pause callback landing inside that
         # window all reach this method. None of them may overwrite the durable
@@ -1340,8 +1351,8 @@ class QueueManager(QObject):
                     t.filename,
                     status,
                     t.gid or self._removing.get(t.id, {}).get("gid") or t.launch_gid or None,
-                    (t.expected_size if t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)
-                     and t.expected_size is not None else t.total_bytes),
+                    (t.expected_size if t.expected_size is not None and (t.source_type == SOURCE_GOFILE_BROWSER
+                     or (t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url))) else t.total_bytes),
                     t.completed_bytes,
                     t.error,
                     t.finished_at,
@@ -1870,6 +1881,61 @@ class QueueManager(QObject):
         if created:
             self._maybe_start_next()
         return [task.id for task in created]
+
+    def add_gofile_browser(self, request, capability):
+        from .config import categorize
+        if not gofile.is_relay_delivery_url(request.get("url")):
+            return None
+        name = validate_public_filename(request.get("filename") or "download")
+        if any(t.url == request["url"] and t.status not in ("completed", "error") for t in self.tasks.values()):
+            return None
+        self.gofile_relay.local_url(capability)  # Must still be a live registration.
+        dest = request.get("directory") or self._resolve_category_dir(request["url"])
+        size, now = request["file_size"], time.time()
+        connections = min(max(int(self.settings.connections_per_server), 1), MAX_CONNECTIONS_PER_SERVER)
+        with db.connect() as conn:
+            cur = conn.execute("""INSERT INTO downloads
+                (url, filename, out_dir, connections, status, created_at, total_bytes, source_type, category)
+                VALUES (?,?,?,?,?,?,?,?,?)""", (request["url"], name, dest, connections, "queued", now,
+                                              size, SOURCE_GOFILE_BROWSER, categorize(name)))
+            tid = cur.lastrowid
+        self.tasks[tid] = DownloadTask(id=tid, url=request["url"], filename=name, out_dir=dest,
+            connections=connections, created_at=now, source_type=SOURCE_GOFILE_BROWSER,
+            expected_size=size or None, total_bytes=size)
+        self._gofile_caps[tid] = capability
+        self.task_added.emit(tid)
+        QTimer.singleShot(0, self._maybe_start_next)
+        return tid
+
+    def _release_gofile(self, t):
+        self.gofile_relay.unregister(self._gofile_caps.pop(t.id, None))
+        t.resolved_url = ""
+
+    def stop_gofile_relay(self):
+        self.gofile_relay.stop()
+        self._gofile_caps.clear()
+        for t in self.tasks.values():
+            if t.source_type == SOURCE_GOFILE_BROWSER:
+                t.resolved_url = ""
+
+    def _gofile_target(self, t):
+        from .gofile_relay import FRESH_AUTHORIZATION
+        if not gofile.is_delivery_url(t.url):
+            raise ValueError(FRESH_AUTHORIZATION)
+        return self.gofile_relay.local_url(self._gofile_caps.get(t.id))
+
+    def _gofile_live(self, t):
+        if t.source_type != SOURCE_GOFILE_BROWSER:
+            return True
+        from .gofile_relay import FRESH_AUTHORIZATION
+        try:
+            self._gofile_target(t)
+            return True
+        except ValueError:
+            t.status, t.error, t.finished_at = "error", FRESH_AUTHORIZATION, time.time()
+            self._persist(t)
+            self.task_changed.emit(t.id)
+            return False
 
     def add_gofile_files(self, entries, out_dir: str) -> list[int]:
         """Commit a selected Gofile manifest atomically.
@@ -3297,6 +3363,9 @@ class QueueManager(QObject):
         t = self.tasks.get(tid)
         if pending is None or t is None:
             return
+        if t.source_type == SOURCE_GOFILE_BROWSER:
+            from .gofile_relay import FRESH_AUTHORIZATION, TRANSFER_FAILED
+            msg = FRESH_AUTHORIZATION if msg == FRESH_AUTHORIZATION else TRANSFER_FAILED
         was_paused = t.status == "paused"
         t.status = "error"
         t.error = msg
@@ -3946,6 +4015,9 @@ class QueueManager(QObject):
         retraction is therefore followed by a convergence check, which sends
         the unpause if aria2 is known to be holding a pause nobody wants now.
         """
+        if self.tasks.get(tid) and self.tasks[tid].source_type == SOURCE_GOFILE_BROWSER:
+            from .gofile_relay import TRANSFER_FAILED
+            msg = TRANSFER_FAILED
         self.error.emit(msg)
         self._note_resolved(tid, gen)
         if self._desired_for(tid, gid) is not True or tid in self._cmd_queued:
@@ -3972,6 +4044,8 @@ class QueueManager(QObject):
     def resume(self, tid: int) -> None:
         t = self.tasks.get(tid)
         if not t or t.status not in {"paused", "error"}:
+            return
+        if not self._gofile_live(t):
             return
         if tid in self._removing and t.status == "error":
             return
@@ -4051,6 +4125,8 @@ class QueueManager(QObject):
         t = self.tasks.get(tid)
         if not t:
             return
+        if t.source_type == SOURCE_GOFILE_BROWSER:
+            self._release_gofile(t)
         if tid in self._removing:
             return
 
@@ -4819,7 +4895,28 @@ class QueueManager(QObject):
     # ---- internals ----------------------------------------------------
 
     def _spawn(self, fn, *args, on_done=None, on_fail=None, **kwargs):
-        call = _RpcCall(fn, *args, **kwargs)
+        from .gofile_relay import FRESH_AUTHORIZATION, TRANSFER_FAILED
+        def relay_arg(value):
+            if isinstance(value, DownloadTask):
+                return value.source_type == SOURCE_GOFILE_BROWSER
+            if isinstance(value, dict):
+                return any(relay_arg(v) for v in value.values())
+            if isinstance(value, (tuple, list)):
+                return any(relay_arg(v) for v in value)
+            return isinstance(value, str) and bool(value) and any(
+                t.source_type == SOURCE_GOFILE_BROWSER and value in (t.gid, t.launch_gid, t.resolved_url)
+                for t in self.tasks.values())
+        if relay_arg(args) or relay_arg(kwargs):
+            original = fn
+            def guarded():
+                try:
+                    return original(*args, **kwargs)
+                except Exception as exc:
+                    raise Aria2Error(FRESH_AUTHORIZATION if str(exc) == FRESH_AUTHORIZATION
+                                     else TRANSFER_FAILED) from None
+            call = _RpcCall(guarded)
+        else:
+            call = _RpcCall(fn, *args, **kwargs)
         if on_done is not None:
             call.signals.done.connect(on_done)
         if on_fail is not None:
@@ -4898,7 +4995,7 @@ class QueueManager(QObject):
                         self._launch(t)
                 elif slots > 0:
                     self._launch(t)
-                    slots -= 1
+                    slots = max(0, self.settings.max_concurrent - self._active_count())
 
         self._scheduling = True
         try:
@@ -5343,6 +5440,8 @@ class QueueManager(QObject):
         proc.start(cmd[0], cmd[1:])
 
     def _launch(self, t: DownloadTask) -> None:
+        if not self._gofile_live(t):
+            return
         if self._aria2_admission != "open" and self._aria2_bound(t):
             if self._aria2_admission == "failed":
                 self._fail_for_startup(t)
@@ -5377,7 +5476,8 @@ class QueueManager(QObject):
         t.reset_display_progress()
         # Any previously generated debrid link has expired by now; a fresh
         # one is resolved from t.url below.
-        browser_gofile = t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)
+        browser_gofile = (t.source_type == SOURCE_GOFILE_BROWSER
+                         or (t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)))
         t.clear_debrid()
         if browser_gofile:
             t.backend = "aria2"
@@ -5521,9 +5621,9 @@ class QueueManager(QObject):
         needs_worker = (
             self.settings.intelligent_segments
             or self._debrid_enabled()
-            or t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE, SOURCE_GOFILE_FILE)
+            or t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE, SOURCE_GOFILE_FILE, SOURCE_GOFILE_BROWSER)
         )
-        if is_http and needs_worker:
+        if t.source_type == SOURCE_GOFILE_BROWSER or (is_http and needs_worker):
             self._spawn(
                 self._probe_and_add,
                 t,
@@ -5599,6 +5699,9 @@ class QueueManager(QObject):
 
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
+        if t.source_type == SOURCE_GOFILE_BROWSER:
+            t.resolved_url = self._gofile_target(t)
+            return t.resolved_url
         if t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url):
             self._require_gofile_cookie()
             return t.url
@@ -5738,7 +5841,7 @@ class QueueManager(QObject):
         content_length = 0
         # A provider that reported a size has already told us everything the
         # probe would; skip it rather than send the node URL a second time.
-        if (not (t.resolved_url and t.total_bytes > 0) and t.source_type != SOURCE_GOFILE_FILE
+        if (not (t.resolved_url and t.total_bytes > 0) and t.source_type not in (SOURCE_GOFILE_FILE, SOURCE_GOFILE_BROWSER)
                 and not gofile.is_delivery_url(t.url)):
             try:
                 resp = self._bound_session().head(target, timeout=5, allow_redirects=True)
@@ -5766,6 +5869,7 @@ class QueueManager(QObject):
             [target], str(work.path), segments,
             t.speed_limit_kbps, requested,
             gid=t.launch_gid or None,
+            **({"options": {"no-proxy": "127.0.0.1"}} if t.source_type == SOURCE_GOFILE_BROWSER else {}),
         )
         # Runs on the probe worker thread; DiagLogger.emit is thread safe.
         # Host class and segment count only - never the URL handed to aria2.
@@ -5887,6 +5991,9 @@ class QueueManager(QObject):
             # Cancellation is already in flight. Completing, failing or
             # cleaning up here would act on a task that is on its way out.
             return
+        if t.source_type == SOURCE_GOFILE_BROWSER:
+            if t.status in ("completed", "error") or not self._gofile_live(t):
+                return
         is_torrent = t.source_type == SOURCE_TORRENT
         if is_torrent:
             # The metadata gid completing is a transition, not a finished
@@ -5929,6 +6036,12 @@ class QueueManager(QObject):
         if a2_status == "complete":
             if t.status == "completed":
                 return
+            if t.source_type == SOURCE_GOFILE_BROWSER and not t.work_dir:
+                from .gofile_relay import TRANSFER_FAILED
+                t.status, t.error = "error", TRANSFER_FAILED
+                self._persist(t)
+                self.task_changed.emit(tid)
+                return
             if not is_torrent and t.work_dir:
                 self._publish_aria2_output(t, files[0].get("path", "") if files else "")
                 return
@@ -5943,7 +6056,10 @@ class QueueManager(QObject):
             self._maybe_start_next()
         elif a2_status == "error":
             t.status = "error"
-            if is_torrent:
+            if t.source_type == SOURCE_GOFILE_BROWSER:
+                from .gofile_relay import TRANSFER_FAILED
+                t.error = TRANSFER_FAILED
+            elif is_torrent:
                 # Never aria2's own text for a torrent: see TORRENT_ARIA2_FAILED.
                 t.error = _torrent_error_text(status.get("errorCode"))
             else:
@@ -5952,8 +6068,8 @@ class QueueManager(QObject):
             t.clear_debrid()
             # aria2's own error code and message: no URL, no command line.
             self._diag("aria2", "final_error", "ERROR", task_id=tid, gid=t.gid,
-                       code=status.get("errorCode"),
-                       message=status.get("errorMessage"))
+                       code=None if t.source_type == SOURCE_GOFILE_BROWSER else status.get("errorCode"),
+                       message=t.error if t.source_type == SOURCE_GOFILE_BROWSER else status.get("errorMessage"))
             self._diag_task_failed(t, "aria2_error")
             self._persist(t)
             self.task_changed.emit(tid)
@@ -6037,10 +6153,11 @@ class QueueManager(QObject):
         requested = t.aria2_filename
         # Gofile rows only: other sources keep exactly the behaviour they had,
         # including legitimately downloading an HTML file.
-        guarded = (t.source_type == SOURCE_GOFILE_FILE
+        guarded = (t.source_type in (SOURCE_GOFILE_FILE, SOURCE_GOFILE_BROWSER)
                    or (t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)))
         verify_name = (t.filename or requested or "") if t.source_type == SOURCE_GOFILE_FILE else ""
         verify = (t.expected_size, verify_name) if guarded else None
+        browser_guard = t.source_type == SOURCE_GOFILE_BROWSER
 
         def publish():
             # Filesystem work only. No task state or Qt objects on this worker.
@@ -6049,7 +6166,8 @@ class QueueManager(QObject):
                 source = validate_engine_output(work, reported)
                 if verify is not None:
                     try:
-                        gofile.verify_download(source, verify[0], verify[1])
+                        gofile.verify_download(source, verify[0], verify[1],
+                                              **({"browser": True} if browser_guard else {}))
                     except gofile.GofileError:
                         # Never leave the bad bytes for a retry to "resume".
                         for stray in (str(source), f"{source}.aria2"):
@@ -6062,6 +6180,10 @@ class QueueManager(QObject):
                                                  allow_copy=True, return_identity=True)
                 return flight["result"]
             except Exception as exc:
+                if browser_guard:
+                    from .gofile_relay import TRANSFER_FAILED
+                    flight["error"] = TRANSFER_FAILED
+                    raise Aria2Error(TRANSFER_FAILED) from None
                 flight["error"] = (getattr(exc, "user_message", None)
                                    or f"{type(exc).__name__}: {exc}")
                 raise

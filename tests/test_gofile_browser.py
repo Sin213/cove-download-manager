@@ -12,6 +12,7 @@ from cove.config import Settings
 from tests.test_queue import queue_env  # noqa: F401
 from tests.test_queue_output_ownership import inline
 from tests.test_gofile import Resp, TOKEN, LANDING
+from tests.test_gofile_relay import loopback_storage, URL as RELAY_URL  # noqa: F401
 
 URL = "https://store-eu-par-6.gofile.io/download/web/11111111-aaaa-4aaa-8aaa-111111111111/movie.mp4"
 SHARE = "https://gofile.io/d/ObvAFn9h"
@@ -84,11 +85,12 @@ def test_host_pages_never_contact_primary(monkeypatch, url):
 
 
 @pytest.mark.parametrize("url", FAMILY_PAGES)
-def test_family_host_refuses_before_primary_or_probe(monkeypatch, url):
+@pytest.mark.parametrize("action", ["download", "download_gofile_relay"])
+def test_family_host_refuses_before_primary_or_probe(monkeypatch, url, action):
     calls = []
     monkeypatch.setattr(host, "deliver_to_primary", lambda request: calls.append(request) or True)
     monkeypatch.setattr(netiface, "bound_requests_session", lambda name: pytest.fail("unapproved probe"))
-    result = host.handle_message({"action": "download", "url": url}, None, Settings(gofile_api_token=TOKEN))
+    result = host.handle_message({"action": action, "url": url, "gofileToken": TOKEN}, None, Settings(gofile_api_token=TOKEN))
     assert result.get("reason") == "gofile_page" and result["status"] == "error"
     assert not calls
 
@@ -619,7 +621,7 @@ def browser_storage(tmp_path, monkeypatch, queue_env):
     if shutil.which("aria2c") is None:
         pytest.skip("real aria2c is not installed")
     assert ".gofile.io\tTRUE\t/\tTRUE\t" in gofile.cookie_jar_text(TOKEN)
-    payload = bytes(range(256)) * 2048
+    payload = bytes(range(256)) * 128  # Small fake; every response also has a byte cap.
     state = SimpleNamespace(mode="good", hits=0, requests=[], payload=payload)
     cert, key = tmp_path / "test-cert.pem", tmp_path / "test-key.pem"
     subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
@@ -658,6 +660,7 @@ def browser_storage(tmp_path, monkeypatch, queue_env):
                 first, _, last = ranged[6:].partition("-")
                 start = int(first or 0)
                 end = min(int(last), end) if last else end
+            end = min(end, start + 256 * 1024 - 1)
             self.send_response((206 if start or end + 1 != len(content) else 200) if allowed else 403)
             self.send_header("Content-Length", str(end - start + 1))
             self.send_header("Content-Type", "application/octet-stream")
@@ -665,7 +668,7 @@ def browser_storage(tmp_path, monkeypatch, queue_env):
                 self.send_header("Content-Range", f"bytes {start}-{end}/{len(content)}")
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(content[start:end + 1])
+            self.wfile.write(content[start:end + 1][:256 * 1024])
 
     try:
         for secure in (True, False):
@@ -776,3 +779,478 @@ def test_real_browser_transfer_and_completion_guard(browser_storage, mode):
     if mode in ("redirect", "downgrade"):
         off_host = [cookie for path, cookie, ua in storage.requests if path == "/steal" and ua.startswith("aria2")]
         assert off_host and all(cookie == "" for cookie in off_host)
+
+
+def test_relay_host_proof_uses_browser_token_without_api_setting(monkeypatch):
+    session = Session(Resp(headers={"Content-Length": "5"}, body=b"video"))
+    calls = []
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: session)
+    monkeypatch.setattr(host, "deliver_to_primary", lambda request: calls.append(request) or True)
+    result = host.handle_message({"action": "download_gofile_relay", "url": URL,
+        "filename": "movie.mp4", "gofileToken": TOKEN}, None, Settings())
+    assert result.get("proof") == "gofile-relay-v1" and result["status"] == "ok"
+    assert calls[0]["gofileToken"] == TOKEN and calls[0]["file_size"] == 5
+    assert session.calls[0][1]["headers"]["Cookie"] == f"accountToken={TOKEN}"
+
+
+def test_relay_ipc_validates_distinct_action():
+    action, request = ipc.validate_request({"version": ipc.PROTOCOL_VERSION,
+        "action": "browser_download_gofile_relay", "url": URL, "gofileToken": TOKEN,
+        "filename": "movie.mp4", "file_size": 5})
+    assert action == "browser_download_gofile_relay" and request["gofileToken"] == TOKEN
+
+
+def test_relay_gate_accepts_browser_authority_without_api_token(queue_env, monkeypatch):
+    from cove.gofile_relay import GofileRelay
+    queue, rpc, _ = queue_env()
+    relay = GofileRelay(queue.settings)
+    relay._server = SimpleNamespace(server_port=12345)
+    monkeypatch.setattr(relay, "start", lambda: None)
+    queue.gofile_relay = relay
+    rpc.gofile_cookie_fingerprint = lambda: ""
+    gate = BrowserDownloadGate()
+    gate.queue, gate.ready = queue, True
+    assert gate.accept({"url": URL, "gofileToken": TOKEN, "filename": "movie.mp4", "file_size": 5})
+    assert next(iter(queue.tasks.values())).source_type == "gofile_browser"
+
+
+@pytest.mark.parametrize("status", ["active", "paused", "error", "complete"])
+@pytest.mark.parametrize("uri", ["http://127.0.0.1:12345/" + "a" * 43 + "/file",
+    "http://[::1]:12345/" + "a" * 43 + "/file", "http://127.0.0.1:12345/short/file"])
+def test_orphan_relay_never_becomes_a_row(queue_env, status, uri):
+    queue, rpc, _ = queue_env()
+    queue.gofile_relay._server = SimpleNamespace(server_port=12345)
+    rpc.tell_external_snapshot = lambda: [{"gid": "orphan", "status": status,
+        "files": [{"uris": [{"uri": uri}]}]}]
+    inline(queue)
+    queue._check_external()
+    assert not queue.tasks
+
+
+@pytest.fixture
+def relay_queue(queue_env, monkeypatch):
+    queue, rpc, _ = queue_env()
+    queue.gofile_relay._server = SimpleNamespace(server_port=12345)
+    monkeypatch.setattr(queue.gofile_relay, "start", lambda: None)
+    rpc.gofile_cookie_fingerprint = lambda: ""
+    gate = BrowserDownloadGate()
+    gate.queue, gate.ready = queue, True
+    request = {"url": URL, "gofileToken": TOKEN, "filename": "movie.mp4", "file_size": 5}
+    yield queue, rpc, gate, request
+    for cap in list(queue._gofile_caps.values()):
+        queue.gofile_relay.unregister(cap)
+
+
+def test_relay_creation_launch_size_resume_and_restart(relay_queue, monkeypatch):
+    from cove.queue import QueueManager
+    from cove.gofile_relay import FRESH_AUTHORIZATION
+    queue, rpc, gate, request = relay_queue
+    assert gate.accept(request) and gate.last_gofile_relay_ready
+    task = next(iter(queue.tasks.values()))
+    cap = queue._gofile_caps[task.id]
+    calls = []
+    monkeypatch.setattr(rpc, "add_uri", lambda *a, **kw: calls.append((a, kw)) or "gid-relay")
+    inline(queue)
+    queue._launch(task)
+    assert task.status == "paused" and calls[0][1]["options"] == {"no-proxy": "127.0.0.1"}
+    assert calls[0][0][0] == [queue.gofile_relay.local_url(cap)]
+    assert cap not in repr(task)
+    assert TOKEN not in repr(calls)
+    task.clear_debrid()
+    assert task.expected_size == 5
+    queue.resume(task.id)
+    assert queue._gofile_caps[task.id] == cap and task.expected_size == 5
+    task.total_bytes = 999  # aria2 observations must never replace the proven size on disk.
+    queue._persist(task)
+    restored = QueueManager(queue.settings, rpc)
+    restored._poll.stop(); restored._ext_poll.stop()
+    restored._scheduler_allows = False
+    inline(restored)
+    other = restored.tasks[task.id]
+    assert other.expected_size == 5
+    restored._launch(other)
+    assert other.status == "error" and other.error == FRESH_AUTHORIZATION
+    assert not restored._gofile_caps and len(calls) == 1
+    with db.connect() as conn:
+        persisted = str(tuple(conn.execute("SELECT * FROM downloads").fetchone()))
+    assert TOKEN not in persisted and cap not in persisted and "127.0.0.1" not in persisted
+
+
+@pytest.mark.parametrize("mode", ["engine", "not_ready", "shutdown", "register", "add", "duplicate"])
+def test_relay_refusal_has_no_extra_row_or_registration(relay_queue, monkeypatch, mode):
+    queue, rpc, gate, request = relay_queue
+    if mode == "engine": rpc.gofile_cookie_fingerprint = lambda: None
+    if mode == "not_ready": gate.ready = False
+    if mode == "shutdown": gate.shutting_down = True
+    if mode == "register": monkeypatch.setattr(queue.gofile_relay, "register", lambda *a: (_ for _ in ()).throw(OSError(TOKEN)))
+    if mode == "add": monkeypatch.setattr(queue, "add_gofile_browser", lambda *a: None)
+    if mode == "duplicate": assert gate.accept(request)
+    before = len(queue.tasks), len(queue.gofile_relay._records)
+    assert not gate.accept(request) and not gate.last_gofile_relay_ready
+    assert before == (len(queue.tasks), len(queue.gofile_relay._records))
+
+
+@pytest.mark.parametrize("body,size", [(b"<html>login", 0), (b'{"error":true}', 0),
+    (b"", 0), (b"vid", 5), (b"video", 5)])
+def test_relay_completion_guard_and_registry_cleanup(relay_queue, body, size):
+    from pathlib import Path
+    queue, rpc, gate, request = relay_queue
+    request["file_size"], request["filename"] = size, "page.html"
+    assert gate.accept(request)
+    task = next(iter(queue.tasks.values()))
+    inline(queue)
+    work = queue._prepare_aria2_work(task)
+    task.aria2_filename = "page.html"
+    path = Path(work.path) / "page.html"
+    path.write_bytes(body)
+    queue._publish_aria2_output(task, str(path))
+    assert task.status == ("completed" if body == b"video" else "error")
+    assert not queue._gofile_caps and not queue.gofile_relay._records
+
+
+def test_relay_error_redaction_remove_and_absent_resume(relay_queue):
+    from cove.gofile_relay import TRANSFER_FAILED, FRESH_AUTHORIZATION
+    queue, rpc, gate, request = relay_queue
+    assert gate.accept(request)
+    task = next(iter(queue.tasks.values()))
+    cap = queue._gofile_caps[task.id]
+    logs = []
+    queue._diag = lambda *a, **kw: logs.append((a, kw))
+    queue._apply_status(task.id, {"status": "error", "errorMessage": cap + TOKEN, "errorCode": cap})
+    assert task.error == TRANSFER_FAILED and cap not in repr(logs) and TOKEN not in repr(logs)
+    assert not queue._gofile_caps
+    task.status, task.gid = "paused", "old-gid"
+    queue.resume(task.id)
+    assert task.status == "error" and task.error == FRESH_AUTHORIZATION and not rpc.unpaused
+    task.gid = None
+    inline(queue)
+    queue.remove(task.id)
+    assert not queue.tasks and not queue.gofile_relay._records
+
+
+@pytest.mark.parametrize("token", [None, "", "short", "x" * 129, "x;other=y", True])
+def test_relay_ipc_rejects_invalid_tokens_and_cross_action(token):
+    base = {"version": ipc.PROTOCOL_VERSION, "url": URL, "file_size": 5, "gofileToken": token}
+    for action in ("browser_download_gofile_relay", "browser_download", "browser_download_gofile", "open"):
+        with pytest.raises(ipc.MessageError):
+            ipc.validate_request({**base, "action": action})
+
+
+@pytest.mark.parametrize("ack", [{}, {"gofile_verified": True}, {"gofile_relay_ready": True},
+                                   {"category": "unknown_action"}])
+def test_relay_host_requires_exact_primary_ack(monkeypatch, ack):
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: Session(Resp(body=b"video", headers={"Content-Length": "5"})))
+    def primary(name, request, **kwargs):
+        if ack.get("category"):
+            kwargs["on_reason"]("unknown_action")
+            return False
+        kwargs["on_response"]({"ok": True, **ack})
+        return True
+    monkeypatch.setattr(ipc, "send_browser_download", primary)
+    result = host.handle_message({"action": "download_gofile_relay", "url": URL,
+        "gofileToken": TOKEN, "filename": "movie.mp4"}, None, Settings())
+    assert (result.get("proof") == "gofile-relay-v1") == bool(ack.get("gofile_relay_ready"))
+
+
+def test_relay_ipc_ack_is_tied_to_gate_and_token_is_forwarded(relay_queue, monkeypatch):
+    queue, rpc, gate, request = relay_queue
+    replies = []
+    pending = SimpleNamespace(_server=SimpleNamespace(browser_download_handler=gate.accept,
+        extension_seen=SimpleNamespace(emit=lambda: None)),
+        _respond_ok=lambda n, **kw: replies.append(kw))
+    ipc._PendingConnection._handle_browser_download(pending, request)
+    assert replies == [{"gofile_relay_ready": True}]
+    sent = []
+    monkeypatch.setattr(ipc, "_request", lambda name, message, *a, **kw: sent.append(message) or True)
+    assert ipc.send_browser_download("fake", request)
+    assert sent[0]["action"] == "browser_download_gofile_relay" and sent[0]["gofileToken"] == TOKEN
+
+
+def test_relay_probe_rejects_json_error_before_primary(monkeypatch):
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: Session(Resp(body=b'{"error":true}')))
+    monkeypatch.setattr(host, "deliver_to_primary", lambda request: pytest.fail("error body admitted"))
+    result = host.handle_message({"action": "download_gofile_relay", "url": URL,
+        "gofileToken": TOKEN, "filename": "movie.mp4"}, None, Settings())
+    assert result.get("reason") == "gofile_page"
+
+
+def test_relay_rpc_failure_is_redacted_before_any_callback(relay_queue):
+    from cove.gofile_relay import TRANSFER_FAILED
+    queue, rpc, gate, request = relay_queue
+    assert gate.accept(request)
+    task = next(iter(queue.tasks.values()))
+    task.gid = "gid-sensitive"
+    queue._pool = SimpleNamespace(start=lambda call: call.run())
+    def fail(gid):
+        if gid == "ordinary": raise RuntimeError("ordinary error")
+        raise RuntimeError(queue.gofile_relay.local_url(queue._gofile_caps[task.id]) + TOKEN)
+    messages = []
+    queue._spawn(fail, task.gid, on_fail=messages.append)
+    assert messages == [TRANSFER_FAILED]
+    queue._spawn(fail, "ordinary", on_fail=messages.append)
+    assert messages[-1] == "RuntimeError: ordinary error"
+
+
+@pytest.mark.parametrize("mode", ["pause", "restart", "redirect", "revoked"])
+def test_relay_backend_real_aria2_end_to_end(loopback_storage, queue_env, monkeypatch, tmp_path, mode):
+    import shutil
+    import socket
+    from cove import aria2
+    from cove.queue import QueueManager
+    from cove.gofile_relay import FRESH_AUTHORIZATION, TRANSFER_FAILED
+    from PySide6.QtCore import QCoreApplication
+    if shutil.which("aria2c") is None:
+        pytest.skip("real aria2c is not installed")
+    state = loopback_storage
+    state.relay.unregister(state.cap)
+    engine = tmp_path / "relay-engine"
+    engine.mkdir()
+    monkeypatch.setattr(aria2, "DATA_DIR", engine)
+    monkeypatch.setattr(aria2, "ARIA2_LOG", engine / "aria2.log")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    queue, _, _ = queue_env(rpc_port=port, proxy_type="http", proxy_host="127.0.0.1", proxy_port=1)
+    daemon = aria2.Aria2Daemon(queue.settings)
+    rpc = restored = None
+    try:
+        daemon.start()
+        rpc = aria2.Aria2RPC(queue.settings, timeout=2, secret_provider=daemon.active_rpc_secret,
+                            cookie_fingerprint_provider=daemon.gofile_cookie_fingerprint)
+        queue.rpc, queue.gofile_relay = rpc, state.relay
+        inline(queue)
+        gate = BrowserDownloadGate()
+        gate.queue, gate.ready = queue, True
+        monkeypatch.setattr(gofile, "upstream_session", lambda _: state.relay.session_factory())
+        def deliver(request):
+            _, payload = ipc.validate_request({"version": ipc.PROTOCOL_VERSION,
+                "action": "browser_download_gofile_relay", **request})
+            return gate.accept(payload)
+        monkeypatch.setattr(host, "deliver_to_primary", deliver)
+        reply = host.handle_message({"action": "download_gofile_relay", "url": RELAY_URL,
+            "gofileToken": TOKEN, "filename": "movie.mp4"}, None, queue.settings)
+        assert reply.get("proof") == "gofile-relay-v1"
+        task = next(iter(queue.tasks.values()))
+        cap = queue._gofile_caps[task.id]
+        state.mode = "redirect" if mode == "redirect" else "slow"
+        queue._scheduler_allows = True
+        queue.force_start(task.id)
+        assert task.gid and TOKEN not in str(rpc._call("aria2.getOption", [task.gid]))
+        if mode != "redirect":
+            assert state.started.wait(3)
+            if mode in ("pause", "restart"):
+                queue.pause(task.id)
+                assert task.status == "paused" and queue._gofile_caps[task.id] == cap
+            state.mode = "revoked" if mode == "revoked" else "good"
+            state.release.set()
+            if mode == "restart":
+                queue.stop_gofile_relay()
+                restored = QueueManager(queue.settings, rpc)
+                restored._poll.stop(); restored._ext_poll.stop()
+                other = restored.tasks[task.id]
+                restored._launch(other)
+                assert other.status == "error" and other.error == FRESH_AUTHORIZATION
+                return
+            if mode == "pause": queue.resume(task.id)
+        deadline = time.monotonic() + 15
+        while task.status not in ("completed", "error") and time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            queue._apply_status(task.id, rpc.tell_status(task.gid))
+            time.sleep(.02)
+        assert task.status == ("completed" if mode == "pause" else "error")
+        if mode != "pause": assert task.error == TRANSFER_FAILED
+        assert not queue._gofile_caps and not state.relay._records
+        assert all(path == "/file" and headers.get("Cookie") == f"accountToken={TOKEN}"
+                   for path, headers in state.calls)
+        assert all(not headers.get("User-Agent", "").startswith("aria2") for _, headers in state.calls)
+        with db.connect() as conn:
+            persisted = str([tuple(row) for row in conn.execute("SELECT * FROM downloads")])
+        assert TOKEN not in persisted and cap not in persisted
+    finally:
+        state.release.set()
+        queue._scheduler_allows = False
+        queue._poll.stop(); queue._ext_poll.stop()
+        queue.stop_gofile_relay()
+        if restored is not None: restored.stop_gofile_relay()
+        if rpc is not None: rpc.close()
+        daemon.stop()
+
+
+def test_relay_publication_error_uses_fixed_sentence(relay_queue):
+    from cove.gofile_relay import TRANSFER_FAILED
+    queue, rpc, gate, request = relay_queue
+    assert gate.accept(request)
+    task = next(iter(queue.tasks.values()))
+    queue._prepare_aria2_work(task)
+    inline(queue)
+    queue._publish_aria2_output(task, queue.gofile_relay.local_url(queue._gofile_caps[task.id]))
+    assert task.error == TRANSFER_FAILED and task.status == "error"
+
+
+def test_native_loop_drops_previous_token_message_and_response(monkeypatch):
+    import io
+    import weakref
+    class Message(dict): pass
+    refs = []
+    def decode(stream):
+        if refs:
+            assert all(ref() is None for ref in refs)
+            return None
+        msg = Message(action="download_gofile_relay", gofileToken=TOKEN)
+        refs.append(weakref.ref(msg))
+        return msg
+    def handle(*args):
+        response = Message(status="error")
+        refs.append(weakref.ref(response))
+        return response
+    monkeypatch.setattr(host, "_LOG", object())
+    monkeypatch.setattr(host, "_log", lambda *a, **kw: None)
+    monkeypatch.setattr(host, "log_host_start", lambda: None)
+    monkeypatch.setattr(host.Settings, "load", lambda: Settings())
+    monkeypatch.setattr(host, "Aria2RPC", lambda *a, **kw: None)
+    monkeypatch.setattr(host, "_binary_stdio", lambda: (io.BytesIO(), io.BytesIO()))
+    monkeypatch.setattr(host, "decode_message", decode)
+    monkeypatch.setattr(host, "handle_message", handle)
+    host.main()
+
+
+@pytest.mark.parametrize("size", [None, -1, True, "", "5", 2**62 + 1])
+def test_relay_ipc_size_bounds(size):
+    with pytest.raises(ipc.MessageError):
+        ipc.validate_request({"version": ipc.PROTOCOL_VERSION, "action": "browser_download_gofile_relay",
+            "url": URL, "gofileToken": TOKEN, "file_size": size})
+    with pytest.raises(ipc.MessageError):
+        ipc.validate_request({"version": ipc.PROTOCOL_VERSION, "action": "browser_download",
+            "url": URL, "gofileToken": TOKEN, "file_size": 5})
+
+
+@pytest.mark.parametrize("response", [Resp(body=b"video"),
+    Resp(body=b"video", status=206, headers={"Content-Length": "4096", "Content-Range": "bytes 0-4095/10000"}),
+    Resp(body=b"video", headers={"Content-Length": "5", "Content-Encoding": "gzip"})])
+def test_relay_probe_never_proves_a_response_the_relay_would_refuse(monkeypatch, response):
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: Session(response))
+    admitted = []
+    monkeypatch.setattr(host, "deliver_to_primary", lambda request: admitted.append(request) or True)
+    result = host.handle_message({"action": "download_gofile_relay", "url": URL,
+        "gofileToken": TOKEN, "filename": "movie.mp4"}, None, Settings())
+    assert result["status"] == "error" and not admitted
+
+
+def test_relay_diagnostics_failure_cannot_turn_accepted_row_into_refusal(relay_queue, monkeypatch):
+    from cove import app
+    queue, rpc, gate, request = relay_queue
+    monkeypatch.setattr(app.diagnostics, "emit", lambda *a, **kw: (_ for _ in ()).throw(OSError()))
+    assert gate.accept(request) and gate.last_gofile_relay_ready and len(queue.tasks) == 1
+
+
+def test_restored_relay_failure_does_not_consume_scheduler_slot(relay_queue):
+    from cove.queue import QueueManager
+    from PySide6.QtCore import QCoreApplication
+    queue, rpc, gate, request = relay_queue
+    queue.settings.max_concurrent, queue.settings.intelligent_segments = 1, False
+    assert gate.accept(request)
+    ordinary = queue.add_url("https://example.test/second", filename="second.bin")
+    restored = QueueManager(queue.settings, rpc)
+    restored._poll.stop(); restored._ext_poll.stop()
+    inline(restored)
+    restored.resume_persisted()
+    deadline = time.monotonic() + .2
+    while time.monotonic() < deadline and restored.tasks[ordinary].status == "queued":
+        QCoreApplication.processEvents()
+    assert restored.tasks[ordinary].gid and restored.tasks[ordinary].status == "active"
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_relay_teardown_failure_cannot_skip_daemon_stop(monkeypatch, raises):
+    from tests import test_app_launch as oracle
+    if raises:
+        monkeypatch.setattr(oracle, "_HARNESS", oracle._HARNESS.replace(
+            "class FakeQueueManager:\n", "class FakeQueueManager:\n"
+            "    def stop_gofile_relay(self): raise RuntimeError('TEARDOWN-CANARY')\n"))
+    out, raw = oracle._run_harness([], True, stop_sequence=[True], return_raw=True)
+    assert out.get("stop_attempts") == [False] and out["returncode"] == 0
+    assert out["constructed"][-2:] == ["shutdown", "diagnostics_shutdown"]
+    assert "TEARDOWN-CANARY" not in raw.stderr
+
+
+@pytest.mark.parametrize("url", [URL.replace("https:", "HTTPS:"), URL.replace("store-eu", "STORE-eu"),
+                                   URL.replace("gofile.io", "GOFILE.IO")])
+def test_relay_case_variants_refused_at_every_boundary(relay_queue, monkeypatch, url):
+    queue, rpc, gate, request = relay_queue
+    assert gofile.is_share_url("HTTPS://GOFILE.IO/d/ObvAFn9h")  # Tab 1 remains case tolerant.
+    assert gofile._download_url(url)  # Tab 1's resolver keeps its original URL policy.
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: Session(Resp(body=b"video", headers={"Content-Length": "5"})))
+    monkeypatch.setattr(host, "deliver_to_primary", lambda request: True)
+    assert host.handle_message({"action": "download_gofile_relay", "url": url,
+        "gofileToken": TOKEN}, None, Settings())["status"] == "error"
+    with pytest.raises(ipc.MessageError):
+        ipc.validate_request({"version": ipc.PROTOCOL_VERSION, "action": "browser_download_gofile_relay", **request, "url": url})
+    assert not gate.accept({**request, "url": url}) and not queue.tasks
+    cap = queue.gofile_relay.register(URL, TOKEN, "movie.mp4", 5)
+    try: assert queue.add_gofile_browser({**request, "url": url}, cap) is None
+    finally: queue.gofile_relay.unregister(cap)
+    assert not queue.tasks and not rpc.added
+
+
+def test_relay_source_never_direct_adds_noncanonical_url(relay_queue, monkeypatch):
+    queue, rpc, gate, request = relay_queue
+    assert gate.accept(request)
+    task = next(iter(queue.tasks.values()))
+    task.url = task.url.replace("https:", "HTTPS:")
+    calls = []
+    monkeypatch.setattr(rpc, "add_uri", lambda *a, **kw: calls.append((a, kw)) or "gid-relay")
+    inline(queue)
+    queue._launch(task)
+    assert not calls or calls[0][0][0] == [queue.gofile_relay.local_url(queue._gofile_caps[task.id])]
+    monkeypatch.setattr(queue, "_gofile_live", lambda _: True)  # Defence beyond the initial gate.
+    queue._launch(task)
+    assert all(a[0] != [task.url] and a[0][0].startswith("http://127.0.0.1:") for a, kw in calls)
+
+
+@pytest.mark.parametrize("url", [URL, URL.replace("https:", "HTTPS:"),
+    URL.replace("store-eu", "STORE-eu"), URL.replace("gofile.io", "GOFILE.IO")])
+def test_legacy_delivery_case_policy_matches_base(url):
+    assert gofile.is_delivery_url(url)  # All four accepted by f5de0cd.
+
+
+@pytest.mark.parametrize("action", ["download", "download_gofile"])
+def test_legacy_mixed_case_host_ipc_and_gate_keep_delivery_policy(queue_env, monkeypatch, action):
+    url = URL.replace("gofile.io", "GOFILE.IO")
+    sent = []
+    monkeypatch.setattr(netiface, "bound_requests_session", lambda _: Session())
+    monkeypatch.setattr(gofile, "verify_browser_download", lambda *a, **kw: 5)
+    monkeypatch.setattr(host, "deliver_to_primary", lambda request: sent.append(request) or True)
+    assert host.handle_message({"action": action, "url": url}, None,
+                               Settings(gofile_api_token=TOKEN))["status"] == "ok"
+    assert sent[0]["file_size"] == 5 and sent[0]["gofile_fp"] == gofile.token_fingerprint(TOKEN)
+    assert ipc.validate_request({"version": ipc.PROTOCOL_VERSION,
+        "action": "browser_download_gofile", **sent[0]})[0] == "browser_download_gofile"
+    with pytest.raises(ipc.MessageError, match="gofile_restart"):
+        ipc.validate_request({"version": ipc.PROTOCOL_VERSION, "action": "browser_download", "url": url})
+    queue, rpc, _ = queue_env(gofile_api_token=TOKEN)
+    rpc.gofile_cookie_fingerprint = lambda: gofile.token_fingerprint(TOKEN)
+    gate = BrowserDownloadGate()
+    gate.queue, gate.ready = queue, True
+    assert gate.accept(sent[0]) and next(iter(queue.tasks.values())).expected_size == 5
+
+
+def test_saved_legacy_mixed_case_delivery_keeps_size_cookie_and_html_guards(queue_env):
+    from pathlib import Path
+    queue, rpc, _ = queue_env(gofile_api_token=TOKEN, intelligent_segments=False)
+    task = queue.tasks[queue.add_url(URL.replace("gofile.io", "GOFILE.IO"), filename="movie.mp4")]
+    task.expected_size = len(LANDING)
+    queue._persist(task)
+    restored, rpc, _ = queue_env(gofile_api_token=TOKEN, intelligent_segments=False)
+    task = next(iter(restored.tasks.values()))
+    assert task.expected_size == len(LANDING)
+    inline(restored)
+    rpc.gofile_cookie_fingerprint = lambda: "stale"
+    restored._launch(task)
+    assert task.status == "error" and not rpc.added
+    rpc.gofile_cookie_fingerprint = lambda: gofile.token_fingerprint(TOKEN)
+    restored._launch(task)
+    assert rpc.added
+    output = Path(task.work_dir) / "movie.mp4"
+    output.write_bytes(LANDING)
+    restored._publish_aria2_output(task, str(output))
+    assert task.status == "error" and task.error == gofile.LANDING_PAGE and not output.exists()

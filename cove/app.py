@@ -265,6 +265,7 @@ class BrowserDownloadGate:
     def accept(self, request: dict) -> bool:
         self.last_reason = "rejected"
         self.last_gofile_verified = False
+        self.last_gofile_relay_ready = False
         # Correlates this add with the extension request that produced it.
         # Never used for a decision, only for the diagnostics trail.
         request_id = request.get("request_id")
@@ -285,6 +286,40 @@ class BrowserDownloadGate:
         if self.shutting_down or not self.ready or self.queue is None:
             result("shutting_down" if self.shutting_down else "not_ready")
             return False
+        if "gofileToken" in request:
+            capability = None
+            self.last_reason = "gofile_unavailable"
+            try:
+                if not gofile.is_relay_delivery_url(request.get("url")):
+                    self.last_reason = "gofile_page"
+                    return False
+                provider = getattr(self.queue.rpc, "gofile_cookie_fingerprint", None)
+                if not callable(provider) or provider() is None:
+                    self.last_reason = "gofile_engine"
+                    return False
+                if any(t.url == request["url"] and t.status not in ("completed", "error")
+                       for t in self.queue.tasks.values()):
+                    self.last_reason = "gofile_duplicate"
+                    return False
+                capability = self.queue.gofile_relay.register(request["url"], request["gofileToken"],
+                    request.get("filename") or "download", request.get("file_size"))
+                tid = self.queue.add_gofile_browser(request, capability)
+                if tid is None:
+                    return False
+                # Cannot prove aria2 reachability before Firefox cancellation. Own engine,
+                # no-proxy, bound relay, registration and new-row admission are prerequisites;
+                # any later transfer failure must end in error, never completion.
+                self.last_gofile_relay_ready = True
+                try:
+                    result("accepted", task_id=tid)
+                except Exception:
+                    pass  # Diagnostics cannot reverse an already accepted row.
+                return True
+            except Exception:
+                return False  # Never attach token-bearing exceptions to diagnostics.
+            finally:
+                if capability is not None and not self.last_gofile_relay_ready:
+                    self.queue.gofile_relay.unregister(capability)
         if delivery:
             size = request.get("file_size", 0)
             if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= 2**62:
@@ -906,6 +941,10 @@ def run() -> int:
         # accepted now would never be driven to completion, and the browser
         # would already have cancelled its own copy.
         browser_gate.shutting_down = True
+        try:
+            queue.stop_gofile_relay()
+        except Exception:
+            pass  # Relay teardown must never prevent the remaining engine cleanup.
         # Stop UI repaint timers first so they don't fire on widgets being
         # torn down during shutdown.
         try:

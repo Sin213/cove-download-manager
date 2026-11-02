@@ -1198,6 +1198,7 @@ class Aria2RPC:
         filename: str | None = None,
         headers: list[str] | None = None,
         gid: str | None = None,
+        options: dict[str, str] | None = None,
     ) -> str:
         connections = min(max(int(connections), 1), MAX_CONNECTIONS_PER_SERVER)
         opts: dict[str, str] = {
@@ -1215,6 +1216,8 @@ class Aria2RPC:
         if gid is not None:
             validate_gid(gid)
             opts["gid"] = gid
+        if options:
+            opts.update(options)
         return self._call("aria2.addUri", [uris, opts])
 
     def add_magnet(
