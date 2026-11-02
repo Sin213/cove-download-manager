@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import stat
 import struct
 import tempfile
@@ -27,7 +28,7 @@ from typing import Iterable
 from PySide6.QtCore import QCoreApplication, QLockFile, QObject, QTimer, Signal
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
-from . import diagnostics
+from . import diagnostics, gofile
 from .torrent import MAX_MAGNET_LENGTH, is_magnet
 
 logger = logging.getLogger("cove.single_instance")
@@ -60,6 +61,11 @@ MAX_BROWSER_FILE_SIZE = 1 << 62
 BROWSER_URL_SCHEMES = ("http://", "https://", "ftp://")
 
 _ERROR_SENTENCES = {
+    "gofile_page": "This Gofile URL is not a verified delivery link.",
+    "gofile_token": "The Gofile token proof no longer matches.",
+    "gofile_restart": "The Gofile engine needs a restart.",
+    "gofile_engine": "The Gofile engine cannot hold scoped credentials.",
+    "gofile_duplicate": "This Gofile download is already in Cove.",
     "unsupported_version": "This request uses an unsupported protocol version.",
     "rejected": "This request was not accepted.",
     "unknown_action": "This request uses an unsupported action.",
@@ -281,6 +287,7 @@ def validate_message(obj) -> tuple[str, list[str]]:
 
 
 BROWSER_DOWNLOAD_ACTION = "browser_download"
+GOFILE_DOWNLOAD_ACTION = "browser_download_gofile"
 
 # A "the extension just talked to me" heartbeat from the native host. It
 # carries no payload and never activates the window: the browser sends it on
@@ -342,8 +349,16 @@ def validate_browser_download(obj: dict) -> dict:
     if file_size < 0 or file_size > MAX_BROWSER_FILE_SIZE:
         raise MessageError("invalid_schema")
 
+    fingerprint = {}
+    if "gofile_fp" in obj:
+        value = obj["gofile_fp"]
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{64}", value) is None:
+            raise MessageError("invalid_schema")
+        fingerprint["gofile_fp"] = value
+
     return {
         "url": url,
+        **fingerprint,
         # "" means "no explicit choice": the queue's own category routing and
         # default download directory still apply.
         "filename": filename or None,
@@ -373,10 +388,16 @@ def validate_request(obj) -> tuple[str, dict]:
     """
     if not isinstance(obj, dict):
         raise MessageError("invalid_schema")
-    if obj.get("action") == BROWSER_DOWNLOAD_ACTION:
+    if obj.get("action") in (BROWSER_DOWNLOAD_ACTION, GOFILE_DOWNLOAD_ACTION):
         if obj.get("version") != PROTOCOL_VERSION:
             raise MessageError("unsupported_version")
-        return BROWSER_DOWNLOAD_ACTION, validate_browser_download(obj)
+        request = validate_browser_download(obj)
+        delivery = gofile.is_delivery_url(request["url"])
+        if obj["action"] == GOFILE_DOWNLOAD_ACTION and not delivery:
+            raise MessageError("gofile_page")
+        if obj["action"] == BROWSER_DOWNLOAD_ACTION and delivery:
+            raise MessageError("gofile_restart")
+        return obj["action"], request
     if obj.get("action") == EXTENSION_PING_ACTION:
         if obj.get("version") != PROTOCOL_VERSION:
             raise MessageError("unsupported_version")
@@ -500,7 +521,7 @@ class _PendingConnection(QObject):
             self._respond_error(exc.category)
             return
 
-        if action == BROWSER_DOWNLOAD_ACTION:
+        if action in (BROWSER_DOWNLOAD_ACTION, GOFILE_DOWNLOAD_ACTION):
             self._handle_browser_download(request)
             return
 
@@ -546,12 +567,17 @@ class _PendingConnection(QObject):
         logger.info("ipc_browser_download accepted=%s", accepted)
         if accepted:
             self._server.extension_seen.emit()
-            self._respond_ok(1)
+            if getattr(getattr(handler, "__self__", None), "last_gofile_verified", False) is True:
+                self._respond_ok(1, gofile_verified=True)
+            else:
+                self._respond_ok(1)
         else:
-            self._respond_error("rejected")
+            reason = getattr(getattr(handler, "__self__", None), "last_reason", "rejected")
+            self._respond_error(reason if reason in _ERROR_SENTENCES else "rejected")
 
-    def _respond_ok(self, accepted: int) -> None:
-        self._write({"version": PROTOCOL_VERSION, "ok": True, "accepted": accepted})
+    def _respond_ok(self, accepted: int, *, gofile_verified=False) -> None:
+        self._write({"version": PROTOCOL_VERSION, "ok": True, "accepted": accepted,
+                     **({"gofile_verified": True} if gofile_verified else {})})
 
     def _respond_error(self, category: str) -> None:
         self._done = True
@@ -773,6 +799,7 @@ def send_browser_download(
     connect_timeout_ms: int = _DEFAULT_CONNECT_TIMEOUT_MS,
     ack_timeout_ms: int = _DEFAULT_ACK_TIMEOUT_MS,
     on_reason=None,
+    on_response=None,
 ) -> bool:
     """Ask the running primary to take one browser download. Never raises.
 
@@ -783,7 +810,8 @@ def send_browser_download(
     own download alone. Nothing is written anywhere on failure, so a later
     Cove launch can never inherit this request.
     """
-    message = {"version": PROTOCOL_VERSION, "action": BROWSER_DOWNLOAD_ACTION}
+    action = GOFILE_DOWNLOAD_ACTION if gofile.is_delivery_url(request.get("url")) else BROWSER_DOWNLOAD_ACTION
+    message = {"version": PROTOCOL_VERSION, "action": action}
     for key in (
         "url",
         "filename",
@@ -791,6 +819,7 @@ def send_browser_download(
         "referrer",
         "user_agent",
         "file_size",
+        "gofile_fp",
     ):
         if request.get(key) not in (None, ""):
             message[key] = request[key]
@@ -799,7 +828,8 @@ def send_browser_download(
         # Additive and optional. A primary that predates request ids simply
         # ignores the extra key; nothing about the handshake depends on it.
         message["request_id"] = request_id
-    return _request(name, message, connect_timeout_ms, ack_timeout_ms, on_reason)
+    observer = {"on_response": on_response} if on_response is not None else {}
+    return _request(name, message, connect_timeout_ms, ack_timeout_ms, on_reason, **observer)
 
 
 def send_extension_ping(
@@ -828,6 +858,7 @@ def _request(
     connect_timeout_ms: int,
     ack_timeout_ms: int,
     on_reason=None,
+    on_response=None,
 ) -> bool:
     """One bounded request/response round trip against `name`. Never raises.
 
@@ -838,6 +869,7 @@ def _request(
     ``on_reason`` is a diagnostics-only observer. It is told which of the
     outcomes below occurred and can neither change the result nor the
     timings; it defaults to a no-op and any exception it raises is dropped.
+    ``on_response`` optionally exposes the parsed reply for capability proof.
     """
     def reason(value: str) -> None:
         if on_reason is None:
@@ -886,6 +918,11 @@ def _request(
             reason("malformed_reply")
             return False
         accepted = isinstance(resp, dict) and resp.get("ok") is True
+        if isinstance(resp, dict) and on_response is not None:
+            try:
+                on_response(resp)
+            except Exception:
+                pass
         reason("ok" if accepted else reply_category(resp))
         return accepted
     except OSError:

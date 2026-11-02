@@ -263,6 +263,8 @@ class BrowserDownloadGate:
         self.shutting_down = False
 
     def accept(self, request: dict) -> bool:
+        self.last_reason = "rejected"
+        self.last_gofile_verified = False
         # Correlates this add with the extension request that produced it.
         # Never used for a decision, only for the diagnostics trail.
         request_id = request.get("request_id")
@@ -274,10 +276,36 @@ class BrowserDownloadGate:
                 task_id=task_id, request_id=request_id, exc=exc, result=name,
             )
 
+        from . import gofile
+        delivery = gofile.is_delivery_url(request.get("url"))
+        if gofile.is_gofile_family(request.get("url")) and not delivery:
+            self.last_reason = "gofile_page"
+            result(self.last_reason)
+            return False
         if self.shutting_down or not self.ready or self.queue is None:
             result("shutting_down" if self.shutting_down else "not_ready")
             return False
+        if delivery:
+            size = request.get("file_size", 0)
+            if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= 2**62:
+                self.last_reason = "invalid_schema"
+                result(self.last_reason)
+                return False
+            try:
+                token = gofile._token(self.queue.settings)
+                if request.get("gofile_fp") != gofile.token_fingerprint(token):
+                    raise gofile.browser_error("gofile_token")
+                self.queue._require_gofile_cookie()
+            except Exception as exc:
+                self.last_reason = {"cookie_stale": "gofile_restart",
+                                    "cookie_external": "gofile_engine"}.get(getattr(exc, "code", ""), "gofile_token")
+                result(self.last_reason)
+                return False
         try:
+            if delivery and self.queue.find_duplicate(request["url"]) is not None:
+                self.last_reason = "gofile_duplicate"
+                result(self.last_reason)
+                return False
             task_id = self.queue.add_url(
                 request["url"],
                 out_dir=request.get("directory") or None,
@@ -287,6 +315,11 @@ class BrowserDownloadGate:
                 user_agent=request.get("user_agent") or "",
                 intake="extension",
             )
+            if delivery and task_id is not None:
+                if size > 0:
+                    self.queue.tasks[task_id].expected_size = size
+                    self.queue.tasks[task_id].total_bytes = size
+                    self.queue._persist(self.queue.tasks[task_id])
         except Exception as exc:
             # Fixed event name only - the request carries a URL, cookies and
             # a referrer, none of which may reach the log.
@@ -294,6 +327,7 @@ class BrowserDownloadGate:
             result("add_failed", exc=exc)
             return False
         result("accepted" if task_id is not None else "add_rejected", task_id=task_id)
+        self.last_gofile_verified = delivery and task_id is not None
         return task_id is not None
 
 

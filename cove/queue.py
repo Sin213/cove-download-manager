@@ -706,6 +706,11 @@ def _task_from_persisted_row(row) -> "DownloadTask":
         # restricted connection, the exact thing they were avoiding.
         status="paused" if _row_get(row, "status", "") == "paused" else "queued",
         total_bytes=row["total_bytes"],
+        # Delivery totals are admission proofs or the engine's last observation.
+        # Zero stays unknown; positive restored totals still get size/HTML guards.
+        expected_size=(row["total_bytes"] if row["total_bytes"] > 0
+                       and not (_row_get(row, "source_type", "") or "")
+                       and gofile.is_delivery_url(row["url"]) else None),
         completed_bytes=row["completed_bytes"],
         created_at=row["created_at"],
         segments=row["segments"],
@@ -835,7 +840,8 @@ class DownloadTask:
         self.resolved_url = ""
         self.debrid_provider = ""
         self.debrid_max_chunks = 0
-        self.expected_size = None
+        if not (self.source_type == SOURCE_PLAIN and gofile.is_delivery_url(self.url)):
+            self.expected_size = None
 
     @property
     def progress(self) -> float:
@@ -1334,7 +1340,8 @@ class QueueManager(QObject):
                     t.filename,
                     status,
                     t.gid or self._removing.get(t.id, {}).get("gid") or t.launch_gid or None,
-                    t.total_bytes,
+                    (t.expected_size if t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)
+                     and t.expected_size is not None else t.total_bytes),
                     t.completed_bytes,
                     t.error,
                     t.finished_at,
@@ -1675,9 +1682,12 @@ class QueueManager(QObject):
         from .config import categorize
         from .extractor import is_extractor_url
         from .hls import is_hls_url
-        backend = "ffmpeg" if is_hls_url(url) else (
-            "yt-dlp" if is_extractor_url(url) else "aria2"
-        )
+        if gofile.is_delivery_url(url):
+            backend = "aria2"
+        else:
+            backend = "ffmpeg" if is_hls_url(url) else (
+                "yt-dlp" if is_extractor_url(url) else "aria2"
+            )
         if backend in {"ffmpeg", "yt-dlp"}:
             import shutil
             executable = "ffmpeg" if backend == "ffmpeg" else "yt-dlp"
@@ -5367,7 +5377,10 @@ class QueueManager(QObject):
         t.reset_display_progress()
         # Any previously generated debrid link has expired by now; a fresh
         # one is resolved from t.url below.
+        browser_gofile = t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)
         t.clear_debrid()
+        if browser_gofile:
+            t.backend = "aria2"
         try:
             self._persist(t)
         except Exception:
@@ -5396,8 +5409,9 @@ class QueueManager(QObject):
         # user's own account and unlocked through the API below. The bypass
         # is keyed on source_type, which only Cove's own materialisation
         # sets — a pasted share link still lands in the branch below.
+        delivery = t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)
         share_reason = (
-            "" if t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
+            "" if delivery or t.source_type in (SOURCE_TORRENT_FILE, SOURCE_DEBRID_FILE)
             else debrid.share_link_reason(t.url, self.settings)
         )
         from .fuckingfast import share_link_reason as browser_share_reason
@@ -5405,6 +5419,11 @@ class QueueManager(QObject):
         gofile_reason = (gofile.INTAKE_MESSAGE
                          if t.source_type == SOURCE_PLAIN and gofile.is_share_url(t.url) else "")
         share_reason = browser_reason or gofile_reason or share_reason
+        if delivery:
+            try:
+                self._require_gofile_cookie()
+            except gofile.GofileError as exc:
+                share_reason = exc.user_message
         if share_reason:
             facts = diagnostics.url_facts(t.url)
             if gofile_reason:
@@ -5580,6 +5599,9 @@ class QueueManager(QObject):
 
         Runs on a QThreadPool worker; never call it from the GUI thread.
         """
+        if t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url):
+            self._require_gofile_cookie()
+            return t.url
         if t.source_type == SOURCE_GOFILE_FILE:
             # The stored URL only names the file. Its download link is
             # fetched, proven to serve file bytes, and used for this launch.
@@ -5716,7 +5738,8 @@ class QueueManager(QObject):
         content_length = 0
         # A provider that reported a size has already told us everything the
         # probe would; skip it rather than send the node URL a second time.
-        if not (t.resolved_url and t.total_bytes > 0) and t.source_type != SOURCE_GOFILE_FILE:
+        if (not (t.resolved_url and t.total_bytes > 0) and t.source_type != SOURCE_GOFILE_FILE
+                and not gofile.is_delivery_url(t.url)):
             try:
                 resp = self._bound_session().head(target, timeout=5, allow_redirects=True)
                 if resp.ok:
@@ -6014,7 +6037,10 @@ class QueueManager(QObject):
         requested = t.aria2_filename
         # Gofile rows only: other sources keep exactly the behaviour they had,
         # including legitimately downloading an HTML file.
-        verify = (t.expected_size, t.filename or requested or "") if t.source_type == SOURCE_GOFILE_FILE else None
+        guarded = (t.source_type == SOURCE_GOFILE_FILE
+                   or (t.source_type == SOURCE_PLAIN and gofile.is_delivery_url(t.url)))
+        verify_name = (t.filename or requested or "") if t.source_type == SOURCE_GOFILE_FILE else ""
+        verify = (t.expected_size, verify_name) if guarded else None
 
         def publish():
             # Filesystem work only. No task state or Qt objects on this worker.

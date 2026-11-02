@@ -777,6 +777,66 @@ browser.downloads.onCreated.addListener((downloadItem) => {
 // Replayed items carry their original startTime, fresh ones start "now".
 const MAX_NEW_DOWNLOAD_AGE_MS = 10000;
 
+function isGofileFamily(url) {
+  if (typeof url !== "string") return false;
+  const authority = url.trim().match(/^(?:https?|ftp):[\\/]*([^/?#]*)/i);
+  if (!authority) return false;
+  let raw = authority[1];
+  try { raw = decodeURIComponent(raw); } catch {}
+  try {
+    if (raw.includes("\\")) throw new Error("Ambiguous authority");
+    const host = new URL(url).hostname.toLowerCase().replace(/\.+$/, "");
+    return host === "gofile.io" || host.endsWith(".gofile.io");
+  } catch {
+    return raw.normalize("NFKC").replace(/[\u3002\uff0e\uff61]/g, ".").toLowerCase().includes("gofile.io");
+  }
+}
+
+function gofileStoreDelivery(url) {
+  try {
+    // Check the original, before WHATWG URL can repair slashes or authority.
+    if (typeof url !== "string" || /[\\\s\p{C}?#]/u.test(url) ||
+        !/^https:\/\/[^/]+\//i.test(url)) return false;
+    const parsed = new URL(url);
+    const authority = url.match(/^https:\/\/([^/]+)/i)[1];
+    return parsed.protocol === "https:" && !parsed.username && !parsed.password &&
+      !authority.includes("@") && !authority.endsWith(":") &&
+      (!parsed.port || parsed.port === "443") && /^[\x00-\x7f]+$/.test(authority) &&
+      authority.replace(/:\d+$/, "").toLowerCase() === parsed.hostname &&
+      /^store(?:-[a-z0-9]+)*\.gofile\.io$/.test(parsed.hostname) &&
+      parsed.hostname.split(".")[0].length <= 63 &&
+      /^\/download\/web\/[A-Za-z0-9-]{6,64}\/[^/]+$/.test(parsed.pathname) &&
+      // Test the original path too: WHATWG URL normalizes dot segments.
+      /^\/download\/web\/[A-Za-z0-9-]{6,64}\/[^/]+$/.test(url.slice(url.indexOf("/", url.indexOf("://") + 3)));
+  } catch { return false; }
+}
+
+function gofileDownloadKind(item) {
+  try {
+    const target = new URL(item.url);
+    if (["gofile.io", "www.gofile.io", "api.gofile.io"].includes(target.hostname)) return "page";
+    if (!gofileStoreDelivery(item.url)) return null;
+    const ref = new URL(item.referrer);
+    if (ref.protocol === "https:" && !ref.username && !ref.password && !ref.port &&
+        ["gofile.io", "www.gofile.io"].includes(ref.hostname) &&
+        /^\/d\/[A-Za-z0-9]{6,8}$/.test(ref.pathname) &&
+        typeof item.referrer === "string" && !/[\\\s\p{C}]/u.test(item.referrer) &&
+        /^https:\/\/(?:www\.)?gofile\.io(?::0*443)?\//i.test(item.referrer)) return "delivery";
+  } catch {}
+  return null;
+}
+
+const gofileRefusals = new Map();
+const gofilePending = new Set();
+function notifyGofileRefusal(result) {
+  const now = Date.now();
+  for (const [key, at] of gofileRefusals) if (now - at > DEDUP_WINDOW_MS) gofileRefusals.delete(key);
+  const key = result.reason + ":" + result.message;
+  if (gofileRefusals.has(key)) return;
+  gofileRefusals.set(key, now);
+  showNotification("Download left to Firefox", result.message);
+}
+
 async function handleCreated(downloadItem) {
   // Restored/replayed history items are never "in_progress". Without this
   // guard, Chrome re-sends the user's entire download history (e.g. items
@@ -790,9 +850,16 @@ async function handleCreated(downloadItem) {
   if (!isNormalContext(downloadItem)) return;
   await ensureSettings();
   const url = downloadItem.url || "";
+  // Firefox-only takeover. Preview image/media requests never enter onCreated.
+  if (/Firefox\//.test(navigator.userAgent)) {
+    const kind = gofileDownloadKind(downloadItem);
+    if (kind === "page") return;
+    if (isGofileFamily(url) && kind !== "delivery") return;
+  }
   if (!settings.enabled) return;
   if (url.startsWith("blob:") || url.startsWith("data:")) return;
   if (isDomainExcluded(url)) return;
+  if (gofilePending.has(url)) return;
   if (wasRecentlyIntercepted(url)) return;
 
   // Size filter: only when the size is known. Small files are left to the
@@ -952,67 +1019,76 @@ async function interceptDownload(downloadItem) {
   const browserFetch = typeof CoveFuckingfast !== "undefined" && CoveFuckingfast.owns(downloadItem)
     ? CoveFuckingfast.armed : null;
   const ownedIdentity = { url: downloadItem.url, startTime: downloadItem.startTime };
-  // Mark synchronously to block concurrent same-URL events before any await.
-  markIntercepted(downloadItem.url);
+  const gofileDelivery = gofileStoreDelivery(downloadItem.url);
+  if (gofileDelivery) gofilePending.add(downloadItem.url);
+  try {
+    // Mark synchronously to block concurrent same-URL events before any await.
+    markIntercepted(downloadItem.url);
 
-  const dlId = downloadItem.id;
+    const dlId = downloadItem.id;
 
-  // Extract filename from the download item.
-  let filename = null;
-  if (downloadItem.filename) {
-    const parts = downloadItem.filename.replace(/\\/g, "/").split("/");
-    filename = parts[parts.length - 1] || null;
-  }
-
-  if (browserFetch && !filename) filename = browserFetch.hint || null;
-  if (!browserFetch) console.log("Cove: sending download to native host", downloadItem.url);
-
-  // Send to native host BEFORE cancelling. The browser download continues
-  // until we have confirmed acceptance of this specific request.
-  const result = await sendNativeMessage({
-    action: "download",
-    url: downloadItem.url,
-    filename: filename,
-    referrer: downloadItem.referrer || "",
-    // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
-    // not know yet, and the primary's schema refuses a negative size outright.
-    fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
-    ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
-    ...(await userAgentField()),
-  });
-
-  if (!browserFetch) console.log("Cove: native host response", JSON.stringify(result));
-
-  if (result && result.status === "ok") {
-    if (browserFetch) CoveFuckingfast.onIntercepted(browserFetch);
-    // Confirmed: native host accepted this download. Now cancel the browser copy.
-    interceptedIds.add(dlId);
-    ownedDownloads.set(dlId, ownedIdentity);
-    await saveInterceptedIds();
-    try {
-      await browser.downloads.cancel(dlId);
-    } catch {
-      // The browser download completed before cancel() ran. Both the browser
-      // and Cove will have the file. This is an inherent limitation of the
-      // WebExtension API: there is no pause/reservation primitive that would
-      // let us hold the browser transfer while confirming with the native host.
-      // The alternative (cancel-first) silently loses downloads when Cove is
-      // unavailable, which is the worse failure mode.
+    // Extract filename from the download item.
+    let filename = null;
+    if (downloadItem.filename) {
+      const parts = downloadItem.filename.replace(/\\/g, "/").split("/");
+      filename = parts[parts.length - 1] || null;
     }
-    browser.downloads.erase({ id: dlId }).catch(() => {});
-    showNotification("Download sent to Cove", filename || (browserFetch ? "Browser download" : downloadItem.url));
-  } else {
-    // Native host failed or is unavailable. Clear the dedup mark so the
-    // browser's original download proceeds unimpeded and future intercepts
-    // of the same URL are not blocked.
-    recentIntercepted.delete(downloadItem.url);
-    // `result` may be null/undefined if the host replied with malformed JSON,
-    // so don't dereference it: an exception here would abort the handler.
-    if (browserFetch) CoveFuckingfast.onRefused(browserFetch);
-    else console.error(
-      "Cove: native host failed, browser download continues",
-      (result && result.message) || "no response"
-    );
+
+    if (browserFetch && !filename) filename = browserFetch.hint || null;
+    if (!browserFetch && !gofileDelivery) console.log("Cove: sending download to native host", downloadItem.url);
+
+    // Send to native host BEFORE cancelling. The browser download continues
+    // until we have confirmed acceptance of this specific request.
+    const result = await sendNativeMessage({
+      action: gofileDelivery ? "download_gofile" : "download",
+      url: downloadItem.url,
+      filename: filename,
+      referrer: downloadItem.referrer || "",
+      // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
+      // not know yet, and the primary's schema refuses a negative size outright.
+      fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
+      ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
+      ...(await userAgentField()),
+    });
+
+    if (!browserFetch && !gofileDelivery) console.log("Cove: native host response", JSON.stringify(result));
+
+    if (result && result.status === "ok" && (!gofileDelivery || result.proof === "gofile-v1")) {
+      if (gofileDelivery) markIntercepted(downloadItem.url);
+      if (browserFetch) CoveFuckingfast.onIntercepted(browserFetch);
+      // Confirmed: native host accepted this download. Now cancel the browser copy.
+      interceptedIds.add(dlId);
+      ownedDownloads.set(dlId, ownedIdentity);
+      await saveInterceptedIds();
+      try {
+        await browser.downloads.cancel(dlId);
+      } catch {
+        // The browser download completed before cancel() ran. Both the browser
+        // and Cove will have the file. This is an inherent limitation of the
+        // WebExtension API: there is no pause/reservation primitive that would
+        // let us hold the browser transfer while confirming with the native host.
+        // The alternative (cancel-first) silently loses downloads when Cove is
+        // unavailable, which is the worse failure mode.
+      }
+      browser.downloads.erase({ id: dlId }).catch(() => {});
+      showNotification("Download sent to Cove", gofileDelivery ? "Gofile download" : filename || (browserFetch ? "Browser download" : downloadItem.url));
+    } else {
+      // Native host failed or is unavailable. Clear the dedup mark so the
+      // browser's original download proceeds unimpeded and future intercepts
+      // of the same URL are not blocked.
+      recentIntercepted.delete(downloadItem.url);
+      // `result` may be null/undefined if the host replied with malformed JSON,
+      // so don't dereference it: an exception here would abort the handler.
+      if (browserFetch) CoveFuckingfast.onRefused(browserFetch);
+      else if (result && typeof result.reason === "string" && result.reason.startsWith("gofile_") &&
+               typeof result.message === "string") notifyGofileRefusal(result);
+      else console.error(
+        "Cove: native host failed, browser download continues",
+        (result && result.message) || "no response"
+      );
+    }
+  } finally {
+    if (gofileDelivery) gofilePending.delete(downloadItem.url);
   }
 }
 

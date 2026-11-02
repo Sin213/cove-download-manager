@@ -14,10 +14,11 @@ import json
 import os
 import struct
 import sys
+import time
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import __version__, diagnostics
+from . import __version__, diagnostics, gofile, netiface
 from .aria2 import Aria2RPC, Aria2Error, read_rpc_record
 from .config import Settings
 
@@ -167,7 +168,16 @@ def _send_to_primary(request: dict, on_reason) -> bool:
     # host freely, so accidentally opening a window here would loop.
     if QCoreApplication.instance() is None:
         QCoreApplication([])
-    return send_browser_download(server_name(DATA_DIR), request, on_reason=on_reason)
+    responses = []
+    delivery = gofile.is_delivery_url(request.get("url"))
+    observer = {"on_response": responses.append} if delivery else {}
+    def report(reason):
+        on_reason("gofile_restart" if delivery and reason == "unknown_action" else reason)
+    accepted = send_browser_download(server_name(DATA_DIR), request, on_reason=report, **observer)
+    if accepted and delivery and not (responses and responses[-1].get("gofile_verified") is True):
+        on_reason("gofile_restart")
+        return False
+    return accepted
 
 
 def deliver_to_primary(request: dict) -> bool:
@@ -259,13 +269,17 @@ def handle_message(
             _log("ping_notify_failed", "WARNING", request_id=request_id, exc=exc)
         return reply({"status": "ok", "version": __version__})
 
-    if action == "download":
+    if action in ("download", "download_gofile"):
         url = msg.get("url", "")
         # Normalize once so the same URL that passed validation is the one
         # forwarded to the drop file (validation checks a stripped copy, so
         # an untrimmed original could slip through otherwise).
         if isinstance(url, str):
             url = url.strip()
+        delivery = gofile.is_delivery_url(url)
+        if not delivery and (action == "download_gofile" or gofile.is_gofile_family(url)):
+            return reply({"status": "error", "message": gofile.BROWSER_MESSAGES["gofile_page"],
+                          "reason": "gofile_page"})
         if not validate_url(url):
             # Never echo the URL: the extension writes this message to the
             # browser console, and the URL may carry a session token.
@@ -285,6 +299,34 @@ def handle_message(
             # Additive and optional. Old primaries ignore an unknown key.
             "request_id": request_id,
         }
+
+        if delivery:
+            session = None
+            try:
+                if settings is None:
+                    raise gofile.browser_error("gofile_unavailable")
+                # Validate before creating a session. Never read browser cookies.
+                token = gofile._token(settings)
+                session = netiface.bound_requests_session(
+                    str(getattr(settings, "torrent_network_interface", "") or ""))
+                size = gofile.verify_browser_download(url, filename, settings, session=session,
+                                                     deadline=time.monotonic() + 15)
+                if size == 0:
+                    raise gofile.browser_error("gofile_empty")
+                request["gofile_fp"] = gofile.token_fingerprint(token)
+                request["file_size"] = size if size is not None else 0
+            except Exception as exc:
+                reason = getattr(exc, "code", "")
+                reason = {"missing_token": "gofile_needs_token", "bad_token": "gofile_denied"}.get(reason, reason)
+                if reason not in gofile.BROWSER_MESSAGES:
+                    reason = "gofile_unavailable"
+                return reply({"status": "error", "message": gofile.BROWSER_MESSAGES[reason], "reason": reason})
+            finally:
+                if session is not None:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
 
         # Every download (plain, HLS, or extractor) is handed to the *running*
         # Cove GUI process, which calls QueueManager.add_url() itself. This
@@ -308,6 +350,10 @@ def handle_message(
         except Exception:
             accepted = False
         if not accepted:
+            if delivery:
+                reason = (_LAST_HANDOFF_REASON if _LAST_HANDOFF_REASON in gofile.BROWSER_MESSAGES
+                          else "gofile_unavailable")
+                return reply({"status": "error", "message": gofile.BROWSER_MESSAGES[reason], "reason": reason})
             # Fixed sentences only, chosen by the fixed category the primary
             # reported: never the URL, cookies or referrer, which the extension
             # logs to the browser console.
@@ -317,7 +363,8 @@ def handle_message(
                     _LAST_HANDOFF_REASON, _HANDOFF_UNAVAILABLE
                 ),
             })
-        return reply({"status": "ok", "message": "Download queued in Cove"})
+        return reply({"status": "ok", "message": "Download queued in Cove",
+                      **({"proof": "gofile-v1"} if delivery else {})})
 
     if action == "status":
         if rpc is None:

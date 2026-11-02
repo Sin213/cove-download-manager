@@ -38,8 +38,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import threading
+import time
 from dataclasses import dataclass
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import unquote, urlencode, urljoin, urlsplit
 
 import requests
 
@@ -89,6 +91,21 @@ COOKIE_RESTART = ("The Gofile token changed after Cove's download engine started
 SIZE_MISMATCH = ("The downloaded file does not match the size Gofile reported. "
                  "The download was not completed.")
 
+# Browser refusals are fixed protocol text, never service-supplied diagnostics.
+BROWSER_MESSAGES = {
+    "gofile_empty": "Cove does not take over empty Gofile files. Firefox is keeping the download.",
+    "gofile_needs_token": "Add your Gofile API token in Cove Settings. Firefox is keeping the download.",
+    "gofile_denied": "Gofile refused access. Check your token and file access. Firefox is keeping the download.",
+    "gofile_gone": "This Gofile file is no longer available. Firefox is keeping the download.",
+    "gofile_rate_limited": "Gofile is limiting requests. Try again later. Firefox is keeping the download.",
+    "gofile_page": "Gofile did not return the file. Check your Gofile API token in Cove Settings. Firefox is keeping the download.",
+    "gofile_unavailable": "Cove could not verify this Gofile download. Try again shortly. Firefox is keeping the download.",
+    "gofile_restart": "Restart Cove to apply your Gofile token to its download engine. Firefox is keeping the download.",
+    "gofile_engine": "Gofile downloads need Cove's own download engine. Firefox is keeping the download.",
+    "gofile_token": "Cove's Gofile token changed during the handoff. Try again. Firefox is keeping the download.",
+    "gofile_duplicate": "This Gofile download is already in Cove. Firefox is keeping the download.",
+}
+
 
 class GofileError(Exception):
     """A Gofile failure already reduced to a fixed, safe sentence."""
@@ -97,6 +114,10 @@ class GofileError(Exception):
         self.code = code
         self.user_message = user_message
         super().__init__(user_message)
+
+
+def browser_error(reason: str) -> GofileError:
+    return GofileError(reason, BROWSER_MESSAGES[reason])
 
 
 @dataclass(frozen=True)
@@ -141,6 +162,54 @@ def is_share_url(url) -> bool:
         return (parts.path == "/d" or parts.path.startswith("/d/")
                 or (parts.path in ("", "/") and "c=" in parts.query))
     except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def is_gofile_family(url) -> bool:
+    """Claim the whole host family for browser refusal, including repaired URLs.
+
+    This is deliberately broader than delivery admission. Decode host escapes,
+    apply IDNA and remove trailing dots; ambiguous authorities containing the
+    family name are claimed rather than passed to a different URL parser.
+    Manual queue intake and the share resolver do not use this predicate.
+    """
+    if not isinstance(url, str):
+        return False
+    authority = re.match(r"^(?:https?|ftp):[\\/]*([^/?#]*)", url.strip(), re.IGNORECASE)
+    if authority is None:
+        return False
+    raw = unquote(authority[1])
+    try:
+        parts = urlsplit(url.strip())
+        host = unquote(parts.hostname or "")
+        parts.port  # Malformed ports/authorities must use the conservative fallback.
+        if not host or "\\" in raw or any(c in host for c in "/@%"):
+            raise ValueError
+        host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        return host == "gofile.io" or host.endswith(".gofile.io")
+    except (ValueError, UnicodeError):
+        try:
+            raw = raw.encode("idna").decode("ascii")
+        except UnicodeError:
+            pass
+        return "gofile.io" in raw.lower()
+
+
+def is_delivery_url(url) -> bool:
+    """Only a credential-free, unambiguous store /download/web file URL."""
+    try:
+        _download_url(url)  # Includes Requests' re-derived destination check.
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        path = parts.path.split("/")
+        return (re.fullmatch(r"store(?:-[a-z0-9]+)*\.gofile\.io", host) is not None
+                and len(host.split(".")[0]) <= 63
+                and not parts.netloc.endswith(":")
+                and "?" not in url and "#" not in url
+                and len(path) == 5 and path[:3] == ["", "download", "web"]
+                and _ID_RE.fullmatch(path[3]) is not None and bool(path[4])
+                and re.fullmatch(r"(?:\.|%2e){1,2}", path[4], re.IGNORECASE) is None)
+    except (GofileError, TypeError, ValueError, AttributeError):
         return False
 
 
@@ -267,6 +336,7 @@ def _download_url(value) -> str:
                  and _is_gofile_host(parts.hostname or "")
                  and parts.username is None and parts.password is None
                  and sent.username is None and sent.password is None
+                 and not parts.netloc.endswith(":")
                  and parts.port in (None, 443) and sent.port in (None, 443))
     except Exception:
         valid = False
@@ -460,7 +530,8 @@ def verify_download(path, expected_size: int | None, name: str) -> None:
         raise GofileError("size_mismatch", SIZE_MISMATCH)
 
 
-def _probe(session, link: str, token: str, name: str, size: int | None = None) -> str:
+def _probe(session, link: str, token: str, name: str, size: int | None = None,
+           *, deadline=None, advertised=None) -> str:
     """Prove `link` serves file bytes before aria2 is involved.
 
     Follows redirects by hand so the token can only ever travel to Gofile
@@ -468,13 +539,17 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None) -
     """
     getter = (debrid.requests if session is None else session).get
     for _ in range(MAX_REDIRECTS + 1):
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            raise GofileError("transport", UNAVAILABLE)
         link = _download_url(link)
         try:
             headers = {"Cookie": f"accountToken={token}", "Accept-Encoding": "identity"}
             if size != 0:  # no byte range exists in an empty file; asking is unsatisfiable (416)
                 headers["Range"] = f"bytes=0-{PROBE_BYTES - 1}"
             resp = getter(link, headers=headers,
-                          timeout=debrid.HTTP_TIMEOUT, allow_redirects=False, stream=True)
+                          timeout=debrid.HTTP_TIMEOUT if remaining is None else min(remaining, 5),
+                          allow_redirects=False, stream=True)
         except Exception:
             raise GofileError("transport", UNAVAILABLE) from None
         try:
@@ -483,7 +558,12 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None) -
                 location = resp.headers.get("Location")
                 if not isinstance(location, str) or not location:
                     raise GofileError("denied", FILE_DENIED)
-                link = urljoin(link, location)
+                try:
+                    if urlsplit(location).scheme:
+                        _download_url(location)
+                    link = urljoin(link, location)
+                except ValueError:
+                    raise GofileError("denied", FILE_DENIED) from None
                 continue
             if status in (401, 403):
                 raise GofileError("denied", FILE_DENIED)
@@ -494,7 +574,14 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None) -
             if status not in (200, 206):
                 raise GofileError("unavailable", UNAVAILABLE)
             try:
-                head = next(resp.iter_content(PROBE_BYTES), b"")
+                head = bytearray()
+                for chunk in resp.iter_content(PROBE_BYTES):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise GofileError("transport", UNAVAILABLE)
+                    head.extend(chunk[:PROBE_BYTES - len(head)])
+                    if len(head) == PROBE_BYTES:
+                        break
+                head = bytes(head)
             except Exception:
                 raise GofileError("transport", UNAVAILABLE) from None
             content_type = str(resp.headers.get("Content-Type", "")).lower()
@@ -503,12 +590,79 @@ def _probe(session, link: str, token: str, name: str, size: int | None = None) -
                 and os.path.splitext(name)[1].lower() not in _HTML_NAMES
             ):
                 raise GofileError("landing_page", LANDING_PAGE)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise GofileError("transport", UNAVAILABLE)
+            if advertised is not None:
+                total = None
+                if status == 206:
+                    match = re.fullmatch(r"bytes ([0-9]{1,19})-([0-9]{1,19})/([0-9]{1,19})", str(resp.headers.get("Content-Range", "")))
+                    first, last, total = map(int, match.groups()) if match else (-1, -1, 0)
+                    if first != 0 or not 0 <= last < total <= 2**62:
+                        raise GofileError("unavailable", UNAVAILABLE)
+                elif str(resp.headers.get("Content-Encoding", "")).strip().lower() in ("", "identity"):
+                    value = resp.headers.get("Content-Length", "")
+                    if isinstance(value, str) and re.fullmatch(r"[0-9]{1,19}", value) and int(value) <= 2**62:
+                        total = int(value)
+                if total == 0 or not head:
+                    raise browser_error("gofile_empty")
+                if total is not None:
+                    advertised.append(total)
             return link
         finally:
             close = getattr(resp, "close", None)
             if close is not None:
                 close()
     raise GofileError("denied", FILE_DENIED)
+
+
+def verify_browser_download(url, filename, settings, *, session=None, deadline):
+    """Prove file access within an absolute monotonic deadline (at most 15s).
+
+    Requests' read timeout limits idle time, not a trickling body or DNS. A
+    daemon worker bounds the caller as well. It can never admit a task; after
+    expiry every subsequent redirect is stopped by _probe's deadline check.
+    The short-lived native host owns this worker and its HTTP session.
+    """
+    try:
+        token = _token(settings)
+    except GofileError as exc:
+        raise browser_error("gofile_needs_token" if exc.code == "missing_token" else "gofile_denied") from None
+    if not is_delivery_url(url):
+        raise browser_error("gofile_page")
+    deadline = min(deadline, time.monotonic() + 15)
+    done, outcome, advertised = threading.Event(), [], []
+
+    def run():
+        owned = None
+        try:
+            owned = requests.Session() if session is None else None
+            _probe(session if session is not None else owned, url, token, "",
+                   deadline=deadline, advertised=advertised)
+            outcome.append(None)
+        except GofileError as exc:
+            reason = {"denied": "gofile_denied", "unsafe_url": "gofile_denied",
+                      "gofile_empty": "gofile_empty",
+                      "gone": "gofile_gone", "rate_limited": "gofile_rate_limited",
+                      "landing_page": "gofile_page"}.get(exc.code, "gofile_unavailable")
+            outcome.append(reason)
+        except Exception:
+            outcome.append("gofile_unavailable")
+        finally:
+            if owned is not None:
+                try:
+                    owned.close()
+                except Exception:
+                    pass
+            done.set()
+
+    if deadline <= time.monotonic():
+        raise browser_error("gofile_unavailable")
+    threading.Thread(target=run, daemon=True, name="gofile-browser-proof").start()
+    if not done.wait(max(0, deadline - time.monotonic())) or time.monotonic() >= deadline:
+        raise browser_error("gofile_unavailable")
+    if outcome[0] is not None:
+        raise browser_error(outcome[0])
+    return advertised[0] if advertised else None
 
 
 def resolve_file(share: str, file_id: str, name: str, settings, *, session=None) -> GofileDownload:
