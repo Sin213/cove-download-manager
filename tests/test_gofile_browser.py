@@ -66,6 +66,74 @@ def test_classifier_accepts_only_store_delivery():
         assert not classify(value), repr(value)
 
 
+STORAGE_NODE_LABELS = ["store", "store3", "store12", "store-eu-par-6", "store-na-phx-1", "store3-eu",
+    "cold-na-phx-8", "zone-1", "a1", "evilstore3", "store3x", "www1", "upload1"]
+INVALID_STORAGE_AUTHORITIES = [
+    "store3.gofile.io.evil.test", "www.gofile.io", "api.gofile.io", "upload.gofile.io", "uploads.gofile.io",
+    "gofile.io", "a.b.gofile.io", "cold.na.gofile.io", "-cold.gofile.io", "cold_8.gofile.io",
+    "cold-.gofile.io", "cold--8.gofile.io", "1evil.gofile.io", "cold-na-phx-8.gofile.io.evil.test",
+    "evilgofile.io", "cold8.gofile.io:444", "a" * 64 + ".gofile.io",
+    "store3.gofile.io:444", "store..gofile.io", "-store3.gofile.io", "store_3.gofile.io",
+]
+
+
+@pytest.mark.parametrize("label", STORAGE_NODE_LABELS)
+def test_storage_node_delivery_predicates(label):
+    target = URL.replace("store-eu-par-6", label)
+    assert gofile.is_delivery_url(target)
+    assert gofile.is_relay_delivery_url(target)
+
+
+@pytest.mark.parametrize("label", STORAGE_NODE_LABELS)
+def test_storage_node_host(monkeypatch, label):
+    target = URL.replace("store-eu-par-6", label)
+    session = Session(Resp(headers={"Content-Length": "5"}, body=b"video"))
+    calls = []
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: session)
+    monkeypatch.setattr(host, "deliver_to_primary", lambda request: calls.append(request) or True)
+    result = host.handle_message({"action":"download_gofile_relay", "url":target,
+        "filename":"movie.mp4", "gofileToken":TOKEN}, None, Settings())
+    assert result == {"status":"ok", "proof":"gofile-relay-v1"}
+    assert calls[0]["url"] == target and calls[0]["gofileToken"] == TOKEN
+    assert session.calls[0][0] == target
+
+
+@pytest.mark.parametrize("label", STORAGE_NODE_LABELS)
+def test_storage_node_gate(relay_queue, label):
+    queue, rpc, gate, request = relay_queue
+    assert gate.accept({**request, "url":URL.replace("store-eu-par-6", label)})
+    assert gate.last_gofile_relay_ready
+    assert len(queue.tasks) == len(queue._gofile_caps) == 1
+
+
+@pytest.mark.parametrize("authority", [*INVALID_STORAGE_AUTHORITIES, "COLD-NA-PHX-8.gofile.io"])
+def test_storage_node_lookalikes_refused(relay_queue, monkeypatch, authority):
+    target = URL.replace("store-eu-par-6.gofile.io", authority)
+    queue, rpc, gate, request = relay_queue
+    assert not gofile.is_relay_delivery_url(target)
+    if authority != "COLD-NA-PHX-8.gofile.io":
+        assert not gofile.is_delivery_url(target)
+    monkeypatch.setattr(gofile, "upstream_session", lambda _: pytest.fail("refused host must not probe"))
+    monkeypatch.setattr(host, "deliver_to_primary", lambda _: pytest.fail("refused host must not hand off"))
+    assert host.handle_message({"action":"download_gofile_relay", "url":target,
+        "gofileToken":TOKEN}, None, Settings())["status"] == "error"
+    assert not gate.accept({**request, "url":target})
+    assert not queue.tasks and not rpc.added
+
+
+@pytest.mark.parametrize("target", [
+    URL.replace("store-eu-par-6", "cold-na-phx-8").replace("https:", "http:"),
+    URL.replace("store-eu-par-6", "user@cold-na-phx-8"),
+    URL.replace("store-eu-par-6", "cold-na-phx-8") + "?query=1",
+    URL.replace("store-eu-par-6", "cold-na-phx-8") + "#fragment",
+    URL.replace("store-eu-par-6", "cold-na-phx-8").replace("/download/web/", "/download/direct/"),
+    URL.replace("store-eu-par-6", "cold-na-phx-8").replace("/download/web/", "/web/"),
+])
+def test_storage_node_url_constraints(target):
+    assert not gofile.is_delivery_url(target)
+    assert not gofile.is_relay_delivery_url(target)
+
+
 def test_host_without_token_never_contacts_primary(monkeypatch):
     calls = []
     monkeypatch.setattr(host, "deliver_to_primary", lambda r: calls.append(r) or True)

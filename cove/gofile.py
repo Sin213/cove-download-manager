@@ -202,7 +202,7 @@ def is_delivery_url(url) -> bool:
         parts = urlsplit(url)
         host = parts.hostname or ""
         path = parts.path.split("/")
-        return (re.fullmatch(r"store(?:-[a-z0-9]+)*\.gofile\.io", host) is not None
+        return (re.fullmatch(r"(?!(?:www|api|upload|uploads)\.gofile\.io$)[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.gofile\.io", host) is not None
                 and len(host.split(".")[0]) <= 63
                 and not parts.netloc.endswith(":")
                 and "?" not in url and "#" not in url

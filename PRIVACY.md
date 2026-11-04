@@ -1,6 +1,6 @@
 # Privacy Policy - Cove Download Manager (browser extension)
 
-_Last updated: 2026-10-17_
+_Last updated: 2026-11-02_
 
 Cove Download Manager is a browser extension that hands downloads off to the
 Cove Download Manager desktop application running on the same computer. This
@@ -20,19 +20,23 @@ happens, it is called out.
   still handling of your data.
 - When you start a download, the extension passes the download address, a
   filename, and the referring page address to the local Cove desktop app. The
-  extension no longer reads or sends your browser's cookies; extension builds
+  extension reads and forwards only the Firefox Gofile accountToken described
+  below; other handoffs do not read or send browser cookies. Extension builds
   that are still installed from before this change did, and keep doing so until
   they are updated. On Firefox it also passes your browser's user-agent
   string when you grant the optional technical-data permission, and omits it
   when you do not. On Chrome the user-agent is always included.
 - A download that the browser reports as private or incognito is left to the
   browser and is not handed to Cove; see Private and incognito windows below.
-- Cove then contacts the site you chose in order to download the file. For new
-  downloads, Cove discards the cookie values it receives before it creates the
+- Cove then contacts the site you chose in order to download the file. The
+  Firefox Gofile relay keeps its accountToken in memory and sends it only to
+  Gofile for that transfer, never to aria2. For other new downloads, Cove
+  discards the legacy cookie values it receives before it creates the
   download, so they are not kept in the new download's record or database entry,
   and Cove does not pass them to its download engines; a file that needs your
-  browser login may therefore not download in Cove. An updated extension does not
-  send cookie values. An updated Cove desktop app discards any that an older
+  browser login may therefore not download in Cove. Apart from the Firefox
+  Gofile accountToken, an updated extension does not send cookie values.
+  An updated Cove desktop app discards any legacy values that an older
   extension still sends; older installed Cove builds are not assumed to do so,
   and downloads added by
   earlier versions of Cove may have stored cookies on your computer, which Cove attempts to clear when it starts and no longer restores into download tasks (see Cookies below). The download
@@ -131,11 +135,22 @@ unchanged.
 
 ### Cookies
 
-The extension no longer reads your browser's cookies, and it does not send
-cookies to Cove. Extension builds from before this change read the cookies your
-browser held for the download address at the moment of a handoff and passed them
-to Cove over the local handoff. For new downloads, Cove does not use your
-browser's cookies. An updated Cove desktop app discards any cookie value that an
+For a Gofile download in Firefox, the extension reads the Gofile `accountToken`
+cookie from the specific browser download request to a Gofile storage server
+(`store*.gofile.io`). It forwards only that one value to the Cove app running on
+this computer for that download. Other cookies and the complete Cookie header
+are not forwarded. No Gofile API key or Premium account is needed.
+
+The extension holds this value only in memory, for at most ten seconds before
+handoff, and consumes it once. Cove keeps it in memory for the transfer. It is
+not written to disk or logs, is not sent to aria2 or any host other than Gofile,
+and after a Cove restart a fresh download from Firefox is needed. A missing,
+expired or ambiguous session leaves the download in Firefox. Firefox is only
+cancelled after Cove positively confirms the relay handoff.
+
+Other download routes do not read browser cookies. Extension builds from before
+the cookie-removal change passed all cookies for a download address over the
+local handoff. An updated Cove desktop app discards any legacy cookie value that an
 older extension build still sends: it is not kept in the download's record or
 database entry, is not forwarded to Cove's download queue and is not passed to
 its download engines. Older installed Cove builds are not assumed to have this
@@ -145,8 +160,8 @@ Cove discards them.
 
 Downloads added by earlier versions of Cove may have stored their cookies in Cove's local database on your computer. When it starts, Cove attempts to clear those stored cookie values from the cookie field of the download records in the database that this copy of Cove uses, checks the result with a separate query, and tries again the next time it starts if the attempt is incomplete or cannot be confirmed. After a confirmed success the cookie field of those records no longer holds cookie values. This clears the cookie field only: other fields of the same records, including saved error messages, are not changed by this cleanup, and the databases of other Cove installations or portable copies are not touched. Cove does not erase the database file, so old copies can remain in leftover parts of that file, in backups, in file system snapshots and in other historical files, and Cove makes no promise that they are erased. Cove no longer restores stored values into download tasks, so they are not forwarded to download engines through the normal restored-download path, and older downloads that relied on them may fail. Cove normally clears the stored values before it reads the download records at start-up, but if the attempt is incomplete the values can still be briefly loaded into memory. An older extension build that has not been updated still passes cookie values from the browser to Cove's native helper. An updated Cove desktop app discards them; older installed Cove builds are not assumed to. This change does not remove all cookie exposure.
 
-This version of the extension does not read or store
-browser cookie values.
+Apart from the Gofile accountToken described above, this version of the extension
+does not read or store browser cookie values.
 
 ### Private and incognito windows
 
@@ -182,6 +197,11 @@ computer. A handoff carries:
 - the file size where the browser knew it,
 - an opaque request id used to match up log entries.
 
+The Firefox Gofile relay sends exactly the action `download_gofile_relay`, the
+download address, the filename and the captured `accountToken` value as
+`gofileToken`. It sends no other cookies, Cookie header, referrer, user-agent or
+file size. The value goes only to the Cove app on this computer for that download.
+
 Not every route sends every field. A right-click handoff sends no size. The
 Firefox stream handoff sends no referrer or browser cookie
 values. Earlier builds included an empty `cookies` field
@@ -197,9 +217,10 @@ currently running, so it can show connection status and progress.
 Reaching Cove is local. The download is not.
 
 To perform the download, Cove's download engine requests the file from the site
-the address points at. For new downloads, Cove does not pass your cookies to the
-engine, so that request does not carry your browser session the way your
-browser's own download would. Cove no longer restores cookies stored by earlier
+the address points at. For the Firefox Gofile relay, Cove sends the captured
+accountToken only to Gofile over HTTPS for the transfer; it is never sent to
+aria2 or another host. Other new downloads do not pass browser cookies to the
+engine. Cove no longer restores cookies stored by earlier
 versions into download tasks, so they are not forwarded to the download engine
 through the normal restored-download path.
 
@@ -225,7 +246,7 @@ developer-controlled endpoint for it to contact.
 
 Firefox has a built-in data-collection consent model, and Mozilla treats data
 passed to a native application through Native Messaging as declared data
-transmission. The Firefox build therefore declares three **required**
+transmission. The Firefox build therefore declares four **required**
 categories:
 
 - **Browsing activity**, which in Mozilla's definition is information about
@@ -238,8 +259,10 @@ categories:
   response information. That is the media address described above.
 - **Website activity**, which covers actions such as saving and downloading.
   That is the handoff itself.
+- **Authentication information** (`authenticationInfo`), because the Gofile
+  relay passes the accountToken session value to the local Cove app.
 
-Those three are required because a download cannot be performed without them.
+These categories are required for the download handoffs described above.
 
 One further category is declared as **optional**:
 
@@ -258,7 +281,7 @@ permission off takes effect on your next download rather than at the next
 restart. It never asks for the permission in the middle of a download.
 
 This optional permission covers the user-agent only. The addresses,
-referrers and the download action itself are covered by the three required
+referrers, Gofile session value and download action are covered by the four required
 categories above and remain necessary for the feature to work; declining the
 technical-data permission does not change them.
 
@@ -274,12 +297,6 @@ That was not accurate for an extension whose purpose is handing downloads to a
 local application, and it was corrected in Firefox version 1.4.10. Firefox may
 ask you to confirm the declared categories when the add-on updates.
 
-**Credentials are not a declared category.** Mozilla's authentication
-category covers passwords, usernames, PINs, security questions and
-registration details. This extension reads none of those, and it no longer reads
-cookies; the cookie case that earlier builds raised sits inside the
-website-content category above.
-
 ## What is stored on your device
 
 - **Settings** in local storage: interception on/off, minimum file size,
@@ -294,6 +311,11 @@ website-content category above.
   held while that tab is open, and dropped when it closes or when it navigates
   to a different address. Reloading the same address does not clear them, so
   addresses seen before a reload can still be listed after it.
+- **Gofile session value**: the captured accountToken stays only in volatile
+  extension memory for at most ten seconds before handoff, then only in Cove's
+  memory for the transfer. It is not written to disk, logs, local storage or
+  session storage. Restarting Cove requires a fresh Firefox download to
+  capture a new value; no Gofile API key or Premium account is needed.
 - **A pending site exclusion**, while one is waiting for your confirmation.
   Choosing "Exclude this site" from the in-page button's menu does not change
   any setting. It records one pending entry and opens a Cove confirmation page.
@@ -349,7 +371,9 @@ deliberately, and what it contains is what is described above.
 - `storage` - for the settings and the diagnostics log described above.
 - Access to all sites - because a download can start on any site, and the
   in-page button has to be able to appear on any site with a video.
-- `webRequest` (Firefox only) - to notice HLS playlists in response headers.
+- `webRequest` (Firefox only) - to notice HLS playlists in response headers and
+  read the Cookie header of the specific Gofile download request, retaining
+  only its accountToken value for the local relay handoff.
 
 ## Data sharing
 

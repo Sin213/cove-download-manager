@@ -167,7 +167,7 @@ def test_s08e_a5_built_manifests_omit_cookie_permission(bundles, browser):
     assert ("webRequest" in manifest["permissions"]) == (browser == "firefox")
     if browser == "firefox":
         assert manifest["browser_specific_settings"]["gecko"]["data_collection_permissions"] == {
-            "required": ["browsingActivity", "websiteContent", "websiteActivity"],
+            "required": ["browsingActivity", "websiteContent", "websiteActivity", "authenticationInfo"],
             "optional": ["technicalAndInteraction"],
         }
     assert "cookies" not in manifest["permissions"], "A5: built manifest must omit cookies permission"
@@ -213,7 +213,7 @@ def test_firefox_declares_the_data_it_sends_to_the_native_app(bundles):
     application, passing the address, the referring page, cookies for that
     address, the filename, the user-agent and the size when known. Under the
     category definitions at extensionworkshop.com/documentation/develop/
-    firefox-builtin-data-consent/ (same date) that is three categories:
+    firefox-builtin-data-consent/ (same date), plus the Gofile session category:
 
     - `browsingActivity`, "Information about the websites users visit, such as
       specific URLs, domains, or categories of pages users view" - the download
@@ -223,9 +223,8 @@ def test_firefox_declares_the_data_it_sends_to_the_native_app(bundles):
       as cookies, audio, page headers, and request and response information".
     - `websiteActivity`, user actions "such as saving and downloading".
 
-    `authenticationInfo` is deliberately absent: Mozilla scopes it to
-    credentials and account data - passwords, usernames, PINs, security
-    questions, registration information - not to cookies.
+    `authenticationInfo` is required: the Gofile download's accountToken
+    session value is passed to the local Cove application for that transfer.
 
     The browser's user-agent also travels, and that is browser information,
     which Mozilla puts under `technicalAndInteraction`. That category is
@@ -255,8 +254,9 @@ def test_firefox_declares_the_data_it_sends_to_the_native_app(bundles):
             "browsingActivity",
             "websiteContent",
             "websiteActivity",
+            "authenticationInfo",
         }, name
-        assert "authenticationInfo" not in required, name
+        assert "authenticationInfo" in required, name
 
         # Mozilla: technicalAndInteraction "cannot be required" and "must be
         # optional". Declaring it in `required` is an AMO rejection, and

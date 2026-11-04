@@ -10,7 +10,7 @@
       "id": "cove-dm@cove-download-manager.net",
       "strict_min_version": "140.0",
       "data_collection_permissions": {
-        "required": ["browsingActivity", "websiteContent", "websiteActivity"],
+        "required": ["browsingActivity", "websiteContent", "websiteActivity", "authenticationInfo"],
         "optional": ["technicalAndInteraction"]
       }
     },

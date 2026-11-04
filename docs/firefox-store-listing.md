@@ -32,7 +32,7 @@ extractor. See `docs/chrome-store-listing.md` for why the Chrome copy differs.
 ```text
 Cove Download Manager (browser extension) hands your downloads off to the Cove desktop app so they download faster and stay organized.
 
-When you start a download, the extension can intercept it and send the link to Cove, along with the referrer. Cove does not use your browser's cookies, so downloads that need you to be signed in may not work in Cove. Cove then downloads the file using multiple connections and manages it in a real queue.
+When you start a download, the extension can intercept it and send the link to Cove, along with the referrer. For Gofile, Firefox captures the accountToken cookie from that specific storage-server download request and forwards only that value to Cove on this computer for the transfer. No Gofile API key or Premium account is needed. Cove then downloads the file using multiple connections and manages it in a real queue.
 
 Features:
 
@@ -50,7 +50,7 @@ Features:
 
 • Supported video pages are handed to Cove for extraction, including HLS (.m3u8) streams
 
-• Sends the referrer and user-agent information; browser cookies are not sent
+• On ordinary handoffs, sends the referrer and user-agent information; browser cookies are not sent
 
 • Downloads from private windows that Firefox reports as private are left to the browser; Cove does not take them over
 
@@ -170,7 +170,7 @@ Permission justifications (the cookies permission is no longer requested and its
 
 • downloads - to observe downloads the user starts and cancel the browser's copy after Cove has taken it over, so the file is not downloaded twice.
 
-• webRequest and <all_urls> - downloads and media can originate from any site, so the add-on cannot enumerate hosts ahead of time. Used to observe request headers for the download being handed off, and to detect media on the page for the in-page pill.
+• webRequest and <all_urls> - downloads and media can originate from any site, so the add-on cannot enumerate hosts ahead of time. Used to read the Cookie header of the specific Gofile storage-server download request, retaining only accountToken for the local handoff, and to detect media on the page for the in-page pill. No cookies API is used and no permissions are added.
 
 • contextMenus - the "Download with Cove" right-click entry on links, images, video, and audio.
 
@@ -184,18 +184,18 @@ No analytics, no telemetry, no remote endpoints. The add-on communicates only wi
 
 Data collection declaration
 
-1.4.10 corrects this. Earlier versions declared data_collection_permissions required: ["none"], which was wrong for an add-on whose purpose is handing a download to a native application. Mozilla's guidance states that data sent to native applications using NativeMessaging must be declared in the data collection consent model, so 1.4.10 declares:
+1.4.10 corrected the earlier required: ["none"] declaration, which was wrong for an add-on whose purpose is handing a download to a native application. Data sent to native applications using NativeMessaging must be declared in the data collection consent model. The current declaration also includes authenticationInfo for the Gofile session handoff:
 
   "data_collection_permissions": {
-    "required": ["browsingActivity", "websiteContent", "websiteActivity"],
+    "required": ["browsingActivity", "websiteContent", "websiteActivity", "authenticationInfo"],
     "optional": ["technicalAndInteraction"]
   }
 
-browsingActivity, because the handoff carries the address being downloaded and the address of the page it came from, and Mozilla defines that category as information about the websites users visit, such as specific URLs and domains. websiteContent, because the handoff also carries the media address (earlier builds also carried the cookies read for that download address) - Mozilla's definition of that category explicitly includes cookies, page headers, and request and response information. websiteActivity, because the action being carried out is a download. These three are required because the download cannot be performed without them.
+browsingActivity, because the handoff carries the address being downloaded and the address of the page it came from. websiteContent, because the handoff carries the media address and the specific Gofile download's accountToken cookie. websiteActivity, because the action being carried out is a download. authenticationInfo, because accountToken authenticates the Gofile session. All four are required for these handoffs.
 
 technicalAndInteraction is optional, and it covers exactly one field: the browser user-agent, which Cove passes so the download can use browser-compatible request headers. Mozilla requires this category to be optional and states that it cannot be required, so the extension reads the user's current grant through permissions.getAll() before every handoff and simply omits the user-agent when it is not granted. The download itself still proceeds. Revoking the permission in about:addons takes effect on the next handoff, with no restart. The extension never calls permissions.request() during a download; the install and about:addons consent flows are the only way it is granted.
 
-authenticationInfo is not declared: Mozilla scopes it to credentials and account data such as passwords, usernames, PINs and registration information, and the cookie case is named inside the websiteContent definition instead. strict_min_version is unchanged at 140.0.
+For Gofile, the extension reads accountToken from the specific browser download request to a Gofile storage server (store*.gofile.io) and forwards only that value to the Cove app running on this computer for that download. Cove keeps it in memory for the transfer; it is not written to disk or logs, is not sent to aria2 or any host other than Gofile, and after a Cove restart a fresh download from Firefox is needed. No Gofile API key or Premium account is needed. authenticationInfo is required; strict_min_version is unchanged at 140.0.
 
 What this declaration does not mean: none of this data goes to the add-on's developer, there is no analytics or tracking, nothing is sold or shared for advertising, and no cookie is stored on any remote server. The recipient is the Cove Download Manager application on the user's own computer, which then contacts the site the user asked to download from. The add-on does not read, collect or transmit your browsing history: what it passes is the address of the file you chose to download and the page you were on when you chose it, at the moment you chose it.
 
@@ -229,8 +229,8 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
 | bundle is a copy of `extension/` with one composed HTML file | `scripts/build_extension.py` `_copy_shared` and `_compose_popup`; 22 of 23 files sha256-identical, `popup/popup.html` differing only by the two marker substitutions, asserted by `tests/test_extension_bundle.py` |
 | the page can only request, never persist, an exclusion | `extension/background.js` `fromExtensionPage` gates `getExcludeConfirmation`, `confirmExcludeSite` and `cancelExcludeConfirmation`; `tests/extension_confirm_exclude.test.js` |
 | the excluded host is the top-level page's | `extension/background.js` `excludableHost` reads `sender.tab.url`; `tests/extension_confirm_exclude.test.js` |
-| S08E-1 removes the `cookies` permission | Relative to the approved S08E-1 base commit, this slice removes `"cookies"` from the `permissions` array. It does not change the version, `data_collection_permissions.required`, `strict_min_version`, the Gecko ID, or `gecko_android`. The complete manifest difference from published Firefox 1.4.9 must be rechecked at release preparation. |
-| the declared categories match what is actually sent | `extension/background.js` native payload (`url`, `referrer`, `filename`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |
+| no `cookies` permission or cookies API | `extension/manifest.json` retains existing API and host permissions; Gofile capture uses the existing `webRequest` permission. Required `authenticationInfo` describes the relay payload (`action`, `url`, `gofileToken`, `filename`); `strict_min_version`, the Gecko ID and `gecko_android` are unchanged. |
+| the declared categories match ordinary handoffs | `extension/background.js` native payload (`url`, `referrer`, `filename`, `userAgent`, `fileSize`); asserted by `test_firefox_declares_the_data_it_sends_to_the_native_app` |
 | downloads Firefox reports as private are left to the browser | `extension/background.js` `handleCreated`, `pillIdentityAllowed`, context-menu handler; `extension/media-sites.js` `downloadStream`; `tests/extension_background.test.js`; manual proof pending |
 
 ## Before submitting
@@ -252,9 +252,9 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
   data collection consent and categorized in the appropriate consent model"
   (<https://extensionworkshop.com/documentation/develop/best-practices-for-collecting-user-data-consents/>,
   read 2026-09-12), and handing a download to the local Cove application is
-  this add-on's entire purpose. 1.4.10 declares:
+  this add-on's entire purpose. The current declaration is:
 
-      "required": ["browsingActivity", "websiteContent", "websiteActivity"],
+      "required": ["browsingActivity", "websiteContent", "websiteActivity", "authenticationInfo"],
       "optional": ["technicalAndInteraction"]
 
   Against the category definitions at
@@ -267,14 +267,14 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
   `websiteContent` "covers anything visible on a website - such as text,
   images, videos, and links - and anything embedded, such as cookies, audio,
   page headers, and request and response information", which is the media
-  address (earlier builds also passed the cookies read for the download address). `websiteActivity`
+  address and the specific Gofile accountToken cookie. `websiteActivity`
   covers user interactions "such as saving and downloading", which is the
   handoff itself.
 
-  `authenticationInfo` is deliberately **not** declared. Mozilla scopes that
-  category to credentials and account data - passwords, usernames, PINs,
-  security questions, registration information - and the cookie case is
-  already named inside the `websiteContent` definition. `none` was removed
+  `authenticationInfo` is required for the Gofile accountToken session value
+  captured from the specific storage-server download request and forwarded to
+  Cove on this computer. It stays in memory, never disk or logs, and is sent
+  only to Gofile, never aria2. `none` was removed
   rather than appended, because it is the standalone "collects nothing" value
   and cannot be combined with a category.
 
@@ -282,7 +282,7 @@ Install Cove, launch it once, then click "Test Connection to Cove" in the extens
   Mozilla's examples for it are "Device and browser info, extension usage and
   settings data, crash and error reports", and the handoff carries the browser
   user-agent, which is browser info. This category cannot be handled like the
-  other three: the same page states it "must be optional", and that personal
+  other four: the same page states it "must be optional", and that personal
   data permissions "can be required or optional, except for
   `technicalAndInteraction` that cannot be required". Declaring it alone would
   therefore not have been enough, because an optional permission that is not

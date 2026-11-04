@@ -65,7 +65,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
     contextMenuClicked: event(),
     downloadErased: event(),
     message: event(),
-    headersReceived: event(), tabUpdated: event(), tabRemoved: event(), tabActivated: event(),
+    headersReceived: event(), beforeSendHeaders: event(), tabUpdated: event(), tabRemoved: event(), tabActivated: event(),
     // The keyboard shortcut is a settings writer, so a test has to be able to
     // fire it rather than infer it.
     command: event(),
@@ -294,7 +294,7 @@ function loadBackground({ nativeResult = { status: "ok" }, settings,
       onUpdated: events.tabUpdated,
       onActivated: events.tabActivated,
     },
-    webRequest: { onHeadersReceived: events.headersReceived },
+    webRequest: { onHeadersReceived: events.headersReceived, onBeforeSendHeaders: events.beforeSendHeaders },
     windows: { async getCurrent() { return { incognito: false }; } },
     extension: { inIncognitoContext: false },
   };
@@ -656,7 +656,7 @@ function unknownItem(descriptor, overrides = {}) {
 
 const E2_DOC_ROWS = [
   ["E2-P1","PRIVACY.md","  when you do not. On Chrome the user-agent is always included.\n","  when you do not. On Chrome the user-agent is always included.\n- A download that the browser reports as private or incognito is left to the\n  browser and is not handed to Cove; see Private and incognito windows below.\n"],
-  ["E2-P2","PRIVACY.md","This version of the extension does not read or store\nbrowser cookie values.\n\n## What is passed to the Cove desktop app","This version of the extension does not read or store\nbrowser cookie values.\n\n### Private and incognito windows\n\nThe extension does not hand a download to Cove when the browser reports it as\nprivate (Firefox) or incognito (Chrome). It relies on the browser's own report\nof whether a download is private. If the browser reports that a download is\nprivate, or does not say, the extension leaves the download to the browser: it\ndoes not send its address to Cove, does not cancel it, does not erase it from\nthe browser's list and does not start a copy of it. The in-page button is not\noffered in tabs the browser reports as private, and the right-click entry and\nthe Firefox popup's stream button send nothing from them.\n\nWhether the extension runs in private windows at all is your browser's setting\n(Firefox: Run in Private Windows; Chrome: Allow in Incognito). Extension builds\nfrom before this change do not apply this rule and can still hand over private\ndownloads that the browser shows them, and this change does not remove anything\nsuch a build already handed to Cove. This covers what the extension hands to\nCove. It does not hide private browsing from your browser, from websites or from\nother extensions, and a download you add in the Cove app yourself is not\naffected.\n\n## What is passed to the Cove desktop app"],
+  ["E2-P2","PRIVACY.md","Apart from the Gofile accountToken described above, this version of the extension\ndoes not read or store browser cookie values.\n\n## What is passed to the Cove desktop app","Apart from the Gofile accountToken described above, this version of the extension\ndoes not read or store browser cookie values.\n\n### Private and incognito windows\n\nThe extension does not hand a download to Cove when the browser reports it as\nprivate (Firefox) or incognito (Chrome). It relies on the browser's own report\nof whether a download is private. If the browser reports that a download is\nprivate, or does not say, the extension leaves the download to the browser: it\ndoes not send its address to Cove, does not cancel it, does not erase it from\nthe browser's list and does not start a copy of it. The in-page button is not\noffered in tabs the browser reports as private, and the right-click entry and\nthe Firefox popup's stream button send nothing from them.\n\nWhether the extension runs in private windows at all is your browser's setting\n(Firefox: Run in Private Windows; Chrome: Allow in Incognito). Extension builds\nfrom before this change do not apply this rule and can still hand over private\ndownloads that the browser shows them, and this change does not remove anything\nsuch a build already handed to Cove. This covers what the extension hands to\nCove. It does not hide private browsing from your browser, from websites or from\nother extensions, and a download you add in the Cove app yourself is not\naffected.\n\n## What is passed to the Cove desktop app"],
   ["E2-P3","PRIVACY.md","accepted, and fall back to a browser download when Cove is unavailable.","accepted, and fall back to a browser download when Cove is unavailable.\n  Downloads the browser reports as private are not handed to Cove."],
   ["E2-R1","README.md","no longer restores them into download tasks.\n\n### Settings","no longer restores them into download tasks.\n\nDownloads that your browser reports as private (Firefox) or incognito (Chrome) are\nnot taken over by the extension: your browser keeps them, and the in-page button\nis not offered in those tabs.\n\n### Settings\n"],
   ["E2-C1","docs/chrome-store-listing.md","may not download in Cove\n\n","may not download in Cove\n\n• Downloads that the browser reports as incognito are left to the browser; Cove does not take them over\n\n"],

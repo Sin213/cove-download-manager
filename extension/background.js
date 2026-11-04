@@ -195,12 +195,17 @@ async function userAgentField() {
 
 function sendNativeMessage(msg, requestId) {
   const action = msg && typeof msg.action === "string" ? msg.action : "unknown";
+  if (action === "download" && refuseGofileTarget(msg.url)) {
+    return Promise.resolve({status:"error", reason:"gofile_page", message:GOFILE_PAGE_DOWNLOAD_MESSAGE});
+  }
   diagRecord("extension.background", "native_message_sent", "INFO",
              { action }, requestId);
   return browser.runtime.sendNativeMessage(HOST_NAME, msg).then((result) => {
     diagRecord("extension.background", "native_message_result", "INFO", {
       action,
-      status: (result && result.status) || "none",
+      status: action === "download_gofile_relay"
+        ? (result && ["ok", "error"].includes(result.status) ? result.status : "none")
+        : (result && result.status) || "none",
     }, requestId);
     return result;
   }).catch((err) => {
@@ -803,7 +808,7 @@ function gofileStoreDelivery(url) {
       !authority.includes("@") && !authority.endsWith(":") &&
       (!parsed.port || parsed.port === "443") && /^[\x00-\x7f]+$/.test(authority) &&
       authority.replace(/:\d+$/, "").toLowerCase() === parsed.hostname &&
-      /^store(?:-[a-z0-9]+)*\.gofile\.io$/.test(parsed.hostname) &&
+      /^(?!(?:www|api|upload|uploads)\.gofile\.io$)[a-z][a-z0-9]*(?:-[a-z0-9]+)*\.gofile\.io$/.test(parsed.hostname) &&
       parsed.hostname.split(".")[0].length <= 63 &&
       /^\/download\/web\/[A-Za-z0-9-]{6,64}\/[^/]+$/.test(parsed.pathname) &&
       // Test the original path too: WHATWG URL normalizes dot segments.
@@ -828,6 +833,161 @@ function gofileDownloadKind(item) {
 
 const gofileRefusals = new Map();
 const gofilePending = new Set();
+const GOFILE_CAPTURE_TTL_MS = 10000;
+const GOFILE_CAPTURE_MAX = 8;
+const GOFILE_CAPTURE_WAIT_MS = 2000;
+const GOFILE_RELAY_DEADLINE_MS = 30000;
+const gofileCaptures = new Map();
+const gofileCaptureWaiters = new Map();
+// Token-free evidence outlives consumption and pending tab verification.
+const gofileCorrelations = new Map();
+const GOFILE_PAGE_DOWNLOAD_MESSAGE = "Gofile downloads are handed to Cove from the Gofile page's Download button. Firefox is keeping the download.";
+
+function refuseGofileTarget(url) {
+  if (!isGofileFamily(url) && !gofileStoreDelivery(url)) return false;
+  notifyGofileRefusal({reason:"gofile_page_button", message:GOFILE_PAGE_DOWNLOAD_MESSAGE});
+  return true;
+}
+
+function invalidateGofileCapture(key) {
+  const entry = gofileCaptures.get(key);
+  if (entry) entry.token = null;
+  if (!entry || !entry.ambiguous) gofileCaptures.delete(key);
+}
+
+function recordGofileCorrelation(key, tabId) {
+  const now = Date.now(), previous = gofileCorrelations.get(key);
+  const live = previous && now - previous.at <= GOFILE_CAPTURE_TTL_MS;
+  const record = {tabId:live ? previous.tabId : tabId, at:now,
+    conflicted:!!live && (previous.conflicted || previous.tabId !== tabId)};
+  gofileCorrelations.delete(key);
+  gofileCorrelations.set(key, record);
+  while (gofileCorrelations.size > GOFILE_CAPTURE_MAX) {
+    gofileCorrelations.delete(gofileCorrelations.keys().next().value);
+  }
+  setTimeout(() => {
+    if (gofileCorrelations.get(key) === record) gofileCorrelations.delete(key);
+  }, GOFILE_CAPTURE_TTL_MS);
+  return record;
+}
+
+function gofileCorrelationCurrent(key, record) {
+  return !!record && gofileCorrelations.get(key) === record && !record.conflicted &&
+    Date.now() - record.at <= GOFILE_CAPTURE_TTL_MS;
+}
+// Protocol sentences only: a malformed native reply must never echo a
+// credential into a notification or the refusal dedup map.
+const GOFILE_RELAY_REFUSALS = {
+  gofile_empty: "Cove does not take over empty Gofile files. Firefox is keeping the download.",
+  gofile_needs_token: "Cove could not prepare this Gofile download. Download it again from Gofile in Firefox. Firefox is keeping the download.",
+  gofile_denied: "Gofile refused access to this file. Download it again from Gofile in Firefox. Firefox is keeping the download.",
+  gofile_gone: "This Gofile file is no longer available. Firefox is keeping the download.",
+  gofile_rate_limited: "Gofile is limiting requests. Try again later. Firefox is keeping the download.",
+  gofile_page: "Gofile did not return the file. Download it again from Gofile in Firefox. Firefox is keeping the download.",
+  gofile_unavailable: "Cove could not verify this Gofile download. Try again shortly. Firefox is keeping the download.",
+  gofile_restart: "Update or restart Cove to hand this Gofile download over. Firefox is keeping the download.",
+  gofile_engine: "Gofile downloads need Cove's own download engine. Firefox is keeping the download.",
+  gofile_token: "Cove could not complete this Gofile handoff. Download it again from Gofile in Firefox. Firefox is keeping the download.",
+  gofile_duplicate: "This Gofile download is already in Cove. Firefox is keeping the download.",
+};
+
+function gofileCaptureKey(item) {
+  return typeof item.cookieStoreId === "string" && item.cookieStoreId && item.incognito === false
+    ? item.cookieStoreId + "\n" + item.url : null;
+}
+
+function consumeGofileCapture(key) {
+  const entry = gofileCaptures.get(key);
+  // An ambiguity tombstone must survive refusals until its TTL, so a later
+  // click cannot revive either tab's session during that window.
+  if (!entry || !entry.ambiguous) gofileCaptures.delete(key);
+  return entry;
+}
+
+function captureGofileSession(details) {
+  // A rejected newer request must invalidate an older session for the same
+  // delivery/container, even if its method, type or privacy metadata is bad.
+  if (!gofileStoreDelivery(details.url) || typeof details.cookieStoreId !== "string" || !details.cookieStoreId) return;
+  const key = details.cookieStoreId + "\n" + details.url;
+  if (details.method !== "GET" || details.type !== "main_frame" || details.incognito !== false ||
+      !Number.isInteger(details.tabId) || details.tabId < 0) {
+    invalidateGofileCapture(key);
+    const record = gofileCorrelations.get(key);
+    if (record && !record.conflicted) gofileCorrelations.delete(key);
+    return;
+  }
+  const correlation = recordGofileCorrelation(key, details.tabId);
+  // Clear the old value before parsing: every validation failure fails open.
+  invalidateGofileCapture(key);
+  if (!Array.isArray(details.requestHeaders)) return;
+  const cookies = details.requestHeaders.filter(h => h && typeof h.name === "string" && h.name.toLowerCase() === "cookie");
+  if (cookies.length !== 1 || typeof cookies[0].value !== "string") return;
+  const pairs = cookies[0].value.split(";").map(p => p.trim()).filter(p => p.split("=", 1)[0] === "accountToken");
+  if (pairs.length !== 1) return;
+  let token = pairs[0].slice(pairs[0].indexOf("=") + 1);
+  if (!/^[A-Za-z0-9_-]{16,128}$/.test(token) || !pairs[0].includes("=")) return;
+  const now = Date.now();
+  const previous = gofileCaptures.get(key);
+  const ambiguous = correlation.conflicted || (!!previous && previous.ambiguous && now - previous.at <= GOFILE_CAPTURE_TTL_MS);
+  if (previous) previous.token = null;
+  const entry = {token:ambiguous ? null : token, tabId:details.tabId, requestId:details.requestId, at:now, ambiguous, correlation};
+  token = null;
+  gofileCaptures.delete(key);
+  gofileCaptures.set(key, entry);
+  while (gofileCaptures.size > GOFILE_CAPTURE_MAX) {
+    const oldest = gofileCaptures.keys().next().value;
+    gofileCaptures.get(oldest).token = null;
+    gofileCaptures.delete(oldest);
+  }
+  setTimeout(() => {
+    if (gofileCaptures.get(key) === entry) gofileCaptures.delete(key);
+    entry.token = null;
+  }, GOFILE_CAPTURE_TTL_MS);
+  const wake = gofileCaptureWaiters.get(key);
+  if (wake) wake();
+}
+
+if (/Firefox\//.test(navigator.userAgent) && browser.webRequest && browser.webRequest.onBeforeSendHeaders) {
+  browser.webRequest.onBeforeSendHeaders.addListener(captureGofileSession,
+    {urls:["https://*.gofile.io/download/web/*"], types:["main_frame"]}, ["requestHeaders"]);
+}
+
+async function takeGofileSession(item) {
+  const key = gofileCaptureKey(item);
+  if (!key) return null;
+  // Consume before yielding, including when a header wakes a waiting download.
+  let entry = consumeGofileCapture(key);
+  if (!entry) entry = await new Promise(resolve => {
+    let timer;
+    const wake = () => {
+      gofileCaptureWaiters.delete(key);
+      clearTimeout(timer);
+      resolve(consumeGofileCapture(key));
+    };
+    gofileCaptureWaiters.set(key, wake);
+    timer = setTimeout(wake, GOFILE_CAPTURE_WAIT_MS);
+  });
+  if (!entry) return null;
+  let token = entry.token;
+  entry.token = null;
+  try {
+    if (!token || entry.ambiguous || !gofileCorrelationCurrent(key, entry.correlation) ||
+        Date.now() - entry.at > GOFILE_CAPTURE_TTL_MS) return null;
+    const tab = await browser.tabs.get(entry.tabId);
+    if (!gofileCorrelationCurrent(key, entry.correlation) ||
+        Date.now() - entry.at > GOFILE_CAPTURE_TTL_MS || !tab || tab.incognito !== false ||
+        (tab.cookieStoreId !== undefined && tab.cookieStoreId !== item.cookieStoreId) ||
+        gofileDownloadKind({url:item.url, referrer:tab.url}) !== "delivery") return null;
+    const page = new URL(tab.url), ref = new URL(item.referrer);
+    if (page.host !== ref.host || page.pathname !== ref.pathname) return null;
+    return {token, key, correlation:entry.correlation};
+  } catch {
+    return null;
+  } finally {
+    token = null;
+  }
+}
+
 function notifyGofileRefusal(result) {
   const now = Date.now();
   for (const [key, at] of gofileRefusals) if (now - at > DEDUP_WINDOW_MS) gofileRefusals.delete(key);
@@ -855,7 +1015,7 @@ async function handleCreated(downloadItem) {
     const kind = gofileDownloadKind(downloadItem);
     if (kind === "page") return;
     if (isGofileFamily(url) && kind !== "delivery") return;
-  }
+  } else if (gofileStoreDelivery(url)) return;
   if (!settings.enabled) return;
   if (url.startsWith("blob:") || url.startsWith("data:")) return;
   if (isDomainExcluded(url)) return;
@@ -1019,11 +1179,33 @@ async function interceptDownload(downloadItem) {
   const browserFetch = typeof CoveFuckingfast !== "undefined" && CoveFuckingfast.owns(downloadItem)
     ? CoveFuckingfast.armed : null;
   const ownedIdentity = { url: downloadItem.url, startTime: downloadItem.startTime };
-  const gofileDelivery = gofileStoreDelivery(downloadItem.url);
+  const gofileDelivery = /Firefox\//.test(navigator.userAgent) && gofileStoreDelivery(downloadItem.url);
+  if (!gofileDelivery && refuseGofileTarget(downloadItem.url)) return;
+  if (gofileDelivery && gofilePending.has(downloadItem.url)) return;
   if (gofileDelivery) gofilePending.add(downloadItem.url);
+  let gofileSession = null;
+  let gofileCorrelation = null; // Token-free proof survives the native await.
+  const confirmGofileCorrelation = () => {
+    if (gofileCorrelation && gofileCorrelationCurrent(gofileCorrelation.key, gofileCorrelation.record)) return true;
+    recentIntercepted.delete(downloadItem.url);
+    const current = gofileCorrelation && gofileCorrelations.get(gofileCorrelation.key);
+    if (current && current.conflicted) notifyGofileRefusal({reason:"gofile_tabs_conflicted", message:
+      "Gofile download left to Firefox because two tabs requested it. Firefox is keeping the download."});
+    return false;
+  };
   try {
     // Mark synchronously to block concurrent same-URL events before any await.
     markIntercepted(downloadItem.url);
+
+    if (gofileDelivery) {
+      gofileSession = await takeGofileSession(downloadItem);
+      if (!gofileSession) {
+        recentIntercepted.delete(downloadItem.url);
+        diagRecord("extension.background", "gofile_session_unavailable", "INFO");
+        return;
+      }
+      gofileCorrelation = {key:gofileSession.key, record:gofileSession.correlation};
+    }
 
     const dlId = downloadItem.id;
 
@@ -1039,8 +1221,32 @@ async function interceptDownload(downloadItem) {
 
     // Send to native host BEFORE cancelling. The browser download continues
     // until we have confirmed acceptance of this specific request.
-    const result = await sendNativeMessage({
-      action: gofileDelivery ? "download_gofile" : "download",
+    let result;
+    if (gofileDelivery) {
+      if (!confirmGofileCorrelation()) return;
+      let deadlineTimer;
+      const expired = {};
+      try {
+        result = await Promise.race([
+          sendNativeMessage({action:"download_gofile_relay", url:downloadItem.url,
+            gofileToken:gofileSession.token, filename}),
+          new Promise(resolve => {
+            deadlineTimer = setTimeout(() => resolve(expired), GOFILE_RELAY_DEADLINE_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(deadlineTimer);
+        gofileSession.token = null;
+        gofileSession = null;
+      }
+      if (result === expired) {
+        recentIntercepted.delete(downloadItem.url);
+        diagRecord("extension.background", "gofile_relay_deadline", "INFO");
+      }
+      if (!confirmGofileCorrelation()) return;
+      if (result === expired) return;
+    } else result = await sendNativeMessage({
+      action: "download",
       url: downloadItem.url,
       filename: filename,
       referrer: downloadItem.referrer || "",
@@ -1053,7 +1259,30 @@ async function interceptDownload(downloadItem) {
 
     if (!browserFetch && !gofileDelivery) console.log("Cove: native host response", JSON.stringify(result));
 
-    if (result && result.status === "ok" && (!gofileDelivery || result.proof === "gofile-v1")) {
+    if (gofileDelivery && result && result.status === "ok" && result.proof === "gofile-relay-v1") {
+      // Cove may already have accepted the transfer when a second tab makes
+      // correlation ambiguous. Firefox keeps its copy: a duplicate is the
+      // safe failure, rather than cancelling a download we cannot identify.
+      // Wait for persistence before granting ownership, so a conflict during
+      // that await cannot expose a tentative owner to completion listeners.
+      await saveInterceptedIds();
+      if (!confirmGofileCorrelation()) return;
+      try {
+        await browser.downloads.cancel(dlId);
+      } catch { /* Firefox may already have completed its copy. */ }
+      // A cancel request already issued cannot be withdrawn, but a conflict
+      // during that API await must still prevent ownership and erasure.
+      if (!confirmGofileCorrelation()) return;
+      interceptedIds.add(dlId);
+      ownedDownloads.set(dlId, ownedIdentity);
+      markIntercepted(downloadItem.url);
+      persistInterceptedIds();
+      browser.downloads.erase({id:dlId}).catch(() => {});
+      showNotification("Download sent to Cove", "Gofile download");
+      return;
+    }
+
+    if (result && result.status === "ok" && (!gofileDelivery || result.proof === "gofile-relay-v1")) {
       if (gofileDelivery) markIntercepted(downloadItem.url);
       if (browserFetch) CoveFuckingfast.onIntercepted(browserFetch);
       // Confirmed: native host accepted this download. Now cancel the browser copy.
@@ -1080,6 +1309,16 @@ async function interceptDownload(downloadItem) {
       // `result` may be null/undefined if the host replied with malformed JSON,
       // so don't dereference it: an exception here would abort the handler.
       if (browserFetch) CoveFuckingfast.onRefused(browserFetch);
+      else if (gofileDelivery) {
+        if (result && result.transport !== "error" && result.status === "error") {
+          if (typeof result.reason === "string" && result.reason.startsWith("gofile_")) {
+            const reason = Object.hasOwn(GOFILE_RELAY_REFUSALS, result.reason) ? result.reason : "gofile_unavailable";
+            notifyGofileRefusal({reason, message:GOFILE_RELAY_REFUSALS[reason]});
+          }
+          else notifyGofileRefusal({reason:"update_cove", message:
+            "Update Cove to hand this Gofile download over. Firefox is keeping the download."});
+        }
+      }
       else if (result && typeof result.reason === "string" && result.reason.startsWith("gofile_") &&
                typeof result.message === "string") notifyGofileRefusal(result);
       else console.error(
@@ -1087,7 +1326,14 @@ async function interceptDownload(downloadItem) {
         (result && result.message) || "no response"
       );
     }
+  } catch (err) {
+    if (!gofileDelivery) throw err;
+    recentIntercepted.delete(downloadItem.url);
+    console.error("Cove: Gofile handoff failed, Firefox download continues");
   } finally {
+    if (gofileSession) gofileSession.token = null;
+    gofileSession = null;
+    gofileCorrelation = null;
     if (gofileDelivery) gofilePending.delete(downloadItem.url);
   }
 }
@@ -1238,6 +1484,7 @@ browser.contextMenus.onClicked.addListener(async (info, tab) => {
     : "";
   const url = /^https?:\/\//i.test(target) ? target : fallbackUrl;
   if (!url) return;
+  if (refuseGofileTarget(url)) return;
 
   let filename = (fallbackUrl && url === fallbackUrl)
     ? CoveMedia.mediaFilename(tab, url)
