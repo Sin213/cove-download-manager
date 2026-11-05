@@ -1041,6 +1041,8 @@ async function handleCreated(downloadItem) {
 let interceptedIds = new Set();
 const ownedDownloads = new Map();
 const cleanupInFlight = new Map();
+const pendingHandoffs = new Set();
+const endedHandoffs = new Map();
 
 function eraseOwnedIfNormal(id, prefetched) {
   if (cleanupInFlight.has(id)) return cleanupInFlight.get(id);
@@ -1157,9 +1159,11 @@ async function forgetIntercepted(id) {
 const interceptedIdsReady = loadInterceptedIds();
 
 browser.downloads.onChanged.addListener(async (delta) => {
+  const state = delta.state && delta.state.current;
+  if (pendingHandoffs.has(delta.id) && !endedHandoffs.has(delta.id) &&
+      (state === "interrupted" || state === "complete")) endedHandoffs.set(delta.id, state);
   await interceptedIdsReady;
   if (!interceptedIds.has(delta.id)) return;
-  const state = delta.state && delta.state.current;
   if (state === "interrupted" || state === "complete") {
     const outcome = await eraseOwnedIfNormal(delta.id);
     if (outcome !== "lookup_failed") await forgetIntercepted(delta.id);
@@ -1169,10 +1173,20 @@ browser.downloads.onChanged.addListener(async (delta) => {
 // Terminal in every ordering, including ones onChanged never reports: the item
 // is gone from the browser's list, so there is nothing left to erase.
 browser.downloads.onErased.addListener(async (id) => {
+  if (pendingHandoffs.has(id)) endedHandoffs.set(id, "erased");
   // Erased means ownership is stale; revoke before hydration so a pending prune lookup cannot act on it.
   ownedDownloads.delete(id);
   await forgetIntercepted(id);
 });
+
+async function resumeBrowserDownload(dlId) {
+  try {
+    await browser.downloads.resume(dlId);
+  } catch {
+    // Keep URLs, credentials and exception details out of this failure log.
+    console.error("Cove: could not resume the browser download");
+  }
+}
 
 async function interceptDownload(downloadItem) {
   if (!isNormalContext(downloadItem)) return;
@@ -1183,6 +1197,16 @@ async function interceptDownload(downloadItem) {
   if (!gofileDelivery && refuseGofileTarget(downloadItem.url)) return;
   if (gofileDelivery && gofilePending.has(downloadItem.url)) return;
   if (gofileDelivery) gofilePending.add(downloadItem.url);
+  const dlId = downloadItem.id;
+  pendingHandoffs.add(dlId);
+  let paused = false;
+  let keepBrowserCopy = true;
+  let resumeAttempted = false;
+  const resumeOnce = async () => {
+    if (!paused || !keepBrowserCopy || resumeAttempted || endedHandoffs.has(dlId)) return;
+    resumeAttempted = true;
+    await resumeBrowserDownload(dlId);
+  };
   let gofileSession = null;
   let gofileCorrelation = null; // Token-free proof survives the native await.
   const confirmGofileCorrelation = () => {
@@ -1197,6 +1221,15 @@ async function interceptDownload(downloadItem) {
     // Mark synchronously to block concurrent same-URL events before any await.
     markIntercepted(downloadItem.url);
 
+    // Verified in Firefox 159: a Gofile download paused at handoff start
+    // cannot be resumed. Leave that copy running while capture and Cove wait.
+    if (!gofileDelivery) {
+      try {
+        await browser.downloads.pause(dlId);
+        paused = true;
+      } catch {}
+    }
+
     if (gofileDelivery) {
       gofileSession = await takeGofileSession(downloadItem);
       if (!gofileSession) {
@@ -1206,8 +1239,6 @@ async function interceptDownload(downloadItem) {
       }
       gofileCorrelation = {key:gofileSession.key, record:gofileSession.correlation};
     }
-
-    const dlId = downloadItem.id;
 
     // Extract filename from the download item.
     let filename = null;
@@ -1219,9 +1250,9 @@ async function interceptDownload(downloadItem) {
     if (browserFetch && !filename) filename = browserFetch.hint || null;
     if (!browserFetch && !gofileDelivery) console.log("Cove: sending download to native host", downloadItem.url);
 
-    // Send to native host BEFORE cancelling. The browser download continues
-    // until we have confirmed acceptance of this specific request.
-    let result;
+    // Ask Cove before cancelling. Gofile keeps downloading during capture
+    // and the native call; unsuccessful handoffs leave its copy untouched.
+    let result = null;
     if (gofileDelivery) {
       if (!confirmGofileCorrelation()) return;
       let deadlineTimer;
@@ -1245,19 +1276,31 @@ async function interceptDownload(downloadItem) {
       }
       if (!confirmGofileCorrelation()) return;
       if (result === expired) return;
-    } else result = await sendNativeMessage({
-      action: "download",
-      url: downloadItem.url,
-      filename: filename,
-      referrer: downloadItem.referrer || "",
-      // Unknown is 0 on this protocol. Firefox reports -1 for a length it does
-      // not know yet, and the primary's schema refuses a negative size outright.
-      fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
-      ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
-      ...(await userAgentField()),
-    });
+    } else {
+      try {
+        result = await sendNativeMessage({
+          action: "download",
+          url: downloadItem.url,
+          filename: filename,
+          referrer: downloadItem.referrer || "",
+          // Unknown is 0 on this protocol. Firefox reports -1 for a length it
+          // does not know yet; the primary refuses a negative size outright.
+          fileSize: knownByteSize(downloadItem.totalBytes) ?? 0,
+          ...(browserFetch && browserFetch.directory ? {directory: browserFetch.directory} : {}),
+          ...(await userAgentField()),
+        });
+      } catch {}
+    }
 
     if (!browserFetch && !gofileDelivery) console.log("Cove: native host response", JSON.stringify(result));
+
+    // A terminal browser event during the native wait must not grant stale
+    // ownership or restart an item the user has already ended.
+    if (result && result.status === "ok" && endedHandoffs.has(dlId)) {
+      recentIntercepted.delete(downloadItem.url);
+      if (browserFetch) CoveFuckingfast.onRefused(browserFetch);
+      return;
+    }
 
     if (gofileDelivery && result && result.status === "ok" && result.proof === "gofile-relay-v1") {
       // Cove may already have accepted the transfer when a second tab makes
@@ -1267,12 +1310,17 @@ async function interceptDownload(downloadItem) {
       // that await cannot expose a tentative owner to completion listeners.
       await saveInterceptedIds();
       if (!confirmGofileCorrelation()) return;
+      if (endedHandoffs.has(dlId)) {
+        recentIntercepted.delete(downloadItem.url);
+        return;
+      }
       try {
         await browser.downloads.cancel(dlId);
       } catch { /* Firefox may already have completed its copy. */ }
       // A cancel request already issued cannot be withdrawn, but a conflict
       // during that API await must still prevent ownership and erasure.
       if (!confirmGofileCorrelation()) return;
+      if (endedHandoffs.get(dlId) === "erased") return;
       interceptedIds.add(dlId);
       ownedDownloads.set(dlId, ownedIdentity);
       markIntercepted(downloadItem.url);
@@ -1283,6 +1331,7 @@ async function interceptDownload(downloadItem) {
     }
 
     if (result && result.status === "ok" && (!gofileDelivery || result.proof === "gofile-relay-v1")) {
+      keepBrowserCopy = false;
       if (gofileDelivery) markIntercepted(downloadItem.url);
       if (browserFetch) CoveFuckingfast.onIntercepted(browserFetch);
       // Confirmed: native host accepted this download. Now cancel the browser copy.
@@ -1292,16 +1341,16 @@ async function interceptDownload(downloadItem) {
       try {
         await browser.downloads.cancel(dlId);
       } catch {
-        // The browser download completed before cancel() ran. Both the browser
-        // and Cove will have the file. This is an inherent limitation of the
-        // WebExtension API: there is no pause/reservation primitive that would
-        // let us hold the browser transfer while confirming with the native host.
-        // The alternative (cancel-first) silently loses downloads when Cove is
-        // unavailable, which is the worse failure mode.
+        // The browser download completed before pause() could hold it, so both
+        // the browser and Cove will have the file. Cancel-first can lose it
+        // silently when Cove is unavailable.
       }
       browser.downloads.erase({ id: dlId }).catch(() => {});
       showNotification("Download sent to Cove", gofileDelivery ? "Gofile download" : filename || (browserFetch ? "Browser download" : downloadItem.url));
     } else {
+      // Match the released ordinary/Fuckingfast flow: hold dedup and the
+      // claim until resume settles. Gofile remains protected by gofilePending.
+      if (!gofileDelivery) await resumeOnce();
       // Native host failed or is unavailable. Clear the dedup mark so the
       // browser's original download proceeds unimpeded and future intercepts
       // of the same URL are not blocked.
@@ -1334,6 +1383,9 @@ async function interceptDownload(downloadItem) {
     if (gofileSession) gofileSession.token = null;
     gofileSession = null;
     gofileCorrelation = null;
+    await resumeOnce();
+    pendingHandoffs.delete(dlId);
+    endedHandoffs.delete(dlId);
     if (gofileDelivery) gofilePending.delete(downloadItem.url);
   }
 }

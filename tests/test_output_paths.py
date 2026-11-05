@@ -298,3 +298,58 @@ def test_a_symlinked_engine_output_is_rejected(tmp_path):
 
     assert not isinstance(excinfo.value, MissingEngineOutputError)
     assert "symlink" in str(excinfo.value)
+
+
+# ---- Sparse pre-creation (Windows zero-fill avoidance) ---------------------
+# aria2 cannot reserve space on Windows without admin rights, and NTFS
+# zero-fills everything below a write past the valid data length. A file
+# that is already sparse skips both, so Cove creates it before aria2 does.
+
+_FILE_ATTRIBUTE_SPARSE_FILE = 0x200
+
+
+def _is_sparse(path):
+    import ctypes
+    return bool(ctypes.windll.kernel32.GetFileAttributesW(str(path)) & _FILE_ATTRIBUTE_SPARSE_FILE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS sparse files")
+def test_sparse_precreation_makes_an_empty_sparse_file(tmp_path):
+    from cove.output_paths import precreate_sparse_output
+    work = create_work_directory(tmp_path)
+
+    assert precreate_sparse_output(work, "big.zip") is True
+
+    output = work.path / "big.zip"
+    assert output.stat().st_size == 0
+    assert _is_sparse(output)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS sparse files")
+def test_sparse_precreation_never_touches_an_existing_file(tmp_path):
+    from cove.output_paths import precreate_sparse_output
+    work = create_work_directory(tmp_path)
+    output = work.path / "big.zip"
+    output.write_bytes(b"partial")
+
+    assert precreate_sparse_output(work, "big.zip") is False
+    assert output.read_bytes() == b"partial"
+    assert not _is_sparse(output)
+
+
+@pytest.mark.parametrize("name", ["", "..", "a/b.zip", r"a\b.zip", "CON.txt", "trailing."])
+def test_sparse_precreation_refuses_a_name_that_is_not_a_plain_basename(tmp_path, name):
+    from cove.output_paths import precreate_sparse_output
+    work = create_work_directory(tmp_path)
+
+    assert precreate_sparse_output(work, name) is False
+    assert list(work.path.iterdir()) == []
+
+
+def test_sparse_precreation_is_windows_only(tmp_path, monkeypatch):
+    import cove.output_paths as paths
+    work = create_work_directory(tmp_path)
+    monkeypatch.setattr(paths, "_is_windows_runtime", lambda: False)
+
+    assert paths.precreate_sparse_output(work, "big.zip") is False
+    assert list(work.path.iterdir()) == []

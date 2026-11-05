@@ -61,7 +61,7 @@ Features:
 
 How interception works:
 
-When you start a download, Cove can take it over instead of leaving it to the browser: installers, archives, documents, and other direct file links.
+When you start a download, Cove can take it over instead of leaving it to the browser: installers, archives, documents, and other direct file links. Ordinary downloads are paused while Cove is asked and resumed if Cove cannot take them. Gofile downloads deliberately keep downloading, because Firefox cannot resume a Gofile download once paused. A very small or fast Gofile download can finish in Firefox before Cove takes over, leaving both copies.
 
 You decide what it touches. Interception can be switched off with a keyboard shortcut, restricted to specific file types, disabled entirely on domains you list, and limited by a minimum file size.
 
@@ -89,7 +89,7 @@ New: Gofile downloads started in Firefox can now be handed to Cove using the bro
 
 When you click Download on a Gofile page, the extension reads only the accountToken cookie from that specific download request and sends it to the Cove desktop app running on your computer. Cove keeps it in memory for the transfer and uses it only to fetch that file from Gofile through a local relay. It is never given to the download engine, never written to disk or logs, and never sent anywhere except Gofile.
 
-Firefox cancels its own copy only after Cove confirms it has taken the download. If Cove is not running, is too old, cannot verify the file, or anything else goes wrong, Firefox keeps downloading as usual. A very small or fast download can finish in Firefox before Cove takes over.
+Firefox keeps its Gofile copy downloading while Cove is asked and cancels it only after Cove confirms it has taken the download. Gofile downloads are deliberately not paused, because Firefox cannot resume a Gofile download once paused. If Cove is not running, is too old, cannot verify the file, or anything else goes wrong, Firefox keeps downloading. A very small or fast Gofile download can finish in Firefox before Cove takes over, leaving both copies. Both copies can also remain if Cove accepted but the extension could not confirm it in time, such as a reply after the 30-second deadline or two tabs asking for the same file.
 
 Requires a Cove desktop version that adds Gofile browser-session support (newer than 3.7.1). With older Cove versions the extension leaves Gofile downloads to Firefox.
 
@@ -130,14 +130,14 @@ What changed in 1.4.13
 
 No new API permissions, no new host permissions, no new content scripts and no new files. Relative to the public 1.4.12 file, after normalising its CRLF line endings against this build's LF, only two members differ:
 
-• background.js - captures and correlates the Gofile browser-session value, hands the download to the local Cove relay, and refuses to send Gofile targets as generic downloads.
+• background.js - captures and correlates the Gofile browser-session value and hands the download to the local Cove relay. Ordinary downloads retain the pause-then-cancel flow from public 1.4.12; Gofile downloads deliberately keep running until a proven takeover. Refuses to send Gofile targets as generic downloads.
 • manifest.json - version 1.4.13; data_collection_permissions.required gains authenticationInfo. The permissions array, background scripts, content scripts, strict_min_version (140.0) and Gecko ID are unchanged.
 
 Gofile capture and handoff
 
 The webRequest.onBeforeSendHeaders listener is non-blocking and read-only. Its URL filter is https://*.gofile.io/download/web/* and its request type is main_frame only. It reads only accountToken from that request's Cookie header, retaining that value in extension memory for at most 10 seconds, with at most 8 entries and single use. Correlation uses the download URL, container and tab. No cookies API or cookies permission is used, and the listener does not change the request.
 
-The native message contains only {action: "download_gofile_relay", url, gofileToken, filename}. Firefox cancels its own copy only after Cove responds with {status: "ok", proof: "gofile-relay-v1"}, within a 30-second deadline. Missing, expired or ambiguous capture, refusal, an old or unavailable Cove app, failed verification and timeouts leave the download in Firefox. A very small or fast download can finish in Firefox before Cove takes over, leaving both copies.
+The native message contains only {action: "download_gofile_relay", url, gofileToken, filename}. Ordinary downloads are paused while Cove is asked and resumed if Cove cannot take them, as in public 1.4.12. Gofile downloads are deliberately not paused: verified on Firefox 159, a Gofile download paused at handoff start cannot be resumed. Firefox keeps downloading while the captured session is checked and Cove is asked. Firefox cancels its Gofile copy only after Cove responds with {status: "ok", proof: "gofile-relay-v1"}, within a 30-second deadline and with correlation still current. Missing, expired or ambiguous capture, refusal, an old or unavailable Cove app, failed verification and timeouts leave Firefox untouched. A very small or fast Gofile download can finish in Firefox before Cove takes over, leaving both copies. Both copies can also remain if Cove accepted but the extension could not confirm it in time, such as a reply after the deadline or two tabs asking for the same file.
 
 Cove holds the session value in memory and fetches the file through a relay on 127.0.0.1 with a random capability URL. The value is sent only to Gofile, never to aria2, disk or logs. After a Cove restart, the download cannot resume; start a fresh download from Firefox.
 
@@ -153,7 +153,7 @@ Permission justifications (the permission list is unchanged from public 1.4.12; 
 
 • nativeMessaging - the entire purpose of the add-on. It passes download requests to the Cove desktop app via the native host cove_dm_host. Without this the add-on does nothing.
 
-• downloads - to observe downloads the user starts and cancel the browser's copy after Cove confirms it has taken over. A very small or fast download can finish in Firefox before that confirmation.
+• downloads - to observe downloads the user starts and cancel the browser copy after Cove confirms takeover. Ordinary downloads are paused while Cove is asked and resumed if Cove cannot take them. Gofile downloads are deliberately not paused because Firefox cannot resume them once paused, so Firefox keeps downloading. A very small or fast Gofile download can finish in Firefox before Cove takes over, leaving both copies. Both copies can also remain after a late acceptance reply or two tabs asking for the same file.
 
 • webRequest and <all_urls> - downloads and media can originate from any site, so the add-on cannot enumerate hosts ahead of time. Used to read the Cookie header of the specific Gofile storage-server download request, retaining only accountToken for the local handoff, and to detect media on the page for the in-page pill. No cookies API is used and no permissions are added.
 

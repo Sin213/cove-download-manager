@@ -342,20 +342,33 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.7.1
+          ## What's new in 3.7.4
 
-          A fix release for magnets and torrents when a debrid provider is enabled.
+          Gofile support. Gofile downloads started in Firefox can now be taken over by Cove with no Gofile API key and no Premium subscription, and Gofile share links can be added directly in Add Download.
+
+          ### New
+
+          - **Gofile downloads from Firefox.** Click Download on a Gofile page and Cove can take over the transfer using the guest session your browser already holds. Firefox keeps its own download whenever Cove cannot take over safely. This works together with the Cove Firefox extension version that adds Gofile support, which is published separately.
+          - **Gofile share links in Add Download.** Paste a `https://gofile.io/d/...` link to see the files in the share and choose which to download. Gofile only lets apps list a share for Premium accounts, so this needs your Gofile Premium API token in Settings, under Gofile.
 
           ### Fixed
 
-          - **Cached debrid magnets download without local P2P.** With a debrid provider enabled, Cove now asks the provider first, by info hash, whether it already holds a magnet. If it does, the download is served from the provider and the local BitTorrent settings (P2P fallback, proxy, and IP disclosure checks) no longer block it, because no peer traffic happens.
-          - **Pick files from a cached torrent.** For a torrent the provider already holds, Cove shows the provider's file list so you can choose which files to download, with no metadata fetch from the swarm.
-          - **Clear progress while checking the provider.** A "Checking your debrid provider..." dialog appears during the lookup and can be cancelled.
-          - **Provider errors never fall back to local BitTorrent.** If the cache check fails, Cove stops and tells you, instead of silently trying the swarm.
-          - **No duplicate adds during the check.** The same torrent added again from the API or the browser extension while the dialog is open is held off until the first request finishes.
+          - **Gofile web pages are no longer saved as finished downloads.** A Gofile share link used to be handed to the download engine as an ordinary file, which saved the site's small web page and marked it complete. Cove now refuses those links, and any Gofile transfer that returns a web page or an error instead of the file, or a file of the wrong size, is marked failed instead of complete.
+
+          ### Changed
+
+          - Gofile browser downloads go through a private relay that only your own computer can reach (127.0.0.1). The browser session value is kept in memory, is never handed to aria2, and is never written to disk or logs.
+
+          ### Known limits
+
+          - A very small or fast Gofile download can finish in Firefox before Cove takes over. Then both copies exist; delete whichever you do not want.
+          - A Gofile download taken over from Firefox cannot resume after Cove restarts, because the session value is deliberately not stored. Cove shows a message saying so. Start the download again from Firefox. Pause and resume while Cove stays open work normally.
+          - If you add or change the Gofile API token in Settings, restart Cove before downloading Gofile share files. Downloads already running are not affected.
+          - On Windows, a download whose full file path would be 260 characters or longer still fails with "Download aborted." In a typical Downloads folder that means filenames longer than about 200 characters. Renaming the download to something shorter works around it.
 
           ### Notes
 
+          - Hidden `.cove-work-...` folders left in your download folder by earlier versions can be deleted once Cove is closed. Newer ones are cleaned up automatically.
           - The browser extension is published separately, on its own schedule and through the two stores; this desktop release neither contains nor updates it.
           - On Linux, Cove uses `aria2` from your system (the .deb declares its dependencies). The Windows builds bundle aria2 and yt-dlp.
 

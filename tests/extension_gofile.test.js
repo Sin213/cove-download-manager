@@ -39,9 +39,206 @@ async function secretFree(b) {
   }
 }
 async function untouched(b) {
+  unpaused(b);
   assert.equal(b.calls.cancel.length, 0); assert.equal(b.calls.erase.length, 0);
   assert.equal(evaluate(b, `recentIntercepted.has(${JSON.stringify(url)})`), false); await secretFree(b);
 }
+
+function unpaused(b) {
+  assert.deepEqual(Array.from(b.calls.pause), []);
+  assert.deepEqual(Array.from(b.calls.resume), []);
+}
+
+for (const route of ["Firefox", "Chrome", "Fuckingfast"]) {
+  test(`repair1 C1: ${route} retains dedup and claim until resume settles`, async () => {
+    const b = load({nativeResult:message => message.action === "fetch_ticket"
+      ? {status:"ok", hint:"movie.mp4"} : message.action === "download" ? {status:"error"} : {status:"ok"}});
+    if (route === "Chrome") b.context.navigator.userAgent = "Chrome/159.0";
+    const target = {...item, url:route === "Fuckingfast"
+      ? "https://node.fuckingfast.co/dl/fake-file" : "https://ordinary.test/movie.mp4"};
+    let fetch;
+    if (route === "Fuckingfast") {
+      vm.runInContext(fs.readFileSync("extension/fuckingfast-fetch.js", "utf8"), b.context);
+      fetch = b.context.CoveFuckingfast;
+      const result = await fetch.claim({nonce:"a".repeat(32), id:"fakepage"},
+        {tab:{id:7}, url:"https://fuckingfast.co/fakepage"});
+      assert.equal(result.ok, true);
+    }
+    await flush();
+    let finishResume;
+    const resumeGate = new Promise(resolve => {finishResume = resolve;});
+    b.context.browser.downloads.resume = async id => {
+      b.calls.resume.push(id); b.calls.order.push("resume"); await resumeGate;
+    };
+    await created(b, target); await flush();
+    try {
+      await created(b, {...target, id:2}); await flush();
+      assert.equal(downloads(b).length, 1, "pending resume must suppress the second handoff");
+      assert.equal(evaluate(b, `recentIntercepted.has(${JSON.stringify(target.url)})`), true);
+      if (fetch) assert.notEqual(fetch.armed, null, "claim remains armed during resume");
+      assert.deepEqual(Array.from(b.calls.pause), [1]);
+      assert.deepEqual(Array.from(b.calls.resume), [1]);
+    } finally {
+      finishResume(); await flush();
+    }
+    assert.equal(evaluate(b, `recentIntercepted.has(${JSON.stringify(target.url)})`), false);
+    if (fetch) assert.equal(fetch.armed, null);
+    assert.deepEqual(Array.from(b.calls.resume), [1], "finally must not resume again");
+  });
+}
+
+for (const route of ["Gofile", "ordinary"]) {
+  for (const ending of ["interrupted", "erased", "complete", "no event", "erased before positive proof", "interrupted before positive proof"]) {
+    test(`repair1 C3: ${route} ${ending} during native wait`, async () => {
+      let finishNative;
+      const target = {...item, url:route === "Gofile" ? url : "https://ordinary.test/movie.mp4"};
+      const b = load({nativeResult:message => message.action.startsWith("download")
+        ? new Promise(resolve => {finishNative = resolve;}) : {status:"ok"}});
+      await flush();
+      assert.equal(b.events.downloadChanged.listeners.length, 1);
+      assert.equal(b.events.downloadErased.listeners.length, 1);
+      if (route === "Gofile") capture(b);
+      b.context.testRepairItem = target;
+      const handoff = evaluate(b, "interceptDownload(testRepairItem)");
+      await flush(); assert.equal(downloads(b).length, 1);
+      assert.deepEqual(Array.from(b.calls.pause), route === "Gofile" ? [] : [1]);
+      if (ending.startsWith("erased")) {
+        await Promise.all(b.events.downloadErased.emit(1));
+        b.context.browser.downloads.cancel = async id => {b.calls.cancel.push(id); throw new Error("Item gone");};
+        b.context.browser.downloads.erase = async query => {b.calls.eraseAttempts.push(query); throw new Error("Item gone");};
+      } else if (ending !== "no event") {
+        await Promise.all(b.events.downloadChanged.emit({id:1, state:{current:ending.split(" ")[0]}}));
+      }
+      finishNative(ending.endsWith("before positive proof") ? {status:"ok", proof:"gofile-relay-v1"}
+        : {status:"error", reason:"gofile_denied"});
+      await assert.doesNotReject(handoff); await flush();
+      assert.deepEqual(Array.from(b.calls.resume), route === "ordinary" && ending === "no event" ? [1] : [],
+        "a user-ended item must never restart");
+      assert.equal(evaluate(b, "interceptedIds.has(1) || ownedDownloads.has(1)"), false,
+        "an externally erased item cannot acquire stale ownership");
+      assert.equal((b.store.data._interceptedIds || []).includes(1), false);
+      if (ending !== "erased before positive proof") {
+        assert.equal(b.calls.cancel.length, 0); assert.equal(b.calls.eraseAttempts.length, 0);
+      }
+      // A later attempt must not inherit the earlier event record.
+      if (route === "Gofile") capture(b);
+      const retry = evaluate(b, "interceptDownload(testRepairItem)"); await flush();
+      finishNative({status:"error", reason:"gofile_denied"});
+      await assert.doesNotReject(retry); await flush();
+      assert.deepEqual(Array.from(b.calls.resume), route === "Gofile" ? [] : ending === "no event" ? [1, 1] : [1]);
+      if (route === "Gofile") {unpaused(b); await secretFree(b);}
+    });
+  }
+}
+
+test("Gofile running: keeps downloading while waiting for a captured session", async () => {
+  const b = load(); await created(b); await flush();
+  assert.deepEqual(Array.from(b.calls.pause), []);
+  assert.equal(evaluate(b, "gofileCaptureWaiters.size"), 1);
+  assert.equal(downloads(b).length, 0);
+  assert.equal(b.calls.resume.length, 0);
+  b.fireTimers(2000); await flush(); unpaused(b); await untouched(b);
+});
+
+for (const failure of ["missing capture", "ambiguous capture", "conflicted capture", "tab verification failure",
+  "tab lookup rejection", "exception"]) {
+  test(`Gofile running: ${failure} leaves Firefox untouched`, async () => {
+    const b = load();
+    if (failure !== "missing capture") capture(b);
+    if (failure === "ambiguous capture") capture(b, {tabId:8});
+    if (failure === "conflicted capture") capture(b, {method:"POST"});
+    if (failure === "tab verification failure") b.context.browser.tabs.get = async () => ({...tab, incognito:true});
+    if (failure === "tab lookup rejection") b.context.browser.tabs.get = async () => {throw new Error(token);};
+    if (failure === "exception") evaluate(b, "takeGofileSession = async () => {throw new Error('fake capture error');}");
+    await created(b); await finishWait(b);
+    unpaused(b); assert.equal(downloads(b).length, 0); await untouched(b);
+  });
+}
+
+for (const [failure, reply] of [
+  ["native refusal", {status:"error", reason:"gofile_denied"}],
+  ["native error", {status:"error", message:"failure"}],
+  ["transport error", {status:"error", transport:"error"}],
+  ["malformed reply", null],
+  ["missing proof", {status:"ok"}],
+  ["wrong proof", {status:"ok", proof:"old-proof"}],
+  ["old Cove Unknown action", {status:"error", message:"Unknown action"}],
+]) {
+  test(`Gofile running: ${failure} leaves Firefox untouched`, async () => {
+    const b = load({nativeResult:reply}); capture(b); await created(b); await flush();
+    unpaused(b); assert.equal(downloads(b).length, 1); await untouched(b);
+  });
+}
+
+test("Gofile running: native exception leaves Firefox untouched", async () => {
+  const b = load(); capture(b);
+  b.context.browser.runtime.sendNativeMessage = () => {throw new Error(token);};
+  await created(b); await flush(); unpaused(b); await untouched(b);
+});
+
+test("Gofile running: successful proof cancels and erases without pause or resume", async () => {
+  const b = load(); await flush(); b.calls.order.length = 0;
+  capture(b); await created(b); await flush();
+  assert.deepEqual(Array.from(b.calls.pause), []);
+  assert.deepEqual(Array.from(b.calls.cancel), [1]);
+  assert.deepEqual(JSON.parse(JSON.stringify(b.calls.erase)), [{id:1}]);
+  assert.equal(b.calls.resume.length, 0);
+  assert.deepEqual(Array.from(b.calls.order.slice(0, 4)), ["native:sent", "native:ok", "cancel", "erase"]);
+  await secretFree(b);
+});
+
+test("Gofile running: conflict after positive proof leaves Firefox untouched", async () => {
+  const b = load(); await flush();
+  let finishWrite;
+  const originalSet = b.store.set;
+  b.store.set = async obj => {
+    if ("_interceptedIds" in obj) await new Promise(resolve => {finishWrite = resolve;});
+    return originalSet(obj);
+  };
+  capture(b); await created(b); await flush();
+  assert.equal(typeof finishWrite, "function");
+  capture(b, {tabId:8}); finishWrite(); await flush();
+  unpaused(b); await untouched(b);
+});
+
+test("Gofile running: deadline leaves Firefox untouched and ignores a late positive reply", async () => {
+  let finish;
+  const b = load({nativeResult:() => new Promise(resolve => {finish = resolve;})});
+  capture(b); await created(b); await flush(); b.fireTimers(30000); await flush();
+  unpaused(b); await untouched(b);
+  finish({status:"ok", proof:"gofile-relay-v1"}); await flush();
+  unpaused(b); await untouched(b);
+});
+
+test("Gofile running: concurrent same-URL event never pauses or resumes", async () => {
+  let finish;
+  const b = load({nativeResult:() => new Promise(resolve => {finish = resolve;})});
+  capture(b); await created(b); await flush();
+  evaluate(b, "recentIntercepted.clear()"); await created(b, {...item, id:2}); await flush();
+  assert.deepEqual(Array.from(b.calls.pause), []);
+  assert.equal(b.calls.resume.length, 0); assert.equal(downloads(b).length, 1);
+  finish({status:"error", reason:"gofile_denied"}); await flush(); unpaused(b); await untouched(b);
+});
+
+for (const accepted of [true, false]) test(`Gofile running: unused rejecting pause cannot affect ${accepted ? "takeover" : "refusal"}`, async () => {
+  const b = load({pauseThrows:true, nativeResult:accepted ? {status:"ok", proof:"gofile-relay-v1"} : {status:"error"}});
+  capture(b); await created(b); await flush();
+  assert.deepEqual(Array.from(b.calls.pause), []); assert.equal(b.calls.resume.length, 0);
+  assert.equal(b.calls.cancel.length, accepted ? 1 : 0); assert.equal(b.calls.erase.length, accepted ? 1 : 0);
+  assert.equal(downloads(b).length, 1); await secretFree(b);
+});
+
+test("Gofile running: never attempts a rejecting resume", async () => {
+  const b = load({nativeResult:{status:"error"}}); await flush();
+  b.context.browser.downloads.resume = async id => {
+    b.calls.resume.push(id); b.calls.order.push("resume"); throw new Error(token + url);
+  };
+  capture(b); b.context.testGofileItem = item;
+  await assert.doesNotReject(evaluate(b, "interceptDownload(testGofileItem)"));
+  unpaused(b);
+  assert.equal(JSON.stringify(b.calls.console).includes("Cove: could not resume the browser download"), false);
+  assert.equal(JSON.stringify(b.calls.console).includes(url), false); await secretFree(b);
+});
 
 const familyPages = [
   "https://gofile.io/file", "https://other.gofile.io/file", "https://api.gofile.io/file",
@@ -178,6 +375,7 @@ test("post-final conflict during cancel await prevents erasure and ownership", a
   assert.deepEqual(Array.from(b.calls.cancel), [1]); assert.equal(b.calls.erase.length, 0);
   assert.equal(evaluate(b, "interceptedIds.has(1) || ownedDownloads.has(1)"), false);
   capture(b, {tabId:8}); finishCancel(); await flush();
+  unpaused(b);
   assert.equal(b.calls.erase.length, 0);
   assert.equal(evaluate(b, "interceptedIds.has(1) || ownedDownloads.has(1)"), false);
   assert.equal(evaluate(b, `recentIntercepted.has(${JSON.stringify(url)})`), false);
@@ -190,6 +388,7 @@ test("post-final expired correlation rejects even a positive native proof", asyn
     ? new Promise(resolve => {finish = resolve;}) : {status:"ok"}});
   capture(b); await created(b); await flush();
   b.fireTimers(10000); finish({status:"ok", proof:"gofile-relay-v1"}); await flush();
+  unpaused(b);
   assert.equal(evaluate(b, "interceptedIds.has(1) || ownedDownloads.has(1)"), false);
   await untouched(b);
 });

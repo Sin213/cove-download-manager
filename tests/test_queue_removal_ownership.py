@@ -661,7 +661,9 @@ def test_ambiguous_absent_metadata_parent_still_owns_payload_child(queue_env, mo
     queue.remove(t.id, delete_file=True)
     add[4]("add reply lost")
     drain(calls)
-    assert probes == [identity, identity]
+    # Two absence probes of the parent; a removed child is then asked once
+    # more, to wait for aria2 to let go of the files before they are deleted.
+    assert probes == ([identity, identity] if refused else [identity, identity, CHILD])
     if refused:
         assert t.id in queue.tasks and payload.exists() and t.gid == CHILD and t.phase == ""
         assert _persisted_row(path, t.id)["gid"] == CHILD
@@ -973,3 +975,78 @@ def test_repair3_cached_retry_after_plain_add_failure_settles_without_losing_ide
     drain(calls)
     assert rpc.removed == [identity, CHILD] and not payload.exists()
     assert t.id not in queue.tasks and _persisted_row(path, t.id) is None
+
+
+# ---- Cleanup waits for aria2 to let go (Windows delete-pending race) -------
+# aria2.forceRemove answers before aria2 has closed the file. On Windows a
+# file deleted while aria2 still holds it stays "delete pending", so cleanup's
+# emptiness check fails with error 5 and the work directory is left behind.
+
+
+def test_removal_cleans_up_only_after_aria2_reports_the_transfer_stopped(queue_env, monkeypatch):
+    queue, rpc, path, t, calls, add = dispatched(queue_env)
+    add[3](EXPECTED)
+    payload = private_payload(t)
+    monkeypatch.setattr(queue, "_REMOVAL_POLL_S", 0)
+    statuses = iter(["active", "active", "removed"])
+    seen = []
+    rpc.tell_status = lambda gid: seen.append(payload.exists()) or {"gid": gid, "status": next(statuses)}
+
+    queue.remove(t.id, delete_file=True)
+    drain(calls)
+
+    assert rpc.removed == [EXPECTED]
+    assert seen == [True, True, True], "cleanup ran before aria2 reported the transfer stopped"
+    assert not payload.exists() and t.id not in queue.tasks
+
+
+@pytest.mark.parametrize("answer", ["stuck", "error", "gone"])
+def test_removal_still_completes_when_aria2_never_reports_stopped(queue_env, monkeypatch, answer):
+    queue, rpc, path, t, calls, add = dispatched(queue_env)
+    add[3](EXPECTED)
+    payload = private_payload(t)
+    monkeypatch.setattr(queue, "_REMOVAL_SETTLE_S", 0.05)
+    monkeypatch.setattr(queue, "_REMOVAL_POLL_S", 0.01)
+    def status(gid):
+        if answer == "error":
+            raise Aria2Error("transport lost")
+        if answer == "gone":
+            raise absent(gid)
+        return {"gid": gid, "status": "active"}
+    rpc.tell_status = status
+
+    queue.remove(t.id, delete_file=True)
+    drain(calls)
+
+    assert rpc.removed == [EXPECTED]
+    assert not payload.exists() and t.id not in queue.tasks
+    assert _persisted_row(path, t.id) is None
+
+
+def test_torrent_removal_deletes_files_only_after_aria2_reports_stopped(queue_env, monkeypatch, tmp_path):
+    queue, rpc, path, t, calls, add = dispatched(queue_env, torrent=True)
+    add[3](EXPECTED)
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"owned torrent bytes")
+    rpc.files_result = [{"path": str(payload)}]
+    monkeypatch.setattr(queue, "_REMOVAL_POLL_S", 0)
+    events = []
+    remove = rpc.remove
+    rpc.remove = lambda gid, force=True: events.append("remove") or remove(gid, force)
+    def status(gid):
+        # Still stopping on the first look after the removal, gone after that.
+        answer = "removed" if events.count("active-after-remove") else "active"
+        if "remove" in events and answer == "active":
+            events.append("active-after-remove")
+        events.append(answer)
+        return {"gid": gid, "status": answer, "followedBy": []}
+    rpc.tell_status = status
+    delete = queue._delete_torrent_files
+    monkeypatch.setattr(queue, "_delete_torrent_files",
+                        lambda paths, base: events.append("delete") or delete(paths, base))
+
+    queue.remove(t.id, delete_file=True)
+    drain(calls)
+
+    assert "removed" in events[:events.index("delete")], "files deleted before aria2 reported the transfer stopped"
+    assert not payload.exists() and t.id not in queue.tasks

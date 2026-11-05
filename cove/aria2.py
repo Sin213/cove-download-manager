@@ -481,6 +481,14 @@ def _bundled_aria2c() -> str | None:
     return None
 
 
+def _file_allocation() -> str:
+    """falloc reserves space without writing it on ext4/xfs/APFS. On Windows
+    it needs SeManageVolumePrivilege (admin) and otherwise falls back to
+    zero-filling the whole file, so Windows uses "none" and the queue
+    pre-creates the output as a sparse file instead."""
+    return "none" if sys.platform == "win32" else "falloc"
+
+
 def _resolve_aria2c() -> str | None:
     return _bundled_aria2c() or shutil.which("aria2c")
 
@@ -591,10 +599,18 @@ class Aria2Daemon:
             f"--rpc-listen-port={port}",
             "--rpc-listen-all=false",
             "--rpc-allow-origin-all=false",
+            # aria2c is detached from Cove, so a crashed or killed Cove would
+            # otherwise leave it downloading (or zero-filling) unseen. aria2
+            # watches this PID and shuts down cleanly once it is gone.
+            f"--stop-with-process={os.getpid()}",
             f"--max-connection-per-server={connections}",
             f"--split={connections}",
             "--min-split-size=1M",
             "--continue=true",
+            # aria2's default "prealloc" writes zeros for the whole file
+            # before downloading. On a multi-GB file that pegs the disk,
+            # blocks aria2's single-threaded RPC loop and lags the machine.
+            f"--file-allocation={_file_allocation()}",
             "--allow-overwrite=false",
             "--auto-file-renaming=true",
             f"--dir={self.settings.download_dir}",

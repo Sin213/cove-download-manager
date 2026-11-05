@@ -35,6 +35,7 @@ from .output_paths import (
     adopt_work_directory,
     cleanup_work_directory,
     create_work_directory,
+    precreate_sparse_output,
     publish_output,
     validate_engine_output,
     validate_public_filename,
@@ -937,6 +938,10 @@ class _RpcCall(QRunnable):
 
 class QueueManager(QObject):
     _ABSENCE_SETTLE_S = 0.25
+    # How long a removal waits for aria2 to let go of the files after
+    # aria2.remove answers, and how often it asks.
+    _REMOVAL_SETTLE_S = 10.0
+    _REMOVAL_POLL_S = 0.05
     _UNRECONCILED_TORRENT_ERROR = "Remove this download first; Cove could not confirm the previous attempt stopped."
     task_added = Signal(int)            # task id
     task_changed = Signal(int)          # task id
@@ -4256,7 +4261,29 @@ class QueueManager(QObject):
                 on_done=confirmed, on_fail=refused,
             )
         else:
-            self._spawn(self.rpc.remove, entry["gid"], on_done=confirmed, on_fail=refused)
+            self._spawn(self._remove_settled, entry["gid"], on_done=confirmed, on_fail=refused)
+
+    def _remove_settled(self, gid: str) -> str:
+        """Remove ``gid``, then wait (on the worker) for aria2 to let go.
+
+        aria2.remove answers before aria2 has closed the file and written its
+        control file. On Windows a file deleted while aria2 still holds it is
+        left "delete pending", so cleanup's emptiness check fails and the
+        work directory stays behind. The wait is best effort: an answer that
+        is not a live status, or no answer at all, ends it and cleanup goes
+        ahead as before.
+        """
+        result = self.rpc.remove(gid)
+        deadline = time.monotonic() + self._REMOVAL_SETTLE_S
+        while time.monotonic() < deadline:
+            try:
+                status = self.rpc.tell_status(gid)
+            except Exception:
+                break
+            if not isinstance(status, dict) or status.get("status") not in {"active", "waiting", "paused"}:
+                break
+            time.sleep(self._REMOVAL_POLL_S)
+        return result
 
     def _cancel_ambiguous_transfer(
         self, entry: dict, is_torrent: bool, follow_children: bool
@@ -4292,7 +4319,7 @@ class QueueManager(QObject):
                 entry, follow_children, bool(entry.get("delete_file"))
             )
         if not entry.get("absent"):
-            self._confirm_removal(self.rpc.remove(gid))
+            self._confirm_removal(self._remove_settled(gid))
         return ()
 
     def _finish_removal(self, tid: int, cleanup) -> None:
@@ -4482,6 +4509,8 @@ class QueueManager(QObject):
         """
         parent = entry["gid"]
         parent_absent = bool(entry.get("absent"))
+        # Only a removal that deletes files has to wait for aria2 to close them.
+        remove = self._remove_settled if delete_file else self.rpc.remove
         children = self._torrent_children(parent, parent_absent) if follow_children else []
         paths: tuple[str, ...] = ()
         if delete_file:
@@ -4496,7 +4525,7 @@ class QueueManager(QObject):
         # them for the retry. Stopping the children first left the opposite -
         # a task restored in the metadata phase whose payload was already gone.
         if not parent_absent:
-            self._confirm_removal(self.rpc.remove(parent))
+            self._confirm_removal(remove(parent))
         if not follow_children:
             return paths
         # aria2 can finish the metadata and create the payload child in the
@@ -4521,7 +4550,7 @@ class QueueManager(QObject):
             if delete_file and child not in children:
                 # The children known before the removal were inventoried above.
                 paths += self._owned_file_paths(child)
-            self._confirm_removal(self.rpc.remove(child))
+            self._confirm_removal(remove(child))
         return paths
 
     def _torrent_children(self, parent: str, known_absent: bool = False) -> list[str]:
@@ -5865,6 +5894,11 @@ class QueueManager(QObject):
         # status poll. Never overwrite a size the provider or user already set.
         if content_length > 0 and t.total_bytes <= 0:
             t.total_bytes = content_length
+        if requested:
+            # Windows only: a sparse file stops NTFS zero-filling a multi-GB
+            # segmented download, which would block aria2. An existing file
+            # (a resume) is left alone.
+            precreate_sparse_output(work, requested)
         gid = self.rpc.add_uri(
             [target], str(work.path), segments,
             t.speed_limit_kbps, requested,

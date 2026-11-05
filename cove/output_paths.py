@@ -822,6 +822,41 @@ def validate_public_filename(filename: str | os.PathLike[str]) -> str:
     return value
 
 
+_WINDOWS_FSCTL_SET_SPARSE = 0x900C4
+
+
+def precreate_sparse_output(work: WorkDirectory, filename: str) -> bool:
+    """Create an empty sparse ``filename`` in ``work`` for aria2 to fill in.
+
+    Without admin rights aria2 cannot reserve space on Windows, and NTFS
+    zero-fills everything below a write past the valid data length, so a
+    segmented multi-GB download blocks aria2 while gigabytes of zeros hit
+    the disk. Writes into a sparse file skip that. Best effort: returns
+    False, leaving at most an empty file aria2 resumes from byte 0, when
+    the name is not a plain basename, the file already exists, or the
+    filesystem has no sparse support.
+    """
+    if not _is_windows_runtime():
+        return False
+    try:
+        name = validate_public_filename(filename)
+    except OutputPathError:
+        return False
+    try:
+        output = open(work.path / name, "xb")
+    except OSError:
+        return False
+    with output:
+        import msvcrt
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        returned = wintypes.DWORD()
+        return bool(kernel32.DeviceIoControl(
+            wintypes.HANDLE(msvcrt.get_osfhandle(output.fileno())),
+            _WINDOWS_FSCTL_SET_SPARSE, None, 0, None, 0,
+            ctypes.byref(returned), None,
+        ))
+
+
 def collision_candidates(filename: str | os.PathLike[str]):
     """Yield deterministic public collision candidates."""
 
