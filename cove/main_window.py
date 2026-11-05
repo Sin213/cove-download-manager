@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QHBoxLayout,
     QHeaderView,
@@ -2014,6 +2015,7 @@ class MainWindow(QMainWindow):
             title="MEGA Folder", loading="Loading MEGA folder...",
             detail="Cove is fetching the file list through AllDebrid so you can choose files.",
             dialog_attr="_mega_dialog", warning="MEGA folder unavailable",
+            duplicate_notice=True,
             unavailable=debrid._MEGA_UNAVAILABLE, errors=(debrid.DebridError,),
             fetch=lambda target: debrid.list_mega_folder(
                 target, self.settings, session=self.queue._bound_session()),
@@ -2089,16 +2091,32 @@ class MainWindow(QMainWindow):
         dialog = flow["dialog"](state["result"], dest)
         setattr(self, flow["dialog_attr"], dialog)
         try:
-            if dialog.exec() != dialog.Accepted or self._preflights_closed:
+            if dialog.exec() != QDialog.DialogCode.Accepted or self._preflights_closed:
                 return []
             try:
-                return flow["commit"](dialog.result_selection(), dest)
+                selection = dialog.result_selection()
+                created = flow["commit"](selection, dest)
             except errors as exc:
                 QMessageBox.warning(self, flow["warning"], exc.user_message)
                 return []
-            except Exception:
+            except Exception as exc:
+                logging.getLogger("cove").warning("listing_commit_failed type=%s", type(exc).__name__)
                 QMessageBox.warning(self, flow["warning"], flow["unavailable"])
                 return []
+            if (flow.get("duplicate_notice") and not self._preflights_closed
+                    and len(created) < len(selection)):
+                skipped = len(selection) - len(created)
+                message = ("These files are already in your download list." if not created else
+                           f"{skipped} of {len(selection)} selected files were already in your "
+                           "download list and were skipped.")
+                try:
+                    box = QMessageBox(QMessageBox.Icon.Information, flow["title"], message,
+                                      QMessageBox.StandardButton.Ok, self)
+                    setattr(self, flow["dialog_attr"], box)
+                    box.exec()
+                except Exception as exc:
+                    logging.getLogger("cove").warning("listing_notice_failed type=%s", type(exc).__name__)
+            return created
         finally:
             setattr(self, flow["dialog_attr"], None)
 

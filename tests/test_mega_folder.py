@@ -1,11 +1,12 @@
 """MEGA folders use fake AllDebrid envelopes only; no provider traffic."""
+import gc
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import requests
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QThread, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QDialog
 
 from cove import db, debrid
@@ -364,13 +365,341 @@ def test_main_flow_selection(queue_env, monkeypatch, tmp_path, accept):
     assert len(ids) == int(accept) and len(queue.tasks) == int(accept)
 
 
-def flow_owner(queue):
+def flow_owner(queue, owner=None):
     import cove.main_window as mw
-    owner = SimpleNamespace(queue=queue, settings=queue.settings, _preflights_closed=False)
+    owner = owner if owner is not None else SimpleNamespace()
+    owner.queue, owner.settings, owner._preflights_closed = queue, queue.settings, False
     owner._mega_folder_preflight = lambda *args: mw.MainWindow._mega_folder_preflight(owner, *args)
     owner._resolve_mega_folder = lambda *args: mw.MainWindow._resolve_mega_folder(owner, *args)
     owner.add_urls_checked = lambda *args: mw.MainWindow.add_urls_checked(owner, *args)
     return owner
+
+
+def flat_listing():
+    links = LINKS + ("https://redirect.alldebrid.com/test-3-abcdef",)
+    names = tuple(f"private-file-{i}.bin" for i in range(4))
+    infos = [dict(link=link, filename=name, size=350_000_000, host="mega",
+                  hostDomain="mega.co.nz") for link, name in zip(links, names)]
+    return debrid.list_mega_folder(URL, settings(), session=session_for(
+        names, infos=infos, links=links))
+
+
+@pytest.fixture
+def real_listing_flow(queue_env, monkeypatch, app, caplog):
+    """Drive real modal buttons, keeping the queue offline and scheduler held."""
+    import cove.main_window as mw
+    queue, rpc, _ = queue_env(all_debrid_api_key=APIKEY)
+    inline(queue)
+    owner = flow_owner(queue, QDialog())
+    notices, warnings, dialogs, callback_errors = [], [], [], []
+    flow = SimpleNamespace(owner=owner, notice_handler=None, fetches=[],
+                           exec_notice=mw.QMessageBox.exec)
+
+    def notice_exec(box):
+        notices.append((box.windowTitle(), box.text()))
+        assert box.icon() == mw.QMessageBox.Icon.Information
+        assert box.standardButtons() == mw.QMessageBox.StandardButton.Ok
+        assert box.parent() is owner
+        if flow.notice_handler is not None:
+            return flow.notice_handler(box)
+        box.accept()
+        return box.result()
+
+    monkeypatch.setattr(mw.QMessageBox, "exec", notice_exec)
+    # Let the old static API reach the same real-box driver during RED runs.
+    monkeypatch.setattr(mw.QMessageBox, "information", lambda parent, title, text:
+                        mw.QMessageBox(mw.QMessageBox.Icon.Information, title, text,
+                                       mw.QMessageBox.StandardButton.Ok, parent).exec())
+    monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a: warnings.append(a[1:]))
+    real_loading = mw.MagnetMetadataDialog
+    monkeypatch.setattr(mw, "MagnetMetadataDialog", lambda *a: real_loading(owner))
+
+    def run(result, dest, *, selected=None, cancel=False, closed=False, gofile=False, drain=False):
+        provider = mw.gofile if gofile else debrid
+        def fetch(target, *a, **kw):
+            flow.fetches.append(target)
+            return result
+        monkeypatch.setattr(provider, "list_share" if gofile else "list_mega_folder",
+                            fetch)
+        dialog_name = "GofileFilesDialog" if gofile else "MegaFolderDialog"
+        from cove import dialogs as real_dialogs
+        dialog_type = getattr(real_dialogs, dialog_name)
+
+        def create(listing, destination, parent):
+            dialog = dialog_type(listing, destination, parent)
+            dialogs.append(dialog)
+
+            def click():
+                try:
+                    assert app.activeModalWidget() is dialog
+                    if selected is not None:
+                        for item, index, _size in dialog._leaves:
+                            item.setCheckState(0, Qt.Checked if index in selected else Qt.Unchecked)
+                    if closed:
+                        owner._preflights_closed = True
+                    if cancel:
+                        dialog.reject()
+                    else:
+                        assert dialog.download_button().text() == "Download Selected"
+                        assert dialog.download_button().isEnabled()
+                        dialog.download_button().click()
+                except BaseException as exc:
+                    callback_errors.append(exc)
+                    dialog.reject()
+
+            QTimer.singleShot(0, click)
+            return dialog
+
+        monkeypatch.setattr(mw, dialog_name, create)
+        if gofile:
+            ids = mw.MainWindow._resolve_gofile_share(owner, "https://gofile.io/d/ObvAFn9h", dest)
+        elif drain:
+            ids = owner._mega_folder_preflight(URL, dest)
+        else:
+            ids = owner._resolve_mega_folder(URL, dest)
+        assert not callback_errors
+        assert getattr(owner, "_gofile_dialog" if gofile else "_mega_dialog") is None
+        assert not rpc.added
+        return ids
+
+    def rows():
+        with db.connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM downloads ORDER BY id")]
+
+    def safe_feedback(result):
+        evidence = repr(notices) + repr(warnings) + caplog.text
+        secrets = [URL, KEY, APIKEY]
+        secrets += [f.name for f in result.files]
+        secrets += [f.locked_link for f in result.files if hasattr(f, "locked_link")]
+        assert all(secret not in evidence for secret in secrets)
+
+    flow.queue, flow.run, flow.notices, flow.warnings = queue, run, notices, warnings
+    flow.dialogs, flow.rows, flow.safe_feedback = dialogs, rows, safe_feedback
+    try:
+        yield flow
+    finally:
+        from shiboken6 import isValid
+
+        assert QThread.currentThread() == app.thread()
+        # Destroy Qt objects while still on the GUI thread, before a later
+        # test's worker can collect the Python closures that retain wrappers.
+        widgets = owner.findChildren(QDialog) + [owner]
+        owned_ids = {id(widget) for widget in widgets}
+        for widget in widgets:
+            if isValid(widget):
+                widget.hide()
+                widget.deleteLater()
+        dialogs.clear()
+        notices.clear()
+        warnings.clear()
+        callback_errors.clear()
+        flow.__dict__.clear()
+        owner.__dict__.clear()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+        assert all(not isValid(widget) for widget in widgets)
+        assert owned_ids.isdisjoint(id(widget) for widget in app.topLevelWidgets())
+        widgets.clear()
+        gc.collect()
+
+
+def test_real_button_accepts_four_flat_files(real_listing_flow, tmp_path):
+    flow, result = real_listing_flow, flat_listing()
+    assert len(result.files) == 4 and sum(f.size for f in result.files) == 1_400_000_000
+    assert all(f.path == (f.name,) for f in result.files)
+    ids = flow.run(result, str(tmp_path))
+    assert len(ids) == len(flow.queue.tasks) == len(flow.rows()) == 4
+    assert {r["url"] for r in flow.rows()} == {f.locked_link for f in result.files}
+    assert {r["filename"] for r in flow.rows()} == {f.name for f in result.files}
+    assert all(Path(r["out_dir"]) == tmp_path for r in flow.rows())
+    assert flow.dialogs[-1].result() == QDialog.DialogCode.Accepted
+    assert not flow.notices and not flow.warnings
+    flow.safe_feedback(result)
+
+
+@pytest.mark.parametrize("cancel,closed", [(False, False), (True, False), (False, True)])
+def test_real_button_subset_cancel_and_closed(real_listing_flow, tmp_path, cancel, closed):
+    flow, result = real_listing_flow, flat_listing()
+    ids = flow.run(result, str(tmp_path), selected={1, 3}, cancel=cancel, closed=closed)
+    count = 0 if cancel or closed else 2
+    assert len(ids) == len(flow.queue.tasks) == len(flow.rows()) == count
+    assert {r["filename"] for r in flow.rows()} == (
+        set() if not count else {result.files[i].name for i in (1, 3)})
+    assert not flow.notices and not flow.warnings
+    flow.safe_feedback(result)
+
+
+@pytest.mark.parametrize("existing,selected,cancel", [
+    (4, None, False), (2, None, False), (2, {0, 1, 3}, False), (4, None, True),
+])
+def test_real_button_duplicate_feedback(real_listing_flow, tmp_path, existing, selected, cancel):
+    flow, result = real_listing_flow, flat_listing()
+    old_ids = flow.queue.add_debrid_files(result.files[:existing], str(tmp_path))
+    before = flow.rows()
+    ids = flow.run(result, str(tmp_path), selected=selected, cancel=cancel)
+    total = len(result.files) if selected is None else len(selected)
+    expected = 0 if cancel else total - existing
+    assert len(ids) == expected and set(ids).isdisjoint(old_ids)
+    assert len(flow.queue.tasks) == len(flow.rows()) == existing + expected
+    assert flow.rows()[:existing] == before
+    assert len({r["url"] for r in flow.rows()}) == len(flow.rows())
+    if cancel:
+        assert not flow.notices
+    else:
+        message = ("These files are already in your download list." if expected == 0 else
+                   f"{existing} of {total} selected files were already in your download list and were skipped.")
+        assert flow.notices == [("MEGA Folder", message)]
+    assert not flow.warnings
+    flow.safe_feedback(result)
+
+
+@pytest.mark.parametrize("failure", ["path", "destination", "escape", "unexpected"])
+def test_real_button_commit_failures_are_safe(real_listing_flow, tmp_path, monkeypatch, caplog, failure):
+    flow, result = real_listing_flow, flat_listing()
+    dest = str(tmp_path)
+    expected = debrid._MEGA_UNAVAILABLE
+    if failure == "path":
+        result = replace(result, files=result.files[:1] + (
+            replace(result.files[1], path=("..", result.files[1].name)),))
+        expected = "returned a file path Cove will not write to."
+    elif failure == "destination":
+        dest += "\x00"  # realpath rejects an invalid destination before insertion
+    elif failure == "escape":
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        base = tmp_path / "base"
+        base.mkdir()
+        (base / "Sub").symlink_to(outside, target_is_directory=True)
+        dest = str(base)
+        result = replace(result, files=result.files[:1] + (
+            replace(result.files[1], path=("Sub", result.files[1].name)),))
+        expected = "This MEGA folder contains a path Cove will not write to."
+    else:
+        def fail(*a):
+            raise RuntimeError(URL + APIKEY + result.files[0].locked_link)
+        monkeypatch.setattr(flow.queue, "add_debrid_files", fail)
+    caplog.set_level("WARNING", logger="cove")
+    assert flow.run(result, dest) == []
+    assert not flow.queue.tasks and not flow.rows() and not flow.notices
+    assert flow.warnings == [("MEGA folder unavailable", expected)]
+    if failure in ("destination", "unexpected"):
+        records = [r for r in caplog.records if r.name == "cove"]
+        assert len(records) == 1
+        error_type = "RuntimeError" if failure == "unexpected" else "ValueError"
+        assert records[0].getMessage() == f"listing_commit_failed type={error_type}"
+        assert records[0].exc_info is None and records[0].stack_info is None
+    flow.safe_feedback(result)
+
+
+def test_notice_failure_retains_ids_and_drains_requests(real_listing_flow, tmp_path, monkeypatch, caplog):
+    flow, result = real_listing_flow, flat_listing()
+    flow.queue.add_debrid_files(result.files[:2], str(tmp_path))
+    commit = flow.queue.add_debrid_files
+    submissions = []
+
+    def commit_and_reenter(selection, dest):
+        ids = commit(selection, dest)
+        submissions.append(ids)
+        if len(submissions) == 1:
+            assert flow.owner._mega_folder_preflight(URL + "/file/child", dest) == []
+        return ids
+
+    def fail_notice(box):
+        raise RuntimeError(URL + KEY + APIKEY + result.files[0].locked_link + result.files[0].name)
+
+    monkeypatch.setattr(flow.queue, "add_debrid_files", commit_and_reenter)
+    flow.notice_handler = fail_notice
+    caplog.set_level("WARNING", logger="cove")
+    ids = flow.run(result, str(tmp_path), drain=True)
+    assert len(ids) == 2 and ids == submissions[0] and submissions[1] == []
+    assert flow.fetches == [URL, URL + "/file/child"]
+    assert len(flow.queue.tasks) == len(flow.rows()) == 4
+    assert not flow.owner._mega_open and not flow.owner._mega_requests
+    assert len(flow.notices) == 2 and not flow.warnings
+    records = [r for r in caplog.records if r.name == "cove"]
+    assert [r.getMessage() for r in records] == ["listing_notice_failed type=RuntimeError"] * 2
+    assert all(r.exc_info is None and r.stack_info is None for r in records)
+    flow.safe_feedback(result)
+
+
+def test_notice_quit_unwinds_real_modal(real_listing_flow, tmp_path, app):
+    import cove.main_window as mw
+    flow, result = real_listing_flow, flat_listing()
+    flow.queue.add_debrid_files(result.files[:2], str(tmp_path))
+    owner = flow.owner
+    owner.discard_magnet_requests = lambda: None
+    owner.discard_torrent_preflights = lambda: None
+    owner._torrent_contents_dialog = None
+    observed, timed_out = [], []
+
+    def close_notice(box):
+        guard = QTimer(owner)
+        guard.setSingleShot(True)
+        def failsafe():
+            timed_out.append(True)
+            box.reject()
+        guard.timeout.connect(failsafe)
+        guard.start(2000)
+        def quit_now():
+            observed.append((app.activeModalWidget() is box, owner._mega_dialog is box))
+            mw.MainWindow.close_interactive_preflights(owner)
+        QTimer.singleShot(0, quit_now)
+        try:
+            return flow.exec_notice(box)
+        finally:
+            guard.stop()
+            guard.deleteLater()
+
+    flow.notice_handler = close_notice
+    ids = flow.run(result, str(tmp_path))
+    assert not timed_out and observed == [(True, True)]
+    assert owner._preflights_closed and owner._mega_dialog is None
+    assert len(ids) == 2 and len(flow.queue.tasks) == len(flow.rows()) == 4
+    assert len(flow.notices) == 1 and not flow.warnings
+    flow.safe_feedback(result)
+
+
+def test_notice_not_opened_when_closed_after_commit(real_listing_flow, tmp_path, monkeypatch):
+    flow, result = real_listing_flow, flat_listing()
+    flow.queue.add_debrid_files(result.files[:2], str(tmp_path))
+    commit = flow.queue.add_debrid_files
+    def commit_and_close(selection, dest):
+        ids = commit(selection, dest)
+        flow.owner._preflights_closed = True
+        return ids
+    monkeypatch.setattr(flow.queue, "add_debrid_files", commit_and_close)
+    ids = flow.run(result, str(tmp_path))
+    assert len(ids) == 2 and len(flow.queue.tasks) == len(flow.rows()) == 4
+    assert not flow.notices and not flow.warnings
+    flow.safe_feedback(result)
+
+
+def test_real_button_preserves_synthetic_nested_paths(real_listing_flow, tmp_path):
+    flow, result = real_listing_flow, listing()
+    assert any(len(f.path) > 1 for f in result.files)
+    ids = flow.run(result, str(tmp_path))
+    assert len(ids) == len(result.files) == len(flow.rows())
+    assert {(r["filename"], Path(r["out_dir"])) for r in flow.rows()} == {
+        (f.name, tmp_path.joinpath(*f.path[:-1])) for f in result.files}
+    assert not flow.notices and not flow.warnings
+
+
+@pytest.mark.parametrize("existing,cancel", [(0, False), (1, False), (3, False), (0, True)])
+def test_real_gofile_button_still_commits(real_listing_flow, tmp_path, existing, cancel):
+    from cove import gofile
+    from cove.queue import SOURCE_GOFILE_FILE
+    flow = real_listing_flow
+    result = gofile.GofileListing(tuple(
+        gofile.GofileFile(f"gofile-{i}.bin", (f"gofile-{i}.bin",), 100,
+                          f"{i:08d}-aaaa", "ObvAFn9h") for i in range(3)))
+    old_ids = flow.queue.add_gofile_files(result.files[:existing], str(tmp_path))
+    ids = flow.run(result, str(tmp_path), gofile=True, cancel=cancel)
+    assert len(ids) == (0 if cancel else 3 - existing)
+    assert set(ids).isdisjoint(old_ids)
+    assert len(flow.queue.tasks) == len(flow.rows()) == existing + len(ids)
+    assert all(r["source_type"] == SOURCE_GOFILE_FILE for r in flow.rows())
+    assert not flow.notices and not flow.warnings
+    flow.safe_feedback(result)
 
 
 @pytest.mark.parametrize("failure", [False, True])
