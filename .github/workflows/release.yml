@@ -342,33 +342,18 @@ jobs:
           VERSION="${{ steps.ver.outputs.version }}"
           NOTES_FILE="$(mktemp)"
           cat > "$NOTES_FILE" <<'NOTESEOF'
-          ## What's new in 3.7.4
+          ## What's new in 3.7.5
 
-          Gofile support. Gofile downloads started in Firefox can now be taken over by Cove with no Gofile API key and no Premium subscription, and Gofile share links can be added directly in Add Download.
-
-          ### New
-
-          - **Gofile downloads from Firefox.** Click Download on a Gofile page and Cove can take over the transfer using the guest session your browser already holds. Firefox keeps its own download whenever Cove cannot take over safely. This works together with the Cove Firefox extension version that adds Gofile support, which is published separately.
-          - **Gofile share links in Add Download.** Paste a `https://gofile.io/d/...` link to see the files in the share and choose which to download. Gofile only lets apps list a share for Premium accounts, so this needs your Gofile Premium API token in Settings, under Gofile.
+          A fix release for choosing files from a MEGA folder or a Gofile share.
 
           ### Fixed
 
-          - **Gofile web pages are no longer saved as finished downloads.** A Gofile share link used to be handed to the download engine as an ordinary file, which saved the site's small web page and marked it complete. Cove now refuses those links, and any Gofile transfer that returns a web page or an error instead of the file, or a file of the wrong size, is marked failed instead of complete.
-
-          ### Changed
-
-          - Gofile browser downloads go through a private relay that only your own computer can reach (127.0.0.1). The browser session value is kept in memory, is never handed to aria2, and is never written to disk or logs.
-
-          ### Known limits
-
-          - A very small or fast Gofile download can finish in Firefox before Cove takes over. Then both copies exist; delete whichever you do not want.
-          - A Gofile download taken over from Firefox cannot resume after Cove restarts, because the session value is deliberately not stored. Cove shows a message saying so. Start the download again from Firefox. Pause and resume while Cove stays open work normally.
-          - If you add or change the Gofile API token in Settings, restart Cove before downloading Gofile share files. Downloads already running are not affected.
-          - On Windows, a download whose full file path would be 260 characters or longer still fails with "Download aborted." In a typical Downloads folder that means filenames longer than about 200 characters. Renaming the download to something shorter works around it.
+          - **MEGA folder downloads no longer fail silently.** After choosing files from a MEGA folder and clicking Download Selected, the window closed, nothing was added to the list and no message appeared. The selected files now queue as expected. Gofile share lists used the same code and had the same problem, so they are fixed too.
+          - **You are told when files are already in your list.** If every selected MEGA file was already queued, Cove used to do nothing and say nothing. It now shows a notice, and when only some files were already queued it says how many were skipped. Files are still never added twice.
+          - **Safer error reporting.** If adding files from a MEGA folder or Gofile share fails unexpectedly, Cove records only the kind of error in its log, never links, folder keys or account details, and still shows a clear message.
 
           ### Notes
 
-          - Hidden `.cove-work-...` folders left in your download folder by earlier versions can be deleted once Cove is closed. Newer ones are cleaned up automatically.
           - The browser extension is published separately, on its own schedule and through the two stores; this desktop release neither contains nor updates it.
           - On Linux, Cove uses `aria2` from your system (the .deb declares its dependencies). The Windows builds bundle aria2 and yt-dlp.
 
